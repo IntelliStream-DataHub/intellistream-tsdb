@@ -279,8 +279,10 @@ struct cluster_vol_rec {
         uint64_t rid;
         uint8_t learner;
         uint8_t unanswered; /* kept in the ISR by the last promotion without a fence reply (meta.h; repl.h unanswered) */
+        uint8_t state;      /* enum meta_member_state (R9 E29: retention for DOWN/held members) */
         uint32_t replaces;  /* a learner: the member it moves in for (0: none); that one's REMOVE gives it its
                              * slot (D10) */
+        uint64_t hold_until_ms; /* proposer's wall clock (ms) until which automatic OUT is held; 0: no hold */
         char peer[META_ADDR_MAX];
     } rep[META_REPLICAS_MAX];
     uint32_t nisr;
@@ -289,6 +291,7 @@ struct cluster_vol_rec {
     uint32_t min_isr, isr_lag_ms, unanswered_ms;
     uint8_t no_owner; /* no ISR member is up in the group's view: UNAVAILABLE(NO_OWNER), not MOVED to a dead leader */
     uint32_t repl_retain_mb, repl_retain_s, idle_seal_ms; /* the settings (meta.h) */
+    uint32_t repl_retain_down_gb; /* R9 E29: per-server WAL retention budget for DOWN/held members, GB (meta.h) */
     uint32_t rebuild_mb_s, rebuild_max, transfer_wait_ms, leader_balance_s; /* R4's settings (meta.h, D16) */
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it

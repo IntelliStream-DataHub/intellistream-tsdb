@@ -649,6 +649,31 @@ void replica_keep_cap(eng *db, uint64_t max_bytes, uint64_t max_ms)
     atomic_store(&rp->keep_set, true);
 }
 
+uint64_t replica_keep_excess(eng *db, uint64_t normal_bytes, uint64_t normal_ms)
+{
+    struct replica *rp = db->rp;
+    if (!rp || (!normal_bytes && !normal_ms))
+        return 0;
+    uint64_t floor = atomic_load(&rp->floor_saved);
+    uint64_t ex = 0;
+    pthread_mutex_lock(&rp->unl_mu);
+    if (rp->nunl > 0) {
+        uint64_t now = unl_now_ms(), sum = 0;
+        for (size_t i = rp->nunl; i-- > 0;) {
+            sum += rp->unl[i].bytes;
+            if ((normal_bytes && sum > normal_bytes) ||
+                (normal_ms && now > rp->unl[i].ms && now - rp->unl[i].ms > normal_ms)) {
+                for (size_t j = 0; j <= i; j++)
+                    if (rp->unl[j].fno_end - 1 <= floor)
+                        ex += rp->unl[j].bytes;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&rp->unl_mu);
+    return ex;
+}
+
 /* The last position the caps let go (unl_mu held): counted from the newest flushed segment back, as a leader counts
  * its kept ones (lk_cap_bound), so what goes is always a prefix of unl[]; 0: none. Without caps every flushed segment
  * goes once the floor passes it, the rule before failover (a replica that never leads keeps nothing for others). */

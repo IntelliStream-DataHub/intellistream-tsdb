@@ -72,6 +72,7 @@ struct rpeer {
     uint64_t wrote, wrote_ms; /* the `written` of its last ACK, and when that last changed */
     uint64_t ahead_ms; /* since when `sent` is past `wrote` (0: it is not): what was sent since has not arrived */
     int heard;
+    int was_down;      /* R9 E29: saw this peer META_DOWN; cleared on META_OUT/META_DESTROYED or META_UP + in ISR */
     uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
     uint64_t acked_ms; /* when its last ACK came (the stalesent fault takes a peer heard from since the file) */
     int rderr;         /* the last error of a catch-up read for it, and when it was said (never silent, not a flood) */
@@ -161,6 +162,15 @@ struct rvol {
     struct rsnap *snap; /* rsnap.c */
     struct rset *set;   /* rset.c */
     struct rtr *tr;     /* rtransfer.c */
+    /* R9 E29: per-volume state for DOWN/held WAL retention within the server budget (server/retain.c) */
+    uint64_t ret_check_ms;                  /* last monotonic ms periodic retention refresh ran */
+    uint64_t ret_excess;                    /* last measured in-memory excess bytes above normal caps */
+    uint64_t ret_last_capb, ret_last_capms; /* last caps applied to the engine */
+    int ret_caps_set;
+    int ret_active; /* 1: currently extending retention for a DOWN/held member */
+    int ret_dirty;  /* 1: member state/hold/budget changed; refresh on volume thread */
+    uint32_t ret_evicted_ids[META_REPLICAS_MAX];
+    uint32_t ret_evicted_n;
     /* references, under G.mu: one for the listing in G.vols and one for each vol_find not yet vol_put. The driver
      * repld_close_end unlists is freed by the last vol_put (vol_free), once no link thread, worker, the cluster
      * thread or the snapshot worker still holds it */
@@ -244,8 +254,10 @@ enum {
     RM_NOEPOCHBOUND,     /* repld.c: a peer message's epochs are not bounded by the highest this member knows */
     RM_NODESCEPOCH,      /* repld.c: an APPEND's descriptor epochs are not checked against prev_epoch and its epoch */
     RM_NODESCCMP,        /* repld.c: a record is not compared with its descriptor's position and span */
-    RM_CHECKLATE         /* repld.c: a message reaches msg_refused and the core before its driver check is verified;
+    RM_CHECKLATE,        /* repld.c: a message reaches msg_refused and the core before its driver check is verified;
                           * checknocmp and checkshort are replwire.c's (rw_mutant) */
+    RM_DOWNNOCAP,        /* r9-retain: ignores the repl_retain_down_gb server budget (downbudget) */
+    RM_KEEPAFTEROUT      /* r9-retain: keeps extending retention even after a member is META_OUT (holdkeep) */
 };
 
 enum { FI_REC = 1, FI_EPOCH, FI_DESC }; /* TSDB_REPLD_TEST=flipin[=epoch|desc] (repld.c flip_received) */

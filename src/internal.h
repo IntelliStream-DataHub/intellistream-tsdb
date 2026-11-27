@@ -1808,6 +1808,10 @@ void eng_leader_keep_floor(struct eng *db, uint64_t pos, uint64_t floor);
  * than `max_bytes`, or it was flushed more than `max_ms` ago. 0 is no cap. Read at the next eng_leader_keep_floor or
  * flush. */
 void eng_leader_keep_cap(struct eng *db, uint64_t max_bytes, uint64_t max_ms);
+/* In-memory excess bytes kept on a leader above normal caps (normal_bytes, normal_ms) and at or below min(lead_saved,
+ * lead_commit), matching lk_cap_bound without disk I/O. Never blocks on flush_lock: returns 0 with *excess_out set, or
+ * 1 if flush_lock is busy (caller reuses its previous measurement). */
+int eng_leader_keep_excess(struct eng *db, uint64_t normal_bytes, uint64_t normal_ms, uint64_t *excess_out);
 /* A leader's clock duties (design-cluster.md 5.3, 5.4), run by its flusher thread once the driver sets them (0 turns one
  * off; both are off until the first call): a NOW marker with eng_now_ms every `now_every_ms` (the replicas' retention
  * clock; also before a DROP), and the idle seal: an active memtable with rows that did not change for `idle_seal_ms` is

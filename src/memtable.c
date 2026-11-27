@@ -2277,6 +2277,35 @@ void eng_leader_keep_cap(eng *db, uint64_t max_bytes, uint64_t max_ms)
     atomic_store(&db->lead_cap_ms, max_ms);
 }
 
+int eng_leader_keep_excess(eng *db, uint64_t normal_bytes, uint64_t normal_ms, uint64_t *excess_out)
+{
+    if (!normal_bytes && !normal_ms) {
+        *excess_out = 0;
+        return 0;
+    }
+    if (pthread_mutex_trylock(&db->flush_lock) != 0)
+        return 1;
+    uint64_t ex = 0;
+    if (db->nlk > 0) {
+        uint64_t now = lk_now_ms(), sum = 0;
+        uint64_t saved = atomic_load(&db->lead_saved), commit = atomic_load(&db->lead_commit);
+        uint64_t lim = MIN(saved, commit);
+        for (size_t i = db->nlk; i-- > 0;) {
+            sum += db->lk[i].bytes;
+            if ((normal_bytes && sum > normal_bytes) ||
+                (normal_ms && now > db->lk[i].ms && now - db->lk[i].ms > normal_ms)) {
+                for (size_t j = 0; j <= i; j++)
+                    if (db->lk[j].fno_end - 1 <= lim)
+                        ex += db->lk[j].bytes;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&db->flush_lock);
+    *excess_out = ex;
+    return 0;
+}
+
 void eng_leader_clock(eng *db, uint64_t now_every_ms, uint64_t idle_seal_ms)
 {
     uint64_t was = atomic_exchange(&db->lead_now_ms, now_every_ms);

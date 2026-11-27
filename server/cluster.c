@@ -6300,7 +6300,9 @@ static void vol_watch_duty(void)
                 r->rep[j].rid = v->rep[j].rid;
                 r->rep[j].learner = v->rep[j].learner;
                 r->rep[j].unanswered = v->rep[j].unanswered;
+                r->rep[j].state = mm ? mm->state : META_OUT;
                 r->rep[j].replaces = v->rep[j].replaces;
+                r->rep[j].hold_until_ms = mm ? mm->hold_until_ms : 0;
                 snprintf(r->rep[j].peer, sizeof r->rep[j].peer, "%s", mm ? mm->peer : "");
             }
             r->nisr = v->nisr;
@@ -6318,6 +6320,7 @@ static void vol_watch_duty(void)
             r->repl_retain_mb = C.sm.set.repl_retain_mb;
             r->repl_retain_s = C.sm.set.repl_retain_s;
             r->idle_seal_ms = C.sm.set.idle_seal_ms;
+            r->repl_retain_down_gb = C.sm.set.repl_retain_down_gb;
             r->rebuild_mb_s = C.sm.set.rebuild_mb_s;
             r->rebuild_max = C.sm.set.rebuild_max;
             r->transfer_wait_ms = C.sm.set.transfer_wait_ms;

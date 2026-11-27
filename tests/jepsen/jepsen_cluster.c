@@ -4616,8 +4616,10 @@ static int cluster_form(void)
      * CLASSES_TAIL_MS). Shorter caps strand a member that fell further behind than them: it needs a snapshot, which
      * is not built yet (r3e-fix14: 3 s left a learner behind in 4 of 13 runs, a partition-only run among them;
      * r3e-fix15: 10 s in 2 of 13, a learner killed again and again while it caught up). */
-    if (retain_eff > 0) /* --retain-s, longdown's 3 s (classes' CLASSES_RETAIN_S only with R4_REPLAY_ON_MAIN 0) */
+    if (retain_eff > 0) { /* --retain-s, longdown's 3 s (classes' CLASSES_RETAIN_S only with R4_REPLAY_ON_MAIN 0) */
         S.repl_retain_s = (uint32_t)retain_eff;
+        S.repl_retain_down_gb = 0; /* longdown / --retain-s tests snapshot catch-up past repl_retain_s (E29 off) */
+    }
     /* Any S.* override added here must be mirrored in ju_init_cluster() (cluster_users.h), which runs
      * `tsdb cluster init --superuser` instead of CLUSTER_OP_INIT on odd-seed --auth runs. */
     uint8_t req[4 * (META_SETTINGS_WORDS + 1)]; /* 64 overflowed since the settings grew past 15 words (ASan) */

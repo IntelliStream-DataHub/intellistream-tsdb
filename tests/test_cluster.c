@@ -770,6 +770,8 @@ static uint32_t init_min_isr; /* nonzero: INIT's min_isr (the volumes' min_isr, 
 static uint32_t init_node_timeout_ms; /* > 0: init_mode sets node_timeout to this instead of 1.5 s */
 static uint32_t init_heartbeat_ms;    /* > 0: init_mode sets heartbeat_ms to this instead of 200 ms */
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
+static uint32_t init_retain_down_gb; /* when init_retain_down_set: INIT's repl_retain_down_gb */
+static int init_retain_down_set;
 static int init_r4_set; /* nonzero: INIT's four settings of R4 off their defaults (snapversion reads them back) */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
 static uint32_t init_rebuild_mb_s, init_rebuild_max; /* nonzero: INIT's rebuild_mb_s, rebuild_max */
@@ -783,8 +785,14 @@ static void init_mode(int i, uint32_t replace_s, int mode)
     meta_settings_default(&s);
     if (init_min_isr)
         s.min_isr = init_min_isr;
-    if (init_retain_s)
+    if (init_retain_s) {
         s.repl_retain_s = init_retain_s;
+        /* R3/R4 scenarios set init_retain_s to force snapshot catch-up; disable DOWN retention unless opted in. */
+        if (!init_retain_down_set)
+            s.repl_retain_down_gb = 0;
+    }
+    if (init_retain_down_set)
+        s.repl_retain_down_gb = init_retain_down_gb;
     if (init_isr_lag_ms)
         s.isr_lag_ms = init_isr_lag_ms;
     if (init_rebuild_mb_s)
@@ -21943,6 +21951,372 @@ static void scen_pace(void)
            bytes4, secs_m2, secs_m1, bytes3, secs_m0);
 }
 
+/* ---- R9 E29: WAL retention for DOWN and held members within repl_retain_down_gb (r9-retain) ---- */
+
+static void await_member_state(int via, uint32_t nid, int state, int ms)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        struct view v;
+        view(via, &v);
+        const struct meta_member *m = meta_member(&v.m, nid);
+        int ok = m && (int)m->state == state;
+        int cur = m ? (int)m->state : -1;
+        view_free(&v);
+        if (ok)
+            return;
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("member %" PRIu32 " stayed state %d (wanted %d) after %d ms", nid, cur, state, ms);
+        usleep(50000);
+    }
+}
+
+static void await_member_hold(int via, uint32_t nid, int want_held, int ms)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        struct view v;
+        view(via, &v);
+        const struct meta_member *m = meta_member(&v.m, nid);
+        int held = m && m->hold_until_ms > 0;
+        view_free(&v);
+        if (held == want_held)
+            return;
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("member %" PRIu32 " hold_until_ms did not become %s after %d ms", nid,
+                want_held ? "nonzero" : "zero", ms);
+        usleep(50000);
+    }
+}
+
+/* downkeep (R9 E29): repl_retain_s 3, a replica stopped for ~15 s under writes then restarted. Both the leader and the
+ * surviving replica retain segments past repl_retain_s within repl_retain_down_gb, and the restarted replica catches up
+ * from WAL segments with zero snapshots installed. */
+static void scen_downkeep(void)
+{
+    scenario("downkeep");
+    init_retain_s = 3;
+    init_retain_down_set = 1;
+    init_retain_down_gb = 64;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    init_retain_down_set = 0;
+    init_retain_down_gb = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of plant is node %u", v.leader);
+    int R = (L + 1) % 3, O = (L + 2) % 3;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    uint64_t rows = 0;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("initial write: %s", ers(rc));
+    rows++;
+    await_isr(0, "plant", 3, 5000, "every replica up");
+    stop(R, SIGKILL);
+    await_isr(0, "plant", 2, 10000, "a replica killed");
+    await_member_state(L, ids[R], META_DOWN, 10000);
+    struct timespec s1 = {1, 0};
+    int64_t t = 10000;
+    for (int k = 0; k < 14; k++) {
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = t++, vv[j] = (float)(k * 100 + j);
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+            die("write %d while replica down: %s", k, ers(rc));
+        rows += 100;
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush %d: %s", k, ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0)
+        die("commit write while replica down: %s", ers(rc));
+    rows++;
+    int nwl = wal_count(L, 1), nwo = wal_count(O, 1);
+    if (nwl < 12)
+        die("downkeep: leader kept only %d WAL segments for DOWN replica (wanted >= 12 across 14 s with repl_retain_s 3)",
+            nwl);
+    if (nwo < 12)
+        die("downkeep: surviving replica %d kept only %d WAL segments for DOWN replica (wanted >= 12)", O, nwo);
+    start(R);
+    await_isr(L, "plant", 3, 30000, "restarted replica catches up from retained segments and rejoins ISR");
+    if (log_has(R, "it needs a snapshot") || log_has(R, "snapshot installed") || log_has(L, "needs a snapshot"))
+        die("downkeep: restarted replica installed or needed a snapshot instead of catching up from retained WAL segments");
+    tsdbc *cr = client(R);
+    int got_rows = -1;
+    for (uint64_t t0 = now_ms(); (got_rows = rows_of(cr, id)) != (int)rows && now_ms() - t0 < 10000;)
+        usleep(50000);
+    if (got_rows != (int)rows)
+        die("downkeep: replica %d has %d rows, leader has %" PRIu64, R, got_rows, rows);
+    tsdbc_close(cr);
+    tsdbc_close(c);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {rows, 0, 0, 0};
+    rep_same(wantr, "downkeep after clean stop");
+    printf("  downkeep: leader kept %d and replica %d kept %d WAL segments across 14 s (repl_retain_s 3); restarted "
+           "replica caught up with 0 snapshots and holds %" PRIu64 " rows\n",
+           nwl, O, nwo, rows);
+}
+
+/* downbudget (R9 E29): tiny per-server repl_retain_down_gb budget via TSDB_CLUSTER_TEST=retain_down_kb=24 with two
+ * volumes (plant writes large segments exceeding 24 KiB, plant2 writes small segments fitting within 24 KiB). Largest-
+ * excess volume (plant) falls back to normal caps and its returning replica installs a snapshot, while small volume
+ * (plant2) stays within budget and catches up from WAL. Mutant downnocap ignores the budget and keeps plant's segments. */
+static void scen_downbudget(void)
+{
+    scenario("downbudget");
+    init_retain_s = 2;
+    init_retain_down_set = 1;
+    init_retain_down_gb = 1;
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "retain_down_kb=24";
+        start(i);
+    }
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    init_retain_down_set = 0;
+    init_retain_down_gb = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num1 = 0, num2 = 0;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num1)) != 0 || num1 != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num1);
+    if ((rc = vol_add(0, "plant2", 3, &num2)) != 0 || num2 != 2)
+        die("volume add plant2: %s, number %" PRIu32, cluster_strerror(rc), num2);
+    for (int i = 0; i < 3; i++) {
+        await_open_gen(0, "plant", i, 1, 0);
+        await_open_gen(0, "plant2", i, 1, 0);
+    }
+    struct meta_volume v1, v2;
+    if (!vol_rec(0, "plant", &v1) || !vol_rec(0, "plant2", &v2))
+        die("no record of plant/plant2");
+    int L1 = server_of(v1.leader), L2 = server_of(v2.leader);
+    int R = -1;
+    for (int i = 0; i < 3; i++)
+        if (i != L1 && i != L2)
+            R = i;
+    if (R < 0)
+        R = (L1 + 1) % 3;
+    tsdbc *c1 = client(L1), *c2 = client(L2);
+    tsdb_sid id1 = rep_series(c1, rep_names[0], "plant", 30000);
+    tsdb_sid id2 = rep_series(c2, rep_names[1], "plant2", 30000);
+    int64_t ts = 1000;
+    float val = 1.0f;
+    if ((rc = tsdbc_insert_series(c1, id1, &ts, &val, 1)) != 0)
+        die("plant initial write: %s", ers(rc));
+    if ((rc = tsdbc_insert_series(c2, id2, &ts, &val, 1)) != 0)
+        die("plant2 initial write: %s", ers(rc));
+    await_isr(0, "plant", 3, 5000, "plant ISR 3");
+    await_isr(0, "plant2", 3, 5000, "plant2 ISR 3");
+    stop(R, SIGKILL);
+    await_isr(L1, "plant", 2, 10000, "plant ISR 2");
+    await_isr(L1, "plant2", 2, 10000, "plant2 ISR 2");
+    await_member_state(L1, ids[R], META_DOWN, 10000);
+    /* Write 8 segments 1 s apart: ~30 KiB per flush on plant (exceeds 24 KiB budget), tiny flushes on plant2. */
+    struct timespec s1 = {1, 0};
+    int64_t t1 = 10000, t2 = 10000;
+    uint32_t rng = 0x12345678u;
+    int64_t *tv1 = malloc(3000 * sizeof *tv1);
+    float *vv1 = malloc(3000 * sizeof *vv1);
+    if (!tv1 || !vv1)
+        die("oom");
+    for (int k = 0; k < 8; k++) {
+        for (int j = 0; j < 3000; j++) {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            tv1[j] = t1++;
+            vv1[j] = (float)(rng & 0xffffu) * 0.12345f;
+        }
+        if ((rc = tsdbc_insert_series(c1, id1, tv1, vv1, 3000)) != 0)
+            die("plant write %d: %s", k, ers(rc));
+        if ((rc = tsdbc_flush(c1)) != 0)
+            die("plant flush %d: %s", k, ers(rc));
+        int64_t tv2[10];
+        float vv2[10];
+        for (int j = 0; j < 10; j++)
+            tv2[j] = t2++, vv2[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c2, id2, tv2, vv2, 10)) != 0)
+            die("plant2 write %d: %s", k, ers(rc));
+        if ((rc = tsdbc_flush(c2)) != 0)
+            die("plant2 flush %d: %s", k, ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    free(tv1);
+    free(vv1);
+    if ((rc = tsdbc_insert_series(c1, id1, &t1, &val, 1)) != 0)
+        die("plant commit write: %s", ers(rc));
+    if ((rc = tsdbc_insert_series(c2, id2, &t2, &val, 1)) != 0)
+        die("plant2 commit write: %s", ers(rc));
+    nanosleep(&s1, NULL);
+    int nw1 = wal_count(L1, 1), nw2 = wal_count(L2, 2);
+    if (nw1 > 5)
+        die("downbudget: past repl_retain_down_gb budget, leader still keeps %d WAL segments of plant (8 flushed, 1 s "
+            "apart)", nw1);
+    if (nw2 < 6)
+        die("downbudget: small volume plant2 only kept %d WAL segments (largest-excess volume plant should be evicted "
+            "first)", nw2);
+    start(R);
+    await_log(R, "volume 1: snapshot installed", 30000, "downbudget: replica back past budget never installed snapshot for plant");
+    await_isr(L1, "plant", 3, 30000, "plant ISR 3 after snapshot");
+    await_isr(L1, "plant2", 3, 30000, "plant2 ISR 3 after WAL catch-up");
+    if (log_has(R, "volume 2: snapshot installed"))
+        die("downbudget: small volume plant2 installed a snapshot instead of catching up from retained WAL segments");
+    int want1 = rows_of(c1, id1), want2 = rows_of(c2, id2);
+    tsdbc *cr = client(R);
+    int got1 = -1, got2 = -1;
+    for (uint64_t t0 = now_ms(); ((got1 = rows_of(cr, id1)) != want1 || (got2 = rows_of(cr, id2)) != want2) &&
+                                 now_ms() - t0 < 10000;)
+        usleep(50000);
+    if (got1 != want1 || got2 != want2)
+        die("downbudget: replica %d has (%d, %d) rows, leaders have (%d, %d)", R, got1, got2, want1, want2);
+    tsdbc_close(cr);
+    tsdbc_close(c1);
+    tsdbc_close(c2);
+    stop_all();
+    printf("  downbudget: past 24 KiB server budget, plant evicted to %d WAL segments (replica installed snapshot), while "
+           "small plant2 kept %d segments (caught up from WAL, 0 snapshots); rows (%d, %d) match\n",
+           nw1, nw2, want1, want2);
+}
+
+/* holdkeep (R9 E29): holds a live member (META_OP_NODE_HOLD via setop_file) with a long node_timeout_ms so it stays
+ * META_UP while stopped across repl_retain_s -> segments are retained on leader and surviving replica and restarted
+ * replica catches up with 0 snapshots; then marks it META_OUT -> retention drops immediately back to normal caps.
+ * Mutant keepafterout keeps extending retention after META_OUT and fails the post-OUT segment count check. */
+static void scen_holdkeep(void)
+{
+    scenario("holdkeep");
+    init_retain_s = 2;
+    init_retain_down_set = 1;
+    init_retain_down_gb = 64;
+    init_node_timeout_ms = 30000;
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "setop_file=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    init_retain_down_set = 0;
+    init_retain_down_gb = 0;
+    init_node_timeout_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num = 0;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader);
+    int R = (L + 1) % 3, O = (L + 2) % 3;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t ts = 1000;
+    float val = 1.0f;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("initial write: %s", ers(rc));
+    await_isr(0, "plant", 3, 5000, "every replica up");
+    /* Part 1: Hold live member R for 60 s and stop it while it remains META_UP -> retained past repl_retain_s (2 s). */
+    char op[64], res[512];
+    snprintf(op, sizeof op, "hold %" PRIu32 " 60", ids[R]);
+    set_op(3, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("hold op: %s", res);
+    await_member_hold(L, ids[R], 1, 10000);
+    stop(R, SIGKILL);
+    await_isr(L, "plant", 2, 10000, "held replica stopped");
+    struct timespec s1 = {1, 0};
+    int64_t t = 10000;
+    for (int k = 0; k < 6; k++) {
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = t++, vv[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+            die("write while held %d: %s", k, ers(rc));
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush while held %d: %s", k, ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0)
+        die("commit write while held: %s", ers(rc));
+    int nwl_held = wal_count(L, 1), nwo_held = wal_count(O, 1);
+    if (nwl_held < 6 || nwo_held < 6)
+        die("holdkeep: held member stopped across repl_retain_s 2 s kept only %d (leader) / %d (replica) segments",
+            nwl_held, nwo_held);
+    start(R);
+    await_isr(L, "plant", 3, 30000, "held replica back and caught up from retained segments");
+    if (log_has(R, "it needs a snapshot") || log_has(R, "snapshot installed") || log_has(L, "needs a snapshot"))
+        die("holdkeep: held replica needed or installed a snapshot instead of catching up from retained WAL segments");
+    /* Part 2: Stop R again, write 6 segments past repl_retain_s (retained), then mark R META_OUT -> retention drops! */
+    stop(R, SIGKILL);
+    await_isr(L, "plant", 2, 10000, "held replica stopped before OUT");
+    for (int k = 0; k < 6; k++) {
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = t++, vv[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+            die("write before OUT %d: %s", k, ers(rc));
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush before OUT %d: %s", k, ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0)
+        die("commit write before OUT: %s", ers(rc));
+    int nw_before_out = wal_count(L, 1);
+    if (nw_before_out < 6)
+        die("holdkeep: before META_OUT leader kept only %d WAL segments", nw_before_out);
+    snprintf(op, sizeof op, "out %" PRIu32, ids[R]);
+    set_op(3, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("out op: %s", res);
+    await_member_state(L, ids[R], META_OUT, 10000);
+    /* Wait up to 6 s for retention refresh (and normal caps) to drop segments older than repl_retain_s (2 s). */
+    int nw_after_out = wal_count(L, 1);
+    for (uint64_t t0 = now_ms(); (nw_after_out = wal_count(L, 1)) > 4 && now_ms() - t0 < 6000;)
+        usleep(100000);
+    if (nw_after_out > 4)
+        die("holdkeep: after META_OUT, leader still keeps %d WAL segments (expected <= 4 under repl_retain_s 2 s)",
+            nw_after_out);
+    int nwo_after_out = wal_count(O, 1);
+    for (uint64_t t0 = now_ms(); (nwo_after_out = wal_count(O, 1)) > 4 && now_ms() - t0 < 6000;)
+        usleep(100000);
+    if (nwo_after_out > 4)
+        die("holdkeep: after META_OUT, replica %d still keeps %d WAL segments (expected <= 4)", O, nwo_after_out);
+    tsdbc_close(c);
+    stop_all();
+    printf("  holdkeep: held replica retained %d/%d segments across repl_retain_s and caught up with 0 snapshots; after "
+           "META_OUT leader dropped %d -> %d segments and replica %d dropped to %d\n",
+           nwl_held, nwo_held, nw_before_out, nw_after_out, O, nwo_after_out);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -21992,7 +22366,8 @@ int main(int argc, char **argv)
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast},
                {"outtimer", scen_outtimer}, {"outback", scen_outback}, {"outguard", scen_outguard},
                {"outhold", scen_outhold}, {"outopening", scen_outopening}, {"outfailstop", scen_outfailstop},
-               {"replfault", scen_replfault}, {"pace", scen_pace}};
+               {"replfault", scen_replfault}, {"pace", scen_pace},
+               {"downkeep", scen_downkeep}, {"downbudget", scen_downbudget}, {"holdkeep", scen_holdkeep}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

@@ -52,6 +52,9 @@ int replica_floor_saved(struct eng *db, uint64_t floor);
  * replica_keep_next sets them for the next eng_open_replica on this thread (its open flushes what it replays). */
 void replica_keep_cap(struct eng *db, uint64_t max_bytes, uint64_t max_ms);
 void replica_keep_next(uint64_t max_bytes, uint64_t max_ms);
+/* In-memory excess bytes kept on a replica above normal caps (normal_bytes, normal_ms) and at or below its saved
+ * floor, matching unl_cap_bound without disk I/O (takes only leaf unl_mu). */
+uint64_t replica_keep_excess(struct eng *db, uint64_t normal_bytes, uint64_t normal_ms);
 /* tests: plants mutant replicadropsfloor (a replica's flushed segments go by the floor alone) in this process; tsdbd
  * calls it for TSDB_REPLD_MUTANT=replicadropsfloor (tests/test_cluster.c failoverkeep) */
 void tsdb_test_replica_drops_floor(void);

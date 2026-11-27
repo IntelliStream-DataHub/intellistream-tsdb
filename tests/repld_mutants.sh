@@ -138,6 +138,8 @@ table=(
     "snapdivlogend|snapdiverged|the DIVERGED replica whose log reaches the leader's P (was not rebuilt|refused a copy as stale)"
     "snapnoleftovers|snapkill|after the crash at snap-halfswap the receiver (fetched a copy again|still has)|the receiver restarted after its crash joins the ISR"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
+    "downnocap|downbudget|downbudget: past repl_retain_down_gb budget, leader still keeps [0-9]+ WAL segments"
+    "keepafterout|holdkeep|holdkeep: after META_OUT, leader still keeps [0-9]+ WAL segments"
 )
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}
 export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)

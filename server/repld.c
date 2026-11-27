@@ -125,6 +125,7 @@
 #include "../src/snapshot.h"
 
 #include "repld_int.h"
+#include "retain.h"
 #include "rset.h"
 #include "rsnap.h"
 #include "rtransfer.h"
@@ -1796,6 +1797,205 @@ static int keep_off(void)
     snprintf(f, sizeof f, "%s/keepoff", G.dir);
     return access(f, F_OK) == 0;
 }
+/* Updates peer[].was_down from the current record (rv->mu held). */
+static void retain_note_states(struct rvol *rv)
+{
+    for (uint32_t i = 0; i < rv->rec.nrep && i < REPL_MAX_NODES; i++) {
+        uint8_t st = rv->rec.rep[i].state;
+        if (st == META_DOWN) {
+            rv->peer[i].was_down = 1;
+        } else if (st == META_OUT || st == META_DESTROYED) {
+            rv->peer[i].was_down = 0;
+        } else if (st == META_UP) {
+            for (uint32_t j = 0; j < rv->rec.nisr && j < META_REPLICAS_MAX; j++)
+                if (rv->rec.isr[j] == rv->rec.rep[i].node) {
+                    rv->peer[i].was_down = 0;
+                    break;
+                }
+        }
+    }
+}
+
+/* Computes effective retention caps (capb, capms) for volume rv (R9 E29, PLAN D16; rv->mu held, temporarily released
+ * only around the lock-free in-memory engine excess query or when waking another evicted volume). */
+static void compute_retain_caps(struct rvol *rv, struct eng *db, uint64_t *capb_out, uint64_t *capms_out)
+{
+    uint64_t wms = retain_wall_ms();
+    retain_note_states(rv);
+    uint64_t normal_b = (uint64_t)rv->rec.repl_retain_mb << 20;
+    uint64_t normal_ms = (uint64_t)rv->rec.repl_retain_s * 1000ull;
+    uint64_t budget = retain_budget_bytes(rv->rec.repl_retain_down_gb);
+    int was_down[REPL_MAX_NODES], heard[REPL_MAX_NODES];
+    uint64_t acked[REPL_MAX_NODES];
+    for (uint32_t i = 0; i < rv->rec.nrep && i < REPL_MAX_NODES; i++) {
+        was_down[i] = rv->peer[i].was_down;
+        heard[i] = rv->peer[i].heard;
+        acked[i] = rv->peer[i].acked;
+    }
+    uint32_t down_ids[META_REPLICAS_MAX], ndown = 0;
+    int is_writer = rv->mode == M_WRITER;
+    int want = retain_vol_wants(&rv->rec, rv->self, was_down, acked, heard, is_writer, rv->log_start, wms,
+                                G.mutant == RM_KEEPAFTEROUT, down_ids, &ndown);
+    if (want && db && (budget > 0 || G.mutant == RM_DOWNNOCAP) && (normal_b || normal_ms)) {
+        pthread_mutex_unlock(&rv->mu);
+        uint64_t ex = 0;
+        int got = 1;
+        if (is_writer)
+            got = eng_leader_keep_excess(db, normal_b, normal_ms, &ex) == 0;
+        else
+            ex = replica_keep_excess(db, normal_b, normal_ms);
+        pthread_mutex_lock(&rv->mu);
+        if (got)
+            rv->ret_excess = ex;
+        /* Re-read state under rv->mu in case repld_update ran while unlocked. */
+        wms = retain_wall_ms();
+        retain_note_states(rv);
+        normal_b = (uint64_t)rv->rec.repl_retain_mb << 20;
+        normal_ms = (uint64_t)rv->rec.repl_retain_s * 1000ull;
+        budget = retain_budget_bytes(rv->rec.repl_retain_down_gb);
+        is_writer = rv->mode == M_WRITER;
+        for (uint32_t i = 0; i < rv->rec.nrep && i < REPL_MAX_NODES; i++) {
+            was_down[i] = rv->peer[i].was_down;
+            heard[i] = rv->peer[i].heard;
+            acked[i] = rv->peer[i].acked;
+        }
+        want = retain_vol_wants(&rv->rec, rv->self, was_down, acked, heard, is_writer, rv->log_start, wms,
+                                G.mutant == RM_KEEPAFTEROUT, down_ids, &ndown);
+    }
+    if (want && rv->ret_evicted_n > 0) {
+        /* If a newly-DOWN/held peer joined that was not part of the previously evicted set, give this volume a fresh
+         * chance within the server budget. */
+        int fresh = 0;
+        for (uint32_t i = 0; i < ndown && !fresh; i++) {
+            int seen = 0;
+            for (uint32_t j = 0; j < rv->ret_evicted_n; j++)
+                if (rv->ret_evicted_ids[j] == down_ids[i])
+                    seen = 1;
+            if (!seen)
+                fresh = 1;
+        }
+        if (fresh) {
+            rv->ret_evicted_n = 0;
+            retain_clear_evicted(rv->number);
+        }
+    }
+    int evicted = 0;
+    uint64_t rem = 0;
+    /* Wake up to 16 newly-evicted peer volumes immediately; any further ones notice on their next 500 ms refresh. */
+    uint32_t ev_vols[16], nev = 0;
+    retain_report(rv->number, want ? rv->ret_excess : 0, budget, want, G.mutant == RM_DOWNNOCAP, &evicted, &rem,
+                  ev_vols, &nev, 16);
+    if (want && !evicted) {
+        if (!rv->ret_active) {
+            say("volume %" PRIu32 ": retaining WAL segments past repl_retain_s for DOWN/held member(s) (server budget "
+                "%" PRIu64 " bytes; replay floor waits as today)", rv->number, budget);
+            rv->ret_active = 1;
+        }
+    } else {
+        if (rv->ret_active) {
+            say("volume %" PRIu32 ": DOWN/held retention ended (%s); normal caps restored", rv->number,
+                evicted ? "server budget exceeded" : "member no longer DOWN/held");
+            rv->ret_active = 0;
+        }
+        if (want && evicted) {
+            rv->ret_evicted_n = ndown;
+            for (uint32_t i = 0; i < ndown; i++)
+                rv->ret_evicted_ids[i] = down_ids[i];
+        } else {
+            rv->ret_evicted_n = 0;
+        }
+    }
+    if (is_writer && (G.mutant == RM_NOCAP || G.keep_all)) {
+        *capb_out = 0;
+        *capms_out = 0;
+    } else if (!normal_b && !normal_ms) {
+        /* Both normal caps disabled (0, 0): never tighten retention for a DOWN/held member. */
+        *capb_out = 0;
+        *capms_out = 0;
+    } else if (want && !evicted) {
+        *capms_out = 0;
+        if (G.mutant == RM_DOWNNOCAP) {
+            *capb_out = is_writer ? 0 : UINT64_MAX;
+        } else if (!normal_b) {
+            /* Time cap was the only normal cap; bound by remaining server budget (>= 1 so a replica never sees 0,0). */
+            *capb_out = rem ? rem : 1;
+        } else {
+            *capb_out = normal_b <= UINT64_MAX - rem ? normal_b + rem : UINT64_MAX;
+        }
+    } else {
+        *capb_out = normal_b;
+        *capms_out = normal_ms;
+    }
+    if (nev > 0) {
+        uint32_t self_vol = rv->number;
+        pthread_mutex_unlock(&rv->mu);
+        for (uint32_t i = 0; i < nev; i++) {
+            if (ev_vols[i] == self_vol)
+                continue;
+            struct rvol *other = vol_find(ev_vols[i]);
+            if (other) {
+                pthread_mutex_lock(&other->mu);
+                other->ret_dirty = 1;
+                pthread_cond_signal(&other->cv);
+                pthread_mutex_unlock(&other->mu);
+                vol_put(other);
+            }
+        }
+        pthread_mutex_lock(&rv->mu);
+    }
+}
+
+/* Periodic or state-change retention refresh on the volume's thread (rv->mu held). */
+static void retain_refresh(struct rvol *rv)
+{
+    if (rv->failed || rv->stop || !rv->core || (rv->mode != M_WRITER && rv->mode != M_REPLICA))
+        return;
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    if (!db)
+        return;
+    uint64_t capb = 0, capms = 0;
+    compute_retain_caps(rv, db, &capb, &capms);
+    if (rv->failed || rv->stop || !rv->core) {
+        pthread_mutex_unlock(&rv->mu);
+        tsdb_cvol_unref(&db);
+        pthread_mutex_lock(&rv->mu);
+        return;
+    }
+    int changed = !rv->ret_caps_set || capb != rv->ret_last_capb || capms != rv->ret_last_capms;
+    if (!changed || !rv->st.floor) {
+        pthread_mutex_unlock(&rv->mu);
+        tsdb_cvol_unref(&db);
+        pthread_mutex_lock(&rv->mu);
+        return;
+    }
+    rv->ret_last_capb = capb;
+    rv->ret_last_capms = capms;
+    rv->ret_caps_set = 1;
+    uint64_t floor = rv->st.floor;
+    int mode = rv->mode;
+    uint64_t keep = floor;
+    if (mode == M_WRITER) {
+        for (int i = 0; i < (int)rv->rec.nrep; i++)
+            if (i != rv->self && rv->peer[i].acked < keep && G.mutant != RM_KEEPIGNORESPEERS)
+                keep = rv->peer[i].acked;
+        if (G.keep_all && !keep_off())
+            keep = 0;
+    }
+    pthread_mutex_unlock(&rv->mu);
+    if (mode == M_WRITER) {
+        eng_leader_keep_cap(db, capb, capms);
+        eng_leader_keep_floor(db, keep, floor);
+    } else {
+        replica_keep_cap(db, capb, capms);
+        if (G.mutant != RM_FLOORNOTTOLD)
+            (void)replica_floor_saved(db, floor);
+    }
+    tsdb_cvol_unref(&db);
+    pthread_mutex_lock(&rv->mu);
+    if (!rv->failed && !rv->stop && G.mutant != RM_NOLOGSTARTCHECK)
+        log_start_check(rv);
+}
+
 static void exec(struct rvol *rv, struct repl_action *a)
 {
     struct eng *db = NULL;
@@ -1894,23 +2094,30 @@ static void exec(struct rvol *rv, struct repl_action *a)
                     keep = rv->peer[i].acked; /* a peer never heard from holds everything */
             if (G.keep_all && !keep_off()) /* until r4-xferinst: a learner added or reset later must find position 1 */
                 keep = 0;
-            /* the caps (design-cluster.md 8.3): past them a lagging peer's segments go, up to the floor, and the core
-             * tells that peer to install a snapshot once the log start passed what it needs */
-            bool nocap = G.mutant == RM_NOCAP || G.keep_all; /* keepall: a learner's position 1 outlives the caps */
-            uint64_t capb = nocap ? 0 : (uint64_t)rv->rec.repl_retain_mb << 20;
-            uint64_t capms = nocap ? 0 : (uint64_t)rv->rec.repl_retain_s * 1000;
+            /* the caps (design-cluster.md 8.3, R9 E29): past them a lagging peer's segments go, up to the floor, and
+             * the core tells that peer to install a snapshot once the log start passed what it needs */
+            uint64_t capb = 0, capms = 0;
+            compute_retain_caps(rv, db, &capb, &capms);
+            rv->ret_last_capb = capb;
+            rv->ret_last_capms = capms;
+            rv->ret_caps_set = 1;
             uint64_t floor = a->floor;
+            uint64_t idle_seal = G.mutant == RM_NOSEAL || G.no_clock ? 0 : rv->rec.idle_seal_ms;
             pthread_mutex_unlock(&rv->mu);
             eng_leader_keep_cap(db, capb, capms);
-            eng_leader_clock(db, G.no_clock ? 0 : NOW_EVERY_MS,
-                             G.mutant == RM_NOSEAL || G.no_clock ? 0 : rv->rec.idle_seal_ms);
+            eng_leader_clock(db, G.no_clock ? 0 : NOW_EVERY_MS, idle_seal);
             eng_leader_keep_floor(db, keep, floor);
             pthread_mutex_lock(&rv->mu);
         } else if (a->floor) {
-            uint64_t capb = (uint64_t)rv->rec.repl_retain_mb << 20, capms = (uint64_t)rv->rec.repl_retain_s * 1000;
+            uint64_t capb = 0, capms = 0;
+            compute_retain_caps(rv, db, &capb, &capms);
+            rv->ret_last_capb = capb;
+            rv->ret_last_capms = capms;
+            rv->ret_caps_set = 1;
+            uint64_t floor = a->floor;
             pthread_mutex_unlock(&rv->mu);
             replica_keep_cap(db, capb, capms); /* the settings may have changed since the open */
-            rc = G.mutant == RM_FLOORNOTTOLD ? 0 : replica_floor_saved(db, a->floor);
+            rc = G.mutant == RM_FLOORNOTTOLD ? 0 : replica_floor_saved(db, floor);
             pthread_mutex_lock(&rv->mu);
         }
         if (G.mutant != RM_NOLOGSTARTCHECK) /* planted: the core never hears that the log start moved */
@@ -2542,7 +2749,21 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
 static void replica_caps_next(struct rvol *rv)
 {
     pthread_mutex_lock(&rv->mu);
-    uint64_t capb = (uint64_t)rv->rec.repl_retain_mb << 20, capms = (uint64_t)rv->rec.repl_retain_s * 1000;
+    uint64_t capb = (uint64_t)rv->rec.repl_retain_mb << 20;
+    uint64_t capms = (uint64_t)rv->rec.repl_retain_s * 1000ull;
+    uint64_t budget = retain_budget_bytes(rv->rec.repl_retain_down_gb);
+    uint32_t nd = 0;
+    if ((capb || capms) && (budget > 0 || G.mutant == RM_DOWNNOCAP) &&
+        retain_vol_wants(&rv->rec, rv->self, NULL, NULL, NULL, 0, 0, retain_wall_ms(),
+                         G.mutant == RM_KEEPAFTEROUT, NULL, &nd)) {
+        capms = 0;
+        if (G.mutant == RM_DOWNNOCAP)
+            capb = UINT64_MAX;
+        else if (!capb)
+            capb = budget;
+        else
+            capb = capb <= UINT64_MAX - budget ? capb + budget : UINT64_MAX;
+    }
     pthread_mutex_unlock(&rv->mu);
     replica_keep_next(capb, capms);
 }
@@ -2649,8 +2870,8 @@ static uint32_t vol_idle_deadline(struct rvol *rv, uint64_t now, uint64_t next_t
     if (max_dt < 1)
         max_dt = 1;
     if (!rv->core || rv->mode == M_PROMOTING || rv->snap || rtr_draining(rv) || rset_pending(rv) || rv->sync_late ||
-        (rv->sync_paused && G.sync_hold) || G.plant_diverge || G.snap_ask || G.late_tick || G.slow_tick ||
-        G.mutant == RM_TICKSTRETCH || G.mutant == RM_STALLCATCHUP) {
+        rv->ret_dirty || (rv->sync_paused && G.sync_hold) || G.plant_diverge || G.snap_ask || G.late_tick ||
+        G.slow_tick || G.mutant == RM_TICKSTRETCH || G.mutant == RM_STALLCATCHUP) {
         *wait_until_out = next_tick;
         return 1;
     }
@@ -2697,6 +2918,12 @@ static void *vol_main(void *arg)
         }
         if ((rv->mode == M_WRITER || rv->mode == M_PROMOTING) && !repl_is_leader(rv->core)) {
             demote(rv);
+            continue;
+        }
+        if (rv->ret_dirty) {
+            rv->ret_dirty = 0;
+            rv->ret_check_ms = now_ms();
+            retain_refresh(rv);
             continue;
         }
         /* a tick that is due goes before the inbox (r3d review L2): under a steady stream of ACKs the inbox is never
@@ -2790,6 +3017,10 @@ static void *vol_main(void *arg)
             drain(rv);
             rsnap_tick(rv);
             rtr_tick(rv);
+            if (!rv->ret_check_ms || now - rv->ret_check_ms >= 500) {
+                rv->ret_check_ms = now;
+                retain_refresh(rv);
+            }
             if (rset_apply(rv) == 2) { /* a set change kept back at its META was applied now: the core gets the record */
                 struct item mi = {.kind = IN_META};
                 handle(rv, &mi);
@@ -2931,6 +3162,7 @@ static void cold_apply_crash(struct eng *db, int which)
 void repld_init(tsdb *t, const char *dir)
 {
     atomic_store_explicit(&pl_stopping, 0, memory_order_relaxed);
+    retain_init();
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.inbox_bytes = INBOX_BYTES;
     G.spill_bytes = SPILL_BYTES;
@@ -3020,6 +3252,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapstalekeep")  ? RM_SNAPSTALEKEEP
                : !strcmp(mu, "snapkeepdiverged") ? RM_SNAPKEEPDIVERGED
                : !strcmp(mu, "checklate")      ? RM_CHECKLATE
+               : !strcmp(mu, "downnocap")      ? RM_DOWNNOCAP
+               : !strcmp(mu, "keepafterout")   ? RM_KEEPAFTEROUT
                                                : RM_NONE;
     rw_mutant = !mu                         ? RW_MUT_NONE
                 : !strcmp(mu, "checknocmp") ? RW_MUT_NOCMP
@@ -3292,8 +3526,19 @@ void repld_update(const struct cluster_vol_rec *r)
     links_up(r);
     pthread_mutex_lock(&rv->mu);
     int changed = r->epoch != rv->rec.epoch || r->isr_version != rv->rec.isr_version || r->leader != rv->rec.leader;
+    int ret_changed = r->repl_retain_down_gb != rv->rec.repl_retain_down_gb ||
+                      r->repl_retain_s != rv->rec.repl_retain_s || r->repl_retain_mb != rv->rec.repl_retain_mb ||
+                      r->nrep != rv->rec.nrep || r->nisr != rv->rec.nisr;
+    for (uint32_t i = 0; !ret_changed && i < r->nrep && i < META_REPLICAS_MAX; i++)
+        if (r->rep[i].node != rv->rec.rep[i].node || r->rep[i].state != rv->rec.rep[i].state ||
+            r->rep[i].hold_until_ms != rv->rec.rep[i].hold_until_ms)
+            ret_changed = 1;
     if (rset_change(rv, r)) /* another set version: kept for the volume's thread (rset.c) */
         changed = 1;
+    if (ret_changed) {
+        rv->ret_dirty = 1;
+        pthread_cond_signal(&rv->cv);
+    }
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);
@@ -3528,6 +3773,7 @@ int repld_close_end(uint32_t v, uint64_t *log_end)
         say("volume %" PRIu32 ": driver stopped (the replica is closed)", v);
     }
     cvol_close(v);
+    retain_forget(v);
     /* The listing's reference (repld_open) is given back here, and rv is freed with what it owns by the last vol_put.
      * Who else may hold it: its own thread (joined above), the engine's jr_ops hooks (ctx = rv: cvol_close has closed
      * the engine, so no write, ship or admit runs on it any more), and every vol_find holder (link threads posting
@@ -3573,6 +3819,7 @@ void repld_stop(void)
         tsdb_cvol_unref(&db);
     }
     rsnap_quiesce(); /* the snapshot worker sends on the links: stopped before they go */
+    retain_reset();
     /* Wait for any unlocked plink_send/plink_sendv (e.g. op_bytes on a writer thread) before freeing the links. */
     atomic_store_explicit(&pl_stopping, 1, memory_order_seq_cst);
     while (atomic_load_explicit(&pl_inflight, memory_order_seq_cst) != 0)

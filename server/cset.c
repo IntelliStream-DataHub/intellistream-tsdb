@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../client/tsdb_crypto.h"
@@ -125,11 +126,48 @@ void cset_setop_file(const char *path)
         char op[16];
         unsigned vol = 0, node = 0, repl = 0;
         int k = sscanf(line, "%15s %u %u %u", op, &vol, &node, &repl);
-        if (k < 3)
+        if (k < 2)
             continue;
         char t[320] = "";
         int rc = 0;
         uint64_t rid = 0;
+        if (!strcmp(op, "hold") || !strcmp(op, "out")) {
+            /* R9 test hook (until r9-ops): "hold NODE FOR_S" (0 releases) or "out NODE" */
+            uint32_t nid = vol;
+            const struct meta_member *mb = meta_member(cl_meta(), nid);
+            if (!mb) {
+                rc = META_ERR_NOTFOUND;
+                snprintf(t, sizeof t, "no member %" PRIu32, nid);
+            } else {
+                struct timespec wt;
+                clock_gettime(CLOCK_REALTIME, &wt);
+                uint64_t wms = (uint64_t)wt.tv_sec * 1000ull + (uint64_t)wt.tv_nsec / 1000000ull;
+                if (!wms)
+                    wms = 1;
+                struct meta_entry e;
+                meta_entry_init(&e);
+                if (!strcmp(op, "hold")) {
+                    uint64_t for_s = k >= 3 ? (uint64_t)node : 0;
+                    meta_op_node_hold(&e, nid, for_s ? wms + for_s * 1000ull : 0, wms);
+                } else {
+                    meta_op_member_state(&e, nid, META_OUT, mb->incarnation, META_DOWN_NONE, 0, wms);
+                }
+                rc = cl_propose(&e);
+            }
+            if (o) {
+                if (!strcmp(op, "hold"))
+                    fprintf(o, "hold %u %u: %s %s\n", vol, k >= 3 ? node : 0u, rc ? "refused" : "proposed", t);
+                else
+                    fprintf(o, "out %u: %s %s\n", vol, rc ? "refused" : "proposed", t);
+            }
+            if (!strcmp(op, "hold"))
+                cl_say("setop hold %u %u: %s %s", vol, k >= 3 ? node : 0u, rc ? "refused" : "proposed", t);
+            else
+                cl_say("setop out %u: %s %s", vol, rc ? "refused" : "proposed", t);
+            continue;
+        }
+        if (k < 3)
+            continue;
         const struct meta_volume *v = meta_volume(cl_meta(), vol);
         if (!strcmp(op, "reset")) {
             rc = reset_propose(vol, node, &rid, t, sizeof t);

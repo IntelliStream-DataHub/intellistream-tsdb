@@ -659,7 +659,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs addreplica
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
-    outtimer outback outguard outhold outopening outfailstop replfault pace
+    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1235,7 +1235,10 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown \
 	    snapstalekeep snapinstallstale snapservebeforeopen snapkeepdiverged snapsetnodefer snapclosekeep \
 	    snapdropafter snapnoendafter snapnofence snapdivlogend snapnoleftovers replaystartlog nomsgcheck nometarefuse bulkframes \
-	    metafenceonly noepochbound nodescepoch nodesccmp checknocmp checkshort checklate
+	    metafenceonly noepochbound nodescepoch nodesccmp checknocmp checkshort checklate downnocap keepafterout
+# r9-retain: DOWN/held retention budget mutants (server/retain.c, server/repld.c; tests/repld_mutants.sh)
+retain-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/repld_mutants.sh $(SCRATCH) downnocap keepafterout
 # disk class detection, DISK metadata and crashfs mutants (src/disk.c, tests/test_disks.c)
 disk-mutants: $(B)/test_disks $(CRASHFS_SO) $(B)/tsdb
 	$(MUT) --name test_disks --list "rotationalflip bindtwice disknosync" -- ./$(B)/test_disks --mutant @M@ @D@
@@ -1292,9 +1295,9 @@ meta-soak: $(B)/test_meta
 # R4's files beside the replication driver and the volume manager (server/repld_int.h, cvolset.h, snapinst.h): stubs
 # until r4-xferlink, r4-xferinst, r4-setchg, r4-transfer fill them; compiled with repld.c wherever it is (and so is
 # server/margins.c, the cluster volumes' margins: every build of tsdbd.c)
-R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/cvolset.c server/cvolset_mgr.c server/snapinst.c \
+R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/retain.c server/cvolset.c server/cvolset_mgr.c server/snapinst.c \
           server/snapinst_run.c server/margins.c
-R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h server/cvolset.h server/snapinst.h \
+R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h server/retain.h server/cvolset.h server/snapinst.h \
           server/margins.h server/pace.h
 # r8f: the peer cold ops and their cluster instance (server/chunkpeer.h), compiled with tsdbd (g_ec_cfg is tsdbd.c's)
 CP_SRC := server/chunkpeer.c server/chunkpeer_cluster.c
