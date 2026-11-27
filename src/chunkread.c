@@ -401,6 +401,8 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
             memset(b, 0, w);
             r->rep->st[p] = CHUNK_ST_VIRTUAL;
         } else if (r->raw) {
+            if (eng_abandoned())
+                return TSDB_ERR_UNAVAILABLE;
             size_t avail = x0 < cl ? (size_t)((y0 < cl ? y0 : cl) - x0) : 0;
             int st = avail ? r->src->read(r->src->ctx, p, s * g->cell + x0, b, avail) : 0;
             if (st) {
@@ -410,6 +412,8 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
             }
             memset(b + avail, 0, w - avail);
         } else {
+            if (eng_abandoned())
+                return TSDB_ERR_UNAVAILABLE;
             int st = fetch_checked(r, p, s, (size_t)cl, b);
             if (st) {
                 sts[p] = st;
@@ -498,6 +502,7 @@ typedef struct cr_pos_task {
     unsigned pos;
     size_t cap;
     bool raw;
+    const volatile int *abandon;
     bool failed;
 } cr_pos_task;
 
@@ -540,6 +545,10 @@ static void cr_pos_run(cr_pos_task *t)
         uint64_t c = s * k + pos;
         if (c < t->c0 || c > t->c1)
             continue;
+        if (t->abandon && __atomic_load_n(t->abandon, __ATOMIC_ACQUIRE)) {
+            failed = true;
+            break;
+        }
         uint64_t cs = c * g->cell, cl = chunk_cell_len(g, c);
         uint64_t a = t->off > cs ? t->off : cs;
         uint64_t b = t->off + t->len < cs + cl ? t->off + t->len : cs + cl;
@@ -627,6 +636,7 @@ static bool try_read_parallel(const chunk_obj *o, const chunk_geom *g, const uin
             .pos = p,
             .cap = cap,
             .raw = raw,
+            .abandon = cur_abandon,
         };
     }
 
@@ -678,6 +688,8 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
         return TSDB_ERR_INVALID;
     if (len == 0)
         return 0;
+    if (eng_abandoned())
+        return TSDB_ERR_UNAVAILABLE;
     uint8_t *buf = vbuf;
     unsigned k = g->k;
     uint64_t c0 = off / g->cell, c1 = (off + len - 1) / g->cell;
@@ -688,6 +700,8 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
         chunk_fault_read == 0) {
         if (try_read_parallel((const chunk_obj *)src->ctx, g, rec_sums, off, len, buf, raw, c0, c1))
             return 0;
+        if (eng_abandoned())
+            return TSDB_ERR_UNAVAILABLE;
     }
     rr r;
     memset(&r, 0, sizeof r);
@@ -719,6 +733,10 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
                 any = true;
                 continue;
             }
+            if (eng_abandoned()) {
+                rc = TSDB_ERR_UNAVAILABLE;
+                break;
+            }
             uint8_t *dst = buf + (a - off);
             int st;
             if (r.raw) {
@@ -737,7 +755,7 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
                 any = true;
             }
         }
-        if (any)
+        if (rc == 0 && any)
             rc = degrade(&r, s, off, bad, have, xs, ys, buf);
     }
 #ifdef TSDB_EC
@@ -761,6 +779,7 @@ struct chunk_obj {
     pthread_mutex_t mu;               /* serializes lazy open of deferred parity positions */
     atomic_bool tried[CHUNK_POS_MAX]; /* release-stored once rd[p]/st[p] are populated */
     chunk_rd *rd[CHUNK_POS_MAX];
+    int rd_store[CHUNK_POS_MAX];      /* store index rd[p] was opened from (-1 if none) */
     int st[CHUNK_POS_MAX];
     const uint64_t *rec;
     char name[40];
@@ -771,10 +790,20 @@ static int st_of(int rc)
     return rc == TSDB_ERR_NOTFOUND ? CHUNK_ST_ABSENT : rc == TSDB_ERR_CORRUPT ? CHUNK_ST_DAMAGED : CHUNK_ST_IOERR;
 }
 
+static bool obj_store_down(const chunk_backend *be, int st_idx)
+{
+    if (!be || st_idx < 0 || chunk_mutant == CHUNK_MUT_DOWNNOREAD)
+        return false;
+    int s = chunk_be_store_state(be, st_idx);
+    if (s == CHUNK_STORE_UP || s == CHUNK_STORE_REPLACING)
+        return false;
+    return s == CHUNK_STORE_DOWN_STALLED || chunk_be_open_store(be, st_idx) == NULL;
+}
+
 static bool obj_healthy_pos_ready(const chunk_obj *o, unsigned pos)
 {
     return pos < CHUNK_POS_MAX && atomic_load_explicit(&((chunk_obj *)o)->tried[pos], memory_order_acquire) &&
-           o->rd[pos] != NULL;
+           o->rd[pos] != NULL && !obj_store_down(o->be, o->rd_store[pos]);
 }
 
 static chunk_backend *obj_backend(const chunk_obj *o)
@@ -788,7 +817,8 @@ static int obj_open_pos(chunk_obj *o, unsigned p, bool *have, int *worst)
     memcpy(id.vuuid, o->vuuid, 16);
     memcpy(id.oid, o->oid, 16);
     chunk_rd *rd = NULL;
-    int rc = chunk_be_rd_open(o->be, &id, &rd);
+    int st_idx = -1;
+    int rc = chunk_be_rd_open_at(o->be, &id, &rd, &st_idx);
     if (rc == 0) {
         const chunk_geom *hg = &chunk_rd_hdr(rd)->g;
         if (!*have) { /* the geometry is the first valid chunk's: the object's own, recorded in every header */
@@ -801,6 +831,7 @@ static int obj_open_pos(chunk_obj *o, unsigned p, bool *have, int *worst)
             return TSDB_ERR_CORRUPT;
         }
         o->rd[p] = rd;
+        o->rd_store[p] = st_idx;
         o->st[p] = CHUNK_ST_OK;
         return 0;
     }
@@ -841,7 +872,17 @@ static int obj_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len
     obj_ensure_pos(o, pos);
     if (!o->rd[pos])
         return o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
-    return chunk_rd_read(o->rd[pos], off, buf, len) == 0 ? 0 : CHUNK_ST_IOERR;
+    int st_idx = o->rd_store[pos];
+    if (obj_store_down(o->be, st_idx))
+        return CHUNK_ST_DOWN;
+    bool real_io = false;
+    int rrc = chunk_rd_read_ex(o->rd[pos], off, buf, len, &real_io);
+    if (rrc != 0) {
+        if (rrc == TSDB_ERR_IO && real_io && st_idx >= 0)
+            chunk_be_note_ioerr(o->be, st_idx);
+        return CHUNK_ST_IOERR;
+    }
+    return 0;
 }
 
 static const uint64_t *obj_sums(void *ctx, unsigned pos, int *status)
@@ -856,6 +897,10 @@ static const uint64_t *obj_sums(void *ctx, unsigned pos, int *status)
         *status = o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
         return NULL;
     }
+    if (obj_store_down(o->be, o->rd_store[pos])) {
+        *status = CHUNK_ST_DOWN;
+        return NULL;
+    }
     return chunk_rd_sums(o->rd[pos]);
 }
 
@@ -865,6 +910,8 @@ int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[1
     chunk_obj *o = calloc(1, sizeof *o);
     if (!o)
         return TSDB_ERR_NOMEM;
+    for (unsigned i = 0; i < CHUNK_POS_MAX; i++)
+        o->rd_store[i] = -1;
     o->be = be;
     o->volume = volume;
     memcpy(o->vuuid, vuuid, 16);

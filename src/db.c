@@ -1261,6 +1261,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         }
     }
     stats_open_done(db); /* load_parts changed the list without db->lock: from here the sweeper may read it */
+    tier_engine_ready(db); /* R15: parts & WAL loaded: attach/sweep worker may now inspect db->parts under db->lock */
     if (open_check) { /* a reopen's comparison with the engine it replaces: before any thread changes the parts */
         void (*check)(const eng *, void *) = open_check;
         open_check = NULL;
@@ -1449,6 +1450,7 @@ int eng_close(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     free(db->mergers);
+    tier_engine_unreg(db); /* R15: remove from tier->engs and drain attach/sweep before parts/ecgc/locks go */
     ecsettle_eng_stop(db); /* R7: before the parts go: a settle of this engine is abandoned or waited for */
     ecgc_eng_stop(db);     /* R8: before the parts and GCMK go */
     eckeep_eng_stop(db); /* R7: before the parts go (the digest thread references them and takes db->lock) */

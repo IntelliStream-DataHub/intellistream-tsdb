@@ -32,7 +32,10 @@
 #include "coldops.h"
 #include "eccache.h"
 #include "ecgc.h"
+#include "ecpart.h"
 #include "feed.h"
+#include "outagefs_ctl.h"
+#include "settle.h"
 #include "tier.h"
 #include "tiers.h"
 #include "tsdb.h"
@@ -45,6 +48,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -58,7 +64,7 @@ static int fails;
         }                                                                                                              \
     } while (0)
 
-static char S[PATH_MAX], SELF[PATH_MAX], SHIM[PATH_MAX + 32];
+static char S[PATH_MAX], SELF[PATH_MAX], SHIM[PATH_MAX + 32], SHIM_OUTAGE[PATH_MAX + 32];
 static uint8_t OBJ[3000]; /* the bytes of every object; filled before anything, a child too */
 
 static void sh(const char *fmt, const char *a)
@@ -876,6 +882,1099 @@ static void t_reval(void)
     printf("  reval: .ec and .part are one part; settled_ is none\n");
 }
 
+#ifdef TSDB_EC
+static int64_t rh_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void rh_sleep_ms(int ms)
+{
+    struct timespec d = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    nanosleep(&d, NULL);
+}
+
+static int rh_unlink_unshimmed(const char *path)
+{
+#ifdef __linux__
+    return (int)syscall(SYS_unlinkat, AT_FDCWD, path, 0);
+#else
+    return unlink(path);
+#endif
+}
+
+typedef struct {
+    size_t n;
+    double sum;
+} rh_sum;
+
+static int rh_sum_cb(void *ctx, const int64_t *ts, const void *v, size_t n)
+{
+    (void)ts;
+    rh_sum *s = ctx;
+    const float *fv = v;
+    for (size_t i = 0; i < n; i++)
+        s->sum += fv[i];
+    s->n += n;
+    return 0;
+}
+
+static int rh_find_ec_oid(eng *db, int64_t part_key, uint8_t oid_out[16])
+{
+    int found = 0;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++) {
+        part *p = db->parts[i];
+        if (p->partition != part_key)
+            continue;
+        struct ecpart *ep = atomic_load_explicit(&p->ec, memory_order_acquire);
+        if (ep && !ep->test_mark) {
+            memcpy(oid_out, ep->rec.oid, 16);
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    return found;
+}
+
+static int rh_settle_part(eng *db, int64_t part_key)
+{
+    for (int attempt = 0; attempt < 20; attempt++) {
+        part *sel[16];
+        size_t n = 0;
+        bool has_ec = false;
+        pthread_mutex_lock(&db->lock);
+        for (size_t i = 0; i < db->nparts && n < 16; i++) {
+            part *p = db->parts[i];
+            if (p->partition != part_key)
+                continue;
+            if (atomic_load_explicit(&p->ec, memory_order_acquire)) {
+                has_ec = true;
+            } else {
+                part_ref(p);
+                sel[n++] = p;
+            }
+        }
+        pthread_mutex_unlock(&db->lock);
+        if (!n)
+            return has_ec ? 0 : TSDB_ERR_NOTFOUND;
+        size_t settled = 0;
+        int rc = eng_settle(db, part_key, sel, n, &settled);
+        for (size_t i = 0; i < n; i++)
+            part_unref(sel[i]);
+        if (rc == 0 && settled == n)
+            return 0;
+        if (rc == 0 || rc == TSDB_ERR_NOTFOUND) {
+            rh_sleep_ms(30);
+            continue;
+        }
+        return rc;
+    }
+    uint8_t tmp[16];
+    return rh_find_ec_oid(db, part_key, tmp) ? 0 : TSDB_ERR_IO;
+}
+
+static int rh_of_cmd(const char *ctl, const char *verb, const char *dir)
+{
+    char line[PATH_MAX + 64], out[256];
+    snprintf(line, sizeof line, "%s %s", verb, dir);
+    return outagefs_cmd(ctl, line, out, sizeof out);
+}
+
+typedef struct {
+    eng *db;
+    uint32_t sid;
+    int64_t t0, t1;
+    atomic_bool done;
+    int rc;
+    rh_sum got;
+} rh_qarg;
+
+static void *rh_query_thread(void *arg)
+{
+    rh_qarg *q = arg;
+    q->got = (rh_sum){0, 0};
+    q->rc = eng_query_raw_ex(q->db, q->sid, q->t0, q->t1, false, 0, rh_sum_cb, &q->got);
+    atomic_store_explicit(&q->done, true, memory_order_release);
+    return NULL;
+}
+
+typedef struct {
+    direct *d;
+    uint32_t sid;
+    atomic_bool stop;
+    atomic_int errs;
+    atomic_int reads;
+} rh_stress_arg;
+
+static void *rh_stress_reader(void *arg)
+{
+    rh_stress_arg *a = arg;
+    while (!atomic_load_explicit(&a->stop, memory_order_acquire)) {
+        eccache_test_drop_entries(a->d->t);
+        rh_sum got = {0, 0};
+        int rc = eng_query_raw_ex(a->d->db, a->sid, 0, 1000, false, 0, rh_sum_cb, &got);
+        if (rc != 0 || got.n != 200 || (int64_t)(got.sum + 0.5) != 19900)
+            atomic_fetch_add(&a->errs, 1);
+        atomic_fetch_add(&a->reads, 1);
+    }
+    return NULL;
+}
+
+/* Regression helper for A4: opens/closes a second volume (v1) concurrently with store attach+sweep. */
+typedef struct {
+    tier *t;
+    const char *dir;
+    atomic_bool stop;
+    atomic_int errs;
+    atomic_int cycles;
+} rh_openclose_arg;
+
+static void *rh_openclose_thread(void *arg)
+{
+    rh_openclose_arg *a = arg;
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_ms = 1000;
+    o.partition_classes = 0;
+    o.create_volumes = 0;
+    while (!atomic_load_explicit(&a->stop, memory_order_acquire)) {
+        eng *db = NULL;
+        tier_want(a->t, 1);
+        int rc = eng_open(a->dir, &o, &db);
+        tier_want(NULL, 0);
+        if (rc != 0 || !db) {
+            atomic_fetch_add(&a->errs, 1);
+            break;
+        }
+        uint32_t sid = 0;
+        if (eng_series_lookup(db, "v1.s", &sid) == 0) {
+            rh_sum got = {0, 0};
+            if (eng_query_raw_ex(db, sid, 0, 1000, false, 0, rh_sum_cb, &got) != 0 || got.n != 100)
+                atomic_fetch_add(&a->errs, 1);
+        }
+        eng_close(db);
+        atomic_fetch_add(&a->cycles, 1);
+    }
+    return NULL;
+}
+
+/* Regression helper for A5: pauses an in-flight eng_settle inside settle_fill_hook while attach+sweep tries to run. */
+static atomic_bool rh_hook_entered;
+static atomic_bool rh_hook_release;
+
+static void rh_settle_pause_hook(eng *db, const part *p, uint64_t stripe)
+{
+    (void)db;
+    (void)p;
+    if (stripe != 0)
+        return;
+    atomic_store_explicit(&rh_hook_entered, true, memory_order_release);
+    while (!atomic_load_explicit(&rh_hook_release, memory_order_acquire))
+        rh_sleep_ms(10);
+}
+
+typedef struct {
+    eng *db;
+    int64_t pk;
+    int rc;
+} rh_settle_arg;
+
+static void *rh_settle_thread(void *arg)
+{
+    rh_settle_arg *a = arg;
+    a->rc = rh_settle_part(a->db, a->pk);
+    return NULL;
+}
+
+/* Child for crashfs power-loss test across store attach + missed-delete sweep. */
+static int child_health_power(const char *dbdir, int victim)
+{
+    atomic_store(&ecgc_test_nosweep, false);
+    tier_health_test_opts(0, -1, 0, 0); /* probes off; drive attach deterministically via domain_state */
+    no_tier_env();
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_ms = 1000;
+    o.partition_classes = 0;
+    o.create_volumes = 0;
+    direct d;
+    if (tier_open(dbdir, &o, &d.t) != 0 || !d.t)
+        return 3;
+    tier_want(d.t, 0);
+    int rc = eng_open(dbdir, &o, &d.db);
+    tier_want(NULL, 0);
+    if (rc != 0 || !d.db) {
+        tier_put(d.t);
+        return 4;
+    }
+    chunk_backend *be = tier_backend(d.t);
+    tier_health_domain_state(d.t, victim, true);
+    tier_health_domain_state(d.t, victim, false);
+    int64_t dl = rh_now_ms() + 10000;
+    while ((chunk_be_store_state(be, victim) != CHUNK_STORE_UP || !tier_writable(d.t)) && rh_now_ms() < dl)
+        rh_sleep_ms(20);
+    bool ok = chunk_be_store_state(be, victim) == CHUNK_STORE_UP && tier_writable(d.t);
+    tier_quiesce(d.t);
+    direct_close(&d);
+    tier_health_test_opts(0, 0, 0, 0);
+    return ok ? 0 : 5;
+}
+
+/* Child process under liboutagefs.so: tests runtime EIO during queries, stall detection within tier_stall_s + 1 s,
+ * reads decoding around DOWN stores, attach healing missing chunks (kills attachnoheal), missed-delete sweep, and
+ * settles pausing while DOWN and resuming after recovery. */
+static int child_health(int argc, char **argv)
+{
+    /* --child health BASE STORES_BASE MUTANT */
+    if (argc < 6)
+        return 2;
+    const char *base = argv[3], *stbase = argv[4], *mut = argv[5];
+    if (strcmp(mut, "downnoread") == 0) {
+        tier_mutant = TIER_MUT_DOWNNOREAD;
+        chunk_mutant = CHUNK_MUT_DOWNNOREAD;
+    } else if (strcmp(mut, "attachnoheal") == 0) {
+        tier_mutant = TIER_MUT_ATTACHNOHEAL;
+        chunk_mutant = CHUNK_MUT_ATTACHNOHEAL;
+    }
+    const char *ctl = getenv("OUTAGEFS_CTL");
+    if (!ctl || !*ctl)
+        return 3;
+
+    /* Enable real orphan sweep for missed-delete verification. */
+    atomic_store(&ecgc_test_nosweep, false);
+    atomic_store(&settle_poll_ms, 100);
+    tier_health_test_opts(1500, 150, 3, 500);
+
+    char dbdir[PATH_MAX + 64], st[3][PATH_MAX + 64];
+    snprintf(dbdir, sizeof dbdir, "%s/db", base);
+    for (int i = 0; i < 3; i++)
+        snprintf(st[i], sizeof st[i], "%s/st%d", stbase, i);
+
+    no_tier_env();
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_ms = 1000;
+    o.partition_classes = 0;
+    o.obsolete_part_lifetime_s = 0;
+    o.create_volumes = 0;
+    tsdb *tdb = NULL;
+    if (tsdb_open(dbdir, &o, &tdb) != 0)
+        return 4;
+    tsdb_close(tdb);
+    for (int i = 0; i < 3; i++)
+        if (tsdb_tier_add_dir(dbdir, st[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) != 0)
+            return 5;
+
+    setenv("TSDB_TEST_TIER", "grace_s=0,keep_s=0", 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+
+    direct d;
+    if (tier_open(dbdir, &o, &d.t) != 0 || !d.t)
+        return 6;
+    tier_want(d.t, 0);
+    int rc = eng_open(dbdir, &o, &d.db);
+    tier_want(NULL, 0);
+    if (rc != 0 || !d.db) {
+        tier_put(d.t);
+        return 7;
+    }
+    chunk_backend *be = tier_backend(d.t);
+    uint32_t sid = 0;
+    if (eng_series(d.db, "rh.s", TSDB_FLOAT32, &sid) != 0)
+        return 8;
+
+    /* Insert 2 partitions: p0 ([0,1000)), p1 ([1000,2000)) -> flush and settle both before faulting. */
+    int64_t ts[200];
+    float vals[200];
+    for (int p = 0; p < 2; p++) {
+        for (int i = 0; i < 200; i++) {
+            ts[i] = (int64_t)p * 1000 + i * 4;
+            vals[i] = (float)(p * 1000 + i);
+        }
+        if (eng_insert_series(d.db, TSDB_FLOAT32, sid, ts, vals, 200) != 0)
+            return 9;
+    }
+    if (eng_flush(d.db) != 0)
+        return 10;
+    int64_t pk0 = 0, pk1 = d.db->cls_kmul;
+    if (rh_settle_part(d.db, pk0) != 0 || rh_settle_part(d.db, pk1) != 0)
+        return 11;
+    uint8_t oid0[16], oid1[16];
+    if (!rh_find_ec_oid(d.db, pk0, oid0) || !rh_find_ec_oid(d.db, pk1, oid1))
+        return 12;
+
+    /* Also put an extra object belonging to volume 0 (oid_missed), whose chunks on st0/st2 we will delete while st1
+     * is DOWN so st1 misses the delete and keeps an orphan chunk until re-attach sweeps it. */
+    uint8_t oid_missed[16];
+    memcpy(oid_missed, OID, 16);
+    oid_missed[0] = 0x99;
+    if (put_obj(&d, oid_missed) != 0)
+        return 13;
+
+    /* Pick stores guaranteed to hold pos 0 and pos 1 of oid1 regardless of derived k' (k' >= 1, m = 1). */
+    int s_eio = chunk_be_place(be, oid1, 0);
+    int s_hang = chunk_be_place(be, oid1, 1);
+
+    /* 1. Inject EIO on s_eio during queries: queries stay right via decode, s_eio becomes DOWN_IOERR, volume serves,
+     *    and settles pause (!tier_writable, 0 settles while DOWN). */
+    if (rh_of_cmd(ctl, "eio", st[s_eio]) != 0)
+        return 14;
+    for (int r = 0; r < 10; r++) {
+        eccache_test_drop(d.t);
+        rh_sum got = {0, 0};
+        if (eng_query_raw_ex(d.db, sid, 1000, 2000, false, 0, rh_sum_cb, &got) != 0 || got.n != 200 ||
+            (int64_t)(got.sum + 0.5) != 219900)
+            return 15;
+    }
+    int64_t dl = rh_now_ms() + 6000;
+    while (chunk_be_store_state(be, s_eio) != CHUNK_STORE_DOWN_IOERR && rh_now_ms() < dl)
+        rh_sleep_ms(30);
+    if (chunk_be_store_state(be, s_eio) != CHUNK_STORE_DOWN_IOERR)
+        return 16;
+    if (tier_writable(d.t))
+        return 17;
+
+    /* Volume keeps serving writes while s_eio is DOWN; new partition p3 flushed, settles MUST NOT run while DOWN. */
+    uint64_t sd_before = atomic_load(&settle_done);
+    for (int i = 0; i < 200; i++) {
+        ts[i] = 3000 + i * 4;
+        vals[i] = (float)(3000 + i);
+    }
+    if (eng_insert_series(d.db, TSDB_FLOAT32, sid, ts, vals, 200) != 0 || eng_flush(d.db) != 0)
+        return 18;
+    rh_sleep_ms(400);
+    if (atomic_load(&settle_done) != sd_before)
+        return 19; /* no settle may run while a store is DOWN */
+
+    /* While s_eio is DOWN:
+     * (a) Remove oid1's pos-0 chunk file on s_eio so attach MUST heal/rebuild it (kills attachnoheal).
+     * (b) Delete oid_missed via chunk_be_del: deletes on the other stores, skipped on DOWN s_eio (missed delete!).
+     * (c) Drop partition 0 via eng_drop_before(1000): retires p0's .ec part; ecgc holds it until s_eio recovers. */
+    char hex1[33], cpath1[PATH_MAX + 128];
+    chunk_oid_hex(oid1, hex1);
+    snprintf(cpath1, sizeof cpath1, "%s/s0/o%s.0.chunk", st[s_eio], hex1);
+    if (rh_unlink_unshimmed(cpath1) != 0)
+        return 20;
+
+    unsigned posm_on_seio = 0;
+    for (unsigned p = 0; p < 3; p++)
+        if (chunk_be_place(be, oid_missed, p) == s_eio)
+            posm_on_seio = p;
+    char hexm[33], cpathm[PATH_MAX + 128];
+    chunk_oid_hex(oid_missed, hexm);
+    snprintf(cpathm, sizeof cpathm, "%s/s0/o%s.%u.chunk", st[s_eio], hexm, posm_on_seio);
+    for (unsigned p = 0; p < 3; p++) {
+        chunk_ident cid = {.volume = 0, .pos = (uint16_t)p};
+        memcpy(cid.vuuid, tier_vuuid(d.db), 16);
+        memcpy(cid.oid, oid_missed, 16);
+        (void)chunk_be_del(be, &cid, 1); /* deletes UP stores; s_eio is DOWN so it misses the delete */
+    }
+    if (eng_drop_before(d.db, 1000) != 0)
+        return 21; /* retires p0; keeps p1, p3 */
+
+    /* 2. Heal s_eio: probe passes N times -> queued attach heals oid1, sweeps oid_missed, promotes s_eio to UP,
+     *    and resumes settles + ecgc. */
+    if (rh_of_cmd(ctl, "heal", st[s_eio]) != 0)
+        return 22;
+    dl = rh_now_ms() + 15000;
+    while (chunk_be_store_state(be, s_eio) != CHUNK_STORE_UP && rh_now_ms() < dl)
+        rh_sleep_ms(30);
+    if (chunk_be_store_state(be, s_eio) != CHUNK_STORE_UP)
+        return 23;
+    dl = rh_now_ms() + 5000;
+    while (!tier_writable(d.t) && rh_now_ms() < dl)
+        rh_sleep_ms(30);
+    if (!tier_writable(d.t))
+        return 24;
+
+    /* Verify attach healed oid1 on s_eio (kills attachnoheal: file must exist and pass scrub). */
+    if (access(cpath1, F_OK) != 0) {
+        fprintf(stderr, "child_health: oid1 chunk on store %d was NOT healed (%s missing)\n", s_eio, cpath1);
+        return 25;
+    }
+    {
+        chunk_store *seio_ref = chunk_be_store_ref(be, s_eio);
+        chunk_ident cid1 = {.volume = 0, .pos = 0};
+        memcpy(cid1.vuuid, tier_vuuid(d.db), 16);
+        memcpy(cid1.oid, oid1, 16);
+        chunk_rd *rd = NULL;
+        uint64_t bad = 1;
+        int crc = seio_ref ? chunk_rd_open(seio_ref, &cid1, &rd) : TSDB_ERR_UNAVAILABLE;
+        if (crc == 0) {
+            crc = chunk_rd_scrub(rd, &bad);
+            chunk_rd_close(rd);
+        }
+        chunk_store_unref(seio_ref);
+        if (crc != 0 || bad != 0)
+            return 26;
+    }
+
+    /* Verify missed chunk delete (oid_missed on s_eio) was swept upon re-attach. */
+    if (access(cpathm, F_OK) == 0) {
+        fprintf(stderr, "child_health: missed delete chunk %s was NOT swept on attach\n", cpathm);
+        return 27;
+    }
+
+    /* Verify settles resume (p3 settles) and p1 still reads exact rows. */
+    dl = rh_now_ms() + 10000;
+    while (atomic_load(&settle_done) == sd_before && rh_now_ms() < dl)
+        rh_sleep_ms(50);
+    if (atomic_load(&settle_done) == sd_before)
+        return 28;
+
+    /* 3. Hang s_hang: probe detects stall and sets s_hang DOWN_STALLED within tier_stall_s + 1 s (1500 + 1000 = 2500 ms).
+     *    New reads skip s_hang and decode around it quickly while s_hang is STILL hung! */
+    int64_t t_hang = rh_now_ms();
+    if (rh_of_cmd(ctl, "hang", st[s_hang]) != 0)
+        return 29;
+    dl = t_hang + 6000;
+    while (chunk_be_store_state(be, s_hang) != CHUNK_STORE_DOWN_STALLED && rh_now_ms() < dl)
+        rh_sleep_ms(20);
+    int64_t detect_ms = rh_now_ms() - t_hang;
+    if (chunk_be_store_state(be, s_hang) != CHUNK_STORE_DOWN_STALLED || detect_ms > 2500) {
+        fprintf(stderr, "child_health: hang detect state=%d in %lld ms (limit 2500 ms)\n",
+                chunk_be_store_state(be, s_hang), (long long)detect_ms);
+        (void)rh_of_cmd(ctl, "heal", st[s_hang]);
+        return 30;
+    }
+
+    /* Drop cache and run a query on p1 while s_hang is STILL hung: must complete before heal (kills downnoread). */
+    eccache_test_drop(d.t);
+    rh_qarg qa = {.db = d.db, .sid = sid, .t0 = 1000, .t1 = 2000, .rc = -1};
+    atomic_init(&qa.done, false);
+    pthread_t qt;
+    if (pthread_create(&qt, NULL, rh_query_thread, &qa) != 0) {
+        (void)rh_of_cmd(ctl, "heal", st[s_hang]);
+        return 31;
+    }
+    int64_t qstart = rh_now_ms();
+    while (!atomic_load_explicit(&qa.done, memory_order_acquire) && rh_now_ms() - qstart < 3000)
+        rh_sleep_ms(10);
+    bool q_fast = atomic_load_explicit(&qa.done, memory_order_acquire);
+    int64_t q_ms = rh_now_ms() - qstart;
+
+    /* Heal s_hang so any stuck probe/query thread unblocks cleanly before exit. */
+    if (rh_of_cmd(ctl, "heal", st[s_hang]) != 0) {
+        pthread_join(qt, NULL);
+        return 32;
+    }
+    pthread_join(qt, NULL);
+    if (!q_fast || qa.rc != 0 || qa.got.n != 200 || (int64_t)(qa.got.sum + 0.5) != 219900) {
+        fprintf(stderr, "child_health: query while store %d hung: fast=%d ms=%lld rc=%d n=%zu sum=%.1f\n", s_hang,
+                q_fast, (long long)q_ms, qa.rc, qa.got.n, qa.got.sum);
+        return 33;
+    }
+
+    /* Wait for s_hang to attach and return to UP after heal. */
+    dl = rh_now_ms() + 15000;
+    while ((chunk_be_store_state(be, s_hang) != CHUNK_STORE_UP || !tier_writable(d.t)) && rh_now_ms() < dl)
+        rh_sleep_ms(30);
+    if (chunk_be_store_state(be, s_hang) != CHUNK_STORE_UP || !tier_writable(d.t))
+        return 34;
+
+    /* 3b. Regression: a store that already failed in service (st->failed = 1, so state reports DOWN_IOERR while
+     *     be->st[i] is still open) and then hangs under outagefs must still be detached by the stall monitor to
+     *     DOWN_STALLED so reads decode around it instead of blocking on the hung mount. */
+    chunk_store *fs = chunk_be_open_store(be, s_hang);
+    if (!fs)
+        return 35;
+    int64_t t_fh = rh_now_ms();
+    if (rh_of_cmd(ctl, "hang", st[s_hang]) != 0)
+        return 36;
+    chunk_store_test_fail(fs); /* in-memory only; hang is already active so no healthy probe can preempt */
+    if (chunk_be_store_state(be, s_hang) != CHUNK_STORE_DOWN_IOERR || chunk_be_open_store(be, s_hang) == NULL) {
+        (void)rh_of_cmd(ctl, "heal", st[s_hang]);
+        return 37;
+    }
+    dl = t_fh + 6000;
+    while ((chunk_be_store_state(be, s_hang) != CHUNK_STORE_DOWN_STALLED || chunk_be_open_store(be, s_hang) != NULL) &&
+           rh_now_ms() < dl)
+        rh_sleep_ms(20);
+    int64_t fh_ms = rh_now_ms() - t_fh;
+    if (chunk_be_store_state(be, s_hang) != CHUNK_STORE_DOWN_STALLED || chunk_be_open_store(be, s_hang) != NULL ||
+        fh_ms > 2500) {
+        fprintf(stderr, "child_health: failed+hang detect state=%d open=%d in %lld ms (limit 2500 ms)\n",
+                chunk_be_store_state(be, s_hang), chunk_be_open_store(be, s_hang) != NULL, (long long)fh_ms);
+        (void)rh_of_cmd(ctl, "heal", st[s_hang]);
+        return 38;
+    }
+    eccache_test_drop(d.t);
+    rh_qarg qa2 = {.db = d.db, .sid = sid, .t0 = 1000, .t1 = 2000, .rc = -1};
+    atomic_init(&qa2.done, false);
+    if (pthread_create(&qt, NULL, rh_query_thread, &qa2) != 0) {
+        (void)rh_of_cmd(ctl, "heal", st[s_hang]);
+        return 39;
+    }
+    qstart = rh_now_ms();
+    while (!atomic_load_explicit(&qa2.done, memory_order_acquire) && rh_now_ms() - qstart < 3000)
+        rh_sleep_ms(10);
+    bool q2_fast = atomic_load_explicit(&qa2.done, memory_order_acquire);
+    if (rh_of_cmd(ctl, "heal", st[s_hang]) != 0) {
+        pthread_join(qt, NULL);
+        return 40;
+    }
+    pthread_join(qt, NULL);
+    if (!q2_fast || qa2.rc != 0 || qa2.got.n != 200 || (int64_t)(qa2.got.sum + 0.5) != 219900) {
+        fprintf(stderr, "child_health: query on failed+hung store %d: fast=%d rc=%d n=%zu sum=%.1f\n", s_hang, q2_fast,
+                qa2.rc, qa2.got.n, qa2.got.sum);
+        return 41;
+    }
+    dl = rh_now_ms() + 15000;
+    while ((chunk_be_store_state(be, s_hang) != CHUNK_STORE_UP || !tier_writable(d.t)) && rh_now_ms() < dl)
+        rh_sleep_ms(30);
+    if (chunk_be_store_state(be, s_hang) != CHUNK_STORE_UP || !tier_writable(d.t))
+        return 42;
+
+    /* 4. Close tier while attach_th is blocked inside a hung outagefs store: tier_quiesce must return within the
+     *    2 s deadline (detaching attach_th with attach_owns_ref), then healing the mount lets attach_th unblock,
+     *    abort before chunk_be_attach, and drop its final tier_put() ref cleanly (verified under ASan and TSan). */
+    uint64_t att_before = atomic_load_explicit(&tier_health_attach_attempts, memory_order_relaxed);
+    if (rh_of_cmd(ctl, "hang", st[s_hang]) != 0)
+        return 43;
+    tier_health_domain_state(d.t, s_hang, true);
+    tier_health_domain_state(d.t, s_hang, false); /* attach_th enters chunk_store_meta_read and blocks on hang */
+    dl = rh_now_ms() + 5000;
+    while (atomic_load_explicit(&tier_health_attach_attempts, memory_order_relaxed) == att_before && rh_now_ms() < dl)
+        rh_sleep_ms(10);
+    if (atomic_load_explicit(&tier_health_attach_attempts, memory_order_relaxed) == att_before) {
+        (void)rh_of_cmd(ctl, "heal", st[s_hang]);
+        return 44;
+    }
+    int64_t qclose0 = rh_now_ms();
+    tier_quiesce(d.t);
+    direct_close(&d);
+    int64_t qclose_ms = rh_now_ms() - qclose0;
+    /* Confirm the detach path actually ran: detached attach_th still holds attach_owns_ref, so tier_find_by_dir
+     * still sees the tier until heal lets attach_th exit and run its final tier_put(). */
+    tier *still = tier_find_by_dir(dbdir);
+    bool was_detached = still != NULL;
+    if (still)
+        tier_put(still);
+    if (rh_of_cmd(ctl, "heal", st[s_hang]) != 0)
+        return 45;
+    dl = rh_now_ms() + 5000;
+    while (rh_now_ms() < dl) {
+        tier *probe_t = tier_find_by_dir(dbdir);
+        if (!probe_t)
+            break;
+        tier_put(probe_t);
+        rh_sleep_ms(10);
+    }
+    tier *after = tier_find_by_dir(dbdir);
+    if (after)
+        tier_put(after);
+    if (!was_detached || after != NULL || qclose_ms > 5500) {
+        fprintf(stderr, "child_health: hung attach close detached=%d freed=%d ms=%lld (limit 5500 ms)\n", was_detached,
+                after == NULL, (long long)qclose_ms);
+        return 46;
+    }
+    no_tier_env();
+    tier_health_test_opts(0, 0, 0, 0);
+    return 0;
+}
+
+static void init_empty_db(const char *dir);
+static int run_child(const char *mode, const char *dir, const char *stores, const char *ack, const char *root, int w,
+                     const char *mark, const char *errf);
+
+static void t_runtime_health(void)
+{
+    char base[PATH_MAX + 32], dbdir[PATH_MAX + 48], st[3][PATH_MAX + 64];
+    snprintf(base, sizeof base, "%s/r15health", S);
+    fresh(base);
+    snprintf(dbdir, sizeof dbdir, "%s/db", base);
+    for (int i = 0; i < 3; i++)
+        snprintf(st[i], sizeof st[i], "%s/st%d", base, i);
+
+    no_tier_env();
+    init_empty_db(dbdir);
+    for (int i = 0; i < 3; i++)
+        CHECK(tsdb_tier_add_dir(dbdir, st[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+
+    /* (A) Abandon-flag check + direct chunk_be_set_down + concurrent reader stress + downnoread mutant check.
+     *     Probes are disabled for A1-A3 so manual chunk_be_attach never races the background attach worker. */
+    tier_health_test_opts(0, -1, 0, 0);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_ms = 1000;
+    o.partition_classes = 0;
+    o.create_volumes = 0;
+    direct d;
+    CHECK(tier_open(dbdir, &o, &d.t) == 0 && d.t != NULL);
+    if (!d.t)
+        return;
+    tier_want(d.t, 0);
+    CHECK(eng_open(dbdir, &o, &d.db) == 0 && d.db != NULL);
+    tier_want(NULL, 0);
+    if (!d.db) {
+        tier_put(d.t);
+        return;
+    }
+    chunk_backend *be = tier_backend(d.t);
+    uint32_t sid = 0;
+    CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sid) == 0);
+    int64_t ts[200];
+    float vals[200];
+    for (int i = 0; i < 200; i++) {
+        ts[i] = i * 4;
+        vals[i] = (float)i;
+    }
+    CHECK(eng_insert_series(d.db, TSDB_FLOAT32, sid, ts, vals, 200) == 0);
+    CHECK(eng_flush(d.db) == 0);
+    CHECK(rh_settle_part(d.db, 0) == 0);
+    uint8_t oid0[16];
+    CHECK(rh_find_ec_oid(d.db, 0, oid0) == 1);
+
+    /* A1: abandon flag set -> seam returns TSDB_ERR_UNAVAILABLE; cleared -> returns exact rows. */
+    eccache_test_drop(d.t);
+    volatile int ab = 1;
+    tsdb_set_abandon_flag(&ab);
+    rh_sum got = {0, 0};
+    CHECK(eng_query_raw_ex(d.db, sid, 0, 1000, false, 0, rh_sum_cb, &got) == TSDB_ERR_UNAVAILABLE);
+    {
+        chunk_obj *ob = NULL;
+        CHECK(chunk_obj_open(be, 0, tier_vuuid(d.db), oid0, NULL, NULL, &ob) == 0 && ob);
+        if (ob) {
+            uint8_t tmp[64];
+            CHECK(chunk_obj_read(ob, 0, sizeof tmp, tmp, 0, NULL) == TSDB_ERR_UNAVAILABLE);
+            chunk_obj_close(ob);
+        }
+    }
+    ab = 0;
+    tsdb_set_abandon_flag(NULL);
+    got = (rh_sum){0, 0};
+    CHECK(eng_query_raw_ex(d.db, sid, 0, 1000, false, 0, rh_sum_cb, &got) == 0 && got.n == 200 &&
+          (int64_t)(got.sum + 0.5) == 19900);
+
+    /* A2: invalid args to chunk_be_set_down refused; valid UP -> DOWN_STALLED skips DOWN store on BOTH already-open
+     *     and newly-opened chunk_obj handles (kills downnoread deterministically!). */
+    CHECK(chunk_be_set_down(be, -1, CHUNK_STORE_DOWN_IOERR) == TSDB_ERR_INVALID);
+    CHECK(chunk_be_set_down(be, 99, CHUNK_STORE_DOWN_IOERR) == TSDB_ERR_INVALID);
+    CHECK(chunk_be_set_down(be, 1, CHUNK_STORE_DOWN_MISSING) == TSDB_ERR_INVALID);
+    {
+        chunk_obj *already = NULL;
+        CHECK(chunk_obj_open(be, 0, tier_vuuid(d.db), oid0, NULL, NULL, &already) == 0 && already);
+        CHECK(chunk_be_set_down(be, 1, CHUNK_STORE_DOWN_STALLED) == 0);
+        CHECK(chunk_be_store_state(be, 1) == CHUNK_STORE_DOWN_STALLED);
+        /* Verify chunk_be_set_down did NOT close dirfd/release flock synchronously on the caller's thread (MUST stay
+         * parked until chunk_be_attach releases it on the attach thread). */
+        {
+            chunk_store *dup = NULL;
+            CHECK(chunk_store_open_quiet(st[1], NULL, &dup) == CHUNK_ERR_BUSY && dup == NULL);
+        }
+        /* Idempotent on already-DOWN store. */
+        CHECK(chunk_be_set_down(be, 1, CHUNK_STORE_DOWN_IOERR) == 0);
+        CHECK(chunk_be_store_state(be, 1) == CHUNK_STORE_DOWN_STALLED);
+
+        unsigned pos_on_1 = 0;
+        for (unsigned p = 0; p < 3; p++)
+            if (chunk_be_place(be, oid0, p) == 1)
+                pos_on_1 = p;
+        const chunk_geom *gm = already ? chunk_obj_geom(already) : NULL;
+        if (already && gm) {
+            uint8_t *buf = malloc((size_t)gm->len);
+            chunk_report rep;
+            memset(&rep, 0, sizeof rep);
+            CHECK(buf && chunk_obj_read(already, 0, gm->len, buf, 0, &rep) == 0);
+            /* Must decode around store 1 (if pos_on_1 < k, data read sees DOWN and decodes; if pos_on_1 == k,
+             * test newly-opened object or a position whose data cell is on store 1). */
+            if (pos_on_1 < gm->k)
+                CHECK(rep.st[pos_on_1] == CHUNK_ST_DOWN && rep.decoded_cells > 0);
+            free(buf);
+            chunk_obj_close(already);
+        }
+        /* Pick the store holding data position 0 of oid0 to guarantee a data position is on the DOWN store. */
+        int data0_st = chunk_be_place(be, oid0, 0);
+        if (data0_st != 1) {
+            /* Bring store 1 back up first, then set data0_st DOWN so data pos 0 is definitely on the DOWN store. */
+            chunk_heal_opts ho = {0};
+            if (chunk_mutant != CHUNK_MUT_DOWNNOREAD)
+                CHECK(chunk_be_attach(be, 1, st[1], NULL, &ho, NULL) == 0);
+            chunk_obj *ob2 = NULL;
+            CHECK(chunk_obj_open(be, 0, tier_vuuid(d.db), oid0, NULL, NULL, &ob2) == 0 && ob2);
+            CHECK(chunk_be_set_down(be, data0_st, CHUNK_STORE_DOWN_STALLED) == 0);
+            if (ob2) {
+                uint8_t buf[128];
+                chunk_report rep;
+                memset(&rep, 0, sizeof rep);
+                CHECK(chunk_obj_read(ob2, 0, sizeof buf, buf, 0, &rep) == 0);
+                CHECK(rep.st[0] == CHUNK_ST_DOWN && rep.decoded_cells > 0); /* kills downnoread */
+                chunk_obj_close(ob2);
+            }
+            if (chunk_mutant != CHUNK_MUT_DOWNNOREAD)
+                CHECK(chunk_be_attach(be, data0_st, st[data0_st], NULL, &ho, NULL) == 0);
+        } else {
+            chunk_obj *ob2 = NULL;
+            CHECK(chunk_obj_open(be, 0, tier_vuuid(d.db), oid0, NULL, NULL, &ob2) == 0 && ob2);
+            if (ob2) {
+                uint8_t buf[128];
+                chunk_report rep;
+                memset(&rep, 0, sizeof rep);
+                CHECK(chunk_obj_read(ob2, 0, sizeof buf, buf, 0, &rep) == 0);
+                CHECK(rep.st[0] == CHUNK_ST_DOWN && rep.decoded_cells > 0); /* kills downnoread */
+                chunk_obj_close(ob2);
+            }
+            chunk_heal_opts ho = {0};
+            if (chunk_mutant != CHUNK_MUT_DOWNNOREAD)
+                CHECK(chunk_be_attach(be, 1, st[1], NULL, &ho, NULL) == 0);
+        }
+    }
+
+    /* A3: Concurrent readers + repeated runtime set_down/attach (TSan/ASan safety check). */
+    if (chunk_mutant != CHUNK_MUT_DOWNNOREAD) {
+        rh_stress_arg sa = {.d = &d, .sid = sid};
+        atomic_init(&sa.stop, false);
+        atomic_init(&sa.errs, 0);
+        atomic_init(&sa.reads, 0);
+        pthread_t rths[4];
+        for (int i = 0; i < 4; i++)
+            CHECK(pthread_create(&rths[i], NULL, rh_stress_reader, &sa) == 0);
+        for (int round = 0; round < 6; round++) {
+            int victim = round % 3;
+            CHECK(chunk_be_set_down(be, victim, (round & 1) ? CHUNK_STORE_DOWN_IOERR : CHUNK_STORE_DOWN_STALLED) == 0);
+            eccache_reopen_all(d.t);
+            rh_sleep_ms(25);
+            chunk_heal_opts ho = {0};
+            int arc = TSDB_ERR_IO;
+            for (int try = 0; try < 50 && arc != 0; try++) {
+                arc = chunk_be_attach(be, victim, st[victim], NULL, &ho, NULL);
+                if (arc == CHUNK_ERR_BUSY)
+                    rh_sleep_ms(10);
+            }
+            CHECK(arc == 0);
+            eccache_reopen_all(d.t);
+            rh_sleep_ms(15);
+        }
+        atomic_store_explicit(&sa.stop, true, memory_order_release);
+        for (int i = 0; i < 4; i++)
+            pthread_join(rths[i], NULL);
+        CHECK(atomic_load(&sa.errs) == 0 && atomic_load(&sa.reads) > 0);
+    }
+
+    /* A4: concurrent engine open/close (v1) during store DOWN -> queued attach + sweep (verifies zero UAF on
+     *     db->lock/parts/ecgc during close and zero live chunks deleted during load_parts). */
+    if (chunk_mutant != CHUNK_MUT_DOWNNOREAD && chunk_mutant != CHUNK_MUT_ATTACHNOHEAL) {
+        bool prev_nosweep = atomic_exchange(&ecgc_test_nosweep, false);
+        char v1dir[PATH_MAX + 48];
+        snprintf(v1dir, sizeof v1dir, "%s/v1", base);
+        eng *v1 = NULL;
+        tier_want(d.t, 1);
+        CHECK(eng_open(v1dir, &o, &v1) == 0 && v1 != NULL);
+        tier_want(NULL, 0);
+        if (v1) {
+            uint32_t v1sid = 0;
+            CHECK(eng_series(v1, "v1.s", TSDB_FLOAT32, &v1sid) == 0);
+            int64_t ts1[100];
+            float fv1[100];
+            for (int i = 0; i < 100; i++)
+                ts1[i] = i * 5, fv1[i] = (float)i;
+            CHECK(eng_insert_series(v1, TSDB_FLOAT32, v1sid, ts1, fv1, 100) == 0);
+            CHECK(eng_flush(v1) == 0);
+            CHECK(rh_settle_part(v1, 0) == 0);
+            eng_close(v1);
+
+            rh_openclose_arg oca = {.t = d.t, .dir = v1dir};
+            atomic_init(&oca.stop, false);
+            atomic_init(&oca.errs, 0);
+            atomic_init(&oca.cycles, 0);
+            pthread_t octh;
+            CHECK(pthread_create(&octh, NULL, rh_openclose_thread, &oca) == 0);
+            for (int round = 0; round < 6; round++) {
+                tier_health_domain_state(d.t, 1, true);
+                rh_sleep_ms(15);
+                tier_health_domain_state(d.t, 1, false);
+                int64_t dl = rh_now_ms() + 10000;
+                while (chunk_be_store_state(be, 1) != CHUNK_STORE_UP && rh_now_ms() < dl)
+                    rh_sleep_ms(10);
+                CHECK(chunk_be_store_state(be, 1) == CHUNK_STORE_UP);
+            }
+            atomic_store_explicit(&oca.stop, true, memory_order_release);
+            pthread_join(octh, NULL);
+            CHECK(atomic_load(&oca.errs) == 0 && atomic_load(&oca.cycles) > 0);
+            /* Verify v1's settled .ec part still has all chunks intact and reads exact rows after attach+sweep. */
+            tier_want(d.t, 1);
+            CHECK(eng_open(v1dir, &o, &v1) == 0 && v1 != NULL);
+            tier_want(NULL, 0);
+            if (v1) {
+                eccache_test_drop(d.t);
+                uint32_t v1s2 = 0;
+                rh_sum got1 = {0, 0};
+                CHECK(eng_series_lookup(v1, "v1.s", &v1s2) == 0);
+                CHECK(eng_query_raw_ex(v1, v1s2, 0, 1000, false, 0, rh_sum_cb, &got1) == 0 && got1.n == 100);
+                eng_close(v1);
+            }
+        }
+
+        /* A5: in-flight settle paused inside settle_fill_hook while store 1 goes DOWN and recovers. Attach+sweep MUST
+         *     wait for the in-flight settle (any_engine_busy + S1-then-S2 sweep ordering) and never delete its chunk. */
+        int64_t ts2[200];
+        float fv2[200];
+        for (int i = 0; i < 200; i++)
+            ts2[i] = d.db->partition_ms + i * 4, fv2[i] = (float)(1000 + i);
+        CHECK(eng_insert_series(d.db, TSDB_FLOAT32, sid, ts2, fv2, 200) == 0);
+        CHECK(eng_flush(d.db) == 0);
+        int64_t pk1 = d.db->cls_kmul;
+        atomic_store_explicit(&rh_hook_entered, false, memory_order_release);
+        atomic_store_explicit(&rh_hook_release, false, memory_order_release);
+        atomic_store_explicit(&settle_fill_hook, rh_settle_pause_hook, memory_order_release);
+        rh_settle_arg sarg = {.db = d.db, .pk = pk1, .rc = -1};
+        pthread_t sth;
+        CHECK(pthread_create(&sth, NULL, rh_settle_thread, &sarg) == 0);
+        int64_t dl = rh_now_ms() + 5000;
+        while (!atomic_load_explicit(&rh_hook_entered, memory_order_acquire) && rh_now_ms() < dl)
+            rh_sleep_ms(10);
+        CHECK(atomic_load_explicit(&rh_hook_entered, memory_order_acquire));
+        /* Drive store 1 DOWN and immediately request attach while settle is still paused (p->settling == true). */
+        tier_health_domain_state(d.t, 1, true);
+        tier_health_domain_state(d.t, 1, false);
+        rh_sleep_ms(300);
+        /* Attach worker MUST defer while settle is in flight (store 1 stays DOWN until settle finishes). */
+        CHECK(chunk_be_store_state(be, 1) == CHUNK_STORE_DOWN_STALLED);
+        /* Verify chunk_be_set_down did NOT close dirfd/release flock synchronously on the caller's thread (MUST stay
+         * parked until chunk_be_attach releases it on the attach thread). */
+        {
+            chunk_store *dup = NULL;
+            CHECK(chunk_store_open_quiet(st[1], NULL, &dup) == CHUNK_ERR_BUSY && dup == NULL);
+        }
+        atomic_store_explicit(&rh_hook_release, true, memory_order_release);
+        pthread_join(sth, NULL);
+        atomic_store_explicit(&settle_fill_hook, NULL, memory_order_release);
+        CHECK(sarg.rc == 0);
+        /* Wait for store 1 to attach & sweep after settle completed. */
+        dl = rh_now_ms() + 10000;
+        while ((chunk_be_store_state(be, 1) != CHUNK_STORE_UP || !tier_writable(d.t)) && rh_now_ms() < dl)
+            rh_sleep_ms(20);
+        CHECK(chunk_be_store_state(be, 1) == CHUNK_STORE_UP && tier_writable(d.t));
+        /* Partition 1 MUST be settled, read exact 200 rows, and keep every encoded chunk intact (none swept!). */
+        eccache_test_drop(d.t);
+        rh_sum got2 = {0, 0};
+        CHECK(eng_query_raw_ex(d.db, sid, d.db->partition_ms, d.db->partition_ms + 1000, false, 0, rh_sum_cb, &got2) ==
+                  0 &&
+              got2.n == 200 && (int64_t)(got2.sum + 0.5) == 219900);
+        uint8_t oid1_chk[16];
+        unsigned npos1 = 0;
+        pthread_mutex_lock(&d.db->lock);
+        for (size_t i = 0; i < d.db->nparts; i++) {
+            if (d.db->parts[i]->partition != pk1)
+                continue;
+            struct ecpart *ep = atomic_load_explicit(&d.db->parts[i]->ec, memory_order_acquire);
+            if (ep && !ep->test_mark) {
+                memcpy(oid1_chk, ep->rec.oid, 16);
+                npos1 = (unsigned)ep->rec.k + (unsigned)ep->rec.m;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&d.db->lock);
+        CHECK(npos1 >= 2);
+        for (unsigned pos = 0; pos < npos1; pos++) {
+            int sidx = chunk_be_place(be, oid1_chk, pos);
+            chunk_store *sref = chunk_be_store_ref(be, sidx);
+            chunk_ident cid = {.volume = 0, .pos = (uint16_t)pos};
+            memcpy(cid.vuuid, tier_vuuid(d.db), 16);
+            memcpy(cid.oid, oid1_chk, 16);
+            chunk_rd *rd = NULL;
+            uint64_t bad = 1;
+            int crc = sref ? chunk_rd_open(sref, &cid, &rd) : TSDB_ERR_UNAVAILABLE;
+            if (crc == 0) {
+                crc = chunk_rd_scrub(rd, &bad);
+                chunk_rd_close(rd);
+            }
+            chunk_store_unref(sref);
+            CHECK(crc == 0 && bad == 0);
+        }
+        atomic_store(&ecgc_test_nosweep, prev_nosweep);
+    }
+
+    tier_quiesce(d.t);
+    direct_close(&d);
+    tier_health_test_opts(0, 0, 0, 0);
+
+    /* A6: 4+2 tier (6 stores) with one store missing (DOWN_MISSING): taking another store DOWN and recovering it
+     *     leaves it in REPLACING without spin-retrying full-backend chunk_be_settle at 5 Hz while the first store
+     *     stays gone. */
+    if (chunk_mutant != CHUNK_MUT_DOWNNOREAD && chunk_mutant != CHUNK_MUT_ATTACHNOHEAL) {
+        char base6[PATH_MAX + 32], db6[PATH_MAX + 48], st6[6][PATH_MAX + 64], st5_gone[PATH_MAX + 80];
+        snprintf(base6, sizeof base6, "%s/r15health_nospin", S);
+        fresh(base6);
+        snprintf(db6, sizeof db6, "%s/db", base6);
+        for (int i = 0; i < 6; i++)
+            snprintf(st6[i], sizeof st6[i], "%s/st%d", base6, i);
+        snprintf(st5_gone, sizeof st5_gone, "%s/st5.gone", base6);
+        tier_env(base6, 6, 4, 2);
+        /* Open once to create stores & write 1 object, then hide st5 so reopen sees st5 DOWN_MISSING. */
+        direct d6;
+        tier_health_test_opts(0, -1, 0, 0);
+        CHECK(tier_open(db6, &o, &d6.t) == 0 && d6.t);
+        if (d6.t) {
+            tier_want(d6.t, 0);
+            CHECK(eng_open(db6, &o, &d6.db) == 0 && d6.db);
+            tier_want(NULL, 0);
+            if (d6.db)
+                CHECK(put_obj(&d6, OID) == 0);
+            tier_quiesce(d6.t);
+            direct_close(&d6);
+        }
+        CHECK(rename(st6[5], st5_gone) == 0);
+
+        /* Reopen with fast probes (100 ms, ok_need 2): st5 is DOWN_MISSING, st0..st4 are UP (5 >= 4 min_up). */
+        tier_health_test_opts(1500, 100, 2, 500);
+        CHECK(tier_open(db6, &o, &d6.t) == 0 && d6.t);
+        if (d6.t) {
+            tier_want(d6.t, 0);
+            CHECK(eng_open(db6, &o, &d6.db) == 0 && d6.db);
+            tier_want(NULL, 0);
+            chunk_backend *be6 = tier_backend(d6.t);
+            CHECK(chunk_be_store_state(be6, 5) == CHUNK_STORE_DOWN_MISSING);
+            uint64_t att0 = atomic_load(&tier_health_attach_attempts);
+            tier_health_domain_state(d6.t, 1, true);
+            CHECK(chunk_be_store_state(be6, 1) == CHUNK_STORE_DOWN_STALLED);
+            tier_health_domain_state(d6.t, 1, false);
+            int64_t dl = rh_now_ms() + 5000;
+            while (chunk_be_store_state(be6, 1) != CHUNK_STORE_REPLACING && rh_now_ms() < dl)
+                rh_sleep_ms(20);
+            CHECK(chunk_be_store_state(be6, 1) == CHUNK_STORE_REPLACING);
+            /* Wait 800 ms with 100 ms probes running: attach worker MUST NOT spin calling chunk_be_settle! */
+            rh_sleep_ms(800);
+            uint64_t att_delta = atomic_load(&tier_health_attach_attempts) - att0;
+            CHECK(att_delta >= 1 && att_delta <= 2);
+            tier_quiesce(d6.t);
+            direct_close(&d6);
+        }
+        no_tier_env();
+        tier_health_test_opts(0, 0, 0, 0);
+    }
+
+    /* (B) Outagefs child: real EIO, hang/stall detection, queued attach/heal, missed deletes swept, settles resume. */
+    if (access(SHIM_OUTAGE, R_OK) != 0) {
+        printf("  runtime_health: abandon+set_down+concurrency ok (outagefs part skipped: no %s)\n", SHIM_OUTAGE);
+        return;
+    }
+    /* Skip spawning outagefs child if downnoread already failed above (keeps mutant runs fast). */
+    if (chunk_mutant == CHUNK_MUT_DOWNNOREAD && fails > 0)
+        return;
+
+    char obase[PATH_MAX + 32], ost[PATH_MAX + 48], ctl[PATH_MAX + 64], roots[4 * PATH_MAX];
+    snprintf(obase, sizeof obase, "%s/r15health_of", S);
+    fresh(obase);
+    snprintf(ost, sizeof ost, "%s/stores", obase);
+    mkdir(ost, 0755);
+    for (int i = 0; i < 3; i++) {
+        char sd[PATH_MAX + 64];
+        snprintf(sd, sizeof sd, "%s/st%d", ost, i);
+        mkdir(sd, 0755);
+    }
+    snprintf(ctl, sizeof ctl, "%s/ctl", obase);
+    snprintf(roots, sizeof roots, "%s/st0:%s/st1:%s/st2", ost, ost, ost);
+    const char *mname = tier_mutant == TIER_MUT_DOWNNOREAD ? "downnoread"
+                        : tier_mutant == TIER_MUT_ATTACHNOHEAL ? "attachnoheal" : "none";
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512];
+        snprintf(asan, sizeof asan, "verify_asan_link_order=0:detect_leaks=0%s%.400s",
+                 getenv("ASAN_OPTIONS") ? ":" : "", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        setenv("LD_PRELOAD", SHIM_OUTAGE, 1);
+        setenv("OUTAGEFS_ROOTS", roots, 1);
+        setenv("OUTAGEFS_CTL", ctl, 1);
+        execl(SELF, "test_tier", "--child", "health", obase, ost, mname, (char *)NULL);
+        _exit(127);
+    }
+    int st_w = -1;
+    CHECK(pid > 0 && waitpid(pid, &st_w, 0) == pid && WIFEXITED(st_w) && WEXITSTATUS(st_w) == 0);
+    if (pid > 0 && (!WIFEXITED(st_w) || WEXITSTATUS(st_w) != 0))
+        fprintf(stderr, "  runtime_health: child exited with status %d (sig %d)\n",
+                WIFEXITED(st_w) ? WEXITSTATUS(st_w) : -1, WIFSIGNALED(st_w) ? WTERMSIG(st_w) : 0);
+
+    /* (C) Crashfs power-loss at every sync step of attach + missed-delete sweep: reopening after every cut keeps
+     *     every live .ec part readable with exact rows and zero corruption. */
+    if (access(SHIM, R_OK) == 0 && chunk_mutant != CHUNK_MUT_DOWNNOREAD && chunk_mutant != CHUNK_MUT_ATTACHNOHEAL) {
+        char pbase[PATH_MAX + 32], pdb[PATH_MAX + 48], pst[3][PATH_MAX + 64];
+        char pack[PATH_MAX + 48], perr[PATH_MAX + 48];
+        snprintf(pbase, sizeof pbase, "%s/r15health_pwr", S);
+        snprintf(pdb, sizeof pdb, "%s/db", pbase);
+        for (int i = 0; i < 3; i++)
+            snprintf(pst[i], sizeof pst[i], "%s/st%d", pbase, i);
+        snprintf(pack, sizeof pack, "%s/r15health_pwr.ack", S);
+        snprintf(perr, sizeof perr, "%s/r15health_pwr.err", S);
+        int cuts = 0, f0 = fails;
+        for (int w = 0; w < 200; w++) {
+            fresh(pbase);
+            no_tier_env();
+            tier_health_test_opts(0, -1, 0, 0);
+            tsdb *tdb = NULL;
+            CHECK(tsdb_open(pdb, &o, &tdb) == 0 && tdb);
+            if (tdb)
+                tsdb_close(tdb);
+            for (int i = 0; i < 3; i++)
+                CHECK(tsdb_tier_add_dir(pdb, pst[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+            direct pd;
+            CHECK(tier_open(pdb, &o, &pd.t) == 0 && pd.t);
+            tier_want(pd.t, 0);
+            CHECK(eng_open(pdb, &o, &pd.db) == 0 && pd.db);
+            tier_want(NULL, 0);
+            uint32_t psid = 0;
+            CHECK(eng_series(pd.db, "hp.s", TSDB_FLOAT32, &psid) == 0);
+            int64_t pts[100];
+            float pfv[100];
+            for (int i = 0; i < 100; i++)
+                pts[i] = i * 5, pfv[i] = (float)i;
+            CHECK(eng_insert_series(pd.db, TSDB_FLOAT32, psid, pts, pfv, 100) == 0);
+            CHECK(eng_flush(pd.db) == 0);
+            CHECK(rh_settle_part(pd.db, 0) == 0);
+            uint8_t poid[16], omiss[16];
+            CHECK(rh_find_ec_oid(pd.db, 0, poid) == 1);
+            memcpy(omiss, OID, 16);
+            omiss[0] = 0x77;
+            CHECK(put_obj(&pd, omiss) == 0);
+            int victim = chunk_be_place(tier_backend(pd.t), poid, 0); /* pos 0 is always present on victim */
+            tier_quiesce(pd.t);
+            direct_close(&pd);
+            /* Remove poid's pos-0 chunk on victim so attach must rebuild it, and leave omiss so sweep deletes it. */
+            char phex[33], pcpath[PATH_MAX + 128], vstr[16];
+            chunk_oid_hex(poid, phex);
+            snprintf(pcpath, sizeof pcpath, "%s/s0/o%s.0.chunk", pst[victim], phex);
+            CHECK(unlink(pcpath) == 0);
+            snprintf(vstr, sizeof vstr, "%d", victim);
+            int crc = run_child("health_power", pdb, pbase, vstr, pst[victim], w, "", perr);
+            /* Reopen after every power cut (rc == 99) or clean finish (rc == 0) and verify exact query rows. */
+            CHECK(crc == 0 || crc == 99);
+            CHECK(tier_open(pdb, &o, &pd.t) == 0 && pd.t);
+            tier_want(pd.t, 0);
+            CHECK(eng_open(pdb, &o, &pd.db) == 0 && pd.db);
+            tier_want(NULL, 0);
+            uint32_t psid2 = 0;
+            rh_sum pgot = {0, 0};
+            CHECK(eng_series_lookup(pd.db, "hp.s", &psid2) == 0);
+            CHECK(eng_query_raw_ex(pd.db, psid2, 0, 1000, false, 0, rh_sum_cb, &pgot) == 0 && pgot.n == 100 &&
+                  (int64_t)(pgot.sum + 0.5) == 4950);
+            tier_quiesce(pd.t);
+            direct_close(&pd);
+            tier_health_test_opts(0, 0, 0, 0);
+            if (fails > f0) {
+                fprintf(stderr, "  runtime_health power: failed at step %d (child exit %d)\n", w, crc);
+                break;
+            }
+            if (crc == 0)
+                break;
+            cuts += crc == 99;
+        }
+        CHECK(cuts > 0);
+        printf("  runtime_health: attach+sweep power loss clean across %d crashfs cuts\n", cuts);
+    }
+
+    printf("  runtime_health: abandon flag, set_down concurrency, open/close + in-flight settle races, outagefs EIO + "
+           "hang + attach heal + missed-delete sweep + settle resume\n");
+}
+#endif
+
 /* ----------------------------------------------------------------------------------------------- power, eio: child */
 
 static int child(int argc, char **argv)
@@ -884,6 +1983,10 @@ static int child(int argc, char **argv)
     if (argc < 6)
         return 2;
     const char *mode = argv[2], *dir = argv[3], *stores = argv[4], *ack = argv[5];
+    if (strcmp(mode, "health") == 0)
+        return child_health(argc, argv);
+    if (strcmp(mode, "health_power") == 0)
+        return child_health_power(dir, atoi(ack));
     tier_env(stores, 3, 2, 1);
     if (strcmp(mode, "power") == 0) {
         tsdb *db;
@@ -936,6 +2039,7 @@ static int run_child(const char *mode, const char *dir, const char *stores, cons
         setenv("CRASHFS_AT_EXIT", "1", 1);
         setenv("CRASHFS_TEAR", "1", 1);
         setenv("CRASHFS_SEED", ws, 1);
+        setenv("TSDB_TEST_TIER_HEALTH", "probe=0", 1);
         if (strcmp(mode, "eio") == 0) {
             setenv("CRASHFS_MODE", "eio", 1);
             setenv("CRASHFS_MARK", mark, 1);
@@ -1622,7 +2726,13 @@ int main(int argc, char **argv)
             tier_mutant = TIER_MUT_DBIDSKIP;
         else if (strcmp(mutant, "lostopen") == 0)
             tier_mutant = TIER_MUT_LOSTOPEN;
-        else {
+        else if (strcmp(mutant, "downnoread") == 0) {
+            tier_mutant = TIER_MUT_DOWNNOREAD;
+            chunk_mutant = CHUNK_MUT_DOWNNOREAD;
+        } else if (strcmp(mutant, "attachnoheal") == 0) {
+            tier_mutant = TIER_MUT_ATTACHNOHEAL;
+            chunk_mutant = CHUNK_MUT_ATTACHNOHEAL;
+        } else {
             fprintf(stderr, "unknown mutant %s\n", mutant);
             return 2;
         }
@@ -1633,6 +2743,8 @@ int main(int argc, char **argv)
         snprintf(SELF, sizeof SELF, "%s", argv[0]);
     char *slash = strrchr(SELF, '/');
     snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
+    snprintf(SHIM_OUTAGE, sizeof SHIM_OUTAGE, "%.*s/liboutagefs.so", slash ? (int)(slash - SELF) : 1,
+             slash ? SELF : ".");
     fresh(S);
     printf("test_tier%s%s\n", mutant ? " --mutant " : "", mutant ? mutant : "");
     t_noec();
@@ -1651,9 +2763,10 @@ int main(int argc, char **argv)
     t_tiers_open();
     t_tiers_defaults();
     t_tiers_settings();
+    t_runtime_health();
 #else
     printf("  volumes, down, lost, fence, unsure, ops, refuse, reval, power, eio, tiers_open, tiers_defaults, "
-           "tiers_settings: skipped (no TSDB_EC in this build)\n");
+           "tiers_settings, runtime_health: skipped (no TSDB_EC in this build)\n");
 #endif
     t_follow();
     if (!fails)

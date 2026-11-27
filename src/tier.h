@@ -69,17 +69,25 @@ typedef struct tier {
     struct eccache_tier *cache;   /* r7-seam: the granule cache and the open objects (src/eccache.c) */
     struct ecgc_tier *gc;         /* r7-gc: the delete queue the settle thread works (src/ecgc.c) */
     struct ecsettle_tier *settle; /* r7-settle: the settle thread (src/settle.c) */
+    _Atomic(struct tier_health *) health; /* r15-health: probes & attach worker (freed only in tier_put) */
     /* r7-tier: the backend over cfg.dirs, opened once by tier_open (chunk_be_open2, min_up = stores - m) and closed by
      * the last tier_put: a store flocks its directory, so one backend per engine would make the second volume BUSY.
-     * halted: a store was not UP (DOWN at open, or failed in service), or did not take a volume's epoch at its open:
-     * settles and chunk deletes stop for the tier until the next handle open, which opens the stores again; reads go
-     * on (tier_writable). One line when it halts, never more. */
+     * halted: settles and chunk deletes are paused while any store is not UP (cleared when all stores return to UP,
+     * unless fence_halted is set by an unfenced UP store at open). One line per pause. */
     struct chunk_backend *be;
     atomic_bool halted;
+    atomic_bool fence_halted;
     /* r8b-coldops: the registry of attached volumes (tier_cold_get), one reference each; cmu is a leaf */
     pthread_mutex_t cmu;
+    pthread_cond_t eng_cv;
     struct coldvol **cvs;
     size_t ncvs;
+    /* r15-health: attached single-server engines (under cmu), for heal live() and missed-delete sweep */
+    eng **engs;
+    size_t nengs, eng_cap;
+    size_t eng_opening; /* engines between tier_engine_attach and tier_engine_ready (parts not loaded yet) */
+    unsigned eng_active;
+    char *dir; /* database root path (canonical if available), for tier_find_by_dir */
     /* R15 (r15-open): loaded TIERS view & db_id when opened from TIERS, plus TSDB_TEST_TIER grace override flag */
     bool from_tiers;
     uint8_t db_id[16];
@@ -95,6 +103,7 @@ bool tier_default_geom(int nstores, bool all_single_copy, int *k_out, int *m_out
  * build cannot serve (no TSDB_EC) is refused with a line. dir: the database, for messages. */
 int tier_open(const char *dir, const tsdb_options *opt, tier **out);
 tier *tier_get(tier *t);  /* another reference; NULL stays NULL */
+tier *tier_try_get(tier *t); /* another reference iff refs > 0, else NULL */
 void tier_put(tier *t);   /* the last one closes the tier (its settle thread, cache, backend) */
 void tier_quiesce(tier *t); /* tsdb_close, before the volumes close: no settle runs from here on */
 const tier_cfg *tier_config(const tier *t);
@@ -126,8 +135,26 @@ enum { TIER_MUT_NONE = 0, TIER_MUT_PERENGINE, TIER_MUT_UNSURE, TIER_MUT_NOEC, TI
        TIER_MUT_SELFEPOCH, /* selfepoch: the epoch provider is bypassed at attach: the stores' own fence (the writer's
                             * epoch) is given as the authoritative one, so an unsure store is raised by it */
        TIER_MUT_DBIDSKIP,  /* dbidskip: skips db_id verification when opening stores from TIERS */
-       TIER_MUT_LOSTOPEN   /* lostopen: opens a LOST store as UP instead of passing NULL (DOWN_MISSING) */ };
+       TIER_MUT_LOSTOPEN,  /* lostopen: opens a LOST store as UP instead of passing NULL (DOWN_MISSING) */
+       TIER_MUT_DOWNNOREAD,   /* downnoread: reads are still sent to a DOWN store */
+       TIER_MUT_ATTACHNOHEAL  /* attachnoheal: returning store marked UP without healing */ };
 extern int tier_mutant;
+
+/* R15 (r15-health): per-store probes, runtime store DOWN, queued attach/heal worker, and tsdbd --health-domain hooks. */
+int tier_health_open(tier *t);
+void tier_health_quiesce(tier *t);
+bool tier_health_close(tier *t); /* returns true if a detached attach worker still references t */
+void tier_health_kick_reopen(tier *t);
+tier *tier_find_by_dir(const char *dir);
+int tier_store_count(const tier *t);
+bool tier_store_path(const tier *t, int i, char *buf, size_t cap);
+int tier_store_state(const tier *t, int i);
+void tier_store_set_down(tier *t, int store, int reason);
+void tier_ensure_paused(tier *t, int store, const char *why);
+void tier_resume_if_all_up(tier *t);
+void tier_health_domain_state(tier *t, int store, bool down);
+void tier_health_test_opts(int stall_ms, int every_ms, int ok_need, int fast_ms);
+extern atomic_uint_fast64_t tier_health_attach_attempts;
 
 /* r8b-coldops (E22). A volume's settings: the tier's configuration on a single server (tier_settings_from_cfg); r8f
  * gives a cluster volume its own from tsdbd's keys (D22). cache_mb is the tier's (one cache per handle), read only by
@@ -232,6 +259,8 @@ void tier_want(tier *t, uint32_t vol);
 /* tier_want with what the volume attaches with (a: copied; NULL is tier_want): r8f's cluster volumes. */
 void tier_want_attach(tier *t, uint32_t vol, const tier_attach *a);
 int tier_engine_attach(eng *db);
+void tier_engine_ready(eng *db);
+void tier_engine_unreg(eng *db);
 void tier_engine_detach(eng *db);
 
 /* The per-engine state of R7's files, db->ecstate (made by tier_engine_attach when the engine has a tier). One pointer
@@ -247,6 +276,8 @@ struct ecstate {
     uint8_t vuuid[16];           /* r7-tier: META's vuuid= (tier_vuuid) */
     struct coldvol *cold;        /* r8b-coldops: the volume's ops, epoch provider and settings (a reference) */
     struct chunk_backend *mut_be; /* r7-tier: the backend of the tierperengine mutant only */
+    bool tier_opening;           /* r15-health: counted in tier->eng_opening until tier_engine_ready */
+    bool tier_registered;        /* r15-health: listed in tier->engs[] until tier_engine_unreg */
 };
 
 #endif

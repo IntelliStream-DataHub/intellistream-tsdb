@@ -617,6 +617,129 @@ static tier_cluster_fn cluster_fn; /* set once before any tsdb_open (tier_set_cl
 static void *cluster_arg;
 static uint64_t cluster_cache_mb;
 
+/* Registry of open single-server tiers keyed by database root path (allows tsdbd's --health-domain and STATUS to find
+ * the active tier without adding public symbols to libtsdb.so or editing src/volumes.c). */
+static pthread_mutex_t tier_reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static tier **tier_reg;
+static size_t ntier_reg;
+
+#ifdef TSDB_EC
+static void tier_reg_add(tier *t, const char *dir)
+{
+    if (!t || !dir || !*dir)
+        return;
+    char canon[PATH_MAX];
+    char *d = strdup(realpath(dir, canon) ? canon : dir);
+    if (!d)
+        return;
+    pthread_mutex_lock(&tier_reg_mu);
+    free(t->dir);
+    t->dir = d;
+    bool present = false;
+    for (size_t i = 0; i < ntier_reg; i++)
+        if (tier_reg[i] == t) {
+            present = true;
+            break;
+        }
+    if (!present) {
+        tier **nt = realloc(tier_reg, (ntier_reg + 1) * sizeof *nt);
+        if (nt) {
+            tier_reg = nt;
+            tier_reg[ntier_reg++] = t;
+        }
+    }
+    pthread_mutex_unlock(&tier_reg_mu);
+}
+#endif
+
+static void tier_reg_remove(tier *t)
+{
+    pthread_mutex_lock(&tier_reg_mu);
+    for (size_t i = 0; i < ntier_reg; i++) {
+        if (tier_reg[i] == t) {
+            tier_reg[i] = tier_reg[--ntier_reg];
+            if (ntier_reg == 0) {
+                free(tier_reg);
+                tier_reg = NULL;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&tier_reg_mu);
+}
+
+tier *tier_try_get(tier *t)
+{
+    if (!t)
+        return NULL;
+    unsigned r = atomic_load_explicit(&t->refs, memory_order_relaxed);
+    while (r > 0) {
+        if (atomic_compare_exchange_weak_explicit(&t->refs, &r, r + 1, memory_order_acquire, memory_order_relaxed))
+            return t;
+    }
+    return NULL;
+}
+
+tier *tier_find_by_dir(const char *dir)
+{
+    if (!dir || !*dir)
+        return NULL;
+    char canon[PATH_MAX];
+    const char *want = realpath(dir, canon) ? canon : dir;
+    tier *found = NULL;
+    pthread_mutex_lock(&tier_reg_mu);
+    for (size_t i = 0; i < ntier_reg; i++) {
+        tier *t = tier_reg[i];
+        if (!t->dir)
+            continue;
+        /* tier_reg_add canonicalized t->dir outside tier_reg_mu, so pure string compare here (no I/O under lock). */
+        if (strcmp(t->dir, want) == 0 || strcmp(t->dir, dir) == 0) {
+            found = tier_try_get(t);
+            if (found)
+                break;
+        }
+    }
+    pthread_mutex_unlock(&tier_reg_mu);
+    return found;
+}
+
+int tier_store_count(const tier *t)
+{
+#ifdef TSDB_EC
+    return (t && t->be) ? chunk_be_nstores(t->be) : 0;
+#else
+    (void)t;
+    return 0;
+#endif
+}
+
+bool tier_store_path(const tier *t, int i, char *buf, size_t cap)
+{
+    if (!t || !buf || cap == 0 || i < 0)
+        return false;
+#ifdef TSDB_EC
+    if (t->be && chunk_be_store_path_copy(t->be, i, buf, cap))
+        return true;
+#endif
+    if (i < t->cfg.ndirs && t->cfg.dirs[i]) {
+        snprintf(buf, cap, "%s", t->cfg.dirs[i]);
+        return true;
+    }
+    buf[0] = '\0';
+    return false;
+}
+
+int tier_store_state(const tier *t, int i)
+{
+#ifdef TSDB_EC
+    return (t && t->be) ? chunk_be_store_state(t->be, i) : -1;
+#else
+    (void)t;
+    (void)i;
+    return -1;
+#endif
+}
+
 void tier_set_cluster(tier_cluster_fn fn, void *arg, uint64_t cache_mb)
 {
     cluster_fn = fn;
@@ -773,7 +896,9 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
         }
         atomic_init(&t->refs, 1);
         atomic_init(&t->halted, false);
+        atomic_init(&t->fence_halted, false);
         pthread_mutex_init(&t->cmu, NULL);
+        pthread_cond_init(&t->eng_cv, NULL);
         t->cfg = c;
         t->from_tiers = true;
         memcpy(t->db_id, db_id, 16);
@@ -788,6 +913,11 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
             return open_rc;
         }
         eccache_set_backend(t, t->be);
+        if ((open_rc = tier_health_open(t)) != 0) {
+            tier_put(t);
+            return open_rc;
+        }
+        tier_reg_add(t, dir);
         *out = t;
         return 0;
 #endif
@@ -841,7 +971,9 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     }
     atomic_init(&t->refs, 1);
     atomic_init(&t->halted, false);
+    atomic_init(&t->fence_halted, false);
     pthread_mutex_init(&t->cmu, NULL);
+    pthread_cond_init(&t->eng_cv, NULL);
     t->cfg = c;
     int open_rc = 0;
 #ifdef TSDB_TEST_HOOKS
@@ -859,6 +991,13 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     }
     /* the cache reads through this backend, never one of its own (its stores' flocks would make that one BUSY) */
     eccache_set_backend(t, t->be);
+    if (t->be) {
+        if ((open_rc = tier_health_open(t)) != 0) {
+            tier_put(t);
+            return open_rc;
+        }
+        tier_reg_add(t, dir);
+    }
     *out = t;
     return 0;
 #endif
@@ -875,12 +1014,18 @@ void tier_put(tier *t)
 {
     if (!t || atomic_fetch_sub_explicit(&t->refs, 1, memory_order_acq_rel) != 1)
         return;
+    tier_reg_remove(t);
+    if (tier_health_close(t))
+        return; /* a detached attach worker is still stuck in the kernel using t/be/cache: leave allocated */
     ecsettle_tier_close(t);
     ecgc_tier_close(t);
     eccache_tier_close(t);
     for (size_t i = 0; i < t->ncvs; i++)
         tier_cold_put(t->cvs[i]); /* before the backend: a directory context names it */
     free(t->cvs);
+    free(t->engs);
+    free(t->dir);
+    pthread_cond_destroy(&t->eng_cv);
     pthread_mutex_destroy(&t->cmu);
 #ifdef TSDB_EC
     if (t->be)
@@ -894,6 +1039,7 @@ void tier_put(tier *t)
 void tier_quiesce(tier *t)
 {
     if (t) {
+        tier_health_quiesce(t);
         ecsettle_tier_quiesce(t);
         ecgc_tier_quiesce(t);
     }
@@ -1280,22 +1426,148 @@ int tier_engine_attach(eng *db)
     if ((rc = ecgc_eng_open(db)) != 0 || (rc = eckeep_eng_open(db)) != 0 || (rc = ecsettle_eng_open(db)) != 0 ||
         (rc = ecswap_eng_open(db)) != 0)
         return rc; /* the open fails; its eng_close detaches */
+    if (!db->ec_cluster) {
+        /* Pre-reserve t->engs[] capacity BEFORE cold_register() so OOM cannot leave a dangling coldvol entry.
+         * The engine is only listed in t->engs[] once load_parts and WAL replay complete (tier_engine_ready). */
+        pthread_mutex_lock(&t->cmu);
+        size_t need = t->nengs + t->eng_opening + 1;
+        if (need > t->eng_cap) {
+            size_t nc = t->eng_cap ? t->eng_cap * 2 : 8;
+            while (nc < need)
+                nc *= 2;
+            eng **ne = realloc(t->engs, nc * sizeof *ne);
+            if (!ne) {
+                pthread_mutex_unlock(&t->cmu);
+                return TSDB_ERR_NOMEM;
+            }
+            t->engs = ne;
+            t->eng_cap = nc;
+        }
+        pthread_mutex_unlock(&t->cmu);
+    }
     /* Last: the registry is what the cache's readers, the gc worker (deletes queued by an engine of the volume that
      * closed since) and tier_epoch find by volume number, so it takes only a context whose epoch was seen. An attach
      * that failed above leaves the volume's previous entry in place (none of those lookups runs before the open
      * returns but the gc worker, which keeps an item it cannot delete yet). */
-    return cold_register(t, cv);
+    rc = cold_register(t, cv);
+    if (rc == 0 && !db->ec_cluster) {
+        pthread_mutex_lock(&t->cmu);
+        t->eng_opening++;
+        db->ecstate->tier_opening = true;
+        pthread_mutex_unlock(&t->cmu);
+    }
+    return rc;
+}
+
+void tier_engine_ready(eng *db)
+{
+    if (!db || !db->tier || !db->ecstate)
+        return;
+    tier *t = db->tier;
+    pthread_mutex_lock(&t->cmu);
+    if (db->ecstate->tier_opening) {
+        db->ecstate->tier_opening = false;
+        if (t->eng_opening > 0)
+            t->eng_opening--;
+        if (!db->ecstate->tier_registered && t->nengs < t->eng_cap) {
+            t->engs[t->nengs++] = db;
+            db->ecstate->tier_registered = true;
+        }
+        pthread_cond_broadcast(&t->eng_cv);
+    }
+    pthread_mutex_unlock(&t->cmu);
+}
+
+void tier_engine_unreg(eng *db)
+{
+    if (!db || !db->tier || !db->ecstate)
+        return;
+    tier *t = db->tier;
+    pthread_mutex_lock(&t->cmu);
+    if (db->ecstate->tier_opening) {
+        db->ecstate->tier_opening = false;
+        if (t->eng_opening > 0)
+            t->eng_opening--;
+        pthread_cond_broadcast(&t->eng_cv);
+    }
+    if (db->ecstate->tier_registered) {
+        for (size_t i = 0; i < t->nengs; i++)
+            if (t->engs[i] == db) {
+                t->engs[i] = t->engs[--t->nengs];
+                break;
+            }
+        db->ecstate->tier_registered = false;
+        while (t->eng_active > 0)
+            pthread_cond_wait(&t->eng_cv, &t->cmu);
+    }
+    pthread_mutex_unlock(&t->cmu);
 }
 
 struct chunk_backend *tier_backend(const tier *t) { return t ? t->be : NULL; }
 
 const uint8_t *tier_vuuid(const eng *db) { return db->ecstate ? db->ecstate->vuuid : NULL; }
 
-void tier_halt_store(tier *t, int i, const char *why)
+static void tier_pause_store(tier *t, int i, const char *why)
 {
     if (!atomic_exchange(&t->halted, true))
-        fprintf(stderr, "tsdb: tier store %d (%s) %s: settles and chunk deletes stop for this tier until it is opened "
-                        "again; reads go on\n", i, t->cfg.dirs[i], why);
+        fprintf(stderr, "tsdb: tier store %d (%s) %s: settles and chunk deletes stop for this tier until stores "
+                        "recover; reads go on\n", i,
+                (i >= 0 && i < t->cfg.ndirs && t->cfg.dirs[i]) ? t->cfg.dirs[i] : "-", why);
+}
+
+void tier_halt_store(tier *t, int i, const char *why)
+{
+    atomic_store(&t->fence_halted, true);
+    tier_pause_store(t, i, why);
+}
+
+void tier_ensure_paused(tier *t, int store, const char *why)
+{
+    if (!t)
+        return;
+    tier_pause_store(t, store, why ? why : "is DOWN");
+}
+
+void tier_store_set_down(tier *t, int store, int reason)
+{
+#ifdef TSDB_EC
+    if (!t || !t->be)
+        return;
+    int prev = chunk_be_store_state(t->be, store);
+    if (chunk_be_set_down(t->be, store, reason) != 0)
+        return;
+    if (prev != CHUNK_STORE_UP || chunk_be_store_state(t->be, store) != CHUNK_STORE_UP) {
+        char why[64];
+        snprintf(why, sizeof why, "is %s", chunk_store_state_name(reason));
+        tier_pause_store(t, store, why);
+    }
+    if (prev == CHUNK_STORE_UP || prev == CHUNK_STORE_REPLACING || prev == CHUNK_STORE_DOWN_IOERR) {
+        /* Do not close cached chunk fds synchronously here (may be called on a health-monitor callback thread where
+         * close() on a hung mount could block): signal the attach worker to reopen/evict stale handles off-thread. */
+        tier_health_kick_reopen(t);
+    }
+#else
+    (void)t;
+    (void)store;
+    (void)reason;
+#endif
+}
+
+void tier_resume_if_all_up(tier *t)
+{
+#ifdef TSDB_EC
+    if (!t || !t->be || atomic_load(&t->fence_halted))
+        return;
+    int n = chunk_be_nstores(t->be);
+    for (int i = 0; i < n; i++)
+        if (chunk_be_store_state(t->be, i) != CHUNK_STORE_UP)
+            return;
+    if (atomic_exchange(&t->halted, false))
+        fprintf(stderr, "tsdb: tier: all %d stores are UP: settles and chunk deletes resume\n", n);
+    ecgc_kick_tier(t);
+#else
+    (void)t;
+#endif
 }
 
 bool tier_writable(tier *t)
@@ -1310,7 +1582,7 @@ bool tier_writable(tier *t)
             continue;
         char why[64];
         snprintf(why, sizeof why, "is %s", chunk_store_state_name(st));
-        tier_halt_store(t, i, why);
+        tier_pause_store(t, i, why);
         return false;
     }
     return true;
@@ -1327,6 +1599,7 @@ int tier_follower_ec(eng *db, const char *name)
 
 void tier_engine_detach(eng *db)
 {
+    tier_engine_unreg(db); /* idempotent: covers failed-open paths where eng_close did not reach unreg */
     if (db->ecstate) {
         ecswap_eng_close(db);
         ecsettle_eng_close(db);

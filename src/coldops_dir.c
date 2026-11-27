@@ -113,9 +113,10 @@ static int d_owner(void *ctx, const chunk_listed *c, uint8_t vuuid[16])
 {
     dirctx *d = ctx;
     chunk_backend *be = wbe(d);
-    chunk_store *st = be ? chunk_be_open_store(be, c->store) : NULL;
+    chunk_store *st = be ? chunk_be_store_ref(be, c->store) : NULL;
     chunk_hdr h;
     int rc = st ? chunk_store_peek(st, d->volume, c->oid, c->pos, &h) : TSDB_ERR_UNAVAILABLE;
+    chunk_store_unref(st);
     if (rc == 0)
         memcpy(vuuid, h.vuuid, 16);
     return rc;
@@ -125,9 +126,10 @@ static int d_chunk_info(void *ctx, const chunk_listed *c, uint8_t vuuid[16], uin
 {
     dirctx *d = ctx;
     chunk_backend *be = wbe(d);
-    chunk_store *st = be ? chunk_be_open_store(be, c->store) : NULL;
+    chunk_store *st = be ? chunk_be_store_ref(be, c->store) : NULL;
     chunk_hdr h;
     int rc = st ? chunk_store_peek(st, d->volume, c->oid, c->pos, &h) : TSDB_ERR_UNAVAILABLE;
+    chunk_store_unref(st);
     if (rc == 0) {
         if (vuuid)
             memcpy(vuuid, h.vuuid, 16);
@@ -155,8 +157,10 @@ static bool d_writable(void *ctx)
     if (!d->own)
         return tier_writable(d->t);
     for (int i = 0; i < chunk_be_nstores(d->own); i++) {
-        chunk_store *st = chunk_be_store(d->own, i);
-        if (chunk_be_store_state(d->own, i) != CHUNK_STORE_UP || !st || chunk_store_failed(st))
+        chunk_store *st = chunk_be_store_ref(d->own, i);
+        bool bad = chunk_be_store_state(d->own, i) != CHUNK_STORE_UP || !st || chunk_store_failed(st);
+        chunk_store_unref(st);
+        if (bad)
             return false;
     }
     return true;
@@ -190,12 +194,15 @@ static int d_see_epoch(void *ctx, uint64_t e)
         return rc;
     int held = tier_mutant == TIER_MUT_FENCE; /* planted: the call's word taken for every store */
     for (int i = 0; i < chunk_be_nstores(be) && tier_mutant != TIER_MUT_FENCE; i++) {
-        chunk_store *st = chunk_be_store(be, i);
-        if (chunk_be_store_state(be, i) != CHUNK_STORE_UP || !st || chunk_store_failed(st))
+        chunk_store *st = chunk_be_store_ref(be, i);
+        if (chunk_be_store_state(be, i) != CHUNK_STORE_UP || !st || chunk_store_failed(st)) {
+            chunk_store_unref(st);
             continue; /* tier_writable halts for these */
+        }
         bool has = chunk_store_epoch(st, vol) >= e && !chunk_store_epoch_unsure(st, vol);
         if (!has && chunk_store_raise(st, vol, e) == 0)
             has = chunk_store_epoch(st, vol) >= e && !chunk_store_epoch_unsure(st, vol);
+        chunk_store_unref(st);
         if (has)
             held++;
         else if (!d->own)

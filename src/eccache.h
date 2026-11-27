@@ -93,6 +93,9 @@ void eccache_forget(struct tier *t, uint32_t volume, const uint8_t oid[16]);
  * holds it and the next reader opens it again (its cached granules stay: they were checked). A read that sees the
  * object degraded (a cell failed or rebuilt, a position away, an error) does the same by itself. */
 void eccache_reopen(struct tier *t, uint32_t volume, const uint8_t oid[16]);
+/* Reopens every cached object (a tier store went DOWN or came back UP): cached granules stay intact, open object
+ * handles leave the table and close once no reader holds them. */
+void eccache_reopen_all(struct tier *t);
 
 /* Prefetch off-switch (R8 D19, F6): on by default (unless TSDB_EC_PREFETCH=0/off/false/no at tier_open);
  * eccache_set_prefetch disables or enables the tier's sequential granule prefetch at run time and resets active

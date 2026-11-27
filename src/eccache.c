@@ -851,6 +851,8 @@ static bool pf_is_degraded_locked(struct eccache_tier *c, const uint8_t oid[16])
 static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart *e, const granule *g, size_t gi,
                       ce *x, bool skip_raw)
 {
+    if (eng_abandoned())
+        return TSDB_ERR_UNAVAILABLE;
     if (!x->data) {
         /* BLK_SLACK zeroed bytes past the granule: the decoders read up to that far beyond a block (in a mapped
          * part the footer covers it), and granule_decode runs on this buffer */
@@ -870,8 +872,16 @@ static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart
     memset(&rep, 0, sizeof rep);
     bool ok = false;
     if (!skip_raw) {
+        if (eng_abandoned()) {
+            obj_put(c, o, false, false, x, false);
+            return TSDB_ERR_UNAVAILABLE;
+        }
         rc = o->ops->obj_read(o->o, x->off, x->len, x->data, CHUNK_RR_RAW, &rep);
         atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
+        if (rc == TSDB_ERR_UNAVAILABLE && eng_abandoned()) {
+            obj_put(c, o, false, false, x, false);
+            return TSDB_ERR_UNAVAILABLE;
+        }
         granule_checks_add(1);
         ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     }
@@ -881,6 +891,10 @@ static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart
      * reading again would double the I/O of every miss while a store is away and answer the same. */
     if ((rc == 0 || eccache_mutant == ECC_MUT_RETRYERR) && !ok && rc != TSDB_ERR_NOMEM && rc != TSDB_ERR_INVALID &&
         eccache_mutant != ECC_MUT_NORETRY) {
+        if (eng_abandoned()) {
+            obj_put(c, o, false, false, x, false);
+            return TSDB_ERR_UNAVAILABLE;
+        }
         /* rot that RAW cannot see: whole cells against the record's sums */
         pthread_mutex_lock(&c->obj_mu);
         c->retries++;
@@ -888,6 +902,10 @@ static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart
         retried = true;
         rc = o->ops->obj_read(o->o, x->off, x->len, x->data, 0, &rep);
         atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
+        if (rc == TSDB_ERR_UNAVAILABLE && eng_abandoned()) {
+            obj_put(c, o, false, false, x, false);
+            return TSDB_ERR_UNAVAILABLE;
+        }
         ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || eccache_mutant == ECC_MUT_NORECHECK ||
                          (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     }
@@ -1141,19 +1159,30 @@ static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart
         }
     }
     co *o = NULL;
+    if (eng_abandoned()) {
+        pf_finish(c, win, ok, k, 0);
+        slab_unref(sl);
+        return TSDB_ERR_UNAVAILABLE;
+    }
     int rc = sl ? obj_get(c, e, x, &o) : TSDB_ERR_NOMEM;
-    bool demand = false, pf_injected = false;
+    bool demand = false, pf_injected = false, abandoned = false;
     if (rc == 0) {
         chunk_report rep;
         memset(&rep, 0, sizeof rep);
-        if (atomic_load_explicit(&eccache_test_pf_fail, memory_order_relaxed) > 0 &&
+        if (eng_abandoned()) {
+            rc = TSDB_ERR_UNAVAILABLE;
+            abandoned = true;
+        } else if (atomic_load_explicit(&eccache_test_pf_fail, memory_order_relaxed) > 0 &&
             atomic_fetch_sub_explicit(&eccache_test_pf_fail, 1, memory_order_relaxed) > 0) {
             rc = TSDB_ERR_UNAVAILABLE; /* a test: the window's read fails as if a store went away under it */
             pf_injected = true;
         } else {
             rc = o->ops->obj_read(o->o, x->off, total, sl->buf, CHUNK_RR_RAW, &rep);
+            if (rc == TSDB_ERR_UNAVAILABLE && eng_abandoned())
+                abandoned = true;
         }
-        atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
+        if (!abandoned)
+            atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
         bool bad_crc = false;
         if (rc == 0) {
             granule_checks_add(1 + k);
@@ -1183,14 +1212,16 @@ static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart
             if (add_refs)
                 atomic_fetch_add_explicit(&sl->refs, add_refs, memory_order_relaxed);
         }
-        bool stale = rc != 0 || rep.bad_cells || rep.decoded_cells || bad_crc;
-        bool degraded = (!pf_injected && rc != 0) || rep.bad_cells || rep.decoded_cells || bad_crc;
+        bool stale = !abandoned && (rc != 0 || rep.bad_cells || rep.decoded_cells || bad_crc);
+        bool degraded = !abandoned && ((!pf_injected && rc != 0) || rep.bad_cells || rep.decoded_cells || bad_crc);
         obj_put(c, o, stale, degraded, x, false);
     }
     if (eccache_test_hook)
         eccache_test_hook(c->t, ECC_HOOK_PFREAD, e->rec.oid);
-    pf_finish(c, win, ok, k, o != NULL ? total : 0);
+    pf_finish(c, win, ok, k, (o != NULL && !abandoned) ? total : 0);
     slab_unref(sl);
+    if (abandoned)
+        return TSDB_ERR_UNAVAILABLE;
     if (!demand && eccache_mutant == ECC_MUT_PFNOFALLBACK && rc)
         return map_rc(rc);
     return demand ? 0 : fill_inner(c, p, e, g, gi, x, rc == 0 && o != NULL);
@@ -1653,6 +1684,31 @@ void eccache_reopen(struct tier *t, uint32_t volume, const uint8_t oid[16])
     struct eccache_tier *c = t ? t->cache : NULL;
     if (c)
         drop_object(c, volume, oid, false);
+}
+
+void eccache_reopen_all(struct tier *t)
+{
+    struct eccache_tier *c = t ? t->cache : NULL;
+    if (!c)
+        return;
+    co *ov = NULL;
+    pthread_mutex_lock(&c->obj_mu);
+    for (size_t i = 0; i < c->ohn; i++) {
+        while (c->oh[i]) {
+            co *o = c->oh[i];
+            co_remove(c, o);
+            if (o->pins == 0) {
+                o->hnext = ov;
+                ov = o;
+            }
+        }
+    }
+    memset(c->pfs, 0, sizeof c->pfs);
+    memset(c->pf_bad, 0, sizeof c->pf_bad);
+    if (c->obj_waiters)
+        pthread_cond_broadcast(&c->obj_cv);
+    pthread_mutex_unlock(&c->obj_mu);
+    co_close_list(c, ov);
 }
 
 /* ------------------------------------------------------------ tests */

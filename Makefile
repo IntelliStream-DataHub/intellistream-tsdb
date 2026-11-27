@@ -616,7 +616,7 @@ test-units-b6:
 	./$(B)/test_ecskip $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecskip --list "mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec" -- ./$(B)/test_ecskip --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_tier $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_tier --list "tierperengine tierunsure tierstrict tierfresh tierfence selfepoch dbidskip lostopen" -- ./$(B)/test_tier --mutant @M@ @D@,$(MUT) --name test_tier --list "tiernoec" -- ./$(B)/test_tier --mutant @M@ @D@) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
+	$(if $(EC_OBJ),$(MUT) --name test_tier --list "tierperengine tierunsure tierstrict tierfresh tierfence selfepoch dbidskip lostopen downnoread attachnoheal" -- ./$(B)/test_tier --mutant @M@ @D@,$(MUT) --name test_tier --list "tiernoec" -- ./$(B)/test_tier --mutant @M@ @D@) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
 	$(if $(EC_OBJ),$(MUT) --name test_chunk_heal --list "heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always" -- ./$(B)/test_chunk_heal --quick --mutant @M@ @D@) # each planted bug must fail it
 test-units-b7:
@@ -1651,7 +1651,7 @@ $(B)/test_ecskip: tests/test_ecskip.c src/internal.h $(R7_HDR) $(LIB)
 
 # the tier of a handle (r7-tier): one backend for every volume, vuuid= and requires=tier in META (power loss at every
 # step), stores DOWN at open and failed in service, the unsure EPOCH, the refusals; mutants must fail it
-$(B)/test_tier: tests/test_tier.c src/internal.h src/ecgc.h src/tier.h src/tiers.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
+$(B)/test_tier: tests/test_tier.c tests/outagefs_ctl.h src/internal.h src/ecgc.h src/tier.h src/tiers.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # the chunk server through a fake link and two real peerlinks: puts, reads, fences, unsure stores, store binding, power

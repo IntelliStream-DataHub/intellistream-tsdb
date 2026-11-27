@@ -111,7 +111,7 @@ Gauges for volumes this server does **not** hold (not listed in the volume's rep
 | `tsdb_cluster_volume_lag_positions{volume}` | gauge | per held volume: replication lag in log positions (leader: written minus commit; replica: max(commit, written) minus applied) |
 | `tsdb_cluster_volume_lag_ms{volume}` | gauge | per held volume: replication lag duration in milliseconds (leader: commit stall or unacked peer age while `lag_positions > 0`; replica: active missing-file fetch wait while `lag_positions > 0`; 0 when caught up) |
 | `tsdb_cluster_volume_unavailable{volume,why}` | gauge | per held volume: 1 while unavailable, labelled by reason (`no_owner`, `diverged`, `recovering`, `unreachable`, `lost`, `stuck`, `nfs_down`, ...); absent while available; page on 1 |
-| `tsdb_chunk_store_state{store}` | gauge | per local chunk store (0-based index): `0` up, `1` missing, `2` other_id, `3` damaged, `4` ioerr, `5` replacing |
+| `tsdb_chunk_store_state{store}` | gauge | per local chunk store (0-based index): `0` up, `1` missing, `2` other_id, `3` damaged, `4` ioerr, `5` replacing, `6` stalled |
 | `tsdb_cluster_out_guard_passed_total` | counter | times automatic member OUT proceeded past the mass-OUT guard bound (R9 D4) |
 | `tsdb_cluster_transfers_total{event}` | counter | planned leadership transfer events since process start (`started`, `done`, `timed_out`, `cancelled`, `fallback`, `balance`, `drain_timed_out`, `blind`, `ready`, `cuts`) |
 | `tsdb_cluster_moves_total{event}` | counter | replica move lifecycle events since process start on the Raft leader (`started`, `done`, `cancelled`) |

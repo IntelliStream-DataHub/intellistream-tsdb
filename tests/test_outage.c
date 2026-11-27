@@ -446,11 +446,14 @@ static int await_writes(side *s, int timeout_ms)
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
-    const char *names[] = {"a", "b", "c"};
-    if (outagefs_reexec(argv, base, names, 3) != 0)
+    const char *names[] = {"a", "b", "c", "t1"};
+    if (outagefs_reexec(argv, base, names, 4) != 0)
         return 1;
     th_watchdog("test_outage", 900);
     const char *dir_a = outagefs_dir("a"), *dir_b = outagefs_dir("b"), *dir_c = outagefs_dir("c");
+#ifdef TSDB_EC
+    const char *dir_t1 = outagefs_dir("t1");
+#endif
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     snprintf(root, sizeof root, "%s.root", getenv("OUTAGEFS_CTL"));
     signal(SIGPIPE, SIG_IGN);
@@ -741,6 +744,133 @@ int main(int argc, char **argv)
     int st;
     waitpid(server, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+#ifdef TSDB_EC
+    /* 5. R15 r15-health (D8): a --health-domain covering a tier store drives that store DOWN when the domain faults
+     *    and enqueues attach when it recovers, NEVER quiescing the volume! */
+    {
+        char troot[PATH_MAX], tst0[PATH_MAX], tst1[PATH_MAX], tst2[PATH_MAX], tpf[PATH_MAX + 64], tfollow[64];
+        snprintf(troot, sizeof troot, "%s.tier_root", getenv("OUTAGEFS_CTL"));
+        snprintf(tst0, sizeof tst0, "%s.tier_st0", getenv("OUTAGEFS_CTL"));
+        snprintf(tst1, sizeof tst1, "%s/st1", dir_t1);
+        snprintf(tst2, sizeof tst2, "%s.tier_st2", getenv("OUTAGEFS_CTL"));
+
+        tsdb *tdb = NULL;
+        tsdb_options to;
+        tsdb_options_init(&to);
+        to.merge_threads = 0;
+        to.partition_ms = 1000;
+        CHECK(tsdb_open(troot, &to, &tdb) == 0 && tdb);
+        if (tdb)
+            CHECK(tsdb_close(tdb) == 0);
+        CHECK(tsdb_tier_add_dir(troot, tst0, "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        CHECK(tsdb_tier_add_dir(troot, tst1, "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        CHECK(tsdb_tier_add_dir(troot, tst2, "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+
+        /* Populate & settle a partition before starting tsdbd so queries hit the tier immediately. */
+        setenv("TSDB_TEST_TIER", "grace_s=0,keep_s=0", 1);
+        setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+        CHECK(tsdb_open(troot, &to, &tdb) == 0 && tdb);
+        tsdb_sid tsid = 0;
+        if (tdb) {
+            CHECK(tsdb_series_create(tdb, "tier.s", TSDB_FLOAT32, NULL, &tsid) == 0);
+            int64_t ts[128];
+            float v[128];
+            for (int i = 0; i < 128; i++)
+                ts[i] = i * 5, v[i] = (float)i;
+            CHECK(tsdb_insert_series(tdb, tsid, ts, v, 128) == 0);
+            CHECK(tsdb_flush(tdb) == 0);
+            /* Wait up to 5 s for the settle thread to move the flushed part to the tier. */
+            char ec_check[PATH_MAX + 64];
+            snprintf(ec_check, sizeof ec_check, "ls '%s'/*.ec >/dev/null 2>&1", troot);
+            for (int w = 0; w < 50 && system(ec_check) != 0; w++)
+                msleep(100);
+            CHECK(system(ec_check) == 0);
+            CHECK(tsdb_close(tdb) == 0);
+        }
+        unsetenv("TSDB_TEST_TIER");
+        unsetenv("TSDB_TEST_TIER_I_KNOW");
+        make_users(troot);
+
+        th_portfile(tpf, sizeof tpf, troot);
+        th_follow_me(tfollow, sizeof tfollow);
+        const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+        setenv("TSDBD_TEST_HEALTH", "down=1500,read=150,write=300,recover=1000,flap=2000,fast=400,spawn=60000", 1);
+        pid_t tpid = fork();
+        if (tpid == 0) {
+            const char *argv[24] = {"tsdbd", "--dir", troot, "--port", "0", "--port-file", tpf, "--workers", "4",
+                                    tfollow, "--health-domain", dir_t1};
+            int n = 12;
+            if (getenv("TSDBD_IO")) {
+                argv[n++] = "--io";
+                argv[n++] = getenv("TSDBD_IO");
+            }
+            argv[n] = NULL;
+            execv(bin, (char *const *)argv);
+            _exit(127);
+        }
+        int tp = th_await(tpf, tpid, 30000);
+        unlink(tpf);
+        CHECK(tp > 0);
+        if (tp > 0) {
+            int saved_port = port;
+            port = tp;
+            CHECK(await_status("tier.stores", "3", 5000) >= 0);
+            CHECK(await_status("tier.store.1.state", "UP", 5000) >= 0);
+            char dir_t1_rp[PATH_MAX];
+            const char *expect_dom = realpath(dir_t1, dir_t1_rp) ? dir_t1_rp : dir_t1;
+            CHECK(await_status("tier.store.1.domain", expect_dom, 5000) >= 0);
+            CHECK(await_status("vol.0.health", "available", 5000) >= 0);
+
+            /* Fault the tier store's health domain with hang: domain goes DOWN, store 1 goes DOWN_STALLED,
+             * volume 0 STAYS AVAILABLE, writes to vol 0 succeed, and queries of settled tier.s decode around st1! */
+            CHECK(fault("hang", dir_t1, NULL) == 0);
+            CHECK(await_status("domain.0.state", "down", 15000) >= 0);
+            CHECK(await_status("tier.store.1.state", "DOWN_STALLED", 10000) >= 0);
+            {
+                tsdbc *tc = NULL;
+                CHECK(connect_noretry("127.0.0.1", port, 3000, &tc) == 0 && tc);
+                if (tc) {
+                    char vhealth[64] = "";
+                    CHECK(status_line(tc, "vol.0.health", vhealth, sizeof vhealth) &&
+                          strcmp(vhealth, "available") == 0);
+                    int64_t wts = 500000;
+                    float wv = 42.0f;
+                    CHECK(tsdbc_insert_series(tc, tsid, &wts, &wv, 1) == 0);
+                    seen got = {0};
+                    CHECK(tsdbc_query_raw(tc, tsid, 0, 1000, collect, &got) == 0 && got.n == 128);
+                    free(got.ts);
+                    tsdbc_close(tc);
+                }
+            }
+
+            /* Heal the domain: domain goes UP and store 1 attaches back to UP. */
+            CHECK(fault("heal", dir_t1, NULL) == 0);
+            CHECK(await_status("domain.0.state", "up", 15000) >= 0);
+            CHECK(await_status("tier.store.1.state", "UP", 15000) >= 0);
+            CHECK(await_status("vol.0.health", "available", 5000) >= 0);
+            {
+                tsdbc *tc = NULL;
+                CHECK(connect_noretry("127.0.0.1", port, 3000, &tc) == 0 && tc);
+                if (tc) {
+                    seen got = {0};
+                    CHECK(tsdbc_query_raw(tc, tsid, 0, 1000, collect, &got) == 0 && got.n == 128);
+                    free(got.ts);
+                    tsdbc_close(tc);
+                }
+            }
+            port = saved_port;
+        }
+        if (tpid > 0) {
+            int thung = 0;
+            int tst = th_stop(tpid, 15000, &thung);
+            CHECK(!thung && WIFEXITED(tst) && WEXITSTATUS(tst) == 0);
+        }
+        fprintf(stderr, "tier health-domain: volume stayed available while tier store domain faulted and recovered\n");
+    }
+#else
+    fprintf(stderr, "tier health-domain: skipped (no TSDB_EC in this build)\n");
+#endif
     fprintf(stderr, "test_outage: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

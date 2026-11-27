@@ -38,20 +38,47 @@ void chunk_rpool_destroy(chunk_rpool *p);
 /* A backend's stores (chunkstore.c) as the heal code (chunkheal.c) needs them. */
 struct chunk_backend {
     int n;
-    _Atomic(chunk_store *) *st;  /* NULL while DOWN; set under `mu` by attach and replace, read without a lock */
+    _Atomic(chunk_store *) *st;  /* NULL while DOWN; guarded by st_mu for swaps and ref acquisition */
     atomic_int *state;           /* CHUNK_STORE_* (an open store that failed in service reads as DOWN_IOERR) */
-    char **path;                 /* what each index was opened or attached at (for messages) */
-    chunk_store **retired;       /* stores replaced after they failed in service: kept open until close, never freed
+    atomic_bool *st_failed;      /* mirrors chunk_store_failed(st[i]) for lock-free chunk_be_store_state() */
+    chunk_store **pending_close; /* stores detached by chunk_be_set_down: unreffed on attach worker or close, never on
+                                  * health/monitor/reader threads where close() on a hung NFS mount could block */
+    char **path;                 /* what each index was opened or attached at (for messages; guarded by st_mu) */
+    chunk_store **retired;       /* stores replaced after they failed in service: kept until close, never freed
                                   * under a thread that may still hold a writer on one */
     int nretired;
-    pthread_mutex_t mu;          /* the in-memory fence, and the swaps of st[] */
+    pthread_mutex_t mu;          /* the in-memory fence, and serializes install() */
+    pthread_mutex_t st_mu;       /* pure leaf lock (never held across I/O; lock order: mu > st_mu): guards st[],
+                                  * state[] transitions, path[], refcount acquisition, and on_ioerr */
     struct fence {
         uint32_t vol;
         uint64_t epoch;
     } *f;
     size_t nf, capf;
     _Atomic(chunk_rpool *) rpool; /* lazy joinable I/O worker pool for parallel chunk_obj reads (chunkread.c) */
+    void (*on_ioerr)(void *ctx, int store); /* optional runtime I/O error hook (r15-health; guarded by st_mu) */
+    void *ioerr_ctx;
+    unsigned ioerr_active;       /* in-flight on_ioerr calls; drained when clearing the callback */
+    pthread_cond_t ioerr_cv;
 };
+/* Reference counting on chunk_store: chunk_store_open returns 1 ref; chunk_store_close is chunk_store_unref. */
+chunk_store *chunk_store_ref(chunk_store *st);
+void chunk_store_unref(chunk_store *st);
+/* Binds a freshly opened store to backend slot (be, idx) BEFORE publishing it into be->st[idx]. */
+void chunk_store_bind_be(chunk_store *st, chunk_backend *be, int idx);
+/* Acquires a reference to open store i under st_mu; caller must chunk_store_unref(). NULL when DOWN. */
+chunk_store *chunk_be_store_ref(const chunk_backend *be, int i);
+/* Releases any store parked on pending_close[i] by chunk_be_set_down (call on attach worker or close only). */
+void chunk_be_release_down(chunk_backend *be, int i);
+/* Reads chunk bytes and sets *real_io = true only on a real kernel storage I/O error (not truncated file or EINVAL). */
+int chunk_rd_read_ex(chunk_rd *r, uint64_t off, void *buf, size_t len, bool *real_io);
+/* Thread-safe copy of backend store i's current path under st_mu. Returns false when out of range or unset. */
+bool chunk_be_store_path_copy(const chunk_backend *be, int i, char *buf, size_t cap);
+/* Registers/clears the runtime I/O error callback (called outside any lock when a read hits TSDB_ERR_IO). */
+void chunk_be_set_ioerr_cb(chunk_backend *be, void (*fn)(void *ctx, int store), void *ctx);
+void chunk_be_note_ioerr(chunk_backend *be, int store);
+/* Opens a chunk for reading and optionally reports which store index it was opened from (*store_out, -1 if none). */
+int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out, int *store_out);
 /* The store the position `pos` of the object is placed on: (chunk_be_place + pos) mod n. */
 int chunk_be_pos_store(const chunk_backend *be, const uint8_t oid[16], unsigned pos);
 /* The fence before a put, a delete or a heal at epoch e (refused below it, raised above it). */

@@ -125,6 +125,8 @@
 #include "chunksrv.h"
 #include "chunkpeer.h"
 #include "../src/tiers.h"
+#include "../src/tier.h"
+#include "../src/chunk.h"
 #include "fwd.h"
 #include "peerlink.h" /* --peer-check, --peer-rdma, --peer-allow-ipoib */
 #include "plrdma.h"
@@ -3418,6 +3420,18 @@ static void handle_status(req *r)
         ST_PUT("domain.%d.state=%s\ndomain.%d.since_ms=%lld\ndomain.%d.outage_id=%llu\ndomain.%d.probe_ms=%d\n", d,
                di.state >= 0 && di.state <= 3 ? st[di.state] : "?", d, (long long)di.since_ms, d,
                (unsigned long long)di.outage_id, d, di.write_ms);
+    }
+    if (dom.tier && dom.nstores > 0) {
+        ST_PUT("tier.stores=%d\n", dom.nstores);
+        for (int s = 0; s < dom.nstores; s++) {
+            int st = tier_store_state(dom.tier, s);
+            char sp[PATH_MAX];
+            bool has_p = tier_store_path(dom.tier, s, sp, sizeof sp);
+            ST_PUT("tier.store.%d.state=%s\ntier.store.%d.path=%s\n", s, chunk_store_state_name(st), s,
+                   has_p ? sp : "-");
+            if (dom.store_dom[s] >= 0 && dom.store_dom[s] < dom.ndoms)
+                ST_PUT("tier.store.%d.domain=%s\n", s, dom.prefix[dom.store_dom[s]]);
+        }
     }
 #undef ST_PUT
     if (sb.oom || sb.len - 4 > UINT32_MAX) {

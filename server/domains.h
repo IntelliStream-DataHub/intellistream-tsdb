@@ -29,6 +29,7 @@
 #define DOM_CAP 4         /* requests inside one domain volume at a time */
 #define DOM_MAX_VOLS 1024 /* volumes with admission state; a higher number is outside every domain */
 #define DOM_MAX 64
+#define DOM_MAX_STORES 64 /* single-server tier stores (matches TIER_DIRS_MAX) */
 
 typedef struct dom_vol {
     atomic_int dom;          /* domain index, -1 outside every domain, -2 not decided yet; workers decide it
@@ -42,6 +43,9 @@ typedef struct dom_vol {
 static struct {
     tsdb *db;
     tsdb_health *health;
+    struct tier *tier; /* refcounted active single-server tier (for --health-domain store mapping and STATUS) */
+    int nstores;
+    int store_dom[DOM_MAX_STORES]; /* domain index covering tier store i, or -1 */
     char prefix[DOM_MAX][PATH_MAX];
     int ndoms;
     atomic_bool nonup[DOM_MAX];
@@ -92,6 +96,23 @@ static bool vol_diverged(size_t v, const char **which)
     return true;
 }
 
+/* Longest --health-domain prefix holding `path` (pure string comparison, no I/O). */
+static int dom_match_path(const char *path)
+{
+    if (!path || dom.ndoms == 0)
+        return -1;
+    int best = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < dom.ndoms; i++) {
+        size_t n = strlen(dom.prefix[i]);
+        if (strncmp(path, dom.prefix[i], n) == 0 && (path[n] == 0 || path[n] == '/' || n == 1) && n >= best_len) {
+            best = i;
+            best_len = n;
+        }
+    }
+    return best;
+}
+
 /* The domain of volume v: the longest prefix that holds its directory. Decided once, by comparing strings (no I/O:
  * the call must never wait for a server that is away). */
 static int dom_of(size_t v)
@@ -104,15 +125,7 @@ static int dom_of(size_t v)
     const char *path = tsdb_volume_path(dom.db, (uint32_t)v);
     if (!path)
         return -1; /* no such volume (yet): not decided */
-    int best = -1;
-    size_t best_len = 0;
-    for (int i = 0; path && i < dom.ndoms; i++) {
-        size_t n = strlen(dom.prefix[i]);
-        if (strncmp(path, dom.prefix[i], n) == 0 && (path[n] == 0 || path[n] == '/' || n == 1) && n >= best_len) {
-            best = i;
-            best_len = n;
-        }
-    }
+    int best = dom_match_path(path);
     atomic_store(&dom.vol[v].dom, best);
     return best;
 }
@@ -374,17 +387,35 @@ static void dom_recover(size_t v)
     pthread_attr_destroy(&at);
 }
 
+static struct tier *dom_tier_ref(int *nstores)
+{
+    pthread_mutex_lock(&dom.mu);
+    struct tier *t = dom.tier ? tier_get(dom.tier) : NULL;
+    if (nstores)
+        *nstores = t ? dom.nstores : 0;
+    pthread_mutex_unlock(&dom.mu);
+    return t;
+}
+
 /* The health monitor reports a state change (a leaf: no lock of the health module is held, it must not block). */
 static void dom_on_change(void *ctx, int d, int old_state, int new_state)
 {
     (void)ctx;
-    if (d < 0 || d >= dom.ndoms)
+    if (atomic_load(&dom.stop) || d < 0 || d >= dom.ndoms)
         return;
     fprintf(stderr, "tsdbd: [%.3f] storage domain %s: %d -> %d\n", dom_now_s(), dom.prefix[d], old_state, new_state);
     if (new_state == TSDB_DOM_UP) {
         pthread_mutex_lock(&dom.mu);
         atomic_store(&dom.nonup[d], false);
         pthread_mutex_unlock(&dom.mu);
+        int ns = 0;
+        struct tier *t = dom_tier_ref(&ns);
+        if (t) {
+            for (int s = 0; s < ns; s++)
+                if (dom.store_dom[s] == d)
+                    tier_health_domain_state(t, s, false);
+            tier_put(t);
+        }
     } else {
         dom_count_inside(d);
         /* A recovery thread that finished before this call fired may already have set the domain UP: its UP came
@@ -395,18 +426,39 @@ static void dom_on_change(void *ctx, int d, int old_state, int new_state)
             pthread_mutex_unlock(&dom.mu);
         }
     }
-    if (new_state == TSDB_DOM_RECOVERING && dom_all_back(d)) {
-        /* No volume of the domain has a recovery thread to set it UP: all are diverged (dom_recover skips them, and
-         * a diverged volume stays refused on its own) or the domain has none. Without this the domain stayed DOWN
-         * for good after any outage that followed the first, and every request that names no volume counted as a
-         * waiting worker. After dom_count_inside: the UP this fires clears the flag that call sets. */
-        tsdb_health_set_up(dom.health, d);
+    if (new_state == TSDB_DOM_RECOVERING) {
+        /* R15 D8: tier stores covered by this domain enqueue attach/heal on the tier attach worker (never blocking
+         * here, and never quiescing any volume). */
+        int ns = 0;
+        struct tier *t = dom_tier_ref(&ns);
+        if (t) {
+            for (int s = 0; s < ns; s++)
+                if (dom.store_dom[s] == d)
+                    tier_health_domain_state(t, s, false);
+            tier_put(t);
+        }
+        if (dom_all_back(d)) {
+            /* No volume of the domain has a recovery thread to set it UP: all are diverged (dom_recover skips them, and
+             * a diverged volume stays refused on its own) or the domain has none (or covers only tier stores). Without
+             * this the domain stayed DOWN for good after any outage, and every request that names no volume counted as
+             * a waiting worker. After dom_count_inside: the UP this fires clears the flag that call sets. */
+            tsdb_health_set_up(dom.health, d);
+        }
     }
     if (new_state == TSDB_DOM_DOWN) {
         size_t n = tsdb_volume_count(dom.db);
         for (size_t v = 1; v < n && v < DOM_MAX_VOLS; v++)
             if (dom_of(v) == d)
                 dom_recover(v); /* quiesces at once; the thread waits for RECOVERING */
+        /* R15 D8: a --health-domain over a tier store drives the store DOWN without quiescing any volume. */
+        int ns = 0;
+        struct tier *t = dom_tier_ref(&ns);
+        if (t) {
+            for (int s = 0; s < ns; s++)
+                if (dom.store_dom[s] == d)
+                    tier_health_domain_state(t, s, true);
+            tier_put(t);
+        }
     }
 }
 
@@ -450,12 +502,25 @@ static int dom_init(tsdb *db, char *const *prefixes, int n, void (*waits)(int))
 {
     dom.db = db;
     dom.waits = waits;
+    dom.tier = NULL;
+    dom.nstores = 0;
     for (int i = 0; i < DOM_MAX_VOLS; i++)
         atomic_store(&dom.vol[i].dom, -2);
+    for (int i = 0; i < DOM_MAX_STORES; i++)
+        dom.store_dom[i] = -1;
+    struct tier *t = tier_find_by_dir(tsdb_volume_path(db, 0));
+    if (t) {
+        dom.tier = t;
+        int ns = tier_store_count(t);
+        dom.nstores = ns > DOM_MAX_STORES ? DOM_MAX_STORES : ns;
+    }
     if (n == 0)
         return 0;
     if (n > DOM_MAX) {
         fprintf(stderr, "tsdbd: at most %d --health-domain\n", DOM_MAX);
+        tier_put(dom.tier);
+        dom.tier = NULL;
+        dom.nstores = 0;
         return -1;
     }
     tsdb_health_options o;
@@ -465,19 +530,41 @@ static int dom_init(tsdb *db, char *const *prefixes, int n, void (*waits)(int))
     dom.health = tsdb_health_open(&o);
     if (!dom.health) {
         fprintf(stderr, "tsdbd: cannot start the storage health monitor\n");
+        tier_put(dom.tier);
+        dom.tier = NULL;
+        dom.nstores = 0;
         return -1;
     }
     for (int i = 0; i < n; i++) {
         char *rp = realpath(prefixes[i], NULL);
         if (!rp) {
             fprintf(stderr, "tsdbd: --health-domain %s: %s\n", prefixes[i], strerror(errno));
+            tier_put(dom.tier);
+            dom.tier = NULL;
+            dom.nstores = 0;
             return -1;
         }
         snprintf(dom.prefix[i], sizeof dom.prefix[i], "%s", rp);
         free(rp);
         dom.ndoms = i + 1; /* before add_domain: a state change may call back at once */
+    }
+    /* Map tier stores before starting domain probes so the very first DOWN callback already sees store_dom[].
+     * realpath() runs once at startup (consistent with tier_open, which already opened the stores). */
+    if (dom.tier) {
+        for (int s = 0; s < dom.nstores; s++) {
+            char sp[PATH_MAX], canon[PATH_MAX];
+            if (!tier_store_path(dom.tier, s, sp, sizeof sp))
+                continue;
+            const char *rp = realpath(sp, canon) ? canon : sp;
+            dom.store_dom[s] = dom_match_path(rp);
+        }
+    }
+    for (int i = 0; i < n; i++) {
         if (tsdb_health_add_domain(dom.health, dom.prefix[i], dom.prefix[i]) != i) {
             fprintf(stderr, "tsdbd: --health-domain %s: cannot probe it\n", prefixes[i]);
+            tier_put(dom.tier);
+            dom.tier = NULL;
+            dom.nstores = 0;
             return -1;
         }
     }
@@ -528,11 +615,19 @@ static void dom_shutdown(void)
     atomic_store(&dom.stop, true);
     for (int i = 0; i < 600 && atomic_load(&dom.threads) > 0; i++)
         dom_sleep_ms(50); /* a reopen stuck on a hung server is left: the process ends anyway */
+    pthread_mutex_lock(&dom.mu);
+    struct tier *t = dom.tier;
+    dom.tier = NULL;
+    dom.nstores = 0;
+    pthread_mutex_unlock(&dom.mu);
     for (int d = 0; d < dom.ndoms; d++)
-        if (tsdb_health_state(dom.health, d) != TSDB_DOM_UP)
+        if (tsdb_health_state(dom.health, d) != TSDB_DOM_UP) {
+            tier_put(t);
             return; /* a probe may hang in the server's call: the process ends with it */
+        }
     if (dom.health)
         tsdb_health_close(dom.health);
+    tier_put(t);
 }
 
 #endif

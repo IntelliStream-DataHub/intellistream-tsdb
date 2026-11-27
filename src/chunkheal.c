@@ -414,36 +414,47 @@ int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_hea
     int stt = chunk_be_store_state(be, store);
     if (stt != CHUNK_STORE_UP && stt != CHUNK_STORE_REPLACING)
         return stt == CHUNK_STORE_DOWN_IOERR && chunk_be_open_store(be, store) ? TSDB_ERR_IO : TSDB_ERR_UNAVAILABLE;
-    chunk_store *tgt = chunk_be_open_store(be, store);
+    chunk_store *tgt = chunk_be_store_ref(be, store);
     if (!tgt)
         return TSDB_ERR_UNAVAILABLE;
     int rc = chunk_be_prepare(be, volume, o->epoch);
-    if (rc)
+    if (rc) {
+        chunk_store_unref(tgt);
         return rc;
+    }
     entv ev = {.store = -1};
     for (int i = 0; i < be->n && rc == 0; i++) {
-        chunk_store *st = chunk_be_open_store(be, i);
-        if (i == store || !st)
+        if (i == store)
+            continue;
+        chunk_store *st = chunk_be_store_ref(be, i);
+        if (!st)
             continue;
         ev.store = i;
         rc = chunk_store_list(st, volume, false, ent_add, &ev);
+        chunk_store_unref(st);
     }
     if (rc) {
         free(ev.v);
+        chunk_store_unref(tgt);
         return rc;
     }
     if (ev.n > 1)
         qsort(ev.v, ev.n, sizeof *ev.v, ent_cmp);
     heal_ctx h = {be, volume, store, tgt, o, rep};
     for (size_t i = 0; i < ev.n && rc == 0;) {
+        if (o->cancel && o->cancel(o->cancel_ctx)) {
+            rc = TSDB_ERR_STOPPED;
+            break;
+        }
         size_t j = i;
         while (j < ev.n && memcmp(ev.v[j].oid, ev.v[i].oid, 16) == 0)
             j++;
         chunk_hdr hd;
         bool got = false;
         for (size_t x = i; x < j && !got; x++) { /* the first chunk of the object whose header reads */
-            chunk_store *st = chunk_be_open_store(be, ev.v[x].store);
+            chunk_store *st = chunk_be_store_ref(be, ev.v[x].store);
             got = st && chunk_store_peek(st, volume, ev.v[x].oid, ev.v[x].pos, &hd) == 0;
+            chunk_store_unref(st);
         }
         if (!got) {
             rep->failed++;
@@ -461,6 +472,10 @@ int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_hea
         oid_vec tv = {.pos0_only = true};
         rc = chunk_store_list_names(tgt, volume, oid_vec_add, &tv);
         for (size_t i = 0; i < tv.n && rc == 0; i++) {
+            if (o->cancel && o->cancel(o->cancel_ctx)) {
+                rc = TSDB_ERR_STOPPED;
+                break;
+            }
             if (ev.n > 0 && bsearch(tv.v[i], ev.v, ev.n, sizeof *ev.v, ent_cmp))
                 continue;
             chunk_hdr hd;
@@ -480,6 +495,7 @@ int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_hea
         free(tv.v);
     }
     free(ev.v);
+    chunk_store_unref(tgt);
     return rc;
 }
 
@@ -496,12 +512,14 @@ int chunk_be_repair(chunk_backend *be, const chunk_ident *id, const chunk_heal_o
     int stt = chunk_be_store_state(be, store);
     if (stt != CHUNK_STORE_UP && stt != CHUNK_STORE_REPLACING)
         return TSDB_ERR_UNAVAILABLE;
-    chunk_store *tgt = chunk_be_open_store(be, store);
+    chunk_store *tgt = chunk_be_store_ref(be, store);
     if (!tgt)
         return TSDB_ERR_UNAVAILABLE;
     int rc = chunk_be_prepare(be, id->volume, o->epoch);
-    if (rc)
+    if (rc) {
+        chunk_store_unref(tgt);
         return rc;
+    }
     chunk_obj *ob = NULL;
     rc = chunk_obj_open(be, id->volume, id->vuuid, id->oid, NULL, NULL, &ob);
     if (rc) { /* nothing of the object can be read: say which kind of nothing */
@@ -513,6 +531,7 @@ int chunk_be_repair(chunk_backend *be, const chunk_ident *id, const chunk_heal_o
             rep->objects++;
             if (!is_live(&h, id->oid)) {
                 rep->not_live++;
+                chunk_store_unref(tgt);
                 return 0;
             }
             rep->unrecoverable++;
@@ -522,21 +541,27 @@ int chunk_be_repair(chunk_backend *be, const chunk_ident *id, const chunk_heal_o
                 fprintf(stderr, "tsdb: repair: object %s (single-copy, m=0): chunk is damaged and cannot be rebuilt\n",
                         hex);
             }
+            chunk_store_unref(tgt);
             return 0;
         }
         if (rc == TSDB_ERR_UNAVAILABLE && any_gone(be, store))
             rep->unavailable++;
         else
             rep->unrecoverable++;
+        chunk_store_unref(tgt);
         return 0;
     }
     chunk_geom g = *chunk_obj_geom(ob);
     uint64_t epoch = chunk_obj_epoch(ob);
     chunk_obj_close(ob);
-    if (id->pos >= chunk_npos(&g))
+    if (id->pos >= chunk_npos(&g)) {
+        chunk_store_unref(tgt);
         return TSDB_ERR_INVALID;
+    }
     heal_ctx h = {be, id->volume, store, tgt, o, rep};
-    return heal_object(&h, id->vuuid, id->oid, &g, epoch, id->pos, true);
+    rc = heal_object(&h, id->vuuid, id->oid, &g, epoch, id->pos, true);
+    chunk_store_unref(tgt);
+    return rc;
 }
 
 /* ---------------------------------------------------------------- settle, attach, replace */
@@ -561,11 +586,13 @@ static int volumes_of(chunk_backend *be, uint32_t **out, size_t *nout)
     }
     pthread_mutex_unlock(&be->mu);
     for (int i = 0; i < be->n; i++) {
-        chunk_store *st = chunk_be_open_store(be, i);
+        chunk_store *st = chunk_be_store_ref(be, i);
         uint32_t *vols;
         uint64_t *eps;
         size_t nv;
-        if (!st || chunk_store_volumes(st, &vols, &eps, &nv) != 0)
+        int vrc = st ? chunk_store_volumes(st, &vols, &eps, &nv) : -1;
+        chunk_store_unref(st);
+        if (vrc != 0)
             continue;
         for (size_t j = 0; j < nv; j++) {
             bool have = false;
@@ -622,6 +649,10 @@ static int be_settle(chunk_backend *be, int store, const chunk_heal_opts *o, chu
     size_t nv = 0;
     int rc = volumes_of(be, &vols, &nv);
     for (size_t i = 0; i < nv && rc == 0; i++) {
+        if (o && o->cancel && o->cancel(o->cancel_ctx)) {
+            rc = TSDB_ERR_STOPPED;
+            break;
+        }
         chunk_heal_opts ho;
         memset(&ho, 0, sizeof ho);
         if (o)
@@ -640,12 +671,23 @@ static int be_settle(chunk_backend *be, int store, const chunk_heal_opts *o, chu
          * is not promoted while any other store is gone (a REPLACING one is open and was listed) */
         if (chunk_mutant == CHUNK_MUT_SETTLE_UP_ALWAYS ||
             (rep->failed == 0 && rep->unavailable == 0 && !any_gone(be, store))) {
-            atomic_store(&be->state[store], CHUNK_STORE_UP);
-            fprintf(stderr, "tsdb: chunk backend: store %d (%s) is UP: %llu chunks rebuilt, %llu objects past repair\n",
-                    store, be->path[store] ? be->path[store] : "-",
-                    (unsigned long long)(rep->rebuilt_missing + rep->rebuilt_damaged),
-                    (unsigned long long)rep->unrecoverable);
-            return 0;
+            char pbuf[PATH_MAX];
+            bool promoted = false;
+            pthread_mutex_lock(&be->st_mu);
+            int cur = atomic_load_explicit(&be->state[store], memory_order_relaxed);
+            chunk_store *cur_st = atomic_load_explicit(&be->st[store], memory_order_relaxed);
+            if (cur == CHUNK_STORE_REPLACING && cur_st && !chunk_store_failed(cur_st)) {
+                atomic_store_explicit(&be->state[store], CHUNK_STORE_UP, memory_order_release);
+                snprintf(pbuf, sizeof pbuf, "%s", be->path[store] ? be->path[store] : "-");
+                promoted = true;
+            }
+            pthread_mutex_unlock(&be->st_mu);
+            if (promoted) {
+                fprintf(stderr, "tsdb: chunk backend: store %d (%s) is UP: %llu chunks rebuilt, %llu objects past repair\n",
+                        store, pbuf, (unsigned long long)(rep->rebuilt_missing + rep->rebuilt_damaged),
+                        (unsigned long long)rep->unrecoverable);
+                return 0;
+            }
         }
         return TSDB_ERR_UNAVAILABLE; /* filled as far as the other stores allow: settle again later */
     }
@@ -664,22 +706,30 @@ static int install(chunk_backend *be, int i, chunk_store *ns, const char *path)
     if (!p)
         return TSDB_ERR_NOMEM;
     pthread_mutex_lock(&be->mu);
-    chunk_store *old = atomic_load(&be->st[i]);
+    chunk_store *old = chunk_be_open_store(be, i);
+    chunk_store **nr = NULL;
     if (old) { /* one that failed in service: kept open until close, a thread may still hold a writer on it */
-        chunk_store **nr = realloc(be->retired, (size_t)(be->nretired + 1) * sizeof *nr);
+        nr = realloc(be->retired, (size_t)(be->nretired + 1) * sizeof *nr);
         if (!nr) {
             pthread_mutex_unlock(&be->mu);
             free(p);
             return TSDB_ERR_NOMEM;
         }
         be->retired = nr;
-        be->retired[be->nretired++] = old;
     }
-    free(be->path[i]);
+    pthread_mutex_lock(&be->st_mu);
+    old = atomic_load_explicit(&be->st[i], memory_order_relaxed);
+    if (old)
+        be->retired[be->nretired++] = old;
+    char *old_path = be->path[i];
     be->path[i] = p;
-    atomic_store(&be->state[i], CHUNK_STORE_REPLACING);
+    chunk_store_bind_be(ns, be, i);
+    atomic_store_explicit(&be->st_failed[i], chunk_store_failed(ns), memory_order_release);
+    atomic_store_explicit(&be->state[i], CHUNK_STORE_REPLACING, memory_order_release);
     atomic_store_explicit(&be->st[i], ns, memory_order_release);
+    pthread_mutex_unlock(&be->st_mu);
     pthread_mutex_unlock(&be->mu);
+    free(old_path);
     return 0;
 }
 
@@ -713,8 +763,12 @@ static int check_epoch(chunk_backend *be, const chunk_heal_opts *o)
 static bool id_taken(chunk_backend *be, int except, const uint8_t id[16])
 {
     for (int i = 0; i < be->n; i++) {
-        chunk_store *st = chunk_be_open_store(be, i);
-        if (i != except && st && memcmp(chunk_store_id(st), id, 16) == 0)
+        if (i == except)
+            continue;
+        chunk_store *st = chunk_be_store_ref(be, i);
+        bool match = st && memcmp(chunk_store_id(st), id, 16) == 0;
+        chunk_store_unref(st);
+        if (match)
             return true;
     }
     return false;
@@ -732,6 +786,8 @@ int chunk_be_attach(chunk_backend *be, int index, const char *path, const uint8_
     int rc = check_epoch(be, o);
     if (rc)
         return rc;
+    /* Release the old store parked by chunk_be_set_down (and its flock) here on the attach thread before reopening. */
+    chunk_be_release_down(be, index);
     rc = chunk_store_open_quiet(path, id, &ns);
     if (rc)
         return rc;
@@ -756,6 +812,15 @@ int chunk_be_attach(chunk_backend *be, int index, const char *path, const uint8_
     if (rc) {
         chunk_store_close(ns);
         return rc;
+    }
+    if (chunk_mutant == CHUNK_MUT_ATTACHNOHEAL) { /* planted: UP without healing missing/damaged chunks */
+        if (rep)
+            memset(rep, 0, sizeof *rep);
+        pthread_mutex_lock(&be->st_mu);
+        if (atomic_load_explicit(&be->state[index], memory_order_relaxed) == CHUNK_STORE_REPLACING)
+            atomic_store_explicit(&be->state[index], CHUNK_STORE_UP, memory_order_release);
+        pthread_mutex_unlock(&be->st_mu);
+        return 0;
     }
     return chunk_be_settle(be, index, o, rep);
 }
@@ -794,10 +859,13 @@ static void count_lost_m0(chunk_backend *be, int index, chunk_store *old, const 
         }
         int orc = 0;
         for (int s = 0; s < be->n && orc == 0; s++) {
-            chunk_store *st = s == index ? NULL : chunk_be_open_store(be, s);
+            if (s == index)
+                continue;
+            chunk_store *st = chunk_be_store_ref(be, s);
             if (!st)
                 continue;
             orc = chunk_store_list_names(st, vol, oid_vec_add, &other);
+            chunk_store_unref(st);
         }
         if (orc != 0) {
             rep->failed++;
@@ -877,10 +945,11 @@ int chunk_be_replace(chunk_backend *be, int index, const char *new_path, uint8_t
         rc = fence_new_store(be, ns);
     chunk_heal_report lost_m0;
     memset(&lost_m0, 0, sizeof lost_m0);
-    chunk_store *old = rc == 0 ? chunk_be_open_store(be, index) : NULL;
-    if (old)
+    chunk_store *old = rc == 0 ? chunk_be_store_ref(be, index) : NULL;
+    if (old) {
         count_lost_m0(be, index, old, o, &lost_m0);
-    else if (rc == 0)
+        chunk_store_unref(old);
+    } else if (rc == 0)
         fprintf(stderr, "tsdb: replace: store %d was not open (%s): any single-copy (m=0) objects placed on it cannot "
                         "be enumerated here and are lost\n",
                 index, chunk_store_state_name(stt));

@@ -532,8 +532,7 @@ cgroup, so `nice` does not keep your work out of its way.
   open of a volume writes `vuuid=` and `requires=tier` to META (tmp, fsync, rename) and raises every store's epoch to the
   constant 1 (D4); it refuses a tier on a read-only open, a follower, a `requires=cluster|replica` volume (D1, D7) and a
   build without `TSDB_EC`; a store without META is a lost disk (DOWN, never remade) once any volume exists. `tier_writable`
-  turns false, with one line, once a store is not UP, failed in service or did not take the volume's epoch at open (mutant `tierfence`): settles and chunk deletes stop until the next
-  handle open, reads go on. `src/ecpart.c`: the `.ec` file (`p<K>_<A>_<B>_<L>.ec`, the name and block range of its source,
+  turns false, with one line, once a store is not UP, failed in service or did not take the volume's epoch at open (mutant `tierfence`): settles and chunk deletes pause while any store is DOWN (`DOWN_IOERR` / `DOWN_STALLED`) and resume once all stores recover to UP (a fence halt stays sticky until reopen); reads go on. `src/tier_health.c` (R15 D8): per-store detached `O_DIRECT` probe threads (`<store>/PROBE.tier`, default 10 s stall bound), runtime `chunk_be_set_down(be, i, reason)` on refcounted `chunk_store`s, a dedicated attach/heal worker (never on the probe thread: verifies META `id`/`db_id`, runs `chunk_be_attach`, sweeps missed-delete orphan chunks, reopens cached handles, resumes settles/GC), `--health-domain` prefix matching over tier stores in `tsdbd` without quiescing volumes (`STATUS` reports `tier.stores` and `tier.store.<i>.{state,path,domain}`), abandon-flag checks in `src/chunkread.c` and `src/eccache.c` returning `TSDB_ERR_UNAVAILABLE`, and mutants `downnoread` and `attachnoheal` in `test_tier`. `src/ecpart.c`: the `.ec` file (`p<K>_<A>_<B>_<L>.ec`, the name and block range of its source,
   D2): the source's header, granule index, tombstones and footer verbatim (so `gx_*` read the index in place, unchanged),
   then the object record (oid, geometry, `object_len`, `object_xxh64`, the source's per-cell sums, `writer_epoch`,
   `settle_ms`, the class check, `positions` (R9 E10: 0 everywhere, or on cluster EC volumes all `k'+m` bits or, when `m >= 2`, `k'+m-1` bits for a degraded settle; single-server tiers still refuse non-zero), `ppos` and `stripe_version` (R8, cluster EC only)) and a
@@ -1165,7 +1164,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `cls_mu` (the class history map)
   is a leaf, and so are the granule cache's mutex (`src/eccache.c`: never held across I/O, an open or close, a decode or
   another lock: a fill waits on its entry, not on the mutex), the digest's (`src/eckeep.c`), the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O), the tier's registry of
-  cold volumes (`t->cmu`, `src/tier.c`: only around the array; the last put, which frees a context, outside it)
+  cold volumes (`t->cmu`, `src/tier.c`: only around the array and `eng_active`/`eng_cv` drain; the last put, which frees a context, and any store I/O stay outside it), the chunk backend's `be->st_mu` (`src/chunkstore.c`: pure leaf under `be->mu`, also taken briefly from `store_fail` and `chunk_be_set_ioerr_cb`/`ioerr_cv` drain), the tier health mutex `th->mu` (`src/tier_health.c`: pure leaf, never held across I/O or engine locks),
   and the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
   sweeper takes `db->lock` only with it released). R7's settle: the policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
   `db->lock` while the settle thread picks) is a leaf; the tier's settle mutex `st->mu` (`src/settle.c`) is never held

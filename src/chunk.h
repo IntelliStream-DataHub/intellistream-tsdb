@@ -226,6 +226,7 @@ enum {
     CHUNK_STORE_DOWN_IOERR,    /* the open failed with an I/O error, or the store failed in service (chunk_store_failed) */
     CHUNK_STORE_REPLACING,     /* open, fenced and being filled by heal (chunk_be_replace, chunk_be_attach): a chunk it
                                 * lacks is read around, as if it were DOWN, until chunk_be_settle finished clean */
+    CHUNK_STORE_DOWN_STALLED,  /* probe stalled >= tier_stall_s, or a --health-domain over the store went DOWN (R15 D8) */
 };
 const char *chunk_store_state_name(int state);
 
@@ -254,6 +255,11 @@ void chunk_be_close(chunk_backend *be);
 int chunk_be_nstores(const chunk_backend *be);
 chunk_store *chunk_be_store(chunk_backend *be, int i); /* NULL while DOWN */
 int chunk_be_store_state(const chunk_backend *be, int i); /* CHUNK_STORE_*; -1 for an index out of range */
+/* Transitions store i from UP or REPLACING to DOWN_IOERR or DOWN_STALLED at runtime (R15 D8). Safe against concurrent
+ * readers and writers: each holds a reference on the chunk_store until its call returns (never UAF). Idempotent when
+ * store i is already DOWN (returns 0 without altering its DOWN reason). Returns TSDB_ERR_INVALID for an index out of
+ * range or a reason other than CHUNK_STORE_DOWN_IOERR / CHUNK_STORE_DOWN_STALLED. */
+int chunk_be_set_down(chunk_backend *be, int i, int reason);
 uint64_t chunk_be_epoch(chunk_backend *be, uint32_t volume);
 /* A request showed epoch e: the fence is at least e, durable in every store before it returns. If a store fails to
  * store it, the first such error is returned even though the others hold it (the fence is in memory and in the stores
@@ -296,6 +302,9 @@ typedef struct chunk_heal_opts {
      * (checked again just before each chunk is named). Without it every object with k' good positions is healed. */
     int (*live)(void *ctx, const uint8_t oid[16]);
     void *live_ctx;
+    /* Optional: non-zero aborts a multi-object heal/settle promptly (returns TSDB_ERR_STOPPED), e.g., on shutdown. */
+    int (*cancel)(void *ctx);
+    void *cancel_ctx;
 } chunk_heal_opts;
 
 typedef struct chunk_heal_report {
@@ -476,7 +485,10 @@ enum { CHUNK_MUT_NONE = 0, CHUNK_MUT_NOSUMS, CHUNK_MUT_NOFENCE, CHUNK_MUT_EOF, C
        CHUNK_MUT_SETTLE_UP_ALWAYS, /* a REPLACING store goes UP whatever the heal said */
        /* tests/test_chunk.c again */
        CHUNK_MUT_STREAM_REREAD,    /* a stream put reads the source a second time for the parity */
-       CHUNK_MUT_M0_PARITY         /* a reader calls chunk_rs_get for m = 0 (fails NOMEM instead of CORRUPT/UNAVAILABLE) */ };
+       CHUNK_MUT_M0_PARITY,        /* a reader calls chunk_rs_get for m = 0 (fails NOMEM instead of CORRUPT/UNAVAILABLE) */
+       /* R15 r15-health mutants (tests/test_tier.c) */
+       CHUNK_MUT_DOWNNOREAD,       /* reads are still sent to a DOWN store instead of decoding around it */
+       CHUNK_MUT_ATTACHNOHEAL      /* chunk_be_attach marks store UP without healing missing/damaged chunks */ };
 extern int chunk_mutant;
 /* Non-zero: chunk_read_range and chunk_obj_open do not log (a fuzz harness provokes the refusal by the million). */
 extern int chunk_log_quiet;
