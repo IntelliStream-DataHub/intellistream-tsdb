@@ -94,17 +94,17 @@ add "$T" "$S/d9" > "$S/d9.err" 2>&1 || fail "user add in root's directory"
 grep -q "running as" "$S/d9.err" && fail "root's own directory: said it runs as another user"
 [ "$(stat -c '%u %a' "$S/d9/USERS")" = "0 600" ] || fail "USERS in root's directory"
 
-# 8. SEC-05: `tsdb chunk-store init` as root drops to target owner and refuses symlinks
+# 8. SEC-05: `tsdb disk init` as root drops to target owner and refuses symlinks
 mkdb d10
-"$T" chunk-store init "$S/d10/cs" --cluster 0123456789abcdef0123456789abcdef --node 1 > "$S/d10.out" 2> "$S/d10.err" || fail "chunk-store init as root"
-grep -q "running as uid $O" "$S/d10.err" || fail "chunk-store init as root did not drop to uid $O"
-[ -z "$(find "$S/d10/cs" ! -user $O)" ] || fail "chunk-store init made non-owner files: $(find "$S/d10/cs" ! -user $O)"
-as_owner ln -s "$out" "$S/d10/cs_link"
-"$T" chunk-store init "$S/d10/cs_link" --cluster 0123456789abcdef0123456789abcdef --node 1 > /dev/null 2>&1 && fail "chunk-store init followed symlink to root dir"
-[ ! -e "$out/META" ] || fail "chunk-store init created META in root dir"
-"$T" chunk-store init "$S/d10/cs_link//newdir" --cluster 0123456789abcdef0123456789abcdef --node 1 > /dev/null 2> "$S/d10dbl.err" && fail "chunk-store init followed double-slash symlink to root dir"
-grep -q "running as uid $O" "$S/d10dbl.err" || fail "chunk-store init double-slash symlink did not drop to uid $O"
-[ ! -e "$out/newdir" ] && [ ! -e "$out/newdir/META" ] || fail "chunk-store init created newdir or META in root dir via double slash"
+"$T" disk init "$S/d10/dk:hdd" > "$S/d10.out" 2> "$S/d10.err" || fail "disk init as root"
+grep -q "running as uid $O" "$S/d10.err" || fail "disk init as root did not drop to uid $O"
+[ -z "$(find "$S/d10/dk" ! -user $O)" ] || fail "disk init made non-owner files: $(find "$S/d10/dk" ! -user $O)"
+as_owner ln -s "$out" "$S/d10/dk_link"
+"$T" disk init "$S/d10/dk_link:hdd" > /dev/null 2>&1 && fail "disk init followed symlink to root dir"
+[ ! -e "$out/DISK" ] || fail "disk init created DISK in root dir"
+"$T" disk init "$S/d10/dk_link//newdir:hdd" > /dev/null 2> "$S/d10dbl.err" && fail "disk init followed double-slash symlink to root dir"
+grep -q "running as uid $O" "$S/d10dbl.err" || fail "disk init double-slash symlink did not drop to uid $O"
+[ ! -e "$out/newdir" ] && [ ! -e "$out/newdir/DISK" ] || fail "disk init created newdir or DISK in root dir via double slash"
 
 # 9. SEC-05: `tsdb <root-dir> volume diverged <owner-vol> --clear` drops to volume owner and refuses symlinks
 mkdir "$S/rootdb"

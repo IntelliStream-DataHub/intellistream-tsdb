@@ -103,8 +103,8 @@
  * TSDB_AUTH_MUTANT=loginbeforecatchup must fail it (`make jepsen-cluster-selftest`).
  *
  * ec (--ec K+M, with kv, kv-via or classes; design-cluster-data.md 10.3, tests/jepsen/cluster_ec.h has the design and the
- * checks): kvr is an erasure-coded volume (VOLUME_ADD_EC, m = 2: 3 replicas), every node has two --chunk-dir stores made
- * with `tsdb chunk-store init` once the cluster has member ids, --metrics-port auto and a short settle grace. The keys
+ * checks): kvr is an erasure-coded volume (VOLUME_ADD_EC, m = 2: 3 replicas), every node has two `--disk PATH:hdd`
+ * stores made with `tsdb disk init PATH:hdd`, --metrics-port auto and a short settle grace. The keys
  * of kv are back-dated (2023), so their partition is past the grace and settles while the writers go on with late rows.
  * Extra nemeses: partial (a stripe member cut from the metadata leader only), diskloss (a node's chunk stores removed
  * and made again empty), rot (bytes flipped in a chunk at rest). Extra checks: no DIVERGED volume (/metrics, polled all
@@ -707,7 +707,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     snprintf(state, sizeof state, "%s/state", n->dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
     const char *argv[64];
-    char rpool[24];
+    char rpool[24], darg[2][PATH_MAX + 8];
     int na = 0;
     argv[na++] = "tsdbd";
     if (!want_auth) /* --auth (and the users workload): every node requires a login, as production does */
@@ -724,6 +724,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     argv[na++] = secret_path;
     argv[na++] = "--state-dir";
     argv[na++] = state;
+    argv[na++] = "--allow-shared-device";
     argv[na++] = "--peer-advertise";
     argv[na++] = padv;
     if (opt_peer_rdma) {
@@ -774,8 +775,9 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
             argv[na++] = "1";
         }
         for (int k = 0; k < 2 && n->chunk[k][0]; k++) {
-            argv[na++] = "--chunk-dir";
-            argv[na++] = n->chunk[k];
+            snprintf(darg[k], sizeof darg[k], "%s:hdd", n->chunk[k]);
+            argv[na++] = "--disk";
+            argv[na++] = darg[k];
         }
     }
     if ((want_ec_k || nn > 6) && i >= 2) { /* D15: io_uring on at most two nodes (8 MB memlock per user), epoll on the rest */
@@ -5151,7 +5153,24 @@ int main(int argc, char **argv)
             die(2, "the outagefs control socket path %s is too long for a unix socket (use a shorter --dir)", nodes[i].octl);
         char st[PATH_MAX + 16];
         snprintf(st, sizeof st, "%s/state", nodes[i].dir);
-        if (mkdir(nodes[i].dir, 0755) != 0 || mkdir(st, 0755) != 0)
+        /* R13 (E58): initialise the node's --dir as an ssd disk before creating state/ inside it. */
+        {
+            const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
+            char spec[PATH_MAX + 8];
+            snprintf(spec, sizeof spec, "%s:ssd", nodes[i].dir);
+            pid_t p = fork();
+            if (p < 0)
+                die(2, "fork: %s", strerror(errno));
+            if (p == 0) {
+                execl(cli, "tsdb", "disk", "init", spec, (char *)NULL);
+                _exit(127);
+            }
+            int wst = 0;
+            waitpid(p, &wst, 0);
+            if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0)
+                die(2, "tsdb disk init %s failed (status 0x%x; TSDB_CLI=%s)", spec, wst, cli);
+        }
+        if (mkdir(st, 0755) != 0)
             die(2, "mkdir %s: %s", st, strerror(errno));
         proxy_start(i);
     }

@@ -412,7 +412,9 @@ before.</p>
 <tr><td><code>--read-barrier on|off</code></td><td>This server's read barrier setting, for shared volumes. Default <code>on</code>.</td></tr>
 <tr><td><code>--wal-sync-ms MS</code></td><td>Must stay <code>0</code> (sync every write before its answer, the default) with <code>--cluster</code>.</td></tr>
 <tr><td><code>--forward on|off</code></td><td>Forward requests for volumes led elsewhere to the leader (default <code>on</code>; <code>off</code> answers <code>MOVED</code>).</td></tr>
-<tr><td><code>--chunk-dir PATH</code></td><td>Chunk store directory for erasure-coded volumes (may be repeated; initialised with <code>tsdb chunk-store init</code>).</td></tr>
+<tr><td><code>--disk PATH[:CLASS]</code></td><td>Cluster disk directory (<code>nvme</code>, <code>ssd</code>, or <code>hdd</code>; repeatable; initialised with <code>tsdb disk init</code>).</td></tr>
+<tr><td><code>--role both|compute|storage</code></td><td>Declared cluster role of this server (default <code>both</code>).</td></tr>
+<tr><td><code>--allow-shared-device</code></td><td>Allow cluster disks to share a filesystem device with <code>/</code>, <code>--state-dir</code>, or another disk (for single-disk tests; health warns while set).</td></tr>
 <tr><td><code>--peer-check none|header|full</code></td><td>Frame integrity check on peer data links.</td></tr>
 <tr><td><code>--peer-rdma off|auto|on</code></td><td>Use RDMA verbs (libibverbs) for peer data links (default <code>off</code>).</td></tr>
 <tr><td><code>--witness</code></td><td>A member without data: needs <code>--cluster</code>, takes no <code>--dir</code> and has no client port. Give it <code>--advertise</code>, the host the others reach it at. It votes and keeps the group's state.</td></tr>

@@ -125,6 +125,36 @@ void cset_setop_file(const char *path)
     while (fgets(line, sizeof line, f)) {
         char op[16];
         unsigned vol = 0, node = 0, repl = 0;
+#ifdef TSDB_TEST_HOOKS
+        if (strncmp(line, "store_state ", 12) == 0) {
+            /* R13 test hook (until r13-ops): "store_state NODE STORE_HEX STATE_NUM" */
+            uint32_t nid = 0;
+            unsigned st_num = 0;
+            char hex[40] = "";
+            if (sscanf(line + 12, "%" PRIu32 " %32s %u", &nid, hex, &st_num) == 3 && strlen(hex) == 32) {
+                uint8_t sid[16];
+                int hok = 1;
+                for (int b = 0; b < 16 && hok; b++) {
+                    unsigned v = 0;
+                    if (sscanf(hex + 2 * b, "%2x", &v) != 1)
+                        hok = 0;
+                    else
+                        sid[b] = (uint8_t)v;
+                }
+                int src = META_ERR_INVALID;
+                if (hok && st_num <= META_STORE_STATE_LAST) {
+                    struct meta_entry e;
+                    meta_entry_init(&e);
+                    meta_op_store_state(&e, nid, sid, (uint8_t)st_num);
+                    src = cl_propose(&e);
+                }
+                if (o)
+                    fprintf(o, "store_state %" PRIu32 " %s %u: %s\n", nid, hex, st_num, src ? "refused" : "proposed");
+                cl_say("setop store_state %" PRIu32 " %s %u: %s", nid, hex, st_num, src ? "refused" : "proposed");
+            }
+            continue;
+        }
+#endif
         int k = sscanf(line, "%15s %u %u %u", op, &vol, &node, &repl);
         if (k < 2)
             continue;

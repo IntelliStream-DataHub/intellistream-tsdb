@@ -4,8 +4,8 @@
  * jepsen_cluster.c before its nemesis dispatch; it uses that file's node table, views, admin calls and histories.
  *
  * What is different in an --ec run.
- *  - Setup: every node gets two chunk stores (`tsdb chunk-store init PATH --cluster UUID --node ID`) once the cluster has
- *    member ids, and is restarted with --chunk-dir for both, --metrics-port auto and --ec-settle-grace-s 3 (when this
+ *  - Setup: every node gets two capacity disks (`tsdb disk init PATH:hdd`) once the cluster has
+ *    member ids, and is restarted with `--disk PATH:hdd` for both, --metrics-port auto and --ec-settle-grace-s 3 (when this
  *    tsdbd settles ec volumes: `ec_settles`, found from `TSDB_EC` and its --help). kvr is then added with
  *    VOLUME_ADD_EC (m + 1 log replicas, 3 for m = 2 and 5 for m = 4), and the workloads of kv, kv-via and classes run on it:
  *    their keys are back-dated (KV_BASE_TS is in 2023), so their partition ended long before the grace and settles while
@@ -69,25 +69,24 @@ static void ec_detect(void)
 #endif
 }
 
-/* tsdb chunk-store init PATH --cluster UUID --node ID (the CLI, TSDB_CLI): a store of this cluster and node */
+/* tsdb disk init PATH:hdd (the CLI, TSDB_CLI): a capacity disk with its chunks/ store */
 static void ec_chunk_init(const char *path, uint32_t id)
 {
+    (void)id;
     const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
-    char hex[40], ids[16];
-    for (int k = 0; k < 16; k++)
-        snprintf(hex + 2 * k, 3, "%02x", ec_uuid[k]);
-    snprintf(ids, sizeof ids, "%" PRIu32, id);
+    char spec[PATH_MAX + 8];
+    snprintf(spec, sizeof spec, "%s:hdd", path);
     pid_t p = fork();
     if (p < 0)
         die(2, "fork: %s", strerror(errno));
     if (p == 0) {
-        execl(cli, "tsdb", "chunk-store", "init", path, "--cluster", hex, "--node", ids, (char *)NULL);
+        execl(cli, "tsdb", "disk", "init", spec, (char *)NULL);
         _exit(127);
     }
     int st = 0;
     waitpid(p, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
-        die(2, "tsdb chunk-store init %s failed (status 0x%x; TSDB_CLI=%s)", path, st, cli);
+        die(2, "tsdb disk init %s failed (status 0x%x; TSDB_CLI=%s)", spec, st, cli);
 }
 
 static void ec_stores_init(int i)
@@ -808,6 +807,8 @@ static void nem_diskloss(void)
         }
     }
     stop_node(i, SIGKILL);
+    /* Each wipe creates 2 fresh store ids via `tsdb disk init` (old ids stay in metadata until r13-ops marks them
+     * OUT/DESTROYED; META_DISKS_MAX = 64 caps registered stores per member, well above a 300 s diskloss run). */
     for (int k = 0; k < 2; k++) {
         rmtree(nodes[i].chunk[k]);
         if (mkdir(nodes[i].chunk[k], 0755) != 0)

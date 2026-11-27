@@ -179,10 +179,16 @@ class Server:
 
     def start(self):
         pf = Path(str(self.log) + ".port.%d" % time.monotonic_ns())
+        extra = list(self.extra)
+        if "--cluster" in extra and "--witness" not in extra:
+            if not (Path(self.dir) / "DISK").exists():
+                subprocess.run([str(self.ctx.tsdb), "disk", "init", "%s:ssd" % self.dir], check=True)
+            if "--allow-shared-device" not in extra:
+                extra.append("--allow-shared-device")
         cmd = [str(self.ctx.tsdbd), "--dir", str(self.dir), "--listen", "127.0.0.1", "--port", "0",
                "--port-file", str(pf), "--workers", "4", "--io", self.io, "--exit-with-parent=%d" % os.getpid()] + \
               ([] if self.ctx.auth else ["--no-auth"]) + \
-              (["--follow", "--refresh-ms", "100"] if self.follow else []) + self.extra
+              (["--follow", "--refresh-ms", "100"] if self.follow else []) + extra
         logf = open(self.log, "ab")
         logf.write(("$ " + " ".join(cmd) + "\n").encode())
         logf.flush()

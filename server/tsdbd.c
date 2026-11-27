@@ -122,6 +122,7 @@
 #include "auth.h"
 #include "tenants.h"
 #include "cluster.h"
+#include "disks.h"
 #include "chunksrv.h"
 #include "chunkpeer.h"
 #include "../src/tiers.h"
@@ -7393,7 +7394,9 @@ int main(int argc, char **argv)
                                    {"peer-rdma-poll-us", required_argument, 0, 0x123},
                                    {"peer-rdma-cm", no_argument, 0, 0x125},
                                    {"peer-allow-ipoib", no_argument, 0, 0x124},
-                                   {"chunk-dir", required_argument, 0, 0x115},
+                                   {"disk", required_argument, 0, 0x129},
+                                   {"role", required_argument, 0, 0x12a},
+                                   {"allow-shared-device", no_argument, 0, 0x12b},
                                    {"chunk-rate-mb-s", required_argument, 0, 0x116},
                                    {"ec-settle-grace-s", required_argument, 0, 0x117},
                                    {"ec-settle-keep-s", required_argument, 0, 0x118},
@@ -7428,8 +7431,10 @@ int main(int argc, char **argv)
     struct plr_cm_listener *rdma_cm_lis = NULL;
     char *health_domains[DOM_MAX];
     int nhealth = 0;
-    const char *chunk_dirs[CHUNKSRV_DIRS_MAX];
-    int nchunk = 0;
+    struct disk_spec *disk_specs = NULL;
+    int ndisks = 0;
+    uint8_t cluster_role = META_ROLE_BOTH;
+    int role_set = 0, allow_shared_device = 0;
     struct tier_cfg_entry *tier_cfg_entries = NULL;
     int ntier_cfg = 0;
     uint64_t tier_cache_mb = 0;
@@ -7678,12 +7683,40 @@ int main(int argc, char **argv)
             allow_ipoib = 1;
             cluster_opts = 1;
             break;
-        case 0x115:
-            if (nchunk >= CHUNKSRV_DIRS_MAX) {
-                fprintf(stderr, "tsdbd: at most %d --chunk-dir\n", CHUNKSRV_DIRS_MAX);
+        case 0x129: {
+            if (ndisks >= DISKS_MAX) {
+                fprintf(stderr, "tsdbd: at most %d --disk entries\n", DISKS_MAX);
+                free(disk_specs);
+                free(tier_cfg_entries);
                 return 2;
             }
-            chunk_dirs[nchunk++] = optarg;
+            if (!disk_specs && !(disk_specs = calloc(DISKS_MAX, sizeof *disk_specs))) {
+                fprintf(stderr, "tsdbd: out of memory\n");
+                free(tier_cfg_entries);
+                return 1;
+            }
+            char derr[256];
+            if (disks_parse_spec(optarg, &disk_specs[ndisks], derr, sizeof derr) != 0) {
+                fprintf(stderr, "tsdbd: %s\n", derr);
+                free(disk_specs);
+                free(tier_cfg_entries);
+                return 2;
+            }
+            ndisks++;
+            break;
+        }
+        case 0x12a:
+            if (disks_parse_role(optarg, &cluster_role) != 0) {
+                fprintf(stderr, "tsdbd: --role %s: expected both, compute or storage\n", optarg);
+                free(disk_specs);
+                free(tier_cfg_entries);
+                return 2;
+            }
+            role_set = 1;
+            cluster_opts = 1;
+            break;
+        case 0x12b:
+            allow_shared_device = 1;
             cluster_opts = 1;
             break;
         case 0x116: chunk_rate = (uint64_t)num_arg("chunk-rate-mb-s", optarg, 1, 1 << 20) << 20; cluster_opts = 1; break;
@@ -7808,19 +7841,27 @@ int main(int argc, char **argv)
                         "%d\n", o.wal_sync_ms);
         return 2;
     }
-    if (witness && (!cluster_on || dir || nchunk || ntier_cfg)) {
+    if (!cluster_on && ndisks > 0) {
+        fprintf(stderr, "tsdbd: --disk (storage.disks) is for --cluster\n");
+        free(disk_specs);
+        free(tier_cfg_entries);
+        return 2;
+    }
+    if (witness && (!cluster_on || dir || ndisks || ntier_cfg || role_set || allow_shared_device)) {
         fprintf(stderr, "tsdbd: --witness is a cluster member without volumes: it needs --cluster, and takes no "
-                        "--dir, no --chunk-dir and no --tier\n");
+                        "--dir, no --disk, no --role, no --allow-shared-device and no --tier\n");
+        free(disk_specs);
         free(tier_cfg_entries);
         return 2;
     }
     if (cluster_on && ntier_cfg) {
         fprintf(stderr, "tsdbd: --tier (storage.tiers) is for a single-server tier, not --cluster\n");
+        free(disk_specs);
         free(tier_cfg_entries);
         return 2;
     }
-    if ((!dir && !witness) || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
-        (metrics_addr && !metrics_on) || (cluster_opts && !cluster_on)) {
+    if ((!dir && !witness && !(cluster_on && ndisks > 0)) || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 ||
+        metrics_port > 65535 || (metrics_addr && !metrics_on) || (cluster_opts && !cluster_on)) {
     usage:
         fprintf(stderr, "usage: tsdbd --version\n"
                         "       tsdbd [--config FILE | --no-config] [--check-config] [any option below]\n"
@@ -7849,7 +7890,8 @@ int main(int argc, char **argv)
                         "              [--peer-rdma-retry-s 600] [--peer-rdma-poll-us 0] [--peer-rdma-cm]\n"
                         "              [--peer-allow-ipoib]\n"
                         "              [--fwd-max-age-ms 1000] [--fwd-reply-ms 30000] [--fwd-workers 4]\n"
-                        "              [--chunk-dir PATH]... [--chunk-rate-mb-s 256]]\n"
+                        "              [--disk PATH[:CLASS]]... [--role both|compute|storage] [--allow-shared-device]\n"
+                        "              [--chunk-rate-mb-s 256]]\n"
                         "             [--ec-settle-grace-s 3600] [--ec-settle-keep-s 86400] [--ec-settle-force-s 3600]\n"
                         "             [--ec-settle-wait-max-s 7200] [--ec-cache-mb MB]\n"
                         "             [--tier PATH[:CLASS]]... [--tier-cache-mb MB]\n"
@@ -7858,11 +7900,13 @@ int main(int argc, char **argv)
                         "             [--power-feed NAME] [--bmc ADDR] [--peer-check none|header|full]\n"
                         "             [--port-file FILE] [--exit-with-parent[=PID]]\n",
                 TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1, TSDB_DEFAULT_PORT + 1);
+        free(disk_specs);
         free(tier_cfg_entries);
         return 2;
     }
     if (check_config) { /* the file and the command line are well-formed: what tsdbd would run with */
         cfg_print_effective(stdout, g_cfg.path ? &g_cfg : NULL, tsdbd_keys, TSDBD_NKEYS, orig_argc, orig_argv);
+        free(disk_specs);
         free(tier_cfg_entries);
         return 0;
     }
@@ -8005,6 +8049,58 @@ int main(int argc, char **argv)
     }
     if (port_file)
         unlink(port_file);
+    if (cluster_on) {
+        /* R13 (E47, E58): validate --disk / --dir DISK metadata and st_dev before opening the database or state dir. */
+        struct disk_spec *all_specs = calloc(DISKS_MAX, sizeof *all_specs);
+        if (!all_specs) {
+            fprintf(stderr, "tsdbd: out of memory\n");
+            free(disk_specs);
+            free(tier_cfg_entries);
+            return 1;
+        }
+        int nall = 0;
+        for (int i = 0; i < ndisks && nall < DISKS_MAX; i++)
+            all_specs[nall++] = disk_specs[i];
+        free(disk_specs);
+        disk_specs = NULL;
+        if (dir) {
+            if (nall >= DISKS_MAX) {
+                fprintf(stderr, "tsdbd: at most %d disks including --dir\n", DISKS_MAX);
+                free(all_specs);
+                free(tier_cfg_entries);
+                return 2;
+            }
+            struct disk_spec ds = {0};
+            snprintf(ds.path, sizeof ds.path, "%s", dir);
+            ds.stated_class = DISK_CLASS_NONE;
+            ds.from_dir = 1;
+            all_specs[nall++] = ds;
+        }
+        struct disks_cfg dcfg = {.specs = all_specs,
+                                 .nspecs = nall,
+                                 .state_dir = state_dir,
+                                 .role = cluster_role,
+                                 .allow_shared_device = allow_shared_device};
+        char derr[512];
+        int drc = disks_prepare(&dcfg, derr, sizeof derr);
+        free(all_specs);
+        if (drc != 0) {
+            fprintf(stderr, "tsdbd: %s\n", derr);
+            free(tier_cfg_entries);
+            return 1;
+        }
+        if (!dir) {
+            dir = disks_primary_dir();
+            if (!dir) {
+                fprintf(stderr, "tsdbd: no usable disk directory found\n");
+                free(tier_cfg_entries);
+                return 1;
+            }
+        }
+    } else {
+        free(disk_specs);
+        disk_specs = NULL;
+    }
     /* The tenants (docs/design-stats.md 4): the engine opens with the list, so it counts under it from the start */
     char **tn_list = NULL;
     size_t tn_n = 0;
@@ -8366,13 +8462,34 @@ int main(int argc, char **argv)
             return 1;
         }
         char cerr[512];
-        if (chunksrv_cluster_start(chunk_dirs, nchunk, chunk_rate, cerr, sizeof cerr) != 0) {
-            fprintf(stderr, "tsdbd: %s\n", cerr); /* D11: a store of another owner, or one another process holds */
+        if (disks_start(cerr, sizeof cerr) != 0) {
+            fprintf(stderr, "tsdbd: %s\n", cerr);
             scrubd_stop();
+            cluster_stop();
+            fwd_cluster_stop();
+            cvol_stop();
+            return 1;
+        }
+        const char *chunk_paths[CHUNKSRV_DIRS_MAX];
+        int nchunk = 0;
+        disks_chunk_paths(chunk_paths, CHUNKSRV_DIRS_MAX, &nchunk);
+        if (chunksrv_cluster_start(chunk_paths, nchunk, chunk_rate, cerr, sizeof cerr) != 0) {
+            fprintf(stderr, "tsdbd: %s\n", cerr);
+            disks_stop();
+            scrubd_stop();
+            cluster_stop();
+            fwd_cluster_stop();
+            cvol_stop();
             return 1;
         }
         if (!witness && sfill_cluster_start(db, state_dir) != 0) {
             fprintf(stderr, "tsdbd: cannot start the stripe fill worker\n");
+            chunksrv_cluster_stop();
+            disks_stop();
+            scrubd_stop();
+            cluster_stop();
+            fwd_cluster_stop();
+            cvol_stop();
             return 1;
         }
         crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
@@ -8414,6 +8531,7 @@ int main(int argc, char **argv)
         creport_reset();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         chunksrv_cluster_stop(); /* likewise for the chunk links; freed below */
+        disks_stop(); /* release disk locks and unregister HBS_DISKS / disk metrics */
         chunkpeer_cluster_stop(); /* its installer thread names the chunk server: before that is freed */
         cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
     }

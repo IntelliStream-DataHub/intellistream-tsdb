@@ -287,6 +287,9 @@ struct cluster_self {
     char advertise[128]; /* the peer address this server advertises */
 };
 int cluster_self(struct cluster_self *out);
+/* Read-only peek of <state_dir>/NODE before cluster_start() (used by disks_prepare() to refuse foreign disks before
+ * tsdb_open). Returns 1 if NODE exists with valid (cluster, node), 0 otherwise. */
+int cluster_peek_node(const char *state_dir, uint8_t uuid_out[16], uint32_t *id_out);
 
 /* ---- this server's replicated volumes as its metadata copy holds them (server/cvol.c) */
 struct cluster_vol_rec {
@@ -407,6 +410,11 @@ const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy 
  * unregistered (pre-r13-start) members as unrestricted. */
 int cluster_member_disks(uint32_t node, struct meta_disk *out, uint32_t cap, uint32_t *total_out, uint8_t *role_out,
                          uint8_t *cap_out);
+/* R13 (r13-start): read-only access to the freshest persisted metadata state loaded synchronously by cluster_start()
+ * (max of Raft snapshot and persisted copy), so disks_start() sees committed STORE_ADD/STORE_CLASS/DESTROYED on
+ * restart even before a voter catches up with the leader. */
+int cluster_initial_disk_lookup(const uint8_t store_id[16], uint32_t *node_out, struct meta_disk *disk_out);
+uint32_t cluster_initial_self_disks(struct meta_disk *out, uint32_t cap);
 const struct cluster_copy_vol *cluster_copy_vol(const struct cluster_copy *c, uint32_t number);    /* NULL: none */
 /* the volume named `name` (n bytes, no NUL needed), NULL: none (s2e routes series ops that name a volume by it) */
 const struct cluster_copy_vol *cluster_copy_vol_named(const struct cluster_copy *c, const char *name, size_t n);

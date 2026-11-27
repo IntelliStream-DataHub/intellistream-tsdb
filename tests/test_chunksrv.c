@@ -614,6 +614,12 @@ static void test_unsure(void)
     CHECK(fake_put(cs, &c, 2, NULL, NULL) == CHUNK_ERR_EPOCH_UNSURE); /* a stale metadata copy does not either */
     CHECK(s.calls > 0);
     s.caught_up = 1; /* the caught-up copy says 8 */
+    /* Regression: CS_OP_LIST at epoch 0 (startup sreconcile) must not raise an unsure store's EPOCH. */
+    int calls_before = s.calls;
+    struct cs_req lr = {.op = CS_OP_LIST, .volume = 1, .epoch = 0, .len = 16};
+    CHECK(fake_req(cs, &lr, &cp) == 0);
+    CHECK(s.calls == calls_before);
+    CHECK(chunk_store_epoch_unsure(chunk_be_store(chunksrv_backend(cs), 0), 1));
     CHECK(fake_put(cs, &c, 3, NULL, NULL) == 0);
     CHECK(chunk_be_epoch(chunksrv_backend(cs), 1) == 9);
     cdata d;
@@ -628,6 +634,33 @@ static void test_unsure(void)
     cdata_free(&c);
     cdata_free(&d);
     chunksrv_close(cs);
+
+    /* R13: a NULL slot for a known-missing chunk disk keeps the store index as DOWN_MISSING so hash%n placement
+     * does not shift and reads of chunks absent from the surviving store answer UNAVAILABLE (not NOTFOUND). */
+    char dmiss[PATH_MAX], sm0[PATH_MAX + 16], merr[256];
+    fresh("nullslot", dmiss, sizeof dmiss);
+    mkstore(dmiss, 0, 7, true, sm0, sizeof sm0);
+    const char *mpaths[2] = {sm0, NULL};
+    struct chunksrv *mcs = chunksrv_open(mpaths, 2, merr, sizeof merr);
+    CHECK(mcs != NULL);
+    if (mcs) {
+        int up = -1;
+        CHECK(chunksrv_stores(mcs, &up, false) == 2 && up == 1);
+        int st0 = -1, st1 = -1;
+        CHECK(chunksrv_store_info(mcs, 0, NULL, 0, &st0, NULL) == 0 && st0 == CHUNK_STORE_UP);
+        CHECK(chunksrv_store_info(mcs, 1, NULL, 0, &st1, NULL) == 0 && st1 == CHUNK_STORE_DOWN_MISSING);
+        cdata mc;
+        cdata_make(&mc, 3, 0, 4096, 30000, 42);
+        struct cs_req mr;
+        req_of(&mr, CS_OP_READ, &mc, 3);
+        mr.off = 0;
+        mr.len = 4096;
+        cap mcp = {0};
+        CHECK(fake_req(mcs, &mr, &mcp) == TSDB_ERR_UNAVAILABLE);
+        free(mcp.body);
+        cdata_free(&mc);
+        chunksrv_close(mcs);
+    }
 }
 
 

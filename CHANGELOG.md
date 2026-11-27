@@ -8,6 +8,19 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+- **Cluster disk flags, start checks, binding, and `HBS_DISKS` (`r13-start`).** Replaces `--chunk-dir`
+  (`cluster.chunk.dir`) and `tsdb chunk-store init` with `--disk PATH[:CLASS]` (`storage.disks`, initialised with
+  `tsdb disk init`), `--role compute|storage|both` (`cluster.role`), and `--allow-shared-device`
+  (`cluster.allow.shared.device`, warning via health and `tsdb_disk_shared_device`). Chunk stores now live at
+  `<disk>/chunks/` of capacity (`hdd`) disks, or of fast (`nvme`/`ssd`) disks on servers without capacity disks
+  (unless `--role compute`). In cluster mode `--dir` requires `DISK` metadata too (uses its `DISK` class without `/sys`
+  detection, with a warning). Enforces E58 start checks before opening the engine (refuses missing `DISK` on unknown
+  paths or `--dir`, `st_dev` collisions against `/`, `--state-dir`, or sibling disks unless `--allow-shared-device`,
+  live `flock` conflicts, foreign cluster/node or `DESTROYED` stores, and explicit `:CLASS` mismatches; logs and counts
+  `/sys` detection mismatches in `tsdb_disk_class_mismatch`; reports known missing secondary stores `DOWN` without
+  re-creating them; binds unbound disks via `disk_bind`). Registers heartbeat section `HBS_DISKS` (section 12) on all
+  cluster members including witnesses, and proposes `STORE_ADD` / `MEMBER_ROLE` on the Raft leader.
+
 - **Cluster metadata snapshot version 10 and R13 disks, roles, store states and R12/R13 settings (`r13-meta`).** Bumps
   `META_SNAP_VERSION` from 9 to 10 (and entry magic from `"TME6"` to `"TME7"`; snapshot version 9 and `"TME6"` entries
   are refused by name — pre-1.0 preview clusters are re-initialised, not upgraded). Adds per-member registered disks

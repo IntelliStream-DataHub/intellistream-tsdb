@@ -101,7 +101,8 @@ norm() {
         -e 's/heard [^ ]+/heard H/' \
         -e 's/cluster [0-9a-f]{32} /cluster UUID /' \
         -e 's/^node [0-9]+ mode ([a-z]+) role ([a-z-]+) term [0-9]+ leader [0-9]+ commit [0-9]+ applied [0-9]+$/node N mode \1 role R term T leader L commit C applied A/' \
-        -e 's/read_barrier (on|off|\?)$/read_barrier X/' \
+        -e 's/ down_reason [a-z]+ down_age [0-9]+s out_in [0-9]+s//' \
+        -e 's/read_barrier (on|off|\?)( role [a-z]+ cap [a-z]+ disks [0-9]+)?$/read_barrier X/' \
         -e 's/^member [0-9]+ (up|down) incarnation/member M \1 incarnation/' \
         -e 's/ rack rack[0-9]+ / rack rackM /' \
         -e 's/^volume ([0-9]+) name ([a-z]+) uuid [0-9a-f]{32} leader [0-9]+ epoch [0-9]+ min_isr ([0-9]+) replicas [0-9,]+ isr [0-9,]+ isr_version [0-9]+ (set_version [0-9]+ preferred [0-9]+) /volume \1 name \2 uuid UUID leader L epoch E min_isr \3 replicas R isr I isr_version V \4 /' \

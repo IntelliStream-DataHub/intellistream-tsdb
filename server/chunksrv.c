@@ -635,7 +635,7 @@ struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_
     if (n > 0) {
         cs->paths = calloc((size_t)n, sizeof *cs->paths);
         for (int i = 0; cs->paths && i < n; i++)
-            cs->paths[i] = strdup(paths[i]);
+            cs->paths[i] = paths[i] ? strdup(paths[i]) : NULL;
         cs->n = n;
         chunk_be_opts o = {.min_up = 0};
         int rc = chunk_be_open2(&cs->be, paths, n, NULL, &o);
@@ -691,8 +691,8 @@ int chunksrv_check_owner(struct chunksrv *cs, const uint8_t cluster[16], uint32_
         if (!o.set) {
             snprintf(err, errlen,
                      "chunk store %s names no cluster and node; this is cluster %s node %" PRIu32
-                     " (make it with tsdb chunk-store init PATH --cluster UUID --node ID)",
-                     cs->paths[i], want, node);
+                     " (initialise the disk with tsdb disk init PATH[:CLASS])",
+                     cs->paths && cs->paths[i] ? cs->paths[i] : "(missing)", want, node);
             return -1;
         }
         chunk_oid_hex(o.cluster, have);
@@ -700,7 +700,7 @@ int chunksrv_check_owner(struct chunksrv *cs, const uint8_t cluster[16], uint32_
             snprintf(err, errlen,
                      "chunk store %s belongs to cluster %s node %" PRIu32 ", but this is cluster %s node %" PRIu32
                      " (a disk moved between members or clusters)",
-                     cs->paths[i], have, o.node, want, node);
+                     cs->paths && cs->paths[i] ? cs->paths[i] : "(missing)", have, o.node, want, node);
             return -1;
         }
     }
@@ -714,7 +714,8 @@ int chunksrv_stores(struct chunksrv *cs, int *up, bool log)
         int s = chunk_be_store_state(cs->be, i); /* a store failed in place is DOWN_IOERR there (E57) */
         u += s == CHUNK_STORE_UP;
         if (log)
-            fprintf(stderr, "tsdbd: chunk store %s: %s\n", cs->paths[i], chunk_store_state_name(s));
+            fprintf(stderr, "tsdbd: chunk store %s: %s\n",
+                    cs->paths && cs->paths[i] ? cs->paths[i] : "(missing)", chunk_store_state_name(s));
     }
     if (up)
         *up = u;
@@ -1459,7 +1460,8 @@ static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, con
         return 0;
     }
     bool mutating = r->op == CS_OP_DEL;
-    int rc = cs_see(cs, r->volume, r->epoch, mutating);
+    /* Read-only CS_OP_LIST at epoch 0 (sent by sreconcile and ecgc) skips cs_see so listing never raises unsure EPOCH. */
+    int rc = (r->op == CS_OP_LIST && r->epoch == 0) ? 0 : cs_see(cs, r->volume, r->epoch, mutating);
     if (rc != 0) {
         reply_rc(reply, arg, r->rid, r->op, rc, NULL, 0);
         return 0;

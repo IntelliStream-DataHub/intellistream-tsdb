@@ -131,8 +131,8 @@ typedef struct chunk_wr chunk_wr;
  * directory that already has a META (TSDB_ERR_INVALID). Synced with its parent. */
 int chunk_store_init(const char *path, const uint8_t *id, uint8_t id_out[16]);
 /* Who a store belongs to:
- * - cluster/node (design-cluster-data.md D11): `tsdb chunk-store init PATH --cluster UUID --node ID` writes both into
- *   META, and tsdbd refuses at start a store of another cluster or node (a disk moved between members).
+ * - cluster/node (design-cluster-data.md D11/D12, E47): optional META owner fields checked by `chunksrv_check_owner`
+ *   in unit tests; cluster `tsdbd` binds ownership in `<disk>/DISK` via `disk_bind` (`server/disks.[ch]`).
  * - database id (R15 D3): `tsdb_tier_add` writes `db=<32-hex>` into META, and opening with an expected db_id refuses a
  *   store belonging to another database naming both. */
 typedef struct chunk_store_owner {

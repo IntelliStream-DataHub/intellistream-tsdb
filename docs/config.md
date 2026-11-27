@@ -107,7 +107,7 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 <!-- keys:tsdbd:begin -->
 | Key | Option | Value | Default | Meaning |
 |---|---|---|---|---|
-| `storage.dir` | `--dir` | string | unset | The database directory (required, unless this is a witness). |
+| `storage.dir` | `--dir` | string | unset | The database directory (required, unless this is a witness or a cluster node with storage.disks; in cluster mode it is also treated as a disk using its DISK metadata without /sys detection). |
 | `storage.fsync` | `--no-fsync` (when false) | boolean | true | false turns fsync off: a power loss then looks like damage and fails the next open. For tests and benchmarks only. |
 | `storage.read.only` | `--read-only` | boolean | false | Serve queries only, from a database another server writes. |
 | `storage.follow` | `--follow` | boolean | false | Follow a database that another writer on shared storage updates (read-only; see docs/ha.md). |
@@ -117,6 +117,7 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `storage.partition` | `--partition-ms` | duration (plain: ms) | 1d | Length of a base partition. Used only when the database is created. |
 | `storage.partition.classes` | `--partition-classes` | integer | 1 | 1: series of different rates go to partitions of 1, 7, 28 or 364 days; 0: all to base partitions. Used only when the database is created. |
 | `storage.granule.rows` | `--granule-rows` | integer | 8192 | Rows per granule. Used only when the database is created. |
+| `storage.disks` | `--disk` | list | unset | The disks of a cluster node, PATH[:CLASS] each (nvme, ssd or hdd; comma-separated; each initialised with tsdb disk init; ':' in the final path component separates :CLASS). |
 | `storage.tiers` | `--tier` | list | unset | The stores of the single-server tier, PATH[:CLASS] each: checked against TIERS at start (never adds a store; a mismatch refuses to start). |
 | `storage.tier.cache` | `--tier-cache-mb` | size (plain: MiB) | unset | Memory of the single-server tier's decoded granule cache. Default: a tenth of the RAM. |
 | `server.listen` | `--listen` | string | 127.0.0.1 | The address clients connect to (there is no TLS: a trusted interface). |
@@ -174,7 +175,8 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `cluster.fwd.max.age` | `--fwd-max-age-ms` | duration (plain: ms) | 1s | A request older than this since it was read is never forwarded, and its leader refuses it (UNAVAILABLE). At most 2 s: clients resend no earlier than 3 s after sending. |
 | `cluster.fwd.reply` | `--fwd-reply-ms` | duration (plain: ms) | 30s | How long a forwarded request may wait for its leader's reply before the client's connection is closed without an answer (its outcome is unknown). 0: no limit (a dead link still ends it). |
 | `cluster.fwd.workers` | `--fwd-workers` | integer | 4 | Worker threads reserved for requests other members forward here (more start while all of them wait). |
-| `cluster.chunk.dir` | `--chunk-dir` | list | unset | The chunk stores of this member, one per disk (each made by tsdb chunk-store init PATH --cluster UUID --node ID); a comma-separated list. A store of another cluster or node refuses the start; a missing or failing one is reported down. |
+| `cluster.role` | `--role` | both,compute,storage | both | Declared role of this member: both (compute and storage as disks allow), compute (log replicas only), or storage (chunk stores only). |
+| `cluster.allow.shared.device` | `--allow-shared-device` | boolean | false | Allow a disk on the same file system as /, cluster.state.dir or another disk (for test harnesses and one-disk development hosts; health warns while set). |
 | `cluster.chunk.rate` | `--chunk-rate-mb-s` | integer | 256 | MB/s of chunk puts to other members, all links together: a cap of its own, apart from replication's. |
 | `ec.settle.grace` | `--ec-settle-grace-s` | duration (plain: s) | 1h | How long after a partition's end it is erasure-coded (settled). |
 | `ec.settle.keep` | `--ec-settle-keep-s` | duration (plain: s) | 1d | How long the parts a settle replaced are kept. |
@@ -192,12 +194,6 @@ Options with no key:
 | `--check-config` | Checks the file and the command line, prints the effective settings and exits. |
 | `--config-keys` | Prints the table of keys (Markdown) and exits. |
 | `--exit-with-parent` | Test harnesses only: stop when the parent process goes away. A file must not make a server depend on it. |
-
-Reserved keys (named for a design that is not built; a file that sets one is refused):
-
-| Key | Why |
-|---|---|
-| `storage.disks` | the disks of a device-class server, PATH[:CLASS] each (docs/design-cluster-data.md, section 15) |
 <!-- keys:tsdbd:end -->
 
 ## The tsdb command line tool

@@ -148,6 +148,8 @@ Gauges for volumes this server does **not** hold (not listed in the volume's rep
 | `tsdb_chunk_scrub_damaged_total{store}` | counter | per local chunk store (0-based index): total damaged chunks (bad cell, header, sums, footer, or EIO) detected by scrub since process start (R12) |
 | `tsdb_chunk_scrub_age_seconds{store}` | gauge | per local chunk store (0-based index): seconds since the start of the last completed whole chunk scrub pass, or the store's first pass start (R12) |
 | `tsdb_chunk_scrub_reports_received_total{volume}` | counter | per held EC volume led by this server: `CHUNK_DAMAGED` reports received from storage servers since process start (R12) |
+| `tsdb_disk_class_mismatch` | gauge | number of local `--disk` entries whose runtime `/sys` block-device class detection disagreed with the authoritative class at start (R13) |
+| `tsdb_disk_shared_device` | gauge | 1 while this server is running with `--allow-shared-device` (`cluster.allow.shared.device`), else 0 (R13) |
 
 Note on overlapping families: `tsdb_volume_{young_margin,settled_margin,settled_state}` report every volume in this server's metadata copy (including volumes held elsewhere), and `tsdb_volume_diverged{volume,path}` covers local engine volumes (standalone and cluster); the `tsdb_cluster_volume_*`, `tsdb_cluster_rebuild_*`, `tsdb_settle_backlog_*`, and `tsdb_cluster_full_refusals_total` families above report only cluster volumes **held** by this server (plus active stripe fills on storage servers) and carry the fixed names used by P4's cluster alerts. Messages a replica dropped for another set version remain a rate-limited log line only (not a counter).
 

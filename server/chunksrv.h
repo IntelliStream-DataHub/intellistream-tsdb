@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * The chunk server (docs/design-cluster-data.md §5.7, E14, E26, E27; R8 D9-D11): this member's chunk stores
- * (`--chunk-dir`, a chunk_backend of them) served to the other members over a peerlink of its own, as the forwarding
+ * The chunk server (docs/design-cluster-data.md §5.7, E14, E26, E27; R8 D9-D11; R13 E47): this member's chunk stores
+ * (`<disk>/chunks/` selected by server/disks.[ch], a chunk_backend of them) served to the other members over a peerlink
+ * of its own, as the forwarding
  * links have theirs (fwd_cluster.c), with two kinds:
  *
  *   PL_KIND_CHUNK   requests and their answers (frames CS_T_REQ, CS_T_RESP below);
@@ -304,7 +305,7 @@ struct chunksrv_ec_cfg {
 };
 extern struct chunksrv_ec_cfg g_ec_cfg;
 
-#define CHUNKSRV_DIRS_MAX 64 /* --chunk-dir, one per disk (E27) */
+#define CHUNKSRV_DIRS_MAX 64 /* one chunk store per --disk (E27, E47) */
 /* ---------------------------------------------------------------- tsdbd's instance (chunksrv_cluster.c) */
 /* Opens the stores (a store held by another process refuses the start; one that is missing, damaged or failing is
  * DOWN), checks their owner when this server's node is known (-1 with the line in err: tsdbd refuses to start) and

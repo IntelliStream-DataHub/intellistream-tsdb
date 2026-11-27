@@ -586,16 +586,31 @@ cgroup, so `nice` does not keep your work out of its way.
 - `server/chunksrv.[ch]`, `server/chunksrv_cluster.c` (R8 D9-D11, E14, E26, E27): the chunk server, a peerlink of its own on
   every cluster member with kinds `PL_KIND_CHUNK` (6, requests and answers, worked by 4 FIFO workers) and `PL_KIND_CHUNKB`
   (7, puts as bulk files under `--chunk-rate-mb-s`; the link's callbacks only queue, a put thread per peer does the store
-  I/O (peerlink.h:24-26), and the put queue is bounded per peer at 16 MiB, with a 32 MiB shared request queue). Every request raises the volume's fence first
-  (E14); an unsure store is raised only from `chunksrv_epoch_source` (`chunkpeer_epoch_source`, D9), and then to
+  I/O (peerlink.h:24-26), and the put queue is bounded per peer at 16 MiB, with a 32 MiB shared request queue). Every epoch-bearing request raises the volume's fence first
+  (E14; read-only `CS_OP_LIST` with `epoch == 0`, as sent by `sreconcile` and `ecgc`, skips `cs_see` so listing does not raise an unsure `EPOCH` as a side effect); an unsure store is raised only from `chunksrv_epoch_source` (`chunkpeer_epoch_source`, D9), and then to
   max(source, backend fence, every sure store's epoch), never from a request. LIST pages never split the copies of one
-  (oid, pos). `chunksrv_cluster.c` opens `--chunk-dir` stores at start (`flock`, META checked against cluster UUID and
-  node ID from `tsdb chunk-store init PATH --cluster UUID --node ID`), listens once a member, follows the members
-  (`chunksrv_keep_peers` stops those that left); EC cluster volumes are production in 0.11.0 (no `--ec-experimental`
+  (oid, pos). `chunksrv_cluster.c` opens the chunk stores selected by `server/disks.[ch]` (`<disk>/chunks/` of capacity
+  disks, or of fast disks on servers without capacity disks unless `--role compute`; ordered by `<state-dir>/DISKS` with
+  a `NULL` `CHUNK_STORE_DOWN_MISSING` slot for temporarily missing configured chunk disks so `hash % n` placement stays
+  stable and reads answer `UNAVAILABLE`), listens once a member, follows the
+  members (`chunksrv_keep_peers` stops those that left); EC cluster volumes are production in 0.11.0 (no `--ec-experimental`
   flag). `TSDB_CHUNKSRV_TEST` is its test hook for `test_cluster chunksrv`. `tests/test_chunksrv.c` (mutants
   `chunknofence chunkselfraise putokearly nocellcheck storeforeign nometacheck sumsonly noreqcheck noopmatch norespcheck`),
-  `test_peerlink chunk`, `tests/test_cli_chunkstore.sh`, fuzz-replframe mode 9. Open: a store that hangs (not fails) in
+  `test_peerlink chunk`, fuzz-replframe mode 9. Open: a store that hangs (not fails) in
   fdatasync holds the backend's fence mutex and stalls every request (R13's health domains).
+- `server/disks.[ch]` (R13 `r13-start`; E47-E49, E58, D11-D13): `--disk PATH[:CLASS]` (repeatable, `storage.disks`),
+  `--role compute|storage|both` (`cluster.role`), `--allow-shared-device` (`cluster.allow.shared.device`, warns on health
+  and `tsdb_disk_shared_device`), replacing `--chunk-dir` and `tsdb chunk-store init`. In cluster mode `--dir` is a disk
+  too (uses its `DISK` metadata class without `/sys` detection, with a warning; missing `DISK` on `--dir` refuses the
+  start). Two-phase startup: `disks_prepare()` checks `st_dev` against `/`, `--state-dir` and sibling `--disk` paths,
+  probes `flock` and `<state-dir>/NODE` ownership before `tsdb_open`, loads `DISK` (`src/disk.h`) and `<state-dir>/DISKS`
+  (pinning the primary disk when `--dir` is omitted, and reporting known missing secondary stores `DOWN` instead of new);
+  `disks_start()` verifies cluster/node ownership and non-`DESTROYED` state against `DISK` and the initial metadata copy
+  (`cluster_initial_disk_lookup`), refuses explicit `:CLASS` mismatches naming both, logs/counts `/sys` detection
+  disagreement (`tsdb_disk_class_mismatch`), binds unbound disks (`disk_bind`), and exports metrics. `disks_creport_register()`
+  registers `HBS_DISKS` (`creport` section 12) in `cluster_start()` for all members including witnesses. The Raft leader
+  proposes `STORE_ADD` for unknown `UP` store ids and `MEMBER_ROLE` on role change.
+  `test_cluster disks`, `make disks-mutants` (`TSDB_DISKS_MUTANT`: `nodevcheck classsilent missingasnew`).
 - `server/chunkpeer.[ch]`, `server/chunkpeer_cluster.c` (R8 r8f/r8k): `coldops_peer`, the `cold_ops` implementation for
   cluster EC volumes (`requires=tier,ec` set by `chunkpeer_cluster_prepare` before `cvol` open). `put_stream` stages each
   position as an unlinked temporary (`mkstemp` + `unlink`, sums then cells), writes the leader's own position locally

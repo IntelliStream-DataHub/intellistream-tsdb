@@ -102,6 +102,7 @@
 
 #include "crashpt.h"
 #include "creport.h"
+#include "disks.h"
 #include "meta.h"
 #include "pace.h"
 #include "peerlink.h"
@@ -1594,6 +1595,37 @@ static int unhex16(const char *s, uint8_t *u)
     return 0;
 }
 
+int cluster_peek_node(const char *state_dir, uint8_t uuid_out[16], uint32_t *id_out)
+{
+    if (!state_dir || !*state_dir)
+        return 0;
+    char path[1200];
+    if (snprintf(path, sizeof path, "%s/NODE", state_dir) >= (int)sizeof path)
+        return 0;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    char line[1200];
+    uint8_t u[16] = {0};
+    uint32_t nid = 0;
+    int got = 0;
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\n")] = 0;
+        if (!strncmp(line, "cluster=", 8) && unhex16(line + 8, u) == 0)
+            got |= 1;
+        else if (!strncmp(line, "node=", 5) && (nid = (uint32_t)strtoul(line + 5, NULL, 10)) != 0)
+            got |= 2;
+    }
+    fclose(f);
+    if ((got & 3) != 3)
+        return 0;
+    if (uuid_out)
+        memcpy(uuid_out, u, 16);
+    if (id_out)
+        *id_out = nid;
+    return 1;
+}
+
 static int node_save(void)
 {
     char u[33], text[2048];
@@ -2533,6 +2565,77 @@ const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy 
         if (c->members[i].id == id)
             return &c->members[i];
     return NULL;
+}
+
+struct init_disk_rec {
+    uint32_t node;
+    struct meta_disk disk;
+};
+static pthread_mutex_t g_init_disks_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct init_disk_rec *g_init_disks;
+static uint32_t g_ninit_disks;
+static uint32_t g_init_disks_self;
+
+static void init_disks_capture(const struct meta_state *st, uint32_t self)
+{
+    uint32_t total = 0;
+    if (st && st->initialised) {
+        for (uint32_t i = 0; i < st->nmembers; i++)
+            total += st->members[i].ndisks < META_DISKS_MAX ? st->members[i].ndisks : META_DISKS_MAX;
+    }
+    struct init_disk_rec *arr = total ? calloc(total, sizeof *arr) : NULL;
+    uint32_t n = 0;
+    if (arr && st && st->initialised) {
+        for (uint32_t i = 0; i < st->nmembers; i++) {
+            const struct meta_member *mb = &st->members[i];
+            for (uint32_t k = 0; k < mb->ndisks && k < META_DISKS_MAX && n < total; k++) {
+                arr[n].node = mb->id;
+                arr[n].disk = mb->disks[k];
+                n++;
+            }
+        }
+    }
+    pthread_mutex_lock(&g_init_disks_mu);
+    free(g_init_disks);
+    g_init_disks = arr;
+    g_ninit_disks = n;
+    g_init_disks_self = self;
+    pthread_mutex_unlock(&g_init_disks_mu);
+}
+
+int cluster_initial_disk_lookup(const uint8_t store_id[16], uint32_t *node_out, struct meta_disk *disk_out)
+{
+    if (!store_id)
+        return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_init_disks_mu);
+    for (uint32_t i = 0; i < g_ninit_disks; i++) {
+        if (memcmp(g_init_disks[i].disk.store_id, store_id, 16) == 0) {
+            if (node_out)
+                *node_out = g_init_disks[i].node;
+            if (disk_out)
+                *disk_out = g_init_disks[i].disk;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_init_disks_mu);
+    return found;
+}
+
+uint32_t cluster_initial_self_disks(struct meta_disk *out, uint32_t cap)
+{
+    uint32_t n = 0;
+    pthread_mutex_lock(&g_init_disks_mu);
+    for (uint32_t i = 0; i < g_ninit_disks && n < cap; i++) {
+        if (g_init_disks_self && g_init_disks[i].node == g_init_disks_self) {
+            if (out)
+                out[n] = g_init_disks[i].disk;
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&g_init_disks_mu);
+    return n;
 }
 
 int cluster_member_disks(uint32_t node, struct meta_disk *out, uint32_t cap, uint32_t *total_out, uint8_t *role_out,
@@ -7489,6 +7592,145 @@ static void propose_opens(uint64_t now)
     }
 }
 
+/* R13 (E47, E49, E52; r13-start): each member reports its bound disks and declared --role in HBS_DISKS (section 12).
+ * The Raft leader proposes STORE_ADD for any UP store_id not yet known on any member, and MEMBER_ROLE when a member's
+ * declared role differs from its committed role and its UP disks satisfy it. Throttled per (node, term) like
+ * propose_opens so an unapplied proposal is not spammed on every beat. */
+#define DISK_RETRY_NS (1000 * MS)
+#define DISK_SENT_CAP 256
+struct disk_sent {
+    uint32_t node;
+    uint64_t term, ns;
+};
+static struct disk_sent disk_sent[DISK_SENT_CAP];
+static uint32_t ndisk_sent, disk_sent_rot;
+static uint64_t disk_sent_term;
+
+static int sm_store_known(const struct meta_state *m, const uint8_t store_id[16])
+{
+    for (uint32_t i = 0; i < m->nmembers; i++)
+        if (meta_member_disk(&m->members[i], store_id))
+            return 1;
+    return 0;
+}
+
+static void propose_disks(uint64_t now)
+{
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
+        return;
+    uint64_t term = raft_get_term(C.r);
+    if (term != disk_sent_term) {
+        ndisk_sent = 0;
+        disk_sent_rot = 0;
+        disk_sent_term = term;
+    } else if (ndisk_sent) {
+        uint32_t dst = 0;
+        for (uint32_t j = 0; j < ndisk_sent; j++)
+            if (disk_sent[j].term == term && since(now, disk_sent[j].ns) < DISK_RETRY_NS)
+                disk_sent[dst++] = disk_sent[j];
+        ndisk_sent = dst;
+        if (ndisk_sent < DISK_SENT_CAP)
+            disk_sent_rot = 0;
+    }
+    for (uint32_t i = 0; i < C.sm.nmembers && C.r && raft_get_role(C.r) == RAFT_LEADER && raft_get_term(C.r) == term;
+         i++) {
+        const struct meta_member *mb = &C.sm.members[i];
+        if (mb->state >= META_OUT)
+            continue;
+        if (!cl_heard_fresh(mb->id, now))
+            continue;
+        struct heard *h = heard_get(mb->id);
+        const struct hbs_disks *hd = h ? creport_heard_get(&h->ext, HBS_DISKS) : NULL;
+        if (!hd)
+            continue;
+        struct disk_sent *ds = NULL;
+        for (uint32_t j = 0; j < ndisk_sent && !ds; j++)
+            if (disk_sent[j].node == mb->id)
+                ds = &disk_sent[j];
+        if (ds && ds->term == term && since(now, ds->ns) < DISK_RETRY_NS)
+            continue;
+
+        struct meta_entry e;
+        meta_entry_init(&e);
+        uint32_t added = 0;
+        uint8_t added_ids[META_DISKS_MAX][16];
+        int post_fast = 0, post_hdd = 0, post_chunk = 0;
+        for (uint32_t k = 0; k < mb->ndisks && k < META_DISKS_MAX; k++) {
+            const struct meta_disk *d = &mb->disks[k];
+            if (d->state != META_STORE_UP)
+                continue;
+            if (meta_disk_class_fast(d->disk_class))
+                post_fast = 1;
+            else if (d->disk_class == META_DISK_HDD)
+                post_hdd = 1;
+            if (d->uses & META_DISK_USE_CHUNK)
+                post_chunk = 1;
+        }
+
+        for (uint32_t k = 0; k < hd->ndisks && mb->ndisks + added < META_DISKS_MAX; k++) {
+            const struct hbs_disk_row *r = &hd->disks[k];
+            if (r->state != META_STORE_UP || r->size_bytes == 0)
+                continue;
+            if (sm_store_known(&C.sm, r->store_id))
+                continue;
+            int dup = 0;
+            for (uint32_t j = 0; j < added; j++) {
+                if (memcmp(added_ids[j], r->store_id, 16) == 0) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup)
+                continue;
+            struct meta_disk md = {0};
+            memcpy(md.store_id, r->store_id, 16);
+            md.disk_class = r->disk_class;
+            md.uses = r->uses;
+            md.state = META_STORE_UP;
+            md.size_bytes = r->size_bytes;
+            md.sync_us = r->sync_us;
+            meta_op_store_add(&e, mb->id, &md);
+            memcpy(added_ids[added++], r->store_id, 16);
+            if (meta_disk_class_fast(md.disk_class))
+                post_fast = 1;
+            else if (md.disk_class == META_DISK_HDD)
+                post_hdd = 1;
+            if (md.uses & META_DISK_USE_CHUNK)
+                post_chunk = 1;
+        }
+
+        if (hd->role <= META_ROLE_LAST && hd->role != mb->role) {
+            uint32_t post_nd = mb->ndisks + added;
+            uint8_t post_cap = META_CAP_NONE;
+            if (post_fast || (C.sm.set.log_on_hdd && post_hdd))
+                post_cap |= META_CAP_COMPUTE;
+            if (post_chunk)
+                post_cap |= META_CAP_STORAGE;
+            int role_ok = (post_nd == 0) || (hd->role == META_ROLE_BOTH) ||
+                          (hd->role == META_ROLE_COMPUTE && (post_cap & META_CAP_COMPUTE)) ||
+                          (hd->role == META_ROLE_STORAGE && (post_cap & META_CAP_STORAGE));
+            if (role_ok)
+                meta_op_member_role(&e, mb->id, hd->role);
+        }
+
+        if (e.nops > 0) {
+            uint32_t nops = e.nops;
+            if (propose(&e, 0, 0, 0) == ISO_OK) {
+                if (!ds) {
+                    if (ndisk_sent < DISK_SENT_CAP)
+                        ds = &disk_sent[ndisk_sent++];
+                    else
+                        ds = &disk_sent[disk_sent_rot++ % DISK_SENT_CAP];
+                }
+                *ds = (struct disk_sent){mb->id, term, now};
+                say("proposes %" PRIu32 " disk/role op(s) for node %" PRIu32, nops, mb->id);
+            }
+        } else {
+            meta_entry_free(&e);
+        }
+    }
+}
+
 /* ISR changes (design-cluster.md 6.1, 8.1 step 5): the leader of a replicated volume reports the change its core asks
  * for in its heartbeats (HBS_ISR) until its record moves; the Raft leader proposes ISR_CHANGE with the request's own
  * basis (epoch, ISR version), so the apply refuses one that is no longer current (META_ERR_STALE), and with the
@@ -8485,6 +8727,7 @@ static void leader_duties(uint64_t now)
         return;
     member_states(now);
     propose_opens(now);
+    propose_disks(now);
     propose_isr(now);
     promote_duty(now);
     ctr_duty(now); /* R4: transfers, moves (cluster_int.h; each checks cl_leading itself) */
@@ -8805,6 +9048,9 @@ int cluster_start(const struct cluster_cfg *cfg)
     nopen_sent = 0;
     open_sent_rot = 0;
     open_sent_term = 0;
+    ndisk_sent = 0;
+    disk_sent_rot = 0;
+    disk_sent_term = 0;
     atomic_store(&g_users_ok, cl_mutant() == CLM_CAUGHTUPEARLY);
     atomic_store_explicit(&g_hb_failstop, 0, memory_order_relaxed);
     atomic_store_explicit(&g_hb_fill_pct, 0xff, memory_order_relaxed);
@@ -9037,7 +9283,11 @@ int cluster_start(const struct cluster_cfg *cfg)
     g_gasp_running = 1;
     pthread_mutex_unlock(&g_gasp_mu);
     (void)creport_progress_register();
+    (void)disks_creport_register(); /* decode HBS_DISKS on every member, witnesses included (for leader propose_disks) */
     cheal_start();
+    /* Capture committed disks from the freshest persisted state (view_state: max of snapshot and copy) synchronously
+     * before cluster_start returns so disks_start() sees STORE_ADD/STORE_CLASS/DESTROYED immediately on restart. */
+    init_disks_capture(view_state(), C.have_node ? C.id : 0);
     if (pthread_create(&C.th, NULL, cluster_main, NULL) != 0) {
         cheal_stop();
         pthread_mutex_lock(&g_gasp_mu);
@@ -9115,6 +9365,7 @@ void cluster_stop(void)
     meta_free(&C.wsm);
     if (C.cpy_on)
         meta_free(&C.cpy);
+    init_disks_capture(NULL, 0);
     ring_reset();
     free(C.snap);
     for (size_t i = 0; i < C.nheard; i++) {

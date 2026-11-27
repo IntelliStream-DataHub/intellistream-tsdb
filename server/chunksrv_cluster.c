@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * tsdbd's chunk server (chunksrv.h) on the cluster, as fwd_cluster.c does it for the forwarding links: the stores of
- * `--chunk-dir` are opened at start (each one's flock: this process is their one owner; a store another process holds
- * refuses the start, a missing, damaged or failing one is DOWN and logged), checked against this member's cluster and
- * node (D11: a store whose META names another cluster or node refuses the start with a line naming both), and a thread
+ * tsdbd's chunk server (chunksrv.h) on the cluster, as fwd_cluster.c does it for the forwarding links: the chunk stores
+ * selected by server/disks.[ch] (`<disk>/chunks/`) are opened at start (each one's flock: this process is their one
+ * owner; a store another process holds refuses the start, a missing, damaged or failing one is DOWN and logged), checked
+ * against this member's cluster and node (`<disk>/DISK`), and a thread
  * makes the peerlink once this server is a member, registers it for PL_KIND_CHUNK and PL_KIND_CHUNKB in the cluster's
  * acceptor table and keeps its peers to the metadata copy's members. Every member holds the links, stores or not: a
  * member without stores still calls the others.
@@ -28,6 +28,7 @@
 
 #include "cluster.h"
 #include "creport.h"
+#include "disks.h"
 #include "peerlink.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/chunk_priv.h"
@@ -328,11 +329,11 @@ static void set_peers(struct chunksrv *cs, const struct cluster_copy *c, uint32_
     free(keep);
 }
 
-/* The node became known after the start: a store of another owner is closed, the member serves none. */
+/* The node became known after the start: bind unbound DISK metadata (D11/D12); a foreign/locked disk stops serving. */
 static void check_late(const struct cluster_self *me)
 {
     char err[512];
-    if (chunksrv_check_owner(G.cs, me->uuid, me->id, err, sizeof err) == 0)
+    if (disks_bind_late(me->uuid, me->id, err, sizeof err) == 0)
         return;
     fprintf(stderr, "tsdbd: %s; serving no chunk store\n", err);
     chunksrv_close(G.cs);
@@ -586,10 +587,11 @@ int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char 
         return -1;
     chunksrv_stores(G.cs, NULL, n > 0);
     struct cluster_self me;
-    if (cluster_self(&me) == 0 && me.have_node) { /* D11: known now, so a foreign store refuses the start */
-        int rc = chunksrv_check_owner(G.cs, me.uuid, me.id, err, errlen);
+    if (cluster_self(&me) == 0 && me.have_node) {
+        /* If this server joined between disks_start() and now, bind unbound DISK metadata immediately. */
+        int brc = disks_bind_late(me.uuid, me.id, err, errlen);
         tsdb_wipe(&me, sizeof me);
-        if (rc != 0) {
+        if (brc != 0) {
             chunksrv_close(G.cs);
             G.cs = NULL;
             return -1;

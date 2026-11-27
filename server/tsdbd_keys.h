@@ -5,11 +5,6 @@
  * Markdown table that docs/config.md holds) and tests/test_config.sh (every option of tsdbd.c has a row, and the
  * document says what this table says) all read it. A row without a key is an option the file cannot take, and says
  * why.
- *
- * Reserved for the device classes (docs/design-cluster-data.md, not built): storage.disks (the --disk of that design,
- * PATH[:CLASS] per element). It is a row with no option (CK_X): a file that sets it is refused with a message, so a
- * file written for a later version is never read as if the key did nothing. When the design is built the row becomes
- * a list with its option.
  */
 #ifndef TSDBD_KEYS_H
 #define TSDBD_KEYS_H
@@ -29,7 +24,9 @@
 
 static const struct cfg_key tsdbd_keys[] = {
     /* storage */
-    CK_S("storage.dir", "dir", "", "The database directory (required, unless this is a witness)."),
+    CK_S("storage.dir", "dir", "",
+         "The database directory (required, unless this is a witness or a cluster node with storage.disks; in cluster "
+         "mode it is also treated as a disk using its DISK metadata without /sys detection)."),
     CK_N("storage.fsync", "no-fsync", "true",
        "false turns fsync off: a power loss then looks like damage and fails the next open. For tests and "
        "benchmarks only."),
@@ -45,7 +42,9 @@ static const struct cfg_key tsdbd_keys[] = {
        "1: series of different rates go to partitions of 1, 7, 28 or 364 days; 0: all to base partitions. Used only "
        "when the database is created."),
     CK_I("storage.granule.rows", "granule-rows", "8192", "Rows per granule. Used only when the database is created."),
-    CK_X("storage.disks", "the disks of a device-class server, PATH[:CLASS] each (docs/design-cluster-data.md, section 15)"),
+    CK_L("storage.disks", "disk", "",
+         "The disks of a cluster node, PATH[:CLASS] each (nvme, ssd or hdd; comma-separated; each initialised with "
+         "tsdb disk init; ':' in the final path component separates :CLASS)."),
     CK_L("storage.tiers", "tier", "",
          "The stores of the single-server tier, PATH[:CLASS] each: checked against TIERS at start (never adds a "
          "store; a mismatch refuses to start)."),
@@ -157,10 +156,12 @@ static const struct cfg_key tsdbd_keys[] = {
          "without an answer (its outcome is unknown). 0: no limit (a dead link still ends it)."),
     CK_I("cluster.fwd.workers", "fwd-workers", "4",
          "Worker threads reserved for requests other members forward here (more start while all of them wait)."),
-    CK_L("cluster.chunk.dir", "chunk-dir", "",
-         "The chunk stores of this member, one per disk (each made by tsdb chunk-store init PATH --cluster UUID --node "
-         "ID); a comma-separated list. A store of another cluster or node refuses the start; a missing or failing one "
-         "is reported down."),
+    CK_E("cluster.role", "role", "both|compute|storage", "both",
+         "Declared role of this member: both (compute and storage as disks allow), compute (log replicas only), or "
+         "storage (chunk stores only)."),
+    CK_B("cluster.allow.shared.device", "allow-shared-device", "false",
+         "Allow a disk on the same file system as /, cluster.state.dir or another disk (for test harnesses and "
+         "one-disk development hosts; health warns while set)."),
     CK_I("cluster.chunk.rate", "chunk-rate-mb-s", "256",
          "MB/s of chunk puts to other members, all links together: a cap of its own, apart from replication's."),
     /* the erasure-coded tier */

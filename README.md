@@ -572,7 +572,7 @@ for tests and try-outs on your own machine. `tsdb <dir> user` on its own lists e
 ### Cluster (preview)
 
 `tsdbd --cluster` joins servers into a Raft metadata group that manages replicated (`--replicas N`) and erasure-coded
-(`--redundancy ec=K+M` with `tsdb chunk-store init` and `tsdbd --chunk-dir`) cluster volumes with failover, leadership
+(`--redundancy ec=K+M` with `tsdb disk init` and `tsdbd --disk PATH[:CLASS]`) cluster volumes with failover, leadership
 transfers, copy moves, snapshot rebuilds, and optional RDMA peer links ([docs/design-rdma.md](docs/design-rdma.md)).
 Clients route through any server (`--forward on`, the default) and log in with cluster-wide users.
 The metadata snapshot format and peer protocol may still change before 1.0 (clusters made on an earlier 0.x build

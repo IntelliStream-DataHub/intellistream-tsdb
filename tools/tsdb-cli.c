@@ -31,70 +31,7 @@
 #define TSDB_BUILD_VERSION "dev"
 #endif
 
-/* a cluster uuid as `tsdb cluster status` prints it: 32 hex digits, dashes anywhere allowed */
-static int uuid_parse(const char *s, uint8_t out[16])
-{
-    int n = 0;
-    for (; *s; s++) {
-        if (*s == '-')
-            continue;
-        int v = *s >= '0' && *s <= '9' ? *s - '0' : *s >= 'a' && *s <= 'f' ? *s - 'a' + 10
-              : *s >= 'A' && *s <= 'F' ? *s - 'A' + 10 : -1;
-        if (v < 0 || n >= 32)
-            return -1;
-        out[n / 2] = (uint8_t)(n % 2 ? out[n / 2] | v : v << 4);
-        n++;
-    }
-    return n == 32 ? 0 : -1;
-}
-
 static void drop_root(const char *dir);
-
-/* `tsdb chunk-store init PATH --cluster UUID --node ID` (design-cluster-data.md R8 D11): makes a chunk store whose
- * META names the cluster and the node it belongs to; tsdbd --chunk-dir refuses at start a store of another one. */
-static int chunk_store_cli(int argc, char **argv)
-{
-    const char *path = NULL, *cl = NULL, *node = NULL;
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--cluster") == 0 && i + 1 < argc)
-            cl = argv[++i];
-        else if (strcmp(argv[i], "--node") == 0 && i + 1 < argc)
-            node = argv[++i];
-        else if (!path && argv[i][0] != '-')
-            path = argv[i];
-        else
-            path = NULL, cl = NULL, i = argc;
-    }
-    if (argc < 2 || strcmp(argv[1], "init") != 0 || !path || !cl || !node) {
-        fprintf(stderr, "usage: tsdb chunk-store init PATH --cluster UUID --node ID\n");
-        return 2;
-    }
-    chunk_store_owner o = {.set = true};
-    char *end = NULL;
-    errno = 0;
-    unsigned long long id = strtoull(node, &end, 10);
-    if (uuid_parse(cl, o.cluster) != 0) {
-        fprintf(stderr, "tsdb chunk-store: %s is not a cluster uuid (32 hex digits)\n", cl);
-        return 2;
-    }
-    if (errno || !end || *end || id == 0 || id > UINT32_MAX || !(node[0] >= '0' && node[0] <= '9')) { /* digits only */
-        fprintf(stderr, "tsdb chunk-store: %s is not a node id\n", node);
-        return 2;
-    }
-    o.node = (uint32_t)id;
-    drop_root(path);
-    uint8_t sid[16];
-    int rc = chunk_store_init2(path, NULL, &o, sid);
-    if (rc != 0) {
-        fprintf(stderr, "tsdb chunk-store: cannot make a store at %s: %s\n", path,
-                rc == TSDB_ERR_INVALID ? "it is a chunk store already" : "I/O error");
-        return 1;
-    }
-    char hex[33];
-    chunk_oid_hex(sid, hex);
-    printf("chunk store %s: id %s, cluster %s, node %u\n", path, hex, cl, o.node);
-    return 0;
-}
 
 /* `tsdb disk init PATH[:CLASS] [--chunks]` and `tsdb disk show PATH` (docs/design-cluster-data.md §15.1, D11). */
 static int disk_cli(int argc, char **argv)
@@ -204,7 +141,6 @@ static void usage(void)
             "usage: tsdb <dir> <command> [args]\n"
             "       tsdb cluster secret|init|node add|status ... (tsdb cluster for the details)\n"
             "       tsdb disk init PATH[:CLASS] [--chunks] | show PATH   (initialise or inspect a disk)\n"
-            "       tsdb chunk-store init PATH --cluster UUID --node ID   (a chunk store for tsdbd --chunk-dir)\n"
             "       tsdb --version\n"
             "\n"
             "  insert <series>                    read \"time,value\" lines from stdin\n"
@@ -2983,8 +2919,6 @@ int main(int argc, char **argv)
     }
     if (argc >= 2 && strcmp(argv[1], "disk") == 0)
         return disk_cli(argc - 1, argv + 1);
-    if (argc >= 2 && strcmp(argv[1], "chunk-store") == 0)
-        return chunk_store_cli(argc - 1, argv + 1);
     /* `tsdb cluster VERB PEER ...`: a server's peer port, no directory. Before the argument count check:
      * `tsdb cluster` alone prints the cluster's commands, as the usage line promises. */
     if (argc >= 2 && strcmp(argv[1], "cluster") == 0) {

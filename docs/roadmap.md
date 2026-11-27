@@ -14,8 +14,8 @@ series store underneath; tsdb does not duplicate it.
 - 0.11.0 (in progress, CHANGELOG.md): statistics over the wire (protocol 15: `STATS_SERIES`, `STATS_TENANTS`,
   `tsdbd --tenants`, `tsdb stats ... --server`, in all four clients and the embedded bindings; docs/design-stats.md step 5),
   replicated cluster volumes with data replication, failover, leadership transfers, copy moves, and snapshot rebuilds
-  (R1–R4, docs/design-cluster.md), erasure-coded cluster volumes (`--redundancy ec=K+M`, `tsdb chunk-store init`,
-  `tsdbd --chunk-dir`, settled-part EC, re-encode, and tiering, R5–R8/R10, docs/design-cluster-data.md), and RDMA peer links
+  (R1–R4, docs/design-cluster.md), erasure-coded cluster volumes (`--redundancy ec=K+M`, `tsdb disk init`,
+  `tsdbd --disk PATH[:CLASS]`, settled-part EC, re-encode, and tiering, R5–R8/R10, docs/design-cluster-data.md), and RDMA peer links
   (`server/plrdma.c`, `dlopen` of libibverbs, `--peer-check`, `--peer-rdma` TCP-to-verbs upgrade, docs/design-rdma.md).
 - 0.10.1 (2026-11-17, CHANGELOG.md): patch release fixing refused-write recovery, flusher backpressure, dropped-user
   connection handling, and C client `UNAVAILABLE` handling in raw/values queries.

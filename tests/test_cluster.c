@@ -35,6 +35,8 @@
 #include "crashpt.h"
 #include "creport.h"
 #include "cvol_check.h"
+#include "disk.h"
+#include "disks.h"
 #include "harness.h"
 #include "meta.h"
 #include "peerlink.h"
@@ -266,12 +268,75 @@ static int strict_reads;
 static int fwd_on; /* the servers forward requests for volumes led elsewhere (tsdbd's default; else --forward off) */
 static int epoll_after_two; /* D15: io_uring on at most two servers (0 and 1), epoll on the rest (22-node scenarios) */
 static int cports[N];  /* the client port of server i */
+static int no_auto_disk[N];  /* 1: do not auto-run `tsdb disk init` on server i's --dir (for scen_disks) */
+static int no_shared_dev[N]; /* 1: do not pass --allow-shared-device to server i (for scen_disks) */
+static int omit_dir[N];      /* 1: omit --dir on server i (when testing --disk only) */
+
+/* Initialise `dir` with `tsdb disk init dir:ssd` if it has no DISK file yet (R13 E58). If a legacy scenario
+ * pre-populated `dir` (e.g. USERS or state/) before calling start(), initialise a temp dir and move DISK in. */
+static void auto_disk_init(const char *dir)
+{
+    char dfile[PATH_MAX + 96];
+    snprintf(dfile, sizeof dfile, "%s/DISK", dir);
+    if (access(dfile, F_OK) == 0)
+        return;
+    const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
+    struct stat st;
+    int nonempty = (stat(dir, &st) == 0);
+    if (nonempty) {
+        DIR *dd = opendir(dir);
+        nonempty = 0;
+        if (dd) {
+            for (struct dirent *e; (e = readdir(dd));) {
+                if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
+                    nonempty = 1;
+                    break;
+                }
+            }
+            closedir(dd);
+        }
+    }
+    char target[PATH_MAX + 96], spec[PATH_MAX + 112];
+    if (nonempty)
+        snprintf(target, sizeof target, "%s.dinit.%d", dir, (int)getpid());
+    else
+        snprintf(target, sizeof target, "%s", dir);
+    snprintf(spec, sizeof spec, "%s:ssd", target);
+    pid_t p = fork();
+    if (p < 0)
+        die("fork: %s", strerror(errno));
+    if (p == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+            close(devnull);
+        }
+        execl(cli, "tsdb", "disk", "init", spec, (char *)NULL);
+        _exit(127);
+    }
+    int wst = 0;
+    waitpid(p, &wst, 0);
+    if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0)
+        die("tsdb disk init %s failed (status 0x%x)", spec, wst);
+    if (nonempty) {
+        char src[PATH_MAX + 112];
+        snprintf(src, sizeof src, "%s/DISK", target);
+        if (rename(src, dfile) != 0)
+            die("rename %s -> %s: %s", src, dfile, strerror(errno));
+        rmdir(target);
+    }
+}
 
 /* Forks and execs server i; writes its portfile path into pf (size pfn) and records pids[i]. */
 static pid_t spawn_server(int i, char *pf, size_t pfn)
 {
     char dir[PATH_MAX + 80], log[PATH_MAX + 80], flag[64];
     server_dir(i, dir, sizeof dir);
+    if (!is_witness[i] && !omit_dir[i] && !no_auto_disk[i])
+        auto_disk_init(dir);
+    else if (omit_dir[i])
+        (void)mkdir(dir, 0755); /* parent for --state-dir <dir>/state */
     snprintf(log, sizeof log, "%s/n%d.log", base, i);
     th_portfile(pf, pfn, dir);
     th_follow_me(flag, sizeof flag);
@@ -311,10 +376,14 @@ static pid_t spawn_server(int i, char *pf, size_t pfn)
         if (is_witness[i])
             argv[n++] = "--witness";
         else {
-            argv[n++] = "--dir";
-            argv[n++] = dir;
+            if (!omit_dir[i]) {
+                argv[n++] = "--dir";
+                argv[n++] = dir;
+            }
             argv[n++] = "--port";
             argv[n++] = "0";
+            if (!no_shared_dev[i])
+                argv[n++] = "--allow-shared-device";
         }
         argv[n++] = "--port-file";
         argv[n++] = pf;
@@ -580,6 +649,9 @@ static void scenario(const char *name)
     init_voters = 0;
     memset(is_witness, 0, sizeof is_witness);
     memset(auth_on, 0, sizeof auth_on);
+    memset(no_auto_disk, 0, sizeof no_auto_disk);
+    memset(no_shared_dev, 0, sizeof no_shared_dev);
+    memset(omit_dir, 0, sizeof omit_dir);
     snprintf(base, sizeof base, "%s/%s", root, name);
     if (mkdir(base, 0755) != 0)
         die("mkdir %s: %s", base, strerror(errno));
@@ -4857,18 +4929,17 @@ static void scen_volumes(void)
 
 /* A node refuses to start with --wal-sync-ms other than 0, with series in its root or with VOLUMES (DECISION D2:
  * the root holds USERS only); login stays per node (USERS in the root). */
-/* R8 D11, E14, E26, E27 (server/chunksrv*.c): two tsdbd with --chunk-dir. A store whose META names another node or
+/* R8 D11, E14, E26, E27; R13 E47, E58 (server/chunksrv*.c, server/disks.c): two tsdbd with --disk PATH:hdd. A disk whose DISK names another node or
  * another cluster refuses the start with a line naming both; a store another tsdbd holds (its flock) and one named
  * twice refuse it too. Then puts through the real peer links (the hook TSDB_CHUNKSRV_TEST in chunksrv_cluster.c):
  * a chunk put from A to B reads back whole, B's fence raised to 5 refuses a put at 3 and a delete at 4; B killed with
  * SIGKILL and restarted still holds the chunk and the fence (a put at 4 is FENCED). The cell checks, power loss around
  * PUT_OK and the unsure stores are test_chunksrv's (with its mutants). */
-static void chunk_store_make(const char *path, const uint8_t uuid[16], uint32_t node)
+/* R13 (E47, E58, D11/D12): initialise a disk with `tsdb disk init PATH:CLASS` (hdd creates <path>/chunks/). */
+static void disk_make(const char *path, const char *cls)
 {
-    char hex[33], args[PATH_MAX + 128], out[4096];
-    for (int k = 0; k < 16; k++)
-        snprintf(hex + 2 * k, 3, "%02x", uuid[k]);
-    snprintf(args, sizeof args, "chunk-store init %s --cluster %s --node %" PRIu32, path, hex, node);
+    char args[PATH_MAX + 128], out[4096];
+    snprintf(args, sizeof args, "disk init %s:%s", path, cls);
     if (cli_run(args, NULL, out, sizeof out) != 0)
         die("`tsdb %s`: %s", args, out);
 }
@@ -4901,22 +4972,26 @@ static void scen_chunksrv(void)
     snprintf(stage, sizeof stage, "%s/stage", base);
     if (mkdir(stage, 0755) != 0)
         die("mkdir %s: %s", stage, strerror(errno));
-    chunk_store_make(s0, uuid, ids[0]);
-    chunk_store_make(s1, uuid, ids[1]);
-    chunk_store_make(sf, uuid, ids[1] + 40); /* another member's disk */
-    chunk_store_make(so, other, ids[1]);     /* this node id in another cluster */
+    disk_make(s0, "hdd");
+    disk_make(s1, "hdd");
+    disk_make(sf, "hdd");
+    disk_make(so, "hdd");
+    if (disk_bind(sf, uuid, ids[1] + 40) != 0) /* another member's disk */
+        die("disk_bind sf failed");
+    if (disk_bind(so, other, ids[1]) != 0) /* this node id in another cluster */
+        die("disk_bind so failed");
     for (int k = 0; k < 16; k++)
         snprintf(hex + 2 * k, 3, "%02x", uuid[k]);
 
     char xa[PATH_MAX * 2 + 64];
-    snprintf(xa, sizeof xa, "--chunk-dir %s", sf);
+    snprintf(xa, sizeof xa, "--disk %s:hdd", sf);
     xargs[1] = xa;
     int rc = start_try(1);
     snprintf(need, sizeof need, "belongs to cluster %s node %" PRIu32 ", but this is cluster %s node %" PRIu32, hex,
              ids[1] + 40, hex, ids[1]);
     if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(1, need))
-        die("a store of another node did not refuse the start naming both (%d, 0x%x)", rc, th_status);
-    snprintf(xa, sizeof xa, "--chunk-dir %s", so);
+        die("a disk of another node did not refuse the start naming both (%d, 0x%x)", rc, th_status);
+    snprintf(xa, sizeof xa, "--disk %s:hdd", so);
     rc = start_try(1);
     char ohex[33];
     for (int k = 0; k < 16; k++)
@@ -4924,26 +4999,26 @@ static void scen_chunksrv(void)
     snprintf(need, sizeof need, "belongs to cluster %s node %" PRIu32 ", but this is cluster %s node %" PRIu32, ohex,
              ids[1], hex, ids[1]);
     if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(1, need))
-        die("a store of another cluster did not refuse the start naming both (%d, 0x%x)", rc, th_status);
-    snprintf(xa, sizeof xa, "--chunk-dir %s --chunk-dir %s", s1, s1);
+        die("a disk of another cluster did not refuse the start naming both (%d, 0x%x)", rc, th_status);
+    snprintf(xa, sizeof xa, "--disk %s:hdd --disk %s:hdd", s1, s1);
     rc = start_try(1);
     if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) == 0)
-        die("a store named twice did not refuse the start (%d, 0x%x)", rc, th_status);
-    printf("  a store of another node, of another cluster and one named twice refuse the start\n");
+        die("a disk named twice did not refuse the start (%d, 0x%x)", rc, th_status);
+    printf("  a disk of another node, of another cluster and one named twice refuse the start\n");
 
-    snprintf(xa, sizeof xa, "--chunk-dir %s", s1);
+    snprintf(xa, sizeof xa, "--disk %s:hdd", s1);
     start(1);
     await_view(0, p_member_state, &up, "server 1 back with a new incarnation");
     stop(0, SIGTERM);
     char xb[PATH_MAX + 64], pe[PATH_MAX + 96];
-    snprintf(xb, sizeof xb, "--chunk-dir %s", s1); /* server 0 names server 1's store: its flock refuses */
+    snprintf(xb, sizeof xb, "--disk %s:hdd", s1); /* server 0 names server 1's disk: its flock refuses */
     xargs[0] = xb;
     rc = start_try(0);
     if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) == 0 || !log_has(0, "is open elsewhere"))
-        die("a store another tsdbd holds did not refuse the start (%d, 0x%x)", rc, th_status);
-    printf("  a store another tsdbd holds refuses the start\n");
+        die("a disk another tsdbd holds did not refuse the start (%d, 0x%x)", rc, th_status);
+    printf("  a disk another tsdbd holds refuses the start\n");
 
-    snprintf(xb, sizeof xb, "--chunk-dir %s", s0);
+    snprintf(xb, sizeof xb, "--disk %s:hdd", s0);
     snprintf(pe, sizeof pe, "TSDB_CHUNKSRV_TEST=put:%" PRIu32 ":%s", ids[1], stage);
     penv[0] = pe;
     start(0);
@@ -14682,10 +14757,11 @@ static void restart_xargs(int i, const char *xa)
 
 static void restart_with_store(int i, const uint8_t uuid[16], char *xa, size_t xn)
 {
+    (void)uuid;
     char sd[PATH_MAX];
     snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
-    chunk_store_make(sd, uuid, ids[i]);
-    snprintf(xa, xn, "--chunk-dir %s", sd);
+    disk_make(sd, "hdd");
+    snprintf(xa, xn, "--disk %s:hdd", sd);
     restart_xargs(i, xa);
 }
 
@@ -14872,8 +14948,8 @@ static void scen_margins(void)
     for (int i = 0; i < 6; i++) { /* restart_with_store's, with a metrics port */
         char sd[PATH_MAX];
         snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s --metrics-port auto", sd);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--disk %s:hdd --metrics-port auto", sd);
         restart_xargs(i, xa[i]);
         margin_mports[i] = th_mport;
     }
@@ -15051,7 +15127,7 @@ static int ecb_chunks_n(uint32_t num, int n_stores)
     int n = 0;
     for (int i = 0; i < n_stores; i++) {
         char p[PATH_MAX + 80];
-        snprintf(p, sizeof p, "%s/ecs%d/s%" PRIu32, base, i, num);
+        snprintf(p, sizeof p, "%s/ecs%d/chunks/s%" PRIu32, base, i, num);
         DIR *dd = opendir(p);
         if (!dd)
             continue;
@@ -15200,8 +15276,8 @@ static void scen_ecbasic(void)
     for (int i = 0; i < 6; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
                  "--flush-interval-ms 200", sd);
         restart_xargs(i, xa[i]);
     }
@@ -15389,7 +15465,7 @@ static void scen_ecbasic(void)
      * copy raises it and the next day settles. */
     int S = victims[0];
     char ep[PATH_MAX + 80], hold[PATH_MAX + 96], needle[96];
-    snprintf(ep, sizeof ep, "%s/ecs%d/s%" PRIu32 "/EPOCH", base, S, num);
+    snprintf(ep, sizeof ep, "%s/ecs%d/chunks/s%" PRIu32 "/EPOCH", base, S, num);
     {
         struct view vv;
         view((S + 1) % 6, &vv);
@@ -15574,9 +15650,9 @@ static void scen_ecslow(void)
     for (int i = 0; i < 6; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
+        disk_make(sd, "hdd");
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                 "--disk %s:hdd --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 "
                  "--ec-cache-mb 1 --merge-idle-s 1 --flush-interval-ms 200",
                  sd);
         restart_xargs(i, xa[i]);
@@ -15930,8 +16006,8 @@ static void scen_ec16(void)
     for (int i = 0; i < EC16_NODES; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
                  "--flush-interval-ms 200 --ec-cache-mb 16", sd);
     }
     /* Restart the 5 Raft voters one by one (ephemeral --port 0 peer ports: restarting all 5 at once loses every
@@ -16189,9 +16265,9 @@ static void scen_ecgc(void)
     for (int i = 0; i < 6; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
+        disk_make(sd, "hdd");
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
                  "--flush-interval-ms 200",
                  sd);
         restart_xargs(i, xa[i]);
@@ -16586,7 +16662,7 @@ static void scen_ecgc(void)
 static int ecd_chunks_of(int srv, uint32_t num)
 {
     char p[PATH_MAX + 80];
-    snprintf(p, sizeof p, "%s/ecs%d/s%" PRIu32, base, srv, num);
+    snprintf(p, sizeof p, "%s/ecs%d/chunks/s%" PRIu32, base, srv, num);
     DIR *dd = opendir(p);
     if (!dd)
         return 0;
@@ -16715,9 +16791,9 @@ static void scen_ecdegraded(void)
     for (int i = 0; i < 7; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
+        disk_make(sd, "hdd");
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --ec-settle-wait-max-s 5 "
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --ec-settle-wait-max-s 5 "
                  "--merge-idle-s 1 --flush-interval-ms 200 --ec-cache-mb 16", sd);
         restart_xargs(i, xa[i]);
     }
@@ -16992,6 +17068,7 @@ static void scen_ecadd(void)
     for (int i = 0; i < 6; i++) {
         penv[i] = "TSDB_REPLD_TEST=cutlinks";
         envs[i] = "copy_probe=1";
+        xargs[i] = "--role compute";
     }
     for (int i = 0; i < 6; i++)
         start(i);
@@ -17056,8 +17133,8 @@ static void scen_ecadd(void)
                 die("e42's stripe names node %" PRIu32 " twice", e.stripe[a]);
     }
     await_same_stripe("e42", &e, "after the add");
-    /* a member whose store is gone (restarted without it): its heartbeats say so, and the next group cannot have it */
-    restart_xargs(5, NULL);
+    /* a member whose store is gone (restarted compute-only): its heartbeats say so, and the next group cannot have it */
+    restart_xargs(5, "--role compute");
     await_ec_five("e43");
     restart_xargs(5, xa[5]);
     int L = -1;
@@ -22994,8 +23071,8 @@ static void scen_ecout(void)
     for (int i = 0; i < 7; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--rack %s --chunk-dir %s", racks7[i], sd);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--rack %s --disk %s:hdd", racks7[i], sd);
         restart_xargs(i, xa[i]);
     }
     unsigned seven = 7;
@@ -24008,10 +24085,10 @@ static void scen_progress(void)
     for (int i = 0; i < 3; i++) {
         char sd[sizeof base + 32];
         snprintf(sd, sizeof sd, "%s/ps%d", base, i);
-        chunk_store_make(sd, cuuid, ids[i]);
+        disk_make(sd, "hdd");
         penv[i] = holdenv;
         snprintf(pxa[i], sizeof pxa[i],
-                 "--metrics-port auto --chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                 "--metrics-port auto --disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 "
                  "--merge-idle-s 1 --flush-interval-ms 200",
                  sd);
         restart_xargs(i, pxa[i]);
@@ -24119,8 +24196,8 @@ static void scen_progress(void)
     char sd3[sizeof base + 32];
     static char pxa3[sizeof base + 256];
     snprintf(sd3, sizeof sd3, "%s/ps3", base);
-    chunk_store_make(sd3, cuuid, ids[3]);
-    snprintf(pxa3, sizeof pxa3, "--metrics-port auto --chunk-dir %s", sd3);
+    disk_make(sd3, "hdd");
+    snprintf(pxa3, sizeof pxa3, "--metrics-port auto --disk %s:hdd", sd3);
     restart_xargs(3, pxa3);
     mports[3] = th_mport;
     await_view(0, p_n_placeable, &four, "server 3 UP with chunk store");
@@ -25936,11 +26013,13 @@ static void scen_ecrebuild(void)
     static char xa[7][PATH_MAX + 256];
     static char sdirs[7][PATH_MAX + 96];
     for (int i = 0; i < 7; i++) {
-        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
-        chunk_store_make(sdirs[i], uuid, ids[i]);
+        char ddir[PATH_MAX + 80];
+        snprintf(ddir, sizeof ddir, "%s/ecs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
-                 "--flush-interval-ms 200 --ec-cache-mb 16", sdirs[i]);
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-cache-mb 16", ddir);
         restart_xargs(i, xa[i]);
     }
     unsigned seven = 7;
@@ -26413,11 +26492,13 @@ static void scen_ecwhole(void)
     static char xa[7][PATH_MAX + 256];
     static char sdirs[7][PATH_MAX + 96];
     for (int i = 0; i < 7; i++) {
-        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
-        chunk_store_make(sdirs[i], uuid, ids[i]);
+        char ddir[PATH_MAX + 80];
+        snprintf(ddir, sizeof ddir, "%s/ecs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
-                 "--flush-interval-ms 200 --ec-cache-mb 16", sdirs[i]);
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-cache-mb 16", ddir);
         restart_xargs(i, xa[i]);
     }
     unsigned seven = 7;
@@ -27321,8 +27402,8 @@ static void scen_nodedrain(void)
     for (int i = 0; i < 7; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ds%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--disk %s:hdd", sd);
         restart_xargs(i, xa[i]);
     }
     unsigned seven = 7;
@@ -27491,8 +27572,8 @@ static void scen_nodereplace(void)
     for (int i = 0; i < 6; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/rs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--disk %s:hdd", sd);
         restart_xargs(i, xa[i]);
     }
     unsigned six = 6;
@@ -27524,8 +27605,8 @@ static void scen_nodereplace(void)
         node_add(0, i);
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/rs%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--disk %s:hdd", sd);
         restart_xargs(i, xa[i]);
     }
     unsigned eight = 8;
@@ -27733,8 +27814,8 @@ static void scen_nodedestroyed(void)
     for (int i = 0; i < 6; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/nd%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--disk %s:hdd", sd);
         restart_xargs(i, xa[i]);
     }
     unsigned six = 6;
@@ -27875,15 +27956,16 @@ static void scen_posmove(void)
     uint8_t uuid[16];
     memcpy(uuid, v0.m.uuid, 16);
     view_free(&v0);
-    /* Give nodes 0..6 chunk stores; leave node 7 without a chunk store to test the no-chunk-stores refusal! */
+    /* Give nodes 0..6 chunk stores; leave node 7 compute-only (no chunk store) to test the no-chunk-stores refusal! */
     static char xa[7][PATH_MAX + 128];
     for (int i = 0; i < 7; i++) {
         char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ps%d", base, i);
-        chunk_store_make(sd, uuid, ids[i]);
-        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i], "--disk %s:hdd", sd);
         restart_xargs(i, xa[i]);
     }
+    restart_xargs(7, "--role compute");
     unsigned eight = 8;
     await_view(0, p_n_placeable, &eight, "8 members UP for posmove");
 
@@ -28101,12 +28183,14 @@ static void scen_ecback(void)
     static char xa[7][PATH_MAX + 256];
     static char sdirs[7][PATH_MAX + 96];
     for (int i = 0; i < 7; i++) {
-        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
-        chunk_store_make(sdirs[i], uuid, ids[i]);
+        char ddir[PATH_MAX + 80];
+        snprintf(ddir, sizeof ddir, "%s/ecs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --ec-settle-wait-max-s 5 "
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --ec-settle-wait-max-s 5 "
                  "--merge-idle-s 1 --flush-interval-ms 200 --ec-cache-mb 16",
-                 sdirs[i]);
+                 ddir);
         restart_xargs(i, xa[i]);
     }
     unsigned seven = 7;
@@ -28303,12 +28387,14 @@ static void scen_ecbackempty(void)
     static char xa[7][PATH_MAX + 256];
     static char sdirs[7][PATH_MAX + 96];
     for (int i = 0; i < 7; i++) {
-        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
-        chunk_store_make(sdirs[i], uuid, ids[i]);
+        char ddir[PATH_MAX + 80];
+        snprintf(ddir, sizeof ddir, "%s/ecs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
                  "--flush-interval-ms 200 --ec-cache-mb 16",
-                 sdirs[i]);
+                 ddir);
         restart_xargs(i, xa[i]);
     }
     unsigned seven = 7;
@@ -28399,9 +28485,11 @@ static void scen_ecbackempty(void)
     struct state_want down_w = {ids[H], META_DOWN, 0};
     await_view(L, p_member_state, &down_w, "holder H marked META_DOWN after stop");
 
-    if (nftw(sdirs[H], rm_one, 16, FTW_DEPTH | FTW_PHYS) != 0)
-        die("ecbackempty: failed to empty %s: %s", sdirs[H], strerror(errno));
-    chunk_store_make(sdirs[H], uuid, ids[H]);
+    char ddir_h[PATH_MAX + 80];
+    snprintf(ddir_h, sizeof ddir_h, "%s/ecs%d", base, H);
+    if (nftw(ddir_h, rm_one, 16, FTW_DEPTH | FTW_PHYS) != 0)
+        die("ecbackempty: failed to empty %s: %s", ddir_h, strerror(errno));
+    disk_make(ddir_h, "hdd");
     if (chunk_store_meta_read(sdirs[H], new_sid, NULL) != 0)
         die("ecbackempty: could not read new store id of %s", sdirs[H]);
     chunk_oid_hex(new_sid, new_hex);
@@ -28506,12 +28594,14 @@ static void scen_ecbackgc(void)
     static char xa[7][PATH_MAX + 256];
     static char sdirs[7][PATH_MAX + 96];
     for (int i = 0; i < 7; i++) {
-        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
-        chunk_store_make(sdirs[i], uuid, ids[i]);
+        char ddir[PATH_MAX + 80];
+        snprintf(ddir, sizeof ddir, "%s/ecs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
                  "--flush-interval-ms 200 --ec-cache-mb 16",
-                 sdirs[i]);
+                 ddir);
         restart_xargs(i, xa[i]);
     }
     unsigned seven = 7;
@@ -28692,12 +28782,14 @@ static void scen_scrub(void)
     static char xa[7][PATH_MAX + 256];
     static char sdirs[7][PATH_MAX + 96];
     for (int i = 0; i < 7; i++) {
-        snprintf(sdirs[i], sizeof sdirs[i], "%s/scs%d", base, i);
-        chunk_store_make(sdirs[i], uuid, ids[i]);
+        char ddir[PATH_MAX + 80];
+        snprintf(ddir, sizeof ddir, "%s/scs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
         snprintf(xa[i], sizeof xa[i],
-                 "--chunk-dir %s --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--disk %s:hdd --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
                  "--flush-interval-ms 200",
-                 sdirs[i]);
+                 ddir);
         restart_xargs(i, xa[i]);
         mports[i] = th_mport;
         if (mports[i] <= 0)
@@ -28854,6 +28946,419 @@ static void scen_scrub(void)
     printf("  CHUNK_DAMAGED reached leader %d (log + counter) within one pass\n", L);
 }
 
+/* R13 (r13-start; docs/design-cluster-data.md §15.1, E47-E49, E58, PLAN.md D11-D13):
+ *   - unmounted path (empty dir without DISK) refused at start;
+ *   - two --disk on one filesystem refused without --allow-shared-device (catches mutant nodevcheck), accepted with
+ *     --allow-shared-device (health warns in STATUS and tsdb_disk_shared_device == 1);
+ *   - first start binds DISK via disk_bind; HBS_DISKS carries disks and --role; leader commits STORE_ADD once per
+ *     disk across restarts and MEMBER_ROLE when --role changes;
+ *   - DISK bound to another node or cluster refused naming both;
+ *   - explicit :hdd stated over an nvme metadata record refused naming both (catches mutant classsilent);
+ *   - /sys detection mismatch logged and counted in tsdb_disk_class_mismatch, never refused;
+ *   - DISK removed while down -> known store reported missing (DOWN), never made new (catches mutant missingasnew);
+ *   - --dir in cluster mode accepted as ssd disk with warning. */
+struct disks_want {
+    uint32_t node;
+    uint32_t ndisks;
+    uint8_t role;
+    uint8_t cap;
+};
+static int p_member_disks(const struct view *v, void *a)
+{
+    const struct disks_want *w = a;
+    const struct meta_member *mb = meta_member(&v->m, w->node);
+    if (!mb || mb->state != META_UP)
+        return 0;
+    return mb->ndisks == w->ndisks && mb->role == w->role && meta_member_effective_cap(mb) == w->cap;
+}
+
+static void scen_disks(void)
+{
+    scenario("disks");
+    char empty_d[PATH_MAX], d0a[PATH_MAX], d0b[PATH_MAX], d1a[PATH_MAX], d1b[PATH_MAX], d2a[PATH_MAX];
+    char df_node[PATH_MAX], df_cl[PATH_MAX];
+    snprintf(empty_d, sizeof empty_d, "%s/empty_mount", base);
+    snprintf(d0a, sizeof d0a, "%s/d0_nvme", base);
+    snprintf(d0b, sizeof d0b, "%s/d0_hdd", base);
+    snprintf(d1a, sizeof d1a, "%s/d1_nvme", base);
+    snprintf(d1b, sizeof d1b, "%s/d1_hdd", base);
+    snprintf(d2a, sizeof d2a, "%s/d2_nvme", base);
+    snprintf(df_node, sizeof df_node, "%s/foreign_node", base);
+    snprintf(df_cl, sizeof df_cl, "%s/foreign_cl", base);
+
+    if (mkdir(empty_d, 0755) != 0)
+        die("disks: mkdir %s: %s", empty_d, strerror(errno));
+    disk_make(d0a, "nvme");
+    disk_make(d0b, "hdd");
+    disk_make(d1a, "nvme");
+    disk_make(d1b, "hdd");
+    disk_make(d2a, "nvme");
+    disk_make(df_node, "hdd");
+    disk_make(df_cl, "hdd");
+
+    disk_meta dm0a, dm0b, dm1a, dm1b;
+    if (disk_load(d0a, &dm0a) != 0 || disk_load(d0b, &dm0b) != 0 || disk_load(d1a, &dm1a) != 0 ||
+        disk_load(d1b, &dm1b) != 0)
+        die("disks: disk_load after disk init failed");
+
+    char xa0[PATH_MAX * 2 + 128], xa1[PATH_MAX * 2 + 128], xa2[PATH_MAX + 128];
+
+    /* 1. Unmounted path (empty directory, no DISK) refused. */
+    no_auto_disk[0] = 1;
+    omit_dir[0] = 1;
+    snprintf(xa0, sizeof xa0, "--disk %s:nvme", empty_d);
+    xargs[0] = xa0;
+    int rc = start_try(0);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(0, "no DISK metadata"))
+        die("disks: unmounted empty dir did not refuse start (%d, 0x%x)", rc, th_status);
+    printf("  unmounted empty path (no DISK) refused\n");
+
+    /* 2. Two --disk on one filesystem refused without --allow-shared-device (catches nodevcheck). */
+    no_shared_dev[0] = 1;
+    snprintf(xa0, sizeof xa0, "--disk %s:nvme --disk %s:hdd", d0a, d0b);
+    xargs[0] = xa0;
+    rc = start_try(0);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(0, "same device (st_dev)"))
+        die("disks: shared st_dev without --allow-shared-device did not refuse (%d, 0x%x)", rc, th_status);
+    printf("  shared st_dev without --allow-shared-device refused\n");
+
+    /* 3. Accepted with --allow-shared-device; form 3-node cluster (node 2 starts --role compute). */
+    no_shared_dev[0] = 0;
+    envs[0] = "setop_file=1";
+    envs[1] = "setop_file=1";
+    envs[2] = "setop_file=1";
+    snprintf(xa0, sizeof xa0, "--disk %s:nvme --disk %s:hdd --metrics-port auto", d0a, d0b);
+    xargs[0] = xa0;
+    start(0);
+    int mport0 = th_mport;
+    if (mport0 <= 0)
+        die("disks: server 0 reported no metrics port");
+
+    no_auto_disk[1] = 1;
+    omit_dir[1] = 1;
+    snprintf(xa1, sizeof xa1, "--disk %s:nvme --disk %s:hdd --metrics-port auto", d1a, d1b);
+    xargs[1] = xa1;
+    start(1);
+    int mport1 = th_mport;
+
+    no_auto_disk[2] = 1;
+    omit_dir[2] = 1;
+    snprintf(xa2, sizeof xa2, "--disk %s:nvme --role compute", d2a);
+    xargs[2] = xa2;
+    start(2);
+
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "disks: three voters");
+
+    struct disks_want w0 = {ids[0], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w1 = {ids[1], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w2 = {ids[2], 1, META_ROLE_COMPUTE, META_CAP_COMPUTE};
+    await_view(0, p_member_disks, &w0, "disks: node 0 STORE_ADD (2 disks)");
+    await_view(0, p_member_disks, &w1, "disks: node 1 STORE_ADD (2 disks)");
+    await_view(0, p_member_disks, &w2, "disks: node 2 STORE_ADD + MEMBER_ROLE compute");
+
+    /* Verify disk_bind wrote (cluster_uuid, node_id) into DISK on first start, and STATUS / metrics warn on shared dev. */
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16], other[16];
+    memcpy(uuid, v.m.uuid, 16);
+    memcpy(other, uuid, 16);
+    other[3] ^= 0x55;
+    int saw_shared_warn = 0;
+    for (uint32_t k = 0; k < v.st.nheard; k++)
+        if (v.st.heard[k].id == ids[0] && v.st.heard[k].sections &&
+            strstr(v.st.heard[k].sections, "warn=allow_shared_device"))
+            saw_shared_warn = 1;
+    view_free(&v);
+    if (!saw_shared_warn)
+        die("disks: STATUS missing warn=allow_shared_device for node 0");
+
+    disk_meta chk0a, chk0b;
+    if (disk_load(d0a, &chk0a) != 0 || !chk0a.bound || chk0a.node_id != ids[0] ||
+        memcmp(chk0a.cluster_uuid, uuid, 16) != 0)
+        die("disks: %s was not bound to cluster/node %" PRIu32, d0a, ids[0]);
+    if (disk_load(d0b, &chk0b) != 0 || !chk0b.bound || chk0b.node_id != ids[0] ||
+        memcmp(chk0b.cluster_uuid, uuid, 16) != 0)
+        die("disks: %s was not bound to cluster/node %" PRIu32, d0b, ids[0]);
+
+    char mbuf[65536];
+    metrics_get(mport0, mbuf, sizeof mbuf);
+    int64_t shv = -1, mmv = -1;
+    if (!metrics_find_i64(mbuf, "\ntsdb_disk_shared_device ", &shv) || shv != 1)
+        die("disks: expected tsdb_disk_shared_device == 1 on node 0");
+    if (!metrics_find_i64(mbuf, "\ntsdb_disk_class_mismatch ", &mmv) || mmv != 0)
+        die("disks: expected tsdb_disk_class_mismatch == 0 on node 0");
+    printf("  first start bound DISK, committed STORE_ADD + MEMBER_ROLE, warned on --allow-shared-device\n");
+
+    /* 4. STORE_ADD committed once per disk across restarts; MEMBER_ROLE changes when --role changes. */
+    for (int r = 0; r < 2; r++) {
+        view(1, &v);
+        const struct meta_member *m0 = meta_member(&v.m, ids[0]);
+        struct state_want up0 = {ids[0], META_UP, m0 ? m0->incarnation + 1 : 1};
+        view_free(&v);
+        stop(0, SIGTERM);
+        start(0);
+        await_view(1, p_member_state, &up0, "disks: node 0 restarted");
+        usleep(700000);
+        view(1, &v);
+        const struct meta_member *m0a = meta_member(&v.m, ids[0]);
+        if (!m0a || m0a->ndisks != 2 || !meta_member_disk(m0a, dm0a.store_id) || !meta_member_disk(m0a, dm0b.store_id))
+            die("disks: node 0 disks changed across restart %d (ndisks=%u)", r, m0a ? m0a->ndisks : 0);
+        view_free(&v);
+    }
+    snprintf(xa2, sizeof xa2, "--disk %s:nvme --role both", d2a);
+    restart_xargs(2, xa2);
+    struct disks_want w2b = {ids[2], 1, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w2b, "disks: node 2 MEMBER_ROLE -> both");
+    printf("  STORE_ADD idempotent across restarts; MEMBER_ROLE updated on --role change\n");
+
+    /* 5. Foreign DISK (another node and another cluster) refused naming both. */
+    if (disk_bind(df_node, uuid, ids[1] + 50) != 0 || disk_bind(df_cl, other, ids[1]) != 0)
+        die("disks: disk_bind foreign failed");
+    stop(1, SIGTERM);
+    char hex[33], ohex[33], need[256];
+    chunk_oid_hex(uuid, hex);
+    chunk_oid_hex(other, ohex);
+
+    snprintf(xa1, sizeof xa1, "--disk %s:hdd", df_node);
+    xargs[1] = xa1;
+    rc = start_try(1);
+    snprintf(need, sizeof need, "belongs to cluster %s node %" PRIu32 ", but this is cluster %s node %" PRIu32, hex,
+             ids[1] + 50, hex, ids[1]);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(1, need))
+        die("disks: foreign node DISK did not refuse naming both (%d, 0x%x)", rc, th_status);
+
+    snprintf(xa1, sizeof xa1, "--disk %s:hdd", df_cl);
+    xargs[1] = xa1;
+    rc = start_try(1);
+    snprintf(need, sizeof need, "belongs to cluster %s node %" PRIu32 ", but this is cluster %s node %" PRIu32, ohex,
+             ids[1], hex, ids[1]);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(1, need))
+        die("disks: foreign cluster DISK did not refuse naming both (%d, 0x%x)", rc, th_status);
+    printf("  foreign node and foreign cluster DISK refused naming both\n");
+
+    /* 6. :hdd stated over an nvme metadata record refused naming both (catches classsilent). */
+    snprintf(xa1, sizeof xa1, "--disk %s:hdd --disk %s:hdd", d1a, d1b);
+    xargs[1] = xa1;
+    rc = start_try(1);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 ||
+        !log_has(1, "stated class hdd disagrees with metadata class nvme"))
+        die("disks: stated :hdd over nvme metadata record did not refuse naming both (%d, 0x%x)", rc, th_status);
+    printf("  stated :hdd over nvme metadata record refused naming both\n");
+
+    /* 7. Detection mismatch logged and counted in tsdb_disk_class_mismatch, NOT refused. */
+    snprintf(xa1, sizeof xa1, "--disk %s:nvme --disk %s:hdd --metrics-port auto", d1a, d1b);
+    xargs[1] = xa1;
+    penv[1] = "TSDB_DISK_DETECT_OVERRIDE=ssd";
+    start(1);
+    mport1 = th_mport;
+    penv[1] = NULL;
+    if (!log_has(1, "detected class ssd disagrees with recorded class"))
+        die("disks: detection mismatch not logged");
+    metrics_get(mport1, mbuf, sizeof mbuf);
+    mmv = -1;
+    if (!metrics_find_i64(mbuf, "\ntsdb_disk_class_mismatch ", &mmv) || mmv != 2)
+        die("disks: expected tsdb_disk_class_mismatch == 2 on node 1, got %" PRId64, mmv);
+    printf("  detection mismatch logged and counted (tsdb_disk_class_mismatch=2), not refused\n");
+
+    /* 8. DISK removed while down -> known store reported missing (DOWN), never made new (catches missingasnew). */
+    view(0, &v);
+    const struct meta_member *m1_pre = meta_member(&v.m, ids[1]);
+    struct state_want up1 = {ids[1], META_UP, m1_pre ? m1_pre->incarnation + 1 : 1};
+    view_free(&v);
+    stop(1, SIGTERM);
+    char d1b_meta[PATH_MAX + 16];
+    snprintf(d1b_meta, sizeof d1b_meta, "%s/DISK", d1b);
+    /* Save bound d1b/DISK bytes so step 8b can restore them after marking the store DESTROYED. */
+    uint8_t saved_disk[8192];
+    size_t saved_disk_len = 0;
+    {
+        FILE *df = fopen(d1b_meta, "rb");
+        if (!df)
+            die("disks: open %s for backup: %s", d1b_meta, strerror(errno));
+        saved_disk_len = fread(saved_disk, 1, sizeof saved_disk, df);
+        fclose(df);
+        if (saved_disk_len == 0 || saved_disk_len == sizeof saved_disk)
+            die("disks: unexpected %s size %zu", d1b_meta, saved_disk_len);
+    }
+    if (unlink(d1b_meta) != 0)
+        die("disks: unlink %s: %s", d1b_meta, strerror(errno));
+    start(1);
+    mport1 = th_mport;
+    await_view(0, p_member_state, &up1, "disks: node 1 restarted with missing DISK");
+    if (access(d1b_meta, F_OK) == 0)
+        die("disks: missing store %s had a new DISK created", d1b);
+    if (!log_has(1, "is missing (no DISK), reporting DOWN"))
+        die("disks: missing known store not logged as DOWN");
+    if (!log_has(1, "chunk store (missing): DOWN_MISSING"))
+        die("disks: missing chunk disk did not keep a DOWN_MISSING slot in chunksrv");
+    metrics_get(mport1, mbuf, sizeof mbuf);
+    int64_t cst = -1;
+    if (!metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"0\"} ", &cst) || cst != 1)
+        die("disks: expected tsdb_chunk_store_state{store=\"0\"} == 1 (DOWN_MISSING), got %" PRId64, cst);
+    char id1b_hex[33], want_down[160];
+    chunk_oid_hex(dm1b.store_id, id1b_hex);
+    snprintf(want_down, sizeof want_down, "id=%s class=hdd uses=chunk state=down", id1b_hex);
+    int saw_down = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000 && !saw_down; usleep(150000)) {
+        view(0, &v);
+        for (uint32_t k = 0; k < v.st.nheard; k++)
+            if (v.st.heard[k].id == ids[1] && v.st.heard[k].sections && strstr(v.st.heard[k].sections, want_down))
+                saw_down = 1;
+        view_free(&v);
+    }
+    if (!saw_down)
+        die("disks: STATUS did not report missing store %s as state=down", id1b_hex);
+    /* Wait 1.5 s and confirm metadata did NOT add a 3rd disk to node 1. */
+    usleep(1500000);
+    view(0, &v);
+    const struct meta_member *m1_post = meta_member(&v.m, ids[1]);
+    if (!m1_post || m1_post->ndisks != 2)
+        die("disks: missing store caused new STORE_ADD (ndisks=%u, expected 2)", m1_post ? m1_post->ndisks : 0);
+    view_free(&v);
+    printf("  DISK removed while down -> known store reported DOWN, never new\n");
+
+    /* 8b. Store marked DESTROYED in metadata -> start with that DISK restored is refused naming the store. */
+    {
+        uint8_t states[3] = {META_STORE_DOWN, META_STORE_OUT, META_STORE_DESTROYED};
+        for (int s = 0; s < 3; s++) {
+            int rl = leader_of(0);
+            if (rl < 0)
+                die("disks: no leader for store_state %u", (unsigned)states[s]);
+            char spath[PATH_MAX + 64];
+            server_dir(rl, spath, sizeof spath);
+            strcat(spath, "/state/setop");
+            FILE *sf = fopen(spath, "w");
+            if (!sf)
+                die("disks: write %s: %s", spath, strerror(errno));
+            fprintf(sf, "store_state %" PRIu32 " %s %u\n", ids[1], id1b_hex, (unsigned)states[s]);
+            fclose(sf);
+            int reached = 0;
+            for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000 && !reached; usleep(100000)) {
+                view(1, &v);
+                const struct meta_member *mb1 = meta_member(&v.m, ids[1]);
+                const struct meta_disk *md1 = mb1 ? meta_member_disk(mb1, dm1b.store_id) : NULL;
+                if (md1 && md1->state == states[s])
+                    reached = 1;
+                view_free(&v);
+            }
+            if (!reached)
+                die("disks: store %s did not reach state %u on node 1", id1b_hex, (unsigned)states[s]);
+        }
+        stop(1, SIGTERM);
+        FILE *rf = fopen(d1b_meta, "wb");
+        if (!rf || fwrite(saved_disk, 1, saved_disk_len, rf) != saved_disk_len || fflush(rf) != 0 ||
+            fsync(fileno(rf)) != 0 || fclose(rf) != 0)
+            die("disks: restore %s failed", d1b_meta);
+        rc = start_try(1);
+        if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 ||
+            !log_has(1, "metadata marks this store DESTROYED"))
+            die("disks: DESTROYED store did not refuse start (%d, 0x%x)", rc, th_status);
+        printf("  store marked DESTROYED in metadata refused at start\n");
+    }
+
+    /* 8c. Replacing a chunk disk at the same path (new store_id while old store_id is still in metadata):
+     * must reuse the single chunk-store slot (store="0" UP, no leaked store="1" NULL slot). */
+    {
+        view(0, &v);
+        const struct meta_member *m0_pre = meta_member(&v.m, ids[0]);
+        struct state_want up0 = {ids[0], META_UP, m0_pre ? m0_pre->incarnation + 1 : 1};
+        view_free(&v);
+        stop(0, SIGTERM);
+        if (nftw(d0b, rm_one, 16, FTW_DEPTH | FTW_PHYS) != 0)
+            die("disks: wipe %s: %s", d0b, strerror(errno));
+        disk_make(d0b, "hdd");
+        start(0);
+        mport0 = th_mport;
+        await_view(2, p_member_state, &up0, "disks: node 0 restarted with replaced chunk disk");
+        metrics_get(mport0, mbuf, sizeof mbuf);
+        int64_t cst0 = -1, cst1 = -1;
+        if (!metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"0\"} ", &cst0) || cst0 != 0)
+            die("disks: expected replaced chunk disk store=\"0\" == 0 (UP), got %" PRId64, cst0);
+        if (metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"1\"} ", &cst1))
+            die("disks: replaced chunk disk leaked a second chunk store slot (store=\"1\"=%" PRId64 ")", cst1);
+        printf("  replaced chunk disk at same path kept 1 UP store slot (no leaked NULL slot)\n");
+    }
+
+    /* 9. Plain --dir in cluster mode works as ssd disk with warning; primary pinned across --disk switch;
+     * removing --dir's DISK refuses start (both alone and alongside --disk X:ssd). */
+    start(3);
+    node_add(0, 3);
+    struct disks_want w3 = {ids[3], 1, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w3, "disks: node 3 (--dir as ssd) STORE_ADD");
+    if (!log_has(3, "used as a cluster disk (class ssd"))
+        die("disks: node 3 --dir missing ssd assumption warning");
+    /* Restart node 3 omitting --dir and adding a faster nvme disk: pinned primary (--dir n3) must remain engine root. */
+    char n3_dir[PATH_MAX + 64], n3_extra[PATH_MAX + 64], xa3[PATH_MAX * 2 + 128];
+    server_dir(3, n3_dir, sizeof n3_dir);
+    snprintf(n3_extra, sizeof n3_extra, "%s/n3_extra_nvme", base);
+    disk_make(n3_extra, "nvme");
+    stop(3, SIGTERM);
+    omit_dir[3] = 1;
+    no_auto_disk[3] = 1;
+    snprintf(xa3, sizeof xa3, "--disk %s:nvme --disk %s:ssd", n3_extra, n3_dir);
+    xargs[3] = xa3;
+    start(3);
+    if (log_has(3, "primary engine disk") && log_has(3, "refusing"))
+        die("disks: node 3 unexpectedly refused pinned primary disk");
+    /* Verify primary engine disk refusal if --dir is pointed at a different disk. */
+    stop(3, SIGTERM);
+    omit_dir[3] = 0;
+    snprintf(xa3, sizeof xa3, "--dir %s --disk %s:ssd", n3_extra, n3_dir);
+    /* Start with explicit --dir n3_extra by overriding omit_dir=1 and passing --dir in xargs. */
+    omit_dir[3] = 1;
+    xargs[3] = xa3;
+    rc = start_try(3);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 ||
+        !log_has(3, "disagrees with recorded primary engine disk"))
+        die("disks: switching --dir to another disk did not refuse start (%d, 0x%x)", rc, th_status);
+    omit_dir[3] = 0;
+    xargs[3] = NULL;
+    char n3_disk[PATH_MAX + 64];
+    server_dir(3, n3_disk, sizeof n3_disk);
+    strcat(n3_disk, "/DISK");
+    if (unlink(n3_disk) != 0)
+        die("disks: unlink %s: %s", n3_disk, strerror(errno));
+    no_auto_disk[3] = 1;
+    rc = start_try(3);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 ||
+        !log_has(3, "refusing to open an unmounted engine directory"))
+        die("disks: missing --dir DISK did not refuse start (%d, 0x%x)", rc, th_status);
+    /* Passing --dir X alongside --disk X:ssd must NOT bypass the unmounted engine-dir refusal. */
+    snprintf(xa3, sizeof xa3, "--disk %s:ssd", n3_dir);
+    xargs[3] = xa3;
+    rc = start_try(3);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 ||
+        !log_has(3, "refusing to open an unmounted engine directory"))
+        die("disks: missing --dir DISK with matching --disk X:ssd did not refuse start (%d, 0x%x)", rc, th_status);
+    xargs[3] = NULL;
+    printf("  --dir in cluster mode pinned as primary and refused when switched or unmounted (alone and with --disk)\n");
+
+    /* 10. Witness Raft leader decodes HBS_DISKS and commits STORE_ADD + MEMBER_ROLE (separate 2-node cluster). */
+    char wdir[PATH_MAX + 64], d5a[PATH_MAX], xa5[PATH_MAX + 128];
+    server_dir(4, wdir, sizeof wdir);
+    if (mkdir(wdir, 0755) != 0)
+        die("disks: mkdir %s: %s", wdir, strerror(errno));
+    snprintf(d5a, sizeof d5a, "%s/d5_nvme", base);
+    disk_make(d5a, "nvme");
+    is_witness[4] = 1;
+    xargs[4] = "--peer-port 0";
+    start(4);
+    no_auto_disk[5] = 1;
+    omit_dir[5] = 1;
+    snprintf(xa5, sizeof xa5, "--disk %s:nvme --role compute", d5a);
+    xargs[5] = xa5;
+    start(5);
+    init_cluster(4, 600);
+    node_add(4, 5);
+    struct disks_want w5 = {ids[5], 1, META_ROLE_COMPUTE, META_CAP_COMPUTE};
+    await_view(4, p_member_disks, &w5, "disks: witness leader commits STORE_ADD + MEMBER_ROLE");
+    printf("  witness Raft leader decoded HBS_DISKS and committed STORE_ADD + MEMBER_ROLE\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -28911,7 +29416,8 @@ int main(int argc, char **argv)
                {"nodehold", scen_nodehold}, {"nodeout", scen_nodeout}, {"nodedrain", scen_nodedrain},
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
                {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
-               {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub}};
+               {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub},
+               {"disks", scen_disks}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

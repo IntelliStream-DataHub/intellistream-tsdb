@@ -344,16 +344,18 @@ refused "--peer-port with no cluster" 'cluster settings are given (--peer-port)'
 # a bare --cluster=false with no file keys is just off
 out=$("$B/tsdbd" --no-config --dir /x --cluster=false --check-config 2>&1) || fail "--cluster=false alone: $out"
 
-# the keys that the device classes will take are reserved: in the table, refused when a file sets one
-for k in storage.disks; do
-    "$B/tsdbd" --config-keys | grep -q "^| \`$k\` | " || fail "--config-keys does not list the reserved key $k"
-    cfg res.properties 'storage.dir = /x' "$k = /nvme0:nvme, /hdd1:hdd"
-    refused "reserved key $k" "res.properties:2: $k is reserved and not implemented yet" \
-        "$B/tsdbd" --config "$dir/res.properties" --check-config
-    refused "reserved key $k with --no-config" "res.properties:2: $k is reserved" \
-        "$B/tsdbd" --config "$dir/res.properties" --dir /y --check-config
-done
-"$B/tsdbd" --no-config --dir /x --check-config 2>&1 | grep -q '^storage.disks' && fail "--check-config prints a reserved key"
+# storage.disks, cluster.role and cluster.allow.shared.device (R13 r13-start)
+cfg diskcfg.properties 'cluster.enabled = true' 'cluster.secret.file = /s' 'cluster.state.dir = /st' \
+    'storage.disks = /nvme0:nvme, /hdd1:hdd' 'cluster.role = both' 'cluster.allow.shared.device = true'
+out=$("$B/tsdbd" --config "$dir/diskcfg.properties" --check-config 2>&1) || fail "storage.disks/role refused: $out"
+check "storage.disks effective" "$(echo "$out" | grep '^storage.disks = ')" "storage.disks = /nvme0:nvme, /hdd1:hdd"
+check "cluster.role effective" "$(echo "$out" | grep '^cluster.role = ')" "cluster.role = both"
+check "cluster.allow.shared.device effective" "$(echo "$out" | grep '^cluster.allow.shared.device = ')" "cluster.allow.shared.device = true"
+refused "--disk without --cluster" "for --cluster" "$B/tsdbd" --no-config --dir /x --disk /nvme0:nvme --check-config
+refused "bad --disk class" "unknown class" "$B/tsdbd" --no-config --cluster --cluster-secret-file /s --state-dir /st --disk /nvme0:tape --check-config
+refused "bad --role" "expected both, compute or storage" "$B/tsdbd" --no-config --dir /x --cluster --cluster-secret-file /s --state-dir /st --role worker --check-config
+refused "--role without --cluster" "cluster settings are given (--role)" "$B/tsdbd" --no-config --dir /x --role compute --check-config
+refused "--allow-shared-device without --cluster" "cluster settings are given (--allow-shared-device)" "$B/tsdbd" --no-config --dir /x --allow-shared-device --check-config
 
 # storage.tiers and storage.tier.cache (R15 D16, D17)
 cfg tiercfg.properties 'storage.dir = /x' 'storage.tiers = /mnt/t0:hdd, /mnt/t1:ssd' 'storage.tier.cache = 128M'
