@@ -232,7 +232,7 @@ $(B)/cfg.o: tools/cfg.c tools/cfg.h tools/props.h | $(B)
 
 # CLUSTER_OBJ (defined further down, with the cluster) is a prerequisite there too: `tsdb cluster` (cluster-cli.c)
 $(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c tools/cluster-cli.c tools/cfg.h \
-          src/disk.h server/cluster.h client/tsdb_client.h $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(CFG_OBJ) $(LIB)
+          src/disk.h src/tiers.h server/cluster.h client/tsdb_client.h $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -DTSDB_FORMAT_VERSION=$(TSDB_FORMAT) -o $@ $< tools/dump.c \
 	    tools/users-cli.c $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ) $(CFG_OBJ) $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 
@@ -632,6 +632,7 @@ test-units-b7:
 	B=$(B) tests/test_cli_users.sh
 	B=$(B) tests/test_cli_diverged.sh
 	B=$(B) tests/test_cli_feed.sh
+	B=$(B) tests/test_cli_tier.sh
 	B=$(B) tests/test_cli_chunkstore.sh
 	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)
 	./$(B)/test_export $(SCRATCH)

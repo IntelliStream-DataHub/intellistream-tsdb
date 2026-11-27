@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Command line client for a tsdb directory. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "cfg.h"
 #include "common.h"
 #include "dump.h"
@@ -9,8 +12,10 @@
 #include "../src/disk.h"
 #include "../src/ecdiverge.h"
 #include "../src/ecunsettle.h"
+#include "../src/tiers.h"
 #include "tsdb_calendar.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -18,6 +23,7 @@
 #include <math.h>
 #include <pwd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #ifndef TSDB_BUILD_VERSION
@@ -248,6 +254,23 @@ static void usage(void)
             "  volume diverged [PATH] [--clear]   the DIVERGED records of volume PATH (default: DIR), whose\n"
             "                                     settled data did not match; --clear (with the writer stopped)\n"
             "                                     removes them so it is served again; refused on a cluster volume\n"
+            "  tier add PATH[:CLASS] [--single-copy] [--allow-shared-device]\n"
+            "                                     add a local tier chunk store (class: nvme, ssd, hdd or\n"
+            "                                     unknown, recorded as stated; --single-copy permits m=0\n"
+            "                                     when redundant underneath); appends to TIERS beside a\n"
+            "                                     running tsdbd (takes effect at next open)\n"
+            "  tier set [--redundancy K+M] [--after DUR] [--high-pct N] [--volume N]\n"
+            "                                     change tier settings (whole database or --volume N;\n"
+            "                                     also --young-high-pct, --rebuild-mb-s, --scrub-mb-s,\n"
+            "                                     --scrub-days); appends to TIERS beside a running tsdbd\n"
+            "                                     (takes effect at next open)\n"
+            "  tier lost STORE (--replace PATH | --shrink)\n"
+            "                                     declare a tier store permanently lost and rebuild onto\n"
+            "                                     a replacement or shrink onto the remaining stores\n"
+            "  tier salvage [--partition P] [--force]\n"
+            "                                     drop settled objects with more than m stores lost\n"
+            "  tier status [--json]               tier stores, bytes per volume and store, margin,\n"
+            "                                     settles waiting, days to full, damage and progress\n"
             "  upgrade                            carry a database closed cleanly by 0.9.x\n"
             "                                     (disk format 8) over to this one, in place; stop followers first\n"
             "  latest NAME... [--with-nulls] [--end TIME]\n"
@@ -1670,6 +1693,1182 @@ static int check_volume_of_dir(const char *dir, const char *path)
     return 0;
 }
 
+/* -------------------------------------------------------------------- tier */
+
+static int tier_usage(void)
+{
+    fprintf(stderr,
+            "usage: tsdb <dir> tier add PATH[:CLASS] [--single-copy] [--allow-shared-device]\n"
+            "       tsdb <dir> tier set [--redundancy K+M] [--after DUR] [--high-pct N] [--volume N]\n"
+            "                           [--young-high-pct N] [--rebuild-mb-s N] [--scrub-mb-s N] [--scrub-days N]\n"
+            "       tsdb <dir> tier lost STORE (--replace PATH | --shrink)\n"
+            "       tsdb <dir> tier salvage [--partition P] [--force]\n"
+            "       tsdb <dir> tier status [--json]\n");
+    return 2;
+}
+
+static bool tier_parse_u32(const char *s, uint32_t lo, uint32_t hi, uint32_t *out)
+{
+    if (!s || !isdigit((unsigned char)*s))
+        return false;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno || !end || *end || v < lo || v > hi)
+        return false;
+    *out = (uint32_t)v;
+    return true;
+}
+
+static bool tier_parse_i64(const char *s, int64_t *out)
+{
+    if (!s || !*s)
+        return false;
+    const char *p = (*s == '-') ? s + 1 : s;
+    if (!isdigit((unsigned char)*p))
+        return false;
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (errno || !end || *end)
+        return false;
+    *out = (int64_t)v;
+    return true;
+}
+
+/* Duration in seconds: plain seconds or with unit s, m, h, d, w (0 .. max_s). */
+static bool tier_parse_dur_s(const char *s, uint64_t max_s, uint64_t *out)
+{
+    if (!s || !isdigit((unsigned char)*s))
+        return false;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno || !end || end == s)
+        return false;
+    uint64_t mult = 1;
+    if (*end) {
+        if (end[1] != '\0')
+            return false;
+        if (*end == 's')
+            mult = 1;
+        else if (*end == 'm')
+            mult = 60;
+        else if (*end == 'h')
+            mult = 3600;
+        else if (*end == 'd')
+            mult = 86400;
+        else if (*end == 'w')
+            mult = 604800;
+        else
+            return false;
+    }
+    if (v > max_s / mult)
+        return false;
+    *out = (uint64_t)v * mult;
+    return true;
+}
+
+static bool tier_parse_redundancy(const char *s, uint16_t *k_out, uint16_t *m_out)
+{
+    if (!s || !*s)
+        return false;
+    const char *plus = strchr(s, '+');
+    if (!plus || plus == s || !plus[1] || strchr(plus + 1, '+'))
+        return false;
+    char kbuf[16];
+    size_t klen = (size_t)(plus - s);
+    if (klen >= sizeof kbuf)
+        return false;
+    memcpy(kbuf, s, klen);
+    kbuf[klen] = '\0';
+    uint32_t k = 0, m = 0;
+    if (!tier_parse_u32(kbuf, 1, CHUNK_K_MAX, &k) || !tier_parse_u32(plus + 1, 0, CHUNK_M_MAX, &m))
+        return false;
+    if (m == 0 && k != 1)
+        return false;
+    *k_out = (uint16_t)k;
+    *m_out = (uint16_t)m;
+    return true;
+}
+
+/* Split PATH[:CLASS] on the last ':' after the last '/' (as `tsdb disk init` does). */
+static int tier_parse_path_class(const char *arg, char *pathbuf, size_t pathcap, const char **cls_out,
+                                 uint8_t *cls_val_out)
+{
+    const char *slash = strrchr(arg, '/');
+    const char *colon = strrchr(slash ? slash + 1 : arg, ':');
+    if (colon) {
+        size_t plen = (size_t)(colon - arg);
+        if (plen == 0 || plen >= pathcap) {
+            fprintf(stderr, "tsdb: tier add: invalid path '%s'\n", arg);
+            return 2;
+        }
+        if (!colon[1] || tiers_class_parse(colon + 1, cls_val_out) != 0) {
+            fprintf(stderr, "tsdb: tier add: unknown class '%s' (expected nvme, ssd, hdd or unknown)\n", colon + 1);
+            return 2;
+        }
+        memcpy(pathbuf, arg, plen);
+        pathbuf[plen] = '\0';
+        *cls_out = colon + 1;
+    } else {
+        if (strlen(arg) >= pathcap) {
+            fprintf(stderr, "tsdb: tier add: path too long\n");
+            return 2;
+        }
+        snprintf(pathbuf, pathcap, "%s", arg);
+        *cls_out = NULL;
+        *cls_val_out = TSDB_TIER_CLASS_UNKNOWN;
+    }
+    return 0;
+}
+
+#ifdef TSDB_EC
+/* Declared in src/tier.h (not included here to avoid pulling in src/internal.h). */
+extern bool tier_default_geom(int nstores, bool all_single_copy, int *k_out, int *m_out);
+
+static int tier_ofd_lock(int fd, short type)
+{
+    struct flock fl = {.l_type = type, .l_whence = SEEK_SET};
+    int r;
+    while ((r = fcntl(fd, F_OFD_SETLKW, &fl)) != 0 && errno == EINTR)
+        ;
+    return r == 0 ? 0 : TSDB_ERR_IO;
+}
+
+static int tier_read_fd_all(int fd, size_t max_bytes, char **out, size_t *len_out)
+{
+    *out = NULL;
+    *len_out = 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t)st.st_size > max_bytes)
+        return TSDB_ERR_IO;
+    size_t sz = (size_t)st.st_size;
+    char *buf = malloc(sz + 1);
+    if (!buf)
+        return TSDB_ERR_NOMEM;
+    size_t got = 0;
+    while (got < sz) {
+        ssize_t r = pread(fd, buf + got, sz - got, (off_t)got);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0) {
+            free(buf);
+            return TSDB_ERR_IO;
+        }
+        got += (size_t)r;
+    }
+    buf[sz] = '\0';
+    *out = buf;
+    *len_out = sz;
+    return 0;
+}
+
+/* Verify <rootfd>/META belongs to a local single-server database root of this disk format.
+ * Matches src/volumes.c:tier_add_impl (rejects unknown requires=, cluster/replica, and parts_v8= on writes). */
+static int tier_check_root_meta(int rootfd, const char *dir, bool for_write)
+{
+    int fd = openat(rootfd, "META", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "tsdb: %s/META: %s\n", dir, strerror(errno));
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    }
+    char *txt = NULL;
+    size_t len = 0;
+    int rc = tier_read_fd_all(fd, 1u << 20, &txt, &len);
+    close(fd);
+    if (rc != 0) {
+        fprintf(stderr, "tsdb: %s/META: read failed\n", dir);
+        return rc;
+    }
+    int version = 0;
+    long vnum = 0;
+    bool bad_req = false, has_v8 = false;
+    for (const char *l = txt; *l;) {
+        const char *nl = strchr(l, '\n');
+        size_t ll = nl ? (size_t)(nl - l) : strlen(l);
+        if (ll > 8 && memcmp(l, "version=", 8) == 0) {
+            uint32_t v = 0;
+            char tmp[32];
+            if (ll - 8 < sizeof tmp) {
+                memcpy(tmp, l + 8, ll - 8);
+                tmp[ll - 8] = '\0';
+                if (tier_parse_u32(tmp, 1, 9999, &v))
+                    version = (int)v;
+            }
+        } else if (ll > 7 && memcmp(l, "volume=", 7) == 0) {
+            uint32_t v = 0;
+            char tmp[32];
+            if (ll - 7 < sizeof tmp) {
+                memcpy(tmp, l + 7, ll - 7);
+                tmp[ll - 7] = '\0';
+                if (tier_parse_u32(tmp, 0, 65535, &v))
+                    vnum = (long)v;
+                else
+                    vnum = -1;
+            } else {
+                vnum = -1;
+            }
+        } else if (ll >= 9 && memcmp(l, "parts_v8=", 9) == 0) {
+            has_v8 = true;
+        } else if (ll >= 9 && memcmp(l, "requires=", 9) == 0) {
+            const char *p = l + 9, *end = l + ll;
+            while (p < end) {
+                const char *c = memchr(p, ',', (size_t)(end - p));
+                size_t tl = c ? (size_t)(c - p) : (size_t)(end - p);
+                bool ok_tok = (tl == 0) || (tl == 4 && memcmp(p, "feed", 4) == 0) ||
+                              (tl == 4 && memcmp(p, "tier", 4) == 0) || (tl == 2 && memcmp(p, "ec", 2) == 0);
+                if (!ok_tok)
+                    bad_req = true;
+                p = c ? c + 1 : end;
+            }
+        }
+        l = nl ? nl + 1 : l + ll;
+    }
+    free(txt);
+    if (version != TSDB_FORMAT_VERSION || vnum != 0 || bad_req) {
+        fprintf(stderr, "tsdb: %s/META is not a local format %d database root: refused\n", dir, TSDB_FORMAT_VERSION);
+        return TSDB_ERR_INVALID;
+    }
+    if (for_write && has_v8) {
+        fprintf(stderr, "tsdb: %s/META still records format-8 parts (parts_v8=); run `tsdb %s optimize` first: refused\n",
+                dir, dir);
+        return TSDB_ERR_INVALID;
+    }
+    return 0;
+}
+
+static void tier_free_paths(char **paths, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        free(paths[i]);
+    free(paths);
+}
+
+/* Parse extra volumes from an open VOLUMES fd (ignores an incomplete torn tail without '\n'). */
+static int tier_read_volumes_fd(int vfd, const char *dir, char ***paths_out, size_t *n_out)
+{
+    *paths_out = NULL;
+    *n_out = 0;
+    char *txt = NULL;
+    size_t len = 0;
+    int rc = tier_read_fd_all(vfd, 16u << 20, &txt, &len);
+    if (rc != 0) {
+        fprintf(stderr, "tsdb: %s/VOLUMES: read failed\n", dir);
+        return rc;
+    }
+    char **paths = NULL;
+    size_t n = 0, cap = 0;
+    for (char *line = txt; line < txt + len;) {
+        char *nl = memchr(line, '\n', len - (size_t)(line - txt));
+        if (!nl)
+            break; /* torn tail: never an acknowledged volume */
+        *nl = '\0';
+        size_t ll = (size_t)(nl - line);
+        if (!vol_line_ok_cli(line, ll, n + 1)) {
+            fprintf(stderr, "tsdb: %s/VOLUMES: line %zu is damaged\n", dir, n + 1);
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        if (n == cap) {
+            cap = cap ? cap * 2 : 8;
+            char **np = realloc(paths, cap * sizeof *np);
+            if (!np) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            paths = np;
+        }
+        paths[n] = strdup(line + 9);
+        if (!paths[n]) {
+            rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        n++;
+        line = nl + 1;
+    }
+    free(txt);
+    if (rc != 0) {
+        tier_free_paths(paths, n);
+        return rc;
+    }
+    *paths_out = paths;
+    *n_out = n;
+    return 0;
+}
+
+static void tier_scan_store_bytes(const char *store_path, size_t nvols, uint64_t *store_total, uint64_t *vol_totals,
+                                  uint64_t *vol_store_col, size_t store_idx, size_t nstores, bool *partial_out)
+{
+    int sfd = open(store_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (sfd < 0) {
+        fprintf(stderr, "tsdb: tier status: %s: %s (byte counts partial)\n", store_path, strerror(errno));
+        *partial_out = true;
+        return;
+    }
+    DIR *sd = fdopendir(sfd);
+    if (!sd) {
+        fprintf(stderr, "tsdb: tier status: %s: %s (byte counts partial)\n", store_path, strerror(errno));
+        close(sfd);
+        *partial_out = true;
+        return;
+    }
+    struct dirent *de;
+    for (;;) {
+        errno = 0;
+        de = readdir(sd);
+        if (!de) {
+            if (errno != 0) {
+                fprintf(stderr, "tsdb: tier status: %s: readdir failed: %s (byte counts partial)\n", store_path,
+                        strerror(errno));
+                *partial_out = true;
+            }
+            break;
+        }
+        const char *nm = de->d_name;
+        if (nm[0] != 's' || !isdigit((unsigned char)nm[1]))
+            continue;
+        if (nm[1] == '0' && nm[2] != '\0')
+            continue;
+        uint32_t vol = 0;
+        if (!tier_parse_u32(nm + 1, 0, 65534, &vol))
+            continue;
+        int vfd = openat(dirfd(sd), nm, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (vfd < 0) {
+            if (errno != ENOENT) {
+                fprintf(stderr, "tsdb: tier status: %s/%s: %s (byte counts partial)\n", store_path, nm, strerror(errno));
+                *partial_out = true;
+            }
+            continue;
+        }
+        DIR *vd = fdopendir(vfd);
+        if (!vd) {
+            fprintf(stderr, "tsdb: tier status: %s/%s: %s (byte counts partial)\n", store_path, nm, strerror(errno));
+            close(vfd);
+            *partial_out = true;
+            continue;
+        }
+        struct dirent *fe;
+        for (;;) {
+            errno = 0;
+            fe = readdir(vd);
+            if (!fe) {
+                if (errno != 0) {
+                    fprintf(stderr, "tsdb: tier status: %s/%s: readdir failed: %s (byte counts partial)\n", store_path,
+                            nm, strerror(errno));
+                    *partial_out = true;
+                }
+                break;
+            }
+            size_t fl = strlen(fe->d_name);
+            if (fl <= 6 || strcmp(fe->d_name + fl - 6, ".chunk") != 0)
+                continue;
+            struct stat st;
+            if (fstatat(dirfd(vd), fe->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                if (errno != ENOENT) {
+                    fprintf(stderr, "tsdb: tier status: %s/%s/%s: %s (byte counts partial)\n", store_path, nm,
+                            fe->d_name, strerror(errno));
+                    *partial_out = true;
+                }
+                continue;
+            }
+            if (!S_ISREG(st.st_mode) || st.st_size < 0)
+                continue;
+            uint64_t sz = (uint64_t)st.st_size;
+            *store_total += sz;
+            if (vol < nvols) {
+                vol_totals[vol] += sz;
+                vol_store_col[(size_t)vol * nstores + store_idx] += sz;
+            }
+        }
+        closedir(vd);
+    }
+    closedir(sd);
+}
+
+static void tier_scan_vol_ec(const char *vol_path, uint64_t *ec_parts_out, uint64_t *ec_bytes_out, bool *partial_out)
+{
+    *ec_parts_out = 0;
+    *ec_bytes_out = 0;
+    int vfd = open(vol_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (vfd < 0) {
+        fprintf(stderr, "tsdb: tier status: %s: %s (volume counts partial)\n", vol_path, strerror(errno));
+        *partial_out = true;
+        return;
+    }
+    DIR *d = fdopendir(vfd);
+    if (!d) {
+        fprintf(stderr, "tsdb: tier status: %s: %s (volume counts partial)\n", vol_path, strerror(errno));
+        close(vfd);
+        *partial_out = true;
+        return;
+    }
+    struct dirent *e;
+    for (;;) {
+        errno = 0;
+        e = readdir(d);
+        if (!e) {
+            if (errno != 0) {
+                fprintf(stderr, "tsdb: tier status: %s: readdir failed: %s (volume counts partial)\n", vol_path,
+                        strerror(errno));
+                *partial_out = true;
+            }
+            break;
+        }
+        const char *nm = e->d_name;
+        size_t nl = strlen(nm);
+        if (nl <= 3 || strcmp(nm + nl - 3, ".ec") != 0)
+            continue;
+        if (strncmp(nm, "retired_", 8) == 0 || strncmp(nm, "tmp_", 4) == 0)
+            continue;
+        struct stat st;
+        if (fstatat(dirfd(d), nm, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT) {
+                fprintf(stderr, "tsdb: tier status: %s/%s: %s (volume counts partial)\n", vol_path, nm, strerror(errno));
+                *partial_out = true;
+            }
+            continue;
+        }
+        if (!S_ISREG(st.st_mode) || st.st_size < 0)
+            continue;
+        (*ec_parts_out)++;
+        *ec_bytes_out += (uint64_t)st.st_size;
+    }
+    closedir(d);
+}
+
+static void json_put_str(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"': fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\b': fputs("\\b", f); break;
+        case '\f': fputs("\\f", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default:
+            if (*p < 0x20)
+                fprintf(f, "\\u%04x", (unsigned)*p);
+            else
+                fputc(*p, f);
+            break;
+        }
+    }
+    fputc('"', f);
+}
+#endif /* TSDB_EC */
+
+static int cmd_tier_add(const char *dir, int argc, char **argv)
+{
+    const char *arg = NULL;
+    uint32_t flags = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--single-copy") == 0) {
+            flags |= TSDB_TIER_SINGLE_COPY;
+        } else if (strcmp(argv[i], "--allow-shared-device") == 0) {
+            flags |= TSDB_TIER_ALLOW_SHARED_DEV;
+        } else if (!arg && argv[i][0] != '-') {
+            arg = argv[i];
+        } else {
+            return tier_usage();
+        }
+    }
+    if (!arg || !*arg)
+        return tier_usage();
+    char pathbuf[PATH_MAX];
+    const char *cls = NULL;
+    uint8_t cls_val = TSDB_TIER_CLASS_UNKNOWN;
+    int prc = tier_parse_path_class(arg, pathbuf, sizeof pathbuf, &cls, &cls_val);
+    if (prc != 0)
+        return prc;
+    if (pathbuf[0] != '/') {
+        fprintf(stderr, "tsdb: tier add: %s: store path must be absolute\n", pathbuf);
+        return 1;
+    }
+    int rc = tsdb_tier_add_dir(dir, pathbuf, cls, flags);
+    if (rc != 0) {
+        fprintf(stderr, "tsdb: tier add %s: %s\n", pathbuf, tsdb_strerror(rc));
+        return 1;
+    }
+#ifdef TSDB_EC
+    char canon[PATH_MAX];
+    const char *shown = realpath(pathbuf, canon) ? canon : pathbuf;
+    uint8_t sid[16];
+    if (chunk_store_meta_read(shown, sid, NULL) == 0) {
+        char hex[33];
+        chunk_oid_hex(sid, hex);
+        printf("tier store %s: id %s, class %s%s (takes effect when the database is next opened)\n", shown, hex,
+               tiers_class_name(cls_val), (flags & TSDB_TIER_SINGLE_COPY) ? ", single-copy" : "");
+        return 0;
+    }
+#endif
+    printf("tier store %s: class %s%s (takes effect when the database is next opened)\n", pathbuf,
+           tiers_class_name(cls_val), (flags & TSDB_TIER_SINGLE_COPY) ? ", single-copy" : "");
+    return 0;
+}
+
+static int cmd_tier_set(const char *dir, int argc, char **argv)
+{
+    tiers_settings s;
+    memset(&s, 0, sizeof s);
+    uint32_t volume = TIERS_VOL_ALL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--redundancy") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!tier_parse_redundancy(val, &s.k, &s.m)) {
+                fprintf(stderr, "tsdb: tier set: invalid --redundancy '%s' (expected K+M, K 1..%d, M 0..%d, M=0 only with K=1)\n",
+                        val, CHUNK_K_MAX, CHUNK_M_MAX);
+                return 2;
+            }
+            s.set_mask |= TSDB_TIER_SET_REDUNDANCY;
+        } else if (strcmp(argv[i], "--after") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!tier_parse_dur_s(val, 315360000ull, &s.tier_after_s)) {
+                fprintf(stderr, "tsdb: tier set: invalid --after '%s' (expected duration e.g. 7d, 24h, 3600s)\n", val);
+                return 2;
+            }
+            s.set_mask |= TSDB_TIER_SET_AFTER;
+        } else if (strcmp(argv[i], "--high-pct") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!tier_parse_u32(val, 1, 100, &s.tier_high_pct)) {
+                fprintf(stderr, "tsdb: tier set: invalid --high-pct '%s' (expected 1..100)\n", val);
+                return 2;
+            }
+            s.set_mask |= TSDB_TIER_SET_HIGH_PCT;
+        } else if (strcmp(argv[i], "--young-high-pct") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!tier_parse_u32(val, 1, 100, &s.young_high_pct)) {
+                fprintf(stderr, "tsdb: tier set: invalid --young-high-pct '%s' (expected 1..100)\n", val);
+                return 2;
+            }
+            s.set_mask |= TSDB_TIER_SET_YOUNG_HIGH_PCT;
+        } else if (strcmp(argv[i], "--rebuild-mb-s") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!tier_parse_u32(val, 1, 100000, &s.rebuild_mb_s)) {
+                fprintf(stderr, "tsdb: tier set: invalid --rebuild-mb-s '%s' (expected 1..100000)\n", val);
+                return 2;
+            }
+            s.set_mask |= TSDB_TIER_SET_REBUILD_MB_S;
+        } else if (strcmp(argv[i], "--scrub-mb-s") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!tier_parse_u32(val, 1, 100000, &s.scrub_mb_s)) {
+                fprintf(stderr, "tsdb: tier set: invalid --scrub-mb-s '%s' (expected 1..100000)\n", val);
+                return 2;
+            }
+            s.set_mask |= TSDB_TIER_SET_SCRUB_MB_S;
+        } else if (strcmp(argv[i], "--scrub-days") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!tier_parse_u32(val, 0, 3650, &s.scrub_days)) {
+                fprintf(stderr, "tsdb: tier set: invalid --scrub-days '%s' (expected 0..3650)\n", val);
+                return 2;
+            }
+            s.set_mask |= TSDB_TIER_SET_SCRUB_DAYS;
+        } else if (strcmp(argv[i], "--volume") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!tier_parse_u32(val, 0, 65534, &volume)) {
+                fprintf(stderr, "tsdb: tier set: invalid --volume '%s' (expected 0..65534)\n", val);
+                return 2;
+            }
+        } else {
+            return tier_usage();
+        }
+    }
+    if (s.set_mask == 0) {
+        fprintf(stderr, "tsdb: tier set: specify at least one setting\n");
+        return tier_usage();
+    }
+#ifndef TSDB_EC
+    (void)dir;
+    fprintf(stderr, "tsdb: tier set: not built with the erasure codec (TSDB_EC)\n");
+    return 1;
+#else
+    char root[PATH_MAX];
+    if (!realpath(dir, root)) {
+        fprintf(stderr, "tsdb: %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    int rootfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0) {
+        fprintf(stderr, "tsdb: %s: %s\n", root, strerror(errno));
+        return 1;
+    }
+    int rc = tier_check_root_meta(rootfd, root, true);
+    if (rc != 0) {
+        close(rootfd);
+        return 1;
+    }
+    bool vol_existed = faccessat(rootfd, "VOLUMES", F_OK, AT_SYMLINK_NOFOLLOW) == 0;
+    int vfd = openat(rootfd, "VOLUMES", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (vfd < 0) {
+        fprintf(stderr, "tsdb: %s/VOLUMES: %s\n", root, strerror(errno));
+        close(rootfd);
+        return 1;
+    }
+    char **vpaths = NULL;
+    size_t nv = 0;
+    tiers_view tv;
+    tiers_view_init(&tv);
+    rc = tier_ofd_lock(vfd, F_WRLCK);
+    if (rc != 0)
+        fprintf(stderr, "tsdb: %s/VOLUMES: lock failed: %s\n", root, strerror(errno));
+    if (rc == 0)
+        rc = tier_read_volumes_fd(vfd, root, &vpaths, &nv);
+    if (rc == 0)
+        rc = tiers_load(rootfd, false, false, &tv);
+    bool has_db_id = false;
+    uint8_t db_id[16];
+    if (rc == 0) {
+        if (tv.nstores == 0) {
+            fprintf(stderr, "tsdb: tier set: %s has no tier stores; add stores with `tier add` first\n", root);
+            rc = TSDB_ERR_INVALID;
+        } else {
+            rc = tiers_db_id_read(rootfd, &has_db_id, db_id);
+            if (rc == 0 && !has_db_id) {
+                fprintf(stderr, "tsdb: tier set: %s/%s lists %zu store(s) but root META has no db_id=: refused\n",
+                        root, TIERS_FILE, tv.nstores);
+                rc = TSDB_ERR_CORRUPT;
+            }
+        }
+    }
+    if (rc == 0 && volume != TIERS_VOL_ALL && (size_t)volume > nv) {
+        fprintf(stderr, "tsdb: tier set: volume %u does not exist (database has %zu volume(s))\n", volume, nv + 1);
+        rc = TSDB_ERR_INVALID;
+    }
+    if (rc == 0 && (s.set_mask & TSDB_TIER_SET_REDUNDANCY)) {
+        bool all_sc = true;
+        size_t active_stores = 0;
+        for (size_t i = 0; i < tv.nstores; i++) {
+            if (!tv.stores[i].single_copy)
+                all_sc = false;
+            if (tv.stores[i].state != TIERS_STATE_LOST)
+                active_stores++;
+        }
+        if (s.m == 0) {
+            if (s.k != 1 || !all_sc) {
+                fprintf(stderr, "tsdb: tier set: %u+0 redundancy requires k = 1 and every store to be --single-copy\n",
+                        (unsigned)s.k);
+                rc = TSDB_ERR_INVALID;
+            }
+        } else if ((size_t)s.k + (size_t)s.m > tv.nstores) {
+            fprintf(stderr, "tsdb: tier set: redundancy %u+%u requires %u stores, only %zu configured\n",
+                    (unsigned)s.k, (unsigned)s.m, (unsigned)(s.k + s.m), tv.nstores);
+            rc = TSDB_ERR_INVALID;
+        } else if ((size_t)s.k + (size_t)s.m > active_stores) {
+            fprintf(stderr, "tsdb: tier set: warning: redundancy %u+%u needs %u stores, only %zu non-lost store(s) "
+                            "currently active; settles will wait until lost stores are replaced\n",
+                    (unsigned)s.k, (unsigned)s.m, (unsigned)(s.k + s.m), active_stores);
+        }
+    }
+    if (rc == 0) {
+        rc = tiers_append_settings(rootfd, true, volume, &s);
+        if (rc != 0)
+            fprintf(stderr, "tsdb: tier set: %s\n", tsdb_strerror(rc));
+        else if (!vol_existed && fsync(rootfd) != 0) {
+            fprintf(stderr, "tsdb: tier set: %s: directory fsync failed: %s\n", root, strerror(errno));
+            rc = TSDB_ERR_IO;
+        }
+    }
+    tiers_view_free(&tv);
+    tier_free_paths(vpaths, nv);
+    close(vfd); /* releases VOLUMES OFD write lock */
+    close(rootfd);
+    if (rc != 0)
+        return 1;
+    if (volume == TIERS_VOL_ALL)
+        printf("tier set (all volumes):");
+    else
+        printf("tier set (volume %u):", volume);
+    if (s.set_mask & TSDB_TIER_SET_REDUNDANCY)
+        printf(" redundancy=%u+%u", (unsigned)s.k, (unsigned)s.m);
+    if (s.set_mask & TSDB_TIER_SET_AFTER)
+        printf(" after=%" PRIu64 "s", s.tier_after_s);
+    if (s.set_mask & TSDB_TIER_SET_HIGH_PCT)
+        printf(" high_pct=%u%%", s.tier_high_pct);
+    if (s.set_mask & TSDB_TIER_SET_YOUNG_HIGH_PCT)
+        printf(" young_high_pct=%u%%", s.young_high_pct);
+    if (s.set_mask & TSDB_TIER_SET_REBUILD_MB_S)
+        printf(" rebuild_mb_s=%u", s.rebuild_mb_s);
+    if (s.set_mask & TSDB_TIER_SET_SCRUB_MB_S)
+        printf(" scrub_mb_s=%u", s.scrub_mb_s);
+    if (s.set_mask & TSDB_TIER_SET_SCRUB_DAYS)
+        printf(" scrub_days=%u", s.scrub_days);
+    puts(" (takes effect when the database is next opened)");
+    return 0;
+#endif
+}
+
+static int cmd_tier_lost(const char *dir, int argc, char **argv)
+{
+    (void)dir;
+    const char *store = NULL, *replace_path = NULL;
+    bool shrink = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--replace") == 0 && i + 1 < argc) {
+            if (replace_path)
+                return tier_usage();
+            replace_path = argv[++i];
+            if (!*replace_path)
+                return tier_usage();
+        } else if (strcmp(argv[i], "--shrink") == 0) {
+            shrink = true;
+        } else if (!store && argv[i][0] != '-') {
+            store = argv[i];
+        } else {
+            return tier_usage();
+        }
+    }
+    if (!store || !*store || (replace_path != NULL) == shrink) {
+        fprintf(stderr, "tsdb: tier lost: specify STORE and exactly one of --replace PATH or --shrink\n");
+        return tier_usage();
+    }
+#ifndef TSDB_EC
+    fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
+#else
+    fprintf(stderr, "tsdb: tier lost: not built\n");
+#endif
+    return 2;
+}
+
+static int cmd_tier_salvage(const char *dir, int argc, char **argv)
+{
+    (void)dir;
+    bool have_part = false, force = false;
+    int64_t part = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--partition") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (have_part) {
+                fprintf(stderr, "tsdb: tier salvage: --partition given twice\n");
+                return 2;
+            }
+            if (!tier_parse_i64(val, &part)) {
+                fprintf(stderr, "tsdb: tier salvage: invalid --partition '%s'\n", val);
+                return 2;
+            }
+            have_part = true;
+        } else if (strcmp(argv[i], "--force") == 0) {
+            force = true;
+        } else {
+            return tier_usage();
+        }
+    }
+    (void)part;
+    (void)force;
+#ifndef TSDB_EC
+    fprintf(stderr, "tsdb: tier salvage: not built with the erasure codec (TSDB_EC)\n");
+#else
+    fprintf(stderr, "tsdb: tier salvage: not built\n");
+#endif
+    return 2;
+}
+
+static int cmd_tier_status(const char *dir, int argc, char **argv)
+{
+    bool json = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--json") == 0)
+            json = true;
+        else
+            return tier_usage();
+    }
+#ifndef TSDB_EC
+    (void)dir;
+    (void)json;
+    fprintf(stderr, "tsdb: tier status: not built with the erasure codec (TSDB_EC)\n");
+    return 1;
+#else
+    char root[PATH_MAX];
+    if (!realpath(dir, root)) {
+        fprintf(stderr, "tsdb: %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    int rootfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0) {
+        fprintf(stderr, "tsdb: %s: %s\n", root, strerror(errno));
+        return 1;
+    }
+    if (tier_check_root_meta(rootfd, root, false) != 0) {
+        close(rootfd);
+        return 1;
+    }
+    char **extra_vols = NULL;
+    size_t nextra = 0;
+    int vfd = openat(rootfd, "VOLUMES", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (vfd >= 0) {
+        int vrc = tier_ofd_lock(vfd, F_RDLCK);
+        if (vrc != 0)
+            fprintf(stderr, "tsdb: %s/VOLUMES: lock failed: %s\n", root, strerror(errno));
+        else
+            vrc = tier_read_volumes_fd(vfd, root, &extra_vols, &nextra);
+        close(vfd);
+        if (vrc != 0) {
+            close(rootfd);
+            return 1;
+        }
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "tsdb: %s/VOLUMES: %s\n", root, strerror(errno));
+        close(rootfd);
+        return 1;
+    }
+    tiers_view tv;
+    tiers_view_init(&tv);
+    int rc = tiers_load(rootfd, false, false, &tv);
+    if (rc != 0) {
+        tier_free_paths(extra_vols, nextra);
+        close(rootfd);
+        return 1;
+    }
+    bool has_db_id = false;
+    uint8_t db_id[16];
+    memset(db_id, 0, sizeof db_id);
+    if (tv.nstores > 0) {
+        rc = tiers_db_id_read(rootfd, &has_db_id, db_id);
+        if (rc != 0 || !has_db_id) {
+            fprintf(stderr, "tsdb: %s: %s lists %zu store(s) but root META has no valid db_id=\n", root, TIERS_FILE,
+                    tv.nstores);
+            tiers_view_free(&tv);
+            tier_free_paths(extra_vols, nextra);
+            close(rootfd);
+            return 1;
+        }
+    }
+    close(rootfd);
+
+    size_t nvols = 1 + nextra;
+    size_t nstores = tv.nstores;
+    const char **vol_paths = calloc(nvols, sizeof *vol_paths);
+    uint64_t *store_bytes = calloc(nstores ? nstores : 1, sizeof *store_bytes);
+    uint64_t *store_fs_tot = calloc(nstores ? nstores : 1, sizeof *store_fs_tot);
+    uint64_t *store_fs_free = calloc(nstores ? nstores : 1, sizeof *store_fs_free);
+    bool *store_has_fs = calloc(nstores ? nstores : 1, sizeof *store_has_fs);
+    bool *store_partial = calloc(nstores ? nstores : 1, sizeof *store_partial);
+    const char **store_state = calloc(nstores ? nstores : 1, sizeof *store_state);
+    uint64_t *vol_tier_bytes = calloc(nvols, sizeof *vol_tier_bytes);
+    uint64_t *vol_ec_parts = calloc(nvols, sizeof *vol_ec_parts);
+    uint64_t *vol_ec_bytes = calloc(nvols, sizeof *vol_ec_bytes);
+    bool *vol_partial = calloc(nvols, sizeof *vol_partial);
+    int *vol_used_pct = calloc(nvols, sizeof *vol_used_pct);
+    uint64_t *vol_store_bytes = calloc(nvols * (nstores ? nstores : 1), sizeof *vol_store_bytes);
+    if (!vol_paths || !store_bytes || !store_fs_tot || !store_fs_free || !store_has_fs || !store_partial ||
+        !store_state || !vol_tier_bytes || !vol_ec_parts || !vol_ec_bytes || !vol_partial || !vol_used_pct ||
+        !vol_store_bytes) {
+        free(vol_paths), free(store_bytes), free(store_fs_tot), free(store_fs_free), free(store_has_fs);
+        free(store_partial), free(store_state), free(vol_tier_bytes), free(vol_ec_parts), free(vol_ec_bytes);
+        free(vol_partial), free(vol_used_pct), free(vol_store_bytes);
+        tiers_view_free(&tv);
+        tier_free_paths(extra_vols, nextra);
+        die("tier status", TSDB_ERR_NOMEM);
+    }
+    vol_paths[0] = root;
+    for (size_t i = 0; i < nextra; i++)
+        vol_paths[i + 1] = extra_vols[i];
+
+    bool all_sc = nstores > 0;
+    size_t n_up = 0, n_down = 0, n_lost = 0;
+    uint64_t total_tier_bytes = 0;
+    bool any_store_partial = false;
+    for (size_t i = 0; i < nstores; i++) {
+        const tiers_store *st = &tv.stores[i];
+        if (!st->single_copy)
+            all_sc = false;
+        if (st->state == TIERS_STATE_LOST) {
+            store_state[i] = "lost";
+            n_lost++;
+            continue;
+        }
+        const uint8_t *expect_id = st->state == TIERS_STATE_REPLACED_BY ? st->replaced_by : st->id;
+        uint8_t disk_id[16];
+        chunk_store_owner ow;
+        int mrc = chunk_store_meta_read(st->path, disk_id, &ow);
+        if (mrc == TSDB_ERR_NOTFOUND) {
+            store_state[i] = "down_missing";
+            n_down++;
+        } else if (mrc == TSDB_ERR_CORRUPT) {
+            store_state[i] = "down_damaged";
+            n_down++;
+        } else if (mrc != 0) {
+            store_state[i] = "down_ioerr";
+            n_down++;
+        } else if (memcmp(disk_id, expect_id, 16) != 0 || !ow.db_set || memcmp(ow.db_id, db_id, 16) != 0) {
+            store_state[i] = "down_other_id";
+            n_down++;
+        } else {
+            store_state[i] = "up";
+            n_up++;
+            tier_scan_store_bytes(st->path, nvols, &store_bytes[i], vol_tier_bytes, vol_store_bytes, i, nstores,
+                                  &store_partial[i]);
+            if (store_partial[i])
+                any_store_partial = true;
+            total_tier_bytes += store_bytes[i];
+            struct statvfs sv;
+            if (statvfs(st->path, &sv) == 0 && sv.f_blocks > 0) {
+                uint64_t fr = sv.f_frsize ? (uint64_t)sv.f_frsize : (uint64_t)sv.f_bsize;
+                store_fs_tot[i] = (uint64_t)sv.f_blocks * fr;
+                store_fs_free[i] = (uint64_t)sv.f_bavail * fr;
+                store_has_fs[i] = true;
+            }
+        }
+    }
+
+    for (size_t v = 0; v < nvols; v++) {
+        tier_scan_vol_ec(vol_paths[v], &vol_ec_parts[v], &vol_ec_bytes[v], &vol_partial[v]);
+        struct statvfs sv;
+        if (statvfs(vol_paths[v], &sv) == 0 && sv.f_blocks > 0) {
+            uint64_t avail = (uint64_t)sv.f_bavail;
+            uint64_t used = sv.f_blocks > avail ? (uint64_t)sv.f_blocks - avail : 0;
+            vol_used_pct[v] = (int)((used * 100ull) / (uint64_t)sv.f_blocks);
+        } else {
+            vol_used_pct[v] = -1;
+        }
+    }
+
+    int gk = 0, gm = 0;
+    bool active = false;
+    if (nstores > 0) {
+        if (tv.global.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+            gk = (int)tv.global.k;
+            gm = (int)tv.global.m;
+            active = true;
+        } else if (tier_default_geom((int)nstores, all_sc, &gk, &gm)) {
+            active = true;
+        }
+    }
+    /* Effective top-level margin is the minimum across global and every volume's redundancy (matching tier_open). */
+    bool underneath = active && all_sc && gm == 0;
+    int min_m = gm;
+    bool have_ec_vol = active && !underneath;
+    if (nstores > 0) {
+        for (size_t v = 0; v < nvols; v++) {
+            tiers_settings vs;
+            tiers_view_settings_for(&tv, (uint32_t)v, &vs);
+            int vm = (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) ? (int)vs.m : gm;
+            bool vact = (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) ? true : active;
+            if (!vact)
+                continue;
+            bool v_under = all_sc && vm == 0;
+            if (!v_under) {
+                if (!have_ec_vol || vm < min_m)
+                    min_m = vm;
+                have_ec_vol = true;
+                underneath = false;
+            }
+        }
+    }
+    int margin = have_ec_vol ? min_m - (int)(n_down + n_lost) : 0;
+    uint64_t settles_waiting = 0;
+    uint64_t damaged_cells = 0;
+
+    char db_hex[33] = "";
+    if (has_db_id)
+        chunk_oid_hex(db_id, db_hex);
+
+    if (json) {
+        fputs("{\n", stdout);
+        printf("  \"configured\": %s,\n", nstores > 0 ? "true" : "false");
+        printf("  \"active\": %s,\n", active ? "true" : "false");
+        fputs("  \"db_id\": ", stdout);
+        if (has_db_id)
+            json_put_str(stdout, db_hex);
+        else
+            fputs("null", stdout);
+        fputs(",\n", stdout);
+        if (active)
+            printf("  \"redundancy\": {\"k\": %d, \"m\": %d},\n", gk, gm);
+        else
+            fputs("  \"redundancy\": null,\n", stdout);
+        if (underneath)
+            fputs("  \"margin\": \"underneath\",\n", stdout);
+        else if (have_ec_vol)
+            printf("  \"margin\": %d,\n", margin);
+        else
+            fputs("  \"margin\": null,\n", stdout);
+        printf("  \"stores_up\": %zu,\n", n_up);
+        printf("  \"stores_down\": %zu,\n", n_down);
+        printf("  \"stores_lost\": %zu,\n", n_lost);
+        printf("  \"total_tier_bytes\": %" PRIu64 ",\n", total_tier_bytes);
+        printf("  \"bytes_partial\": %s,\n", any_store_partial ? "true" : "false");
+        printf("  \"settings\": {\"after_s\": %" PRIu64 ", \"high_pct\": %u, \"young_high_pct\": %u, "
+               "\"rebuild_mb_s\": %u, \"scrub_mb_s\": %u, \"scrub_days\": %u},\n",
+               tv.global.tier_after_s, tv.global.tier_high_pct, tv.global.young_high_pct, tv.global.rebuild_mb_s,
+               tv.global.scrub_mb_s, tv.global.scrub_days);
+        printf("  \"settles_waiting\": %" PRIu64 ",\n", settles_waiting);
+        fputs("  \"days_to_full\": null,\n", stdout);
+        printf("  \"damaged_cells\": %" PRIu64 ",\n", damaged_cells);
+        fputs("  \"rebuild\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
+        fputs("  \"scrub\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
+        fputs("  \"stores\": [", stdout);
+        for (size_t i = 0; i < nstores; i++) {
+            const tiers_store *st = &tv.stores[i];
+            const uint8_t *cur_id = st->state == TIERS_STATE_REPLACED_BY ? st->replaced_by : st->id;
+            char shex[33];
+            chunk_oid_hex(cur_id, shex);
+            const char *tstate = st->state == TIERS_STATE_LOST ? "lost"
+                               : st->state == TIERS_STATE_REPLACED_BY ? "replaced" : "active";
+            printf("%s\n    {\"index\": %zu, \"id\": \"%s\", \"class\": \"%s\", \"single_copy\": %s, "
+                   "\"tiers_state\": \"%s\", \"state\": \"%s\", \"bytes\": %" PRIu64 ", \"bytes_partial\": %s, "
+                   "\"damaged_cells\": 0, \"fs_total_bytes\": ",
+                   i ? "," : "", i, shex, tiers_class_name(st->cls), st->single_copy ? "true" : "false", tstate,
+                   store_state[i], store_bytes[i], store_partial[i] ? "true" : "false");
+            if (store_has_fs[i])
+                printf("%" PRIu64 ", \"fs_free_bytes\": %" PRIu64, store_fs_tot[i], store_fs_free[i]);
+            else
+                fputs("null, \"fs_free_bytes\": null", stdout);
+            fputs(", \"path\": ", stdout);
+            json_put_str(stdout, st->path);
+            fputc('}', stdout);
+        }
+        fputs(nstores ? "\n  ],\n" : "],\n", stdout);
+        fputs("  \"volumes\": [", stdout);
+        for (size_t v = 0; v < nvols; v++) {
+            tiers_settings vs;
+            tiers_view_settings_for(&tv, (uint32_t)v, &vs);
+            int vk = gk, vm = gm;
+            bool vactive = active;
+            if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+                vk = (int)vs.k;
+                vm = (int)vs.m;
+                vactive = true;
+            }
+            bool v_under = vactive && all_sc && vm == 0;
+            printf("%s\n    {\"volume\": %zu, \"path\": ", v ? "," : "", v);
+            json_put_str(stdout, vol_paths[v]);
+            printf(", \"tier_bytes\": %" PRIu64 ", \"bytes_partial\": %s, \"ec_parts\": %" PRIu64
+                   ", \"ec_index_bytes\": %" PRIu64 ", \"fs_used_pct\": ",
+                   vol_tier_bytes[v], (vol_partial[v] || any_store_partial) ? "true" : "false", vol_ec_parts[v],
+                   vol_ec_bytes[v]);
+            if (vol_used_pct[v] >= 0)
+                printf("%d", vol_used_pct[v]);
+            else
+                fputs("null", stdout);
+            if (vactive)
+                printf(", \"redundancy\": {\"k\": %d, \"m\": %d}", vk, vm);
+            else
+                fputs(", \"redundancy\": null", stdout);
+            if (v_under)
+                fputs(", \"margin\": \"underneath\"", stdout);
+            else if (vactive)
+                printf(", \"margin\": %d", vm - (int)(n_down + n_lost));
+            else
+                fputs(", \"margin\": null", stdout);
+            printf(", \"after_s\": %" PRIu64 ", \"high_pct\": %u, \"bytes_by_store\": [", vs.tier_after_s,
+                   vs.tier_high_pct);
+            for (size_t i = 0; i < nstores; i++)
+                printf("%s{\"store\": %zu, \"bytes\": %" PRIu64 "}", i ? ", " : "", i,
+                       vol_store_bytes[v * nstores + i]);
+            fputs("]}", stdout);
+        }
+        fputs("\n  ]\n}\n", stdout);
+    } else if (nstores == 0) {
+        puts("tier: not configured");
+    } else {
+        char tot_h[32];
+        human((double)total_tier_bytes, tot_h, sizeof tot_h);
+        printf("tier: configured (%s, %zu store%s: %zu up, %zu down, %zu lost)\n", active ? "active" : "inactive",
+               nstores, nstores == 1 ? "" : "s", n_up, n_down, n_lost);
+        printf("db_id: %s\n", db_hex);
+        if (active)
+            printf("redundancy: %d+%d\n", gk, gm);
+        else
+            puts("redundancy: none (need at least 2 stores or --single-copy)");
+        if (underneath) {
+            if (n_down + n_lost == 0)
+                puts("margin: underneath");
+            else
+                printf("margin: underneath (%zu store(s) unavailable)\n", n_down + n_lost);
+        } else if (have_ec_vol) {
+            if (margin < 0)
+                printf("margin: %d store(s) (below redundancy, %d store(s) short)\n", margin, -margin);
+            else
+                printf("margin: %d store(s)\n", margin);
+        } else {
+            puts("margin: none");
+        }
+        printf("tier_bytes: %s (%" PRIu64 " B)%s\n", tot_h, total_tier_bytes, any_store_partial ? " (partial)" : "");
+        printf("settings: after=%" PRIu64 "s high_pct=%u%% young_high_pct=%u%% rebuild_mb_s=%u scrub_mb_s=%u "
+               "scrub_days=%u\n",
+               tv.global.tier_after_s, tv.global.tier_high_pct, tv.global.young_high_pct, tv.global.rebuild_mb_s,
+               tv.global.scrub_mb_s, tv.global.scrub_days);
+        printf("settles_waiting: %" PRIu64 "\n", settles_waiting);
+        puts("days_to_full: unknown");
+        printf("damage: %" PRIu64 " cell(s)\n", damaged_cells);
+        puts("rebuild: idle");
+        puts("scrub: idle");
+        puts("stores:");
+        for (size_t i = 0; i < nstores; i++) {
+            const tiers_store *st = &tv.stores[i];
+            const uint8_t *cur_id = st->state == TIERS_STATE_REPLACED_BY ? st->replaced_by : st->id;
+            char shex[33], sb[32];
+            chunk_oid_hex(cur_id, shex);
+            human((double)store_bytes[i], sb, sizeof sb);
+            printf("  %zu\t%s\t%s\t%s%s\t%s%s\tdamage=0\t%s\n", i, shex, tiers_class_name(st->cls), store_state[i],
+                   st->single_copy ? " (single-copy)" : "", sb, store_partial[i] ? " (partial)" : "", st->path);
+        }
+        puts("volumes:");
+        for (size_t v = 0; v < nvols; v++) {
+            tiers_settings vs;
+            tiers_view_settings_for(&tv, (uint32_t)v, &vs);
+            int vk = gk, vm = gm;
+            bool vactive = active;
+            if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+                vk = (int)vs.k;
+                vm = (int)vs.m;
+                vactive = true;
+            }
+            bool v_under = vactive && all_sc && vm == 0;
+            char vb[32];
+            human((double)vol_tier_bytes[v], vb, sizeof vb);
+            printf("  %zu\t%s\ttier=%s%s\tec_parts=%" PRIu64 "\tredundancy=", v, vol_paths[v], vb,
+                   (vol_partial[v] || any_store_partial) ? " (partial)" : "", vol_ec_parts[v]);
+            if (vactive)
+                printf("%d+%d", vk, vm);
+            else
+                fputs("none", stdout);
+            if (v_under)
+                fputs("\tmargin=underneath", stdout);
+            else if (vactive)
+                printf("\tmargin=%d", vm - (int)(n_down + n_lost));
+            else
+                fputs("\tmargin=none", stdout);
+            printf("\tafter=%" PRIu64 "s\thigh_pct=%u%%\n", vs.tier_after_s, vs.tier_high_pct);
+            for (size_t i = 0; i < nstores; i++) {
+                char vsb[32];
+                human((double)vol_store_bytes[v * nstores + i], vsb, sizeof vsb);
+                printf("    store %zu: %s\n", i, vsb);
+            }
+        }
+    }
+
+    free(vol_paths), free(store_bytes), free(store_fs_tot), free(store_fs_free), free(store_has_fs);
+    free(store_partial), free(store_state), free(vol_tier_bytes), free(vol_ec_parts), free(vol_ec_bytes);
+    free(vol_partial), free(vol_used_pct), free(vol_store_bytes);
+    tiers_view_free(&tv);
+    tier_free_paths(extra_vols, nextra);
+    return 0;
+#endif
+}
+
+static int cmd_tier(const char *dir, int argc, char **argv)
+{
+    if (argc < 1)
+        return tier_usage();
+    const char *verb = argv[0];
+    if (strcmp(verb, "add") == 0)
+        return cmd_tier_add(dir, argc - 1, argv + 1);
+    if (strcmp(verb, "set") == 0)
+        return cmd_tier_set(dir, argc - 1, argv + 1);
+    if (strcmp(verb, "lost") == 0)
+        return cmd_tier_lost(dir, argc - 1, argv + 1);
+    if (strcmp(verb, "salvage") == 0)
+        return cmd_tier_salvage(dir, argc - 1, argv + 1);
+    if (strcmp(verb, "status") == 0)
+        return cmd_tier_status(dir, argc - 1, argv + 1);
+    fprintf(stderr, "tsdb: tier: unknown command '%s'\n", verb);
+    return tier_usage();
+}
+
 int main(int argc, char **argv)
 {
     const char *cfg_path = NULL;
@@ -1837,6 +3036,8 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "volume") == 0 && (argc != 4 || strcmp(argv[3], "list") != 0))
         usage();
+    if (strcmp(cmd, "tier") == 0)
+        return cmd_tier(dir, argc - 3, argv + 3);
     if (strcmp(cmd, "user") == 0)
         return user_main(dir, argc - 3, argv + 3); /* USERS only: the engine is not opened */
     if (strcmp(cmd, "export") == 0)
