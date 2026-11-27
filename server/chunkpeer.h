@@ -86,6 +86,9 @@ struct chunkpeer {
     int timeout_ms;           /* per request or put; 0: 30,000 */
     /* R9 (E10): optional reconcile hook notified after a degraded settle commits (NULL in standalone tests). */
     void (*note_missing)(uint32_t volume, const uint8_t oid[16], unsigned pos);
+    /* R12 (E11, r12-repair): optional hook notified when a read finds a bad survivor (CHUNK_ST_DAMAGED). */
+    void (*on_damaged)(void *arg, uint32_t volume, const uint8_t oid[16], unsigned pos, uint32_t node);
+    void *on_damaged_arg;
 };
 
 extern const cold_ops coldops_peer;

@@ -30081,6 +30081,560 @@ static void scen_twodisks(void)
     stop_all();
 }
 
+#ifdef TSDB_EC
+/* Helpers for scen_scrubrepair (R12, r12-repair; E11, E14, E25, E26, §5.9). */
+static void sr_flip_byte(const char *path, off_t off)
+{
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        die("scrubrepair: open %s: %s", path, strerror(errno));
+    uint8_t b = 0;
+    if (pread(fd, &b, 1, off) != 1)
+        die("scrubrepair: pread %s: %s", path, strerror(errno));
+    b ^= 0x5au;
+    if (pwrite(fd, &b, 1, off) != 1 || fsync(fd) != 0)
+        die("scrubrepair: pwrite/fsync %s: %s", path, strerror(errno));
+    close(fd);
+}
+
+static uint8_t sr_read_byte(const char *path, off_t off)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        die("scrubrepair: open %s: %s", path, strerror(errno));
+    uint8_t b = 0;
+    if (pread(fd, &b, 1, off) != 1)
+        die("scrubrepair: pread %s: %s", path, strerror(errno));
+    close(fd);
+    return b;
+}
+
+/* Reads and verifies a chunk file directly on disk (read-only, no flock). Returns 1 if intact, 0 if missing/damaged.
+ * When intact, optionally fills *hdr_out and compares raw cell bytes against expect_cells[0..expect_len). */
+static int sr_verify_chunk_file(const char *path, chunk_hdr *hdr_out, const uint8_t *expect_cells, size_t expect_len,
+                                bool *bytes_match_out)
+{
+    if (bytes_match_out)
+        *bytes_match_out = false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || (uint64_t)sb.st_size < CHUNK_HDR_BYTES + CHUNK_FTR_BYTES) {
+        close(fd);
+        return 0;
+    }
+    uint8_t hb[CHUNK_HDR_BYTES];
+    if (pread(fd, hb, sizeof hb, 0) != (ssize_t)sizeof hb) {
+        close(fd);
+        return 0;
+    }
+    chunk_hdr h;
+    if (chunk_hdr_decode(hb, &h) != 0 || (uint64_t)sb.st_size != chunk_file_size(&h.g, h.pos)) {
+        close(fd);
+        return 0;
+    }
+    uint64_t nc = chunk_pos_cells(&h.g, h.pos);
+    size_t tl = (size_t)(8 * nc + CHUNK_FTR_BYTES);
+    uint8_t *tail = malloc(tl);
+    uint8_t *cells = malloc(h.chunk_len ? (size_t)h.chunk_len : 1);
+    if (!tail || !cells) {
+        free(tail);
+        free(cells);
+        close(fd);
+        return 0;
+    }
+    int ok = 1;
+    if (pread(fd, tail, tl, (off_t)(CHUNK_HDR_BYTES + h.chunk_len)) != (ssize_t)tl)
+        ok = 0;
+    if (ok && h.chunk_len > 0 && pread(fd, cells, (size_t)h.chunk_len, CHUNK_HDR_BYTES) != (ssize_t)h.chunk_len)
+        ok = 0;
+    close(fd);
+    if (ok) {
+        uint64_t off = 0;
+        for (uint64_t i = 0; i < nc; i++) {
+            uint64_t cl = h.pos < h.g.k
+                              ? (i * (uint64_t)h.g.k + h.pos < chunk_ncells(&h.g)
+                                     ? ((i * (uint64_t)h.g.k + h.pos + 1) * (uint64_t)h.g.cell <= h.g.len
+                                            ? h.g.cell
+                                            : h.g.len - (i * (uint64_t)h.g.k + h.pos) * (uint64_t)h.g.cell)
+                                     : 0)
+                              : chunk_stripe_len(&h.g, i);
+            uint64_t want = 0;
+            for (int b = 7; b >= 0; b--)
+                want = (want << 8) | tail[8 * i + (size_t)b];
+            struct pl_xxh xh;
+            pl_xxh_init(&xh);
+            pl_xxh_update(&xh, cells + off, (size_t)cl);
+            if (off + cl > h.chunk_len || pl_xxh_final(&xh) != want) {
+                ok = 0;
+                break;
+            }
+            off += cl;
+        }
+    }
+    if (ok && hdr_out)
+        *hdr_out = h;
+    if (ok && expect_cells && bytes_match_out)
+        *bytes_match_out = (h.chunk_len == expect_len && memcmp(cells, expect_cells, expect_len) == 0);
+    free(tail);
+    free(cells);
+    return ok;
+}
+
+static uint8_t *sr_slurp_cells(const char *path, size_t *len_out, uint64_t *epoch_out)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        die("scrubrepair: open %s: %s", path, strerror(errno));
+    uint8_t hb[CHUNK_HDR_BYTES];
+    if (pread(fd, hb, sizeof hb, 0) != (ssize_t)sizeof hb)
+        die("scrubrepair: pread hdr %s", path);
+    chunk_hdr h;
+    if (chunk_hdr_decode(hb, &h) != 0)
+        die("scrubrepair: decode hdr %s", path);
+    uint8_t *buf = malloc(h.chunk_len ? (size_t)h.chunk_len : 1);
+    if (!buf)
+        die("scrubrepair: OOM");
+    if (h.chunk_len > 0 && pread(fd, buf, (size_t)h.chunk_len, CHUNK_HDR_BYTES) != (ssize_t)h.chunk_len)
+        die("scrubrepair: pread cells %s", path);
+    close(fd);
+    *len_out = (size_t)h.chunk_len;
+    if (epoch_out)
+        *epoch_out = h.epoch;
+    return buf;
+}
+
+/* Finds a settled 4+2 object across 7 storage dirs whose oid != skip_oid (if non-NULL) and has all 6 positions. */
+static int sr_find_obj(char sdirs[7][PATH_MAX + 96], uint32_t vol, const char *skip_oid, char oid_out[33],
+                       char paths_out[6][PATH_MAX + 128], int srvs_out[6])
+{
+    for (int i = 0; i < 7; i++) {
+        char vdir[PATH_MAX + 64];
+        snprintf(vdir, sizeof vdir, "%s/s%" PRIu32, sdirs[i], vol);
+        DIR *d = opendir(vdir);
+        if (!d)
+            continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            size_t len = strlen(e->d_name);
+            if (len < 41 || e->d_name[0] != 'o' || e->d_name[33] != '.')
+                continue;
+            char *end = NULL;
+            unsigned long pos = strtoul(e->d_name + 34, &end, 10);
+            if (!end || strcmp(end, ".chunk") != 0 || pos >= 6)
+                continue;
+            char cand[33];
+            memcpy(cand, e->d_name + 1, 32);
+            cand[32] = '\0';
+            if (skip_oid && strcmp(cand, skip_oid) == 0)
+                continue;
+            /* Check if all 6 positions exist across the 7 stores. */
+            int found = 0;
+            for (int p = 0; p < 6; p++) {
+                srvs_out[p] = -1;
+                paths_out[p][0] = '\0';
+                for (int s = 0; s < 7; s++) {
+                    char pth[PATH_MAX + 128];
+                    snprintf(pth, sizeof pth, "%s/s%" PRIu32 "/o%s.%d.chunk", sdirs[s], vol, cand, p);
+                    if (access(pth, F_OK) == 0) {
+                        snprintf(paths_out[p], sizeof paths_out[p], "%s", pth);
+                        srvs_out[p] = s;
+                        found++;
+                        break;
+                    }
+                }
+            }
+            if (found == 6) {
+                memcpy(oid_out, cand, 33);
+                closedir(d);
+                return 1;
+            }
+        }
+        closedir(d);
+    }
+    return 0;
+}
+
+static int sr_await_leader(int probe, const char *vname, int avoid, struct meta_volume *out)
+{
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(probe, vname, out) && out->leader) {
+            int l = server_of(out->leader);
+            if (l >= 0 && l != avoid && pids[l] > 0)
+                return l;
+        }
+        if (now_ms() - t0 > 60000)
+            die("scrubrepair: no active leader of %s (avoid %d) after 60 s", vname, avoid);
+    }
+}
+
+static int sr_count_oid_chunks(char sdirs[7][PATH_MAX + 96], uint32_t vol, const char *oid_hex)
+{
+    int cnt = 0;
+    for (int s = 0; s < 7; s++) {
+        for (int p = 0; p < 6; p++) {
+            char pth[PATH_MAX + 128];
+            snprintf(pth, sizeof pth, "%s/s%" PRIu32 "/o%s.%d.chunk", sdirs[s], vol, oid_hex, p);
+            if (access(pth, F_OK) == 0)
+                cnt++;
+        }
+    }
+    return cnt;
+}
+#endif
+
+/* scrubrepair (R12, r12-repair; E11, E14, E25, E26, §5.9; PLAN.md D5, D9):
+ *   1. Epoch bump E2 > E1, flip data pos 0 & parity pos 4 -> leader repairs both preserving hdr.epoch == E1 < E2
+ *      (catches repairownepoch), metrics increment, re-scrub clean, reads equal model.
+ *   2. Flip TWO data positions (0 and 1) simultaneously -> leader skips bad survivor via rec_sums and repairs both
+ *      bit-exact (catches repairnosums).
+ *   3. Flip m+1=3 positions (0, 1, 2) of a second object -> leader counts unrecoverable, logs health line, writes
+ *      nothing.
+ *   4. Drop/MK_GC race with TSDB_REPAIR_TEST=pause_before_put: pause before put -> retention expires & MK_GC deletes
+ *      all chunks -> release pause -> 0 chunks resurrected on all 7 stores (catches repairnolive).
+ *   5. Kill leader mid-repair (while paused before put) -> new leader elected -> next scrub report repairs chunk. */
+static void scen_scrubrepair(void)
+{
+    scenario("scrubrepair");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    static char pausef[PATH_MAX + 64];
+    snprintf(pausef, sizeof pausef, "%s/repair_pause", base);
+    unlink(pausef);
+
+    static char penv_buf[PATH_MAX + 256];
+    snprintf(penv_buf, sizeof penv_buf,
+             "TSDB_CHUNKSCRUB_TEST=interval_ms=250,mb_s=50,out_count=1000 "
+             "TSDB_ECGC_TEST=orphan_grace_ms=1000,poll_ms=200,lifetime_s=1 "
+             "TSDB_REPAIR_TEST=pause_before_put=%s",
+             pausef);
+
+    int mports[7] = {0};
+    for (int i = 0; i < 7; i++) {
+        penv[i] = penv_buf;
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of seven members");
+
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    static char sdirs[7][PATH_MAX + 96];
+    for (int i = 0; i < 7; i++) {
+        char ddir[PATH_MAX + 64];
+        snprintf(ddir, sizeof ddir, "%s/srs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
+        snprintf(xa[i], sizeof xa[i],
+                 "--disk %s:hdd --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200",
+                 ddir);
+        restart_xargs(i, xa[i]);
+        mports[i] = th_mport;
+        if (mports[i] <= 0)
+            die("scrubrepair: server %d reported no metrics port", i);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with their volumes open");
+
+    uint32_t num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "sr42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("scrubrepair: ec=4+2 add: %s (%s)", cluster_strerror(rc), text);
+
+    struct meta_volume mv = {0};
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "sr42", &mv) || !mv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("scrubrepair: no record of sr42 with a leader");
+    int L = server_of(mv.leader);
+    int nonrep = -1;
+    for (int i = 0; i < 7; i++)
+        if (!ecb_is_rep(&mv, i)) {
+            nonrep = i;
+            break;
+        }
+    if (L < 0 || nonrep < 0)
+        die("scrubrepair: bad leader/nonrep");
+
+    tsdbc *c = client(L);
+    tsdb_sid ide[ECB_SERIES];
+    const int64_t day0 = 1704067200000LL;
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "sr.s%d", s);
+        ide[s] = ecb_series(c, nm, "sr42");
+    }
+    ecb_write_day(c, ide, day0);
+    tsdbc_close(c);
+    c = NULL;
+
+    char oid1[33] = "";
+    char p1[6][PATH_MAX + 128];
+    int s1[6];
+    for (uint64_t t0 = now_ms();
+         ecb_ec_parts(L, num) == 0 || !sr_find_obj(sdirs, num, NULL, oid1, p1, s1);
+         usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("scrubrepair: day0 did not settle within 120 s");
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("scrubrepair: .part files left in leader's v%" PRIu32 ":%s", num, live);
+
+    size_t len0 = 0, len1 = 0, len4 = 0;
+    uint64_t E1 = 0;
+    uint8_t *orig0 = sr_slurp_cells(p1[0], &len0, &E1);
+    uint8_t *orig1 = sr_slurp_cells(p1[1], &len1, NULL);
+    uint8_t *orig4 = sr_slurp_cells(p1[4], &len4, NULL);
+
+    /* ---- Step 1: Bump volume epoch E2 > E1 via failover, flip data pos 0 and parity pos 4 -> both repaired
+     * preserving hdr.epoch == E1 < E2 (catches repairownepoch). */
+    int oldL = L;
+    stop(oldL, SIGKILL);
+    L = sr_await_leader(nonrep, "sr42", oldL, &mv);
+    if (L == oldL || mv.epoch <= E1)
+        die("scrubrepair: failover did not advance epoch (E1=%" PRIu64 " now=%" PRIu64 ")", E1, mv.epoch);
+    uint64_t E2 = mv.epoch;
+    start(oldL);
+    mports[oldL] = th_mport;
+    char lead_line[64];
+    snprintf(lead_line, sizeof lead_line, "leads epoch %" PRIu64, E2);
+    for (uint64_t t0 = now_ms(); !log_has(L, lead_line); usleep(100000))
+        if (now_ms() - t0 > 30000)
+            die("scrubrepair: new leader %d did not open as writer for epoch %" PRIu64, L, E2);
+    await_isr(L, "sr42", 3, 60000, "all 3 replicas in ISR after epoch bump");
+    printf("  step 1: epoch bumped %" PRIu64 " -> %" PRIu64 " (leader %d -> %d); flipping pos 0 and pos 4\n", E1, E2,
+           oldL, L);
+
+    sr_flip_byte(p1[0], CHUNK_HDR_BYTES + 16);
+    sr_flip_byte(p1[4], CHUNK_HDR_BYTES + 16);
+
+    char mbuf[65536];
+    int rep1_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 30000; usleep(150000)) {
+        chunk_hdr h0, h4;
+        bool m0 = false, m4 = false;
+        if (sr_verify_chunk_file(p1[0], &h0, orig0, len0, &m0) && m0 &&
+            sr_verify_chunk_file(p1[4], &h4, orig4, len4, &m4) && m4) {
+            if (h0.epoch != E1 || h4.epoch != E1)
+                die("scrubrepair: repaired chunk has wrong header epoch (pos0=%" PRIu64 " pos4=%" PRIu64
+                    ", want E1=%" PRIu64 " < E2=%" PRIu64 ")",
+                    h0.epoch, h4.epoch, E1, E2);
+            metrics_get(mports[L], mbuf, sizeof mbuf);
+            int64_t rcnt = 0, rbytes = 0;
+            if (metrics_find_i64(mbuf, "\ntsdb_chunk_repairs_total{result=\"repaired\"} ", &rcnt) && rcnt >= 2 &&
+                metrics_find_i64(mbuf, "\ntsdb_chunk_repair_bytes_total ", &rbytes) && rbytes > 0) {
+                rep1_ok = 1;
+                break;
+            }
+        }
+    }
+    if (!rep1_ok)
+        die("scrubrepair: step 1 did not repair pos 0 and pos 4 cleanly at epoch %" PRIu64, E1);
+
+    c = client(L);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum rs;
+        if ((rc = ecb_read(c, ide[s], &rs)) != 0 || rs.n != 2 * ECB_ROWS)
+            die("scrubrepair: step 1 read series %d failed: rc=%d rows=%" PRIu64, s, rc, rs.n);
+    }
+    printf("  step 1 passed: pos 0 & pos 4 repaired with hdr.epoch=%" PRIu64 " < fence=%" PRIu64 "\n", E1, E2);
+
+    /* ---- Step 2: Flip TWO data positions (pos 0 and pos 1) simultaneously -> skips rotten survivor via rec_sums,
+     * repairs both bit-exact (catches repairnosums). */
+    sr_flip_byte(p1[0], CHUNK_HDR_BYTES + 24);
+    sr_flip_byte(p1[1], CHUNK_HDR_BYTES + 24);
+    /* Also trigger a read while both are damaged to exercise the read-path hook (E11). */
+    struct ecb_sum r2;
+    if ((rc = ecb_read(c, ide[0], &r2)) != 0 || r2.n != 2 * ECB_ROWS)
+        die("scrubrepair: step 2 degraded read failed: rc=%d rows=%" PRIu64, rc, r2.n);
+
+    int rep2_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 30000; usleep(150000)) {
+        chunk_hdr h0, h1;
+        bool m0 = false, m1 = false;
+        if (sr_verify_chunk_file(p1[0], &h0, orig0, len0, &m0) && sr_verify_chunk_file(p1[1], &h1, orig1, len1, &m1)) {
+            if (!m0 || !m1)
+                die("scrubrepair: step 2 repaired chunk bytes differ from original (repairnosums!)");
+            if (h0.epoch != E1 || h1.epoch != E1)
+                die("scrubrepair: step 2 wrong hdr epoch %" PRIu64 "/%" PRIu64 " want %" PRIu64, h0.epoch, h1.epoch, E1);
+            rep2_ok = 1;
+            break;
+        }
+    }
+    if (!rep2_ok)
+        die("scrubrepair: step 2 did not repair both pos 0 and pos 1 bit-exact");
+    printf("  step 2 passed: two simultaneous bad data positions repaired bit-exact\n");
+
+    /* ---- Step 3: Write day1 -> flip m+1=3 positions (0, 1, 2) -> unrecoverable, health log, nothing written. */
+    ecb_write_day(c, ide, day0 + 2 * 86400000LL);
+    char oid2[33] = "";
+    char p2[6][PATH_MAX + 128];
+    int s2[6];
+    for (uint64_t t0 = now_ms(); !sr_find_obj(sdirs, num, oid1, oid2, p2, s2); usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("scrubrepair: day1 did not settle within 120 s");
+
+    sr_flip_byte(p2[0], CHUNK_HDR_BYTES + 32);
+    sr_flip_byte(p2[1], CHUNK_HDR_BYTES + 32);
+    sr_flip_byte(p2[2], CHUNK_HDR_BYTES + 32);
+    uint8_t bad_b0 = sr_read_byte(p2[0], CHUNK_HDR_BYTES + 32);
+
+    int unrec_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 30000; usleep(150000)) {
+        metrics_get(mports[L], mbuf, sizeof mbuf);
+        int64_t ucnt = 0;
+        if (metrics_find_i64(mbuf, "\ntsdb_chunk_repairs_total{result=\"unrecoverable\"} ", &ucnt) && ucnt >= 1 &&
+            log_has(L, "health: chunk repair unrecoverable")) {
+            unrec_ok = 1;
+            break;
+        }
+    }
+    if (!unrec_ok)
+        die("scrubrepair: step 3 did not record unrecoverable + health log line");
+    if (sr_read_byte(p2[0], CHUNK_HDR_BYTES + 32) != bad_b0)
+        die("scrubrepair: step 3 modified unrecoverable chunk on disk (must write nothing)");
+    /* Restore pos 1 & 2 of oid2 so oid2 does not keep spamming unrecoverable during later steps. */
+    sr_flip_byte(p2[1], CHUNK_HDR_BYTES + 32);
+    sr_flip_byte(p2[2], CHUNK_HDR_BYTES + 32);
+    for (uint64_t t0 = now_ms(); !sr_verify_chunk_file(p2[0], NULL, NULL, 0, NULL); usleep(150000))
+        if (now_ms() - t0 > 30000)
+            die("scrubrepair: step 3 oid2 pos 0 did not recover after restoring pos 1 & 2");
+    printf("  step 3 passed: m+1 bad positions counted unrecoverable with health log and nothing written\n");
+
+    /* ---- Step 4: Drop / MK_GC race (D9) with pause_before_put -> 0 chunks resurrected (catches repairnolive). */
+    int paused0 = log_count(L, "chunkrepair: paused before put");
+    int resumed0 = log_count(L, "chunkrepair: resumed before put");
+    touch_file(pausef);
+    sr_flip_byte(p1[0], CHUNK_HDR_BYTES + 40);
+    for (uint64_t t0 = now_ms(); log_count(L, "chunkrepair: paused before put") <= paused0; usleep(100000))
+        if (now_ms() - t0 > 30000)
+            die("scrubrepair: step 4 leader %d did not pause before put", L);
+
+    /* Expire all settled parts via retention and wait for committed MK_GC to delete every chunk of oid1. */
+    for (int s = 0; s < ECB_SERIES; s++)
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_set_retention(c, ide[s], 86400000LL)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("scrubrepair: step 4 set_retention: %s", ers(rc));
+    tsdbc_close(c);
+    c = NULL;
+    for (uint64_t t0 = now_ms(); sr_count_oid_chunks(sdirs, num, oid1) > 0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("scrubrepair: step 4 MK_GC did not delete oid1 chunks (%d left)", sr_count_oid_chunks(sdirs, num, oid1));
+
+    /* Release repair worker: it MUST re-check live/GC and write NOTHING (0 put sent, 0 resurrected). */
+    unlink(pausef);
+    for (uint64_t t0 = now_ms(); log_count(L, "chunkrepair: resumed before put") <= resumed0; usleep(100000))
+        if (now_ms() - t0 > 20000)
+            die("scrubrepair: step 4 leader %d did not resume after pause_before_put", L);
+    int step4_done = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(100000)) {
+        metrics_get(mports[L], mbuf, sizeof mbuf);
+        int64_t qd = -1, nlcnt = 0;
+        if (metrics_find_i64(mbuf, "\ntsdb_chunk_repair_queue_depth ", &qd) && qd == 0 &&
+            metrics_find_i64(mbuf, "\ntsdb_chunk_repairs_total{result=\"not_live\"} ", &nlcnt) && nlcnt >= 1) {
+            step4_done = 1;
+            break;
+        }
+        if (sr_count_oid_chunks(sdirs, num, oid1) != 0 || log_has(s1[0], "chunk replace refused"))
+            break;
+    }
+    if (sr_count_oid_chunks(sdirs, num, oid1) != 0)
+        die("scrubrepair: step 4 resurrected %d chunk(s) of GC'd oid1 (repairnolive!)",
+            sr_count_oid_chunks(sdirs, num, oid1));
+    if (log_has(s1[0], "chunk replace refused"))
+        die("scrubrepair: step 4 leader sent replace-put for GC'd oid1 (repairnolive!)");
+    if (!step4_done)
+        die("scrubrepair: step 4 expected queue_depth==0 and tsdb_chunk_repairs_total{result=\"not_live\"} >= 1");
+    printf("  step 4 passed: MK_GC deleted oid1 while paused before put; 0 puts sent, 0 chunks resurrected\n");
+
+    /* ---- Step 5: Kill leader mid-repair (while paused before put) -> new leader repairs after next scrub report. */
+    c = client(L);
+    tsdb_sid id3[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "sr3.s%d", s);
+        id3[s] = ecb_series(c, nm, "sr42");
+    }
+    ecb_write_day(c, id3, day0);
+    tsdbc_close(c);
+    c = NULL;
+
+    char oid3[33] = "";
+    char p3[6][PATH_MAX + 128];
+    int s3[6];
+    for (uint64_t t0 = now_ms(); !sr_find_obj(sdirs, num, NULL, oid3, p3, s3); usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("scrubrepair: step 5 oid3 did not settle within 120 s");
+    size_t len3 = 0;
+    uint64_t E3 = 0;
+    uint8_t *orig3 = sr_slurp_cells(p3[0], &len3, &E3);
+
+    int paused5 = log_count(L, "chunkrepair: paused before put");
+    touch_file(pausef);
+    sr_flip_byte(p3[0], CHUNK_HDR_BYTES + 48);
+    for (uint64_t t0 = now_ms(); log_count(L, "chunkrepair: paused before put") <= paused5; usleep(100000))
+        if (now_ms() - t0 > 30000)
+            die("scrubrepair: step 5 leader %d did not pause before put", L);
+
+    oldL = L;
+    stop(oldL, SIGKILL);
+    unlink(pausef);
+    L = sr_await_leader(nonrep, "sr42", oldL, &mv);
+    if (L == oldL)
+        die("scrubrepair: step 5 leader did not change after SIGKILL");
+    start(oldL);
+    mports[oldL] = th_mport;
+
+    int rep5_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 40000; usleep(150000)) {
+        chunk_hdr h3;
+        bool m3 = false;
+        if (sr_verify_chunk_file(p3[0], &h3, orig3, len3, &m3) && m3 && h3.epoch == E3) {
+            metrics_get(mports[L], mbuf, sizeof mbuf);
+            int64_t rcnt = 0;
+            if (metrics_find_i64(mbuf, "\ntsdb_chunk_repairs_total{result=\"repaired\"} ", &rcnt) && rcnt >= 1) {
+                rep5_ok = 1;
+                break;
+            }
+        }
+    }
+    if (!rep5_ok)
+        die("scrubrepair: step 5 new leader %d did not repair oid3 pos 0 after old leader SIGKILL", L);
+
+    c = client(L);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum rs;
+        for (uint64_t t0 = now_ms(); (rc = ecb_read(c, id3[s], &rs)) != 0; usleep(100000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("scrubrepair: step 5 read series %d failed: %s", s, ers(rc));
+        if (rs.n != 2 * ECB_ROWS)
+            die("scrubrepair: step 5 read series %d rows=%" PRIu64 " want %d", s, rs.n, 2 * ECB_ROWS);
+    }
+    tsdbc_close(c);
+    free(orig0);
+    free(orig1);
+    free(orig4);
+    free(orig3);
+    printf("  step 5 passed: killed leader %d mid-repair; new leader %d repaired oid3 pos 0 cleanly\n", oldL, L);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -30139,7 +30693,7 @@ int main(int argc, char **argv)
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
                {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
                {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub},
-               {"disks", scen_disks}, {"twodisks", scen_twodisks}};
+               {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

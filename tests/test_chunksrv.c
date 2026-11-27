@@ -185,11 +185,11 @@ static int fake_put(struct chunksrv *cs, const cdata *c, uint64_t file, bool *su
 {
     size_t n;
     uint8_t *f = cdata_file(c, &n);
-    uint8_t meta[CS_PUT_META_LEN];
-    cs_put_meta_encode(&c->m, meta);
+    uint8_t meta[CS_PUT_META_MAX];
+    size_t ml = cs_put_meta_encode(&c->m, meta);
     cap cp = {.ackf = ackf};
     struct cs_put *p = NULL;
-    int rc = chunksrv_put_begin(cs, 2, file, meta, sizeof meta, n, cap_reply, &cp, &p);
+    int rc = chunksrv_put_begin(cs, 2, file, meta, ml, n, cap_reply, &cp, &p);
     if (rc == 0) {
         size_t off = 0;
         while (off < n && rc == 0) {
@@ -206,7 +206,7 @@ static int fake_put(struct chunksrv *cs, const cdata *c, uint64_t file, bool *su
     }
     if (sum_ok)
         *sum_ok = rc == 0 && cp.body_len == 8 &&
-                  le64(cp.body) == cs_put_answer_hash(meta, cs_sums_hash(c->sums, c->ncells));
+                  le64(cp.body) == cs_put_answer_hash_len(meta, ml, cs_sums_hash(c->sums, c->ncells));
     free(cp.body);
     free(f);
     return rc;
@@ -352,6 +352,36 @@ static void test_wire(void)
     c.m.pos = 5; /* position 5 of 3+2, with a check that holds */
     cs_put_meta_encode(&c.m, meta);
     CHECK(cs_put_meta_decode(meta, sizeof meta, &m) == -1);
+    /* v2 put meta (CS_PUT_F_REPLACE + hdr_epoch) */
+    c.m.pos = 4;
+    c.m.flags = CS_PUT_F_REPLACE;
+    c.m.hdr_epoch = 3;
+    uint8_t meta2[CS_PUT_META_MAX];
+    size_t ml2 = cs_put_meta_encode(&c.m, meta2);
+    CHECK(ml2 == CS_PUT_META_V2_LEN);
+    CHECK(cs_put_meta_decode(meta2, ml2, &m) == 0 && m.flags == CS_PUT_F_REPLACE && m.hdr_epoch == 3 &&
+          m.epoch == 5 && m.pos == 4);
+    CHECK(cs_put_meta_decode(meta2, ml2 - 1, &m) == -1);
+    int taken2 = 0;
+    for (size_t k = 0; k < 8 * ml2; k++) {
+        meta2[k / 8] ^= (uint8_t)(1u << k % 8);
+        taken2 += cs_put_meta_decode(meta2, ml2, &m) == 0;
+        meta2[k / 8] ^= (uint8_t)(1u << k % 8);
+    }
+    CHECK(taken2 == 0);
+    uint64_t h2 = cs_put_answer_hash_len(meta2, ml2, 42);
+    meta2[70] ^= 1; /* hdr_epoch bit */
+    CHECK(cs_put_answer_hash_len(meta2, ml2, 42) != h2);
+    c.m.hdr_epoch = 0;
+    ml2 = cs_put_meta_encode(&c.m, meta2);
+    CHECK(cs_put_meta_decode(meta2, ml2, &m) == -1);
+    c.m.hdr_epoch = 6; /* > epoch (5) */
+    ml2 = cs_put_meta_encode(&c.m, meta2);
+    CHECK(cs_put_meta_decode(meta2, ml2, &m) == -1);
+    c.m.flags = 2; /* unknown flag */
+    c.m.hdr_epoch = 3;
+    ml2 = cs_put_meta_encode(&c.m, meta2);
+    CHECK(cs_put_meta_decode(meta2, ml2, &m) == -1);
     cdata_free(&c);
     CHECK(chunksrv_st(0) == CHUNK_ST_OK && chunksrv_st(TSDB_ERR_NOTFOUND) == CHUNK_ST_ABSENT &&
           chunksrv_st(TSDB_ERR_CORRUPT) == CHUNK_ST_DAMAGED && chunksrv_st(TSDB_ERR_IO) == CHUNK_ST_IOERR &&
@@ -1017,6 +1047,243 @@ static void test_crashfs(void)
     }
     printf("  crashfs: %d power cuts in a put (%d after PUT_OK), %d runs acknowledged then lost power at exit or before\n",
            crashes, acked_crashes, acked_runs);
+    CHECK(finished && crashes > 3 && acked_runs > 3);
+    cdata_free(&c);
+}
+
+/* ---------------------------------------------------------------- replace-put & crashfs power loss (R12) */
+static void test_replace_put(void)
+{
+    char dir[PATH_MAX], st0[PATH_MAX + 16], st1[PATH_MAX + 16];
+    fresh("replace", dir, sizeof dir);
+    mkstore(dir, 0, 7, true, st0, sizeof st0);
+    mkstore(dir, 1, 7, true, st1, sizeof st1);
+    const char *pp[2] = {st0, st1};
+    char err[256] = "";
+    struct chunksrv *cs = chunksrv_open(pp, 2, err, sizeof err);
+    CHECK(cs != NULL);
+    if (!cs)
+        return;
+
+    cdata c;
+    cdata_make(&c, 2, 1, 4096, 4096 * 3 * 3 + 100, 77);
+    bool ok = false;
+    CHECK(fake_put(cs, &c, 1, &ok, NULL) == 0 && ok);
+
+    /* Find which store holds the chunk, raise fence to 5, and corrupt one cell byte on disk. */
+    chunk_ident id = {.volume = c.m.volume, .pos = c.m.pos};
+    memcpy(id.vuuid, c.m.vuuid, 16);
+    memcpy(id.oid, c.m.oid, 16);
+    chunk_backend *be = chunksrv_backend(cs);
+    int orig_idx = chunk_be_place(be, c.m.oid, c.m.pos);
+    chunk_store *orig_st = chunk_be_store(be, orig_idx);
+    CHECK(orig_st != NULL);
+    CHECK(chunk_be_see_epoch(be, c.m.volume, 5) == 0);
+    CHECK(chunk_store_test_flip(orig_st, &id) == 0);
+
+    /* Confirm chunk is now damaged on scrub. */
+    chunk_rd *rd = NULL;
+    CHECK(chunk_rd_open(orig_st, &id, &rd) == 0);
+    uint64_t nbad = 0;
+    CHECK(chunk_rd_scrub(rd, &nbad) == 0 && nbad >= 1);
+    chunk_rd_close(rd);
+
+    /* Deposed leader (fence 4 < 5): replace-put MUST be fenced (E14). */
+    cdata rep = c;
+    rep.m.flags = CS_PUT_F_REPLACE;
+    rep.m.hdr_epoch = 2;
+    rep.m.epoch = 4;
+    CHECK(fake_put(cs, &rep, 2, &ok, NULL) == CHUNK_ERR_FENCED);
+
+    /* Current leader (fence 5, hdr_epoch 2): replaces in place, reads back clean, preserves hdr_epoch == 2! */
+    rep.m.epoch = 5;
+    CHECK(fake_put(cs, &rep, 3, &ok, NULL) == 0 && ok);
+
+    rd = NULL;
+    CHECK(chunk_rd_open(orig_st, &id, &rd) == 0);
+    CHECK(chunk_rd_hdr(rd)->epoch == 2);
+    nbad = 1;
+    CHECK(chunk_rd_scrub(rd, &nbad) == 0 && nbad == 0);
+    uint8_t *buf = malloc(c.len);
+    CHECK(buf && chunk_rd_read(rd, 0, buf, c.len) == 0 && memcmp(buf, c.cells, c.len) == 0);
+    free(buf);
+    chunk_rd_close(rd);
+
+    /* Other store must NOT have received a duplicate copy. */
+    chunk_store *other_st = chunk_be_store(be, 1 - orig_idx);
+    rd = NULL;
+    CHECK(chunk_rd_open(other_st, &id, &rd) == TSDB_ERR_NOTFOUND);
+
+    /* Deleted chunk (D9): replace-put MUST return NOTFOUND at open and MUST NOT resurrect the file. */
+    CHECK(chunk_be_del(be, &id, 5) == 0);
+    CHECK(fake_put(cs, &rep, 4, &ok, NULL) == TSDB_ERR_NOTFOUND);
+    rd = NULL;
+    CHECK(chunk_rd_open(orig_st, &id, &rd) == TSDB_ERR_NOTFOUND);
+    CHECK(chunk_rd_open(other_st, &id, &rd) == TSDB_ERR_NOTFOUND);
+
+    /* Late/racing delete after put_begin and before put_end (D9): commit-time check under st->mu MUST return
+     * NOTFOUND, send no PUT_OK, and NOT resurrect the deleted chunk on any store. */
+    {
+        cdata c_race = c;
+        c_race.m.epoch = 5;
+        CHECK(fake_put(cs, &c_race, 5, &ok, NULL) == 0 && ok);
+        size_t flen = 0;
+        uint8_t *fbytes = cdata_file(&c_race, &flen);
+        CHECK(fbytes != NULL);
+        uint8_t meta_buf[CS_PUT_META_MAX];
+        size_t meta_len = cs_put_meta_encode(&rep.m, meta_buf);
+        cap cp = {0};
+        struct cs_put *p = NULL;
+        CHECK(chunksrv_put_begin(cs, 2, 100, meta_buf, meta_len, flen, cap_reply, &cp, &p) == 0 && p != NULL);
+        /* Delete the chunk while the replace-put writer is open (before data/commit). */
+        CHECK(chunk_be_del(be, &id, 5) == 0);
+        if (p) {
+            CHECK(chunksrv_put_data(p, 0, fbytes, flen) == 0);
+            chunksrv_put_end(p, 0);
+            CHECK(cp.n == 1 && cp.rc == TSDB_ERR_NOTFOUND && cp.body_len == 0);
+        }
+        free(cp.body);
+        free(fbytes);
+        rd = NULL;
+        CHECK(chunk_rd_open(orig_st, &id, &rd) == TSDB_ERR_NOTFOUND);
+        CHECK(chunk_rd_open(other_st, &id, &rd) == TSDB_ERR_NOTFOUND);
+    }
+
+    /* Holding store DOWN: replace-put MUST return UNAVAILABLE and MUST NOT duplicate onto other_st. */
+    cdata c2 = c;
+    c2.m.epoch = 5;
+    CHECK(fake_put(cs, &c2, 6, &ok, NULL) == 0 && ok);
+    CHECK(chunk_be_mark_down(be, orig_idx, orig_st, CHUNK_STORE_DOWN_DAMAGED) == 1);
+    rep.m.epoch = 6;
+    CHECK(fake_put(cs, &rep, 7, &ok, NULL) == TSDB_ERR_UNAVAILABLE);
+    rd = NULL;
+    CHECK(chunk_rd_open(other_st, &id, &rd) == TSDB_ERR_NOTFOUND);
+
+    cdata_free(&c);
+    chunksrv_close(cs);
+}
+
+static int child_replace(const char *dir, const char *ackf)
+{
+    char st[PATH_MAX + 16];
+    snprintf(st, sizeof st, "%s/st0", dir);
+    const char *pp[1] = {st};
+    char err[256];
+    struct chunksrv *cs = chunksrv_open(pp, 1, err, sizeof err);
+    if (!cs)
+        return 3;
+    cdata c;
+    cdata_make(&c, 5, 1, 4096, 4096 * 3 * 3 + 100, 42);
+    c.m.flags = CS_PUT_F_REPLACE;
+    c.m.hdr_epoch = 2;
+    bool ok = false;
+    int rc = fake_put(cs, &c, 2, &ok, ackf);
+    cdata_free(&c);
+    chunksrv_close(cs);
+    return rc == 0 && ok ? 0 : 4;
+}
+
+static int run_child_mode(const char *mode, const char *dir, const char *ackf, int warmup, int seed)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512], w[16], sd[16];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0:detect_leaks=0",
+                 getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        snprintf(w, sizeof w, "%d", warmup);
+        snprintf(sd, sizeof sd, "%d", seed);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", dir, 1);
+        setenv("CRASHFS_PROB", "1", 1);
+        setenv("CRASHFS_WARMUP", w, 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        setenv("CRASHFS_TEAR", "1", 1);
+        setenv("CRASHFS_SEED", sd, 1);
+        int null = open("/dev/null", O_WRONLY);
+        if (null >= 0) {
+            dup2(null, 1);
+            dup2(null, 2);
+        }
+        execl(SELF, "test_chunksrv", mode, dir, ackf, (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+static void test_crashfs_replace(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  crashfs-replace: SKIPPED (no %s)\n", SHIM);
+        return;
+    }
+    cdata c;
+    cdata_make(&c, 2, 1, 4096, 4096 * 3 * 3 + 100, 42);
+    int crashes = 0, acked_runs = 0, extra = 0;
+    bool finished = false;
+    for (int k = 0, last = -1; k < 400 && extra < (quick ? 6 : 16); k += finished ? 0 : 1) {
+        char dir[PATH_MAX], st[PATH_MAX + 16], ackf[PATH_MAX + 32];
+        fresh("crashrep", dir, sizeof dir);
+        mkstore(dir, 0, 7, true, st, sizeof st);
+        /* Pre-populate damaged chunk at epoch 2 and raise fence to 5 before crashfs runs. */
+        chunk_store *pre = NULL;
+        CHECK(chunk_store_open(st, NULL, &pre) == 0);
+        chunk_ident id = {.volume = 1, .pos = c.m.pos};
+        memcpy(id.vuuid, c.m.vuuid, 16);
+        memcpy(id.oid, c.m.oid, 16);
+        CHECK(chunk_store_put(pre, &id, &c.m.g, 2, c.cells, c.sums) == 0);
+        CHECK(chunk_store_raise(pre, 1, 5) == 0);
+        CHECK(chunk_store_test_flip(pre, &id) == 0);
+        chunk_store_close(pre);
+
+        snprintf(ackf, sizeof ackf, "%s.ack", dir);
+        unlink(ackf);
+        int code = run_child_mode("--child-replace", dir, ackf, finished ? last : k, k + 1 + extra * 7);
+        if (finished)
+            extra++;
+        CHECK(code == 0 || code == 99);
+        if (code != 0 && code != 99)
+            break;
+        crashes += code == 99;
+        struct stat sb;
+        bool acked = stat(ackf, &sb) == 0 && sb.st_size > 0;
+        acked_runs += acked;
+
+        chunk_store *s = NULL;
+        int rc = chunk_store_open(st, NULL, &s);
+        CHECK(rc == 0);
+        if (rc == 0) {
+            chunk_rd *rd = NULL;
+            rc = chunk_rd_open(s, &id, &rd);
+            /* Must NEVER be missing or unparseable: either the old damaged file or the whole new file. */
+            CHECK(rc == 0);
+            if (rc == 0) {
+                CHECK(chunk_rd_hdr(rd)->epoch == 2);
+                uint64_t bad = 0;
+                CHECK(chunk_rd_scrub(rd, &bad) == 0);
+                if (acked) {
+                    if (bad != 0)
+                        fprintf(stderr, "FAIL crashfs-replace step %d: PUT_OK went out, chunk still damaged\n", k);
+                    CHECK(bad == 0);
+                    uint8_t *b = malloc(c.len);
+                    CHECK(b && chunk_rd_read(rd, 0, b, c.len) == 0 && memcmp(b, c.cells, c.len) == 0);
+                    free(b);
+                } else {
+                    CHECK(bad == 0 || bad == 1);
+                }
+                chunk_rd_close(rd);
+            }
+            chunk_store_close(s);
+        }
+        if (code == 0 && !finished) {
+            finished = true;
+            last = k;
+        }
+    }
+    printf("  crashfs-replace: %d power cuts in replace-put, %d acknowledged runs\n", crashes, acked_runs);
     CHECK(finished && crashes > 3 && acked_runs > 3);
     cdata_free(&c);
 }
@@ -1738,6 +2005,8 @@ int main(int argc, char **argv)
         chunksrv_mutant = chunksrv_mutant_parse(getenv("TSDB_CHUNKSRV_MUTANT"));
     if (argc >= 4 && strcmp(argv[1], "--child") == 0)
         return child_put(argv[2], argv[3]);
+    if (argc >= 4 && strcmp(argv[1], "--child-replace") == 0)
+        return child_replace(argv[2], argv[3]);
     if (argc >= 3 && strcmp(argv[1], "--child-eio") == 0)
         return child_eio(argv[2]);
     for (int i = 1; i < argc; i++) {
@@ -1796,6 +2065,8 @@ int main(int argc, char **argv)
     test_bounds();
     test_owner();
     test_crashfs();
+    test_replace_put();
+    test_crashfs_replace();
     test_eio();
     test_net();
     test_objlist_reopen_chunkr();

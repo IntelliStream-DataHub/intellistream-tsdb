@@ -590,6 +590,22 @@ cgroup, so `nice` does not keep your work out of its way.
   `tsdb_chunk_scrub_*` (`docs/metrics.md`). Test knobs `TSDB_CHUNKSCRUB_TEST` and `TSDB_CHUNKSCRUB_MUTANT`
   (`TSDB_TEST_HOOKS`). `tests/test_chunkscrub.c`, `make chunkscrub-mutants`
   (`scrubskipcell scrubeioclean scrubrestart`), `test_cluster scrub`.
+- `server/chunkrepair.[ch]` (volume-leader chunk repair; R12, r12-repair, E11, E14, E25, E26, §5.9, D5, D9): bounded,
+  deduped `(volume, oid, pos)` repair queue with per-target-node serialization, exponential-backoff retries on
+  transient `UNAVAILABLE`/`FAILED`, and a bounded post-failure cooldown per `(volume, oid, pos)` (default 30 s) so
+  repeated read/scrub hits on a broken chunk do not storm peers; fed by `CS_OP_DAMAGED` (`cp_damaged_srv`) and
+  read-path bad survivors (`chunkpeer.on_damaged`, skipping `META_STRIPE_FILLING` positions). Verifies live /
+  not-retired / not-pending-`MK_GC` (`ecgc_oid_is_live`) before decoding and again right before the replace-put under
+  `ecgc_oid_lock` (shared with `ecgcmk` `delete_cluster_object`, D9; both `oid_mu` and the engine ref are released
+  before `net_put`). Decodes from `k` sum-verified survivors via `iso_rs`, checks every rebuilt cell against the object
+  record's `sums` (E26; `< k` good with damaged survivors counts `unrecoverable`, emits a health log line, and writes
+  nothing), and sends a v2 replace-put (`CS_PUT_MAGIC_V2`, `CS_PUT_F_REPLACE`: preserves `hdr_epoch = writer_epoch`
+  under leader's pinned `fence_epoch`, refuses open/commit unless the target chunk file still exists under `st->mu` so
+  late puts never resurrect deleted chunks or duplicate across stores, and runs `chunk_rd_scrub` read-back before
+  `PUT_OK`). Exports
+  `tsdb_chunk_repairs_total{result}`, `tsdb_chunk_repair_bytes_total`, and `tsdb_chunk_repair_queue_depth`. Test hooks
+  `TSDB_REPAIR_MUTANT` and `TSDB_REPAIR_TEST=pause_before_put=PATH` (`TSDB_TEST_HOOKS`). `tests/test_chunkrepair.c`,
+  `test_cluster scrubrepair`, `make repair-mutants` (`repairnolive repairnosums repairownepoch`).
 - `server/chunksrv.[ch]`, `server/chunksrv_cluster.c` (R8 D9-D11, E14, E26, E27): the chunk server, a peerlink of its own on
   every cluster member with kinds `PL_KIND_CHUNK` (6, requests and answers, worked by 4 FIFO workers) and `PL_KIND_CHUNKB`
   (7, puts as bulk files under `--chunk-rate-mb-s`; the link's callbacks only queue, a put thread per peer does the store
@@ -1248,8 +1264,11 @@ cgroup, so `nice` does not keep your work out of its way.
   `publish_lock` > `ppos_mu` (its append, `fdatasync` and creation `eng_sync_dir`) > `ppos` map mutex (a leaf, never
   held across I/O; `ppos_of` takes only it), and `ppos_mu` is never taken under `db->lock`, `latest_rw` or `buf_lock`
   (records go out before those are taken); `DIVERGED` (`src/ecdiverge.h`) takes its mutex > `dir_sync_lock` > `fail_lock`
-  under no engine lock; `GCMK` (`src/ecgcmk.c`) takes `apply_mu` > `rp->mu` (or leader GC worker `wmu`) > `g->fmu` >
-  `g->mu` (leaf), and `latest_rw` > `db->lock` > `ecgc_tier.mu` (a leaf: never held across I/O or another lock).
+  under no engine lock; `GCMK` (`src/ecgcmk.c`) takes `apply_mu` > `rp->mu` (or leader GC worker `wmu`) > `oid_mu`
+  (`ecgc_oid_lock`, 64-stripe mutex array on `ecgc_tier` serializing `ecgcmk` `delete_cluster_object` against
+  `cp_repair_check_and_put`'s `ecgc_oid_is_live`; `cp_repair_check_and_put` releases `oid_mu` and its engine ref before
+  `net_put`, never holding either across network I/O) > `db->lock` / `g->fmu` > `g->mu` (leaf), and `latest_rw` >
+  `db->lock` > `ecgc_tier.mu` (a leaf: never held across I/O or another lock).
   `cls_mu` (the class history map)
   is a leaf, and so are the granule cache's mutex (`src/eccache.c`: never held across I/O, an open or close, a decode or
   another lock: a fill waits on its entry, not on the mutex), the digest's (`src/eckeep.c`), the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O), the tier's registry of

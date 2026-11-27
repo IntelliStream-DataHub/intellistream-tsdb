@@ -177,9 +177,12 @@ typedef struct gc_eng {
     bool stopping;
 } gc_eng;
 
+#define ECGC_OID_LOCKS 64u
+
 struct ecgc_tier {
     pthread_mutex_t mu;
     pthread_cond_t cv;
+    pthread_mutex_t oid_mu[ECGC_OID_LOCKS]; /* outer per-(volume, oid) lock serializing MK_GC deletes with repair */
     gc_item *q; /* the entries are q[qh .. nq): a pop moves qh, a push compacts only once qh is half of nq */
     size_t qh, nq, capq;
     gc_phold *ptab;
@@ -635,6 +638,8 @@ int ecgc_tier_open(tier *t)
         return TSDB_ERR_NOMEM;
     pthread_mutex_init(&g->mu, NULL);
     tsdb_cond_init_mono(&g->cv);
+    for (size_t i = 0; i < ECGC_OID_LOCKS; i++)
+        pthread_mutex_init(&g->oid_mu[i], NULL);
     t->gc = g;
     if (!atomic_load(&ecgc_test_manual)) {
         if (tsdb_thread_create(&g->thread, gc_main, t) != 0)
@@ -676,6 +681,8 @@ void ecgc_tier_close(tier *t)
     for (size_t i = 0; i < g->ndef; i++)
         free(g->def[i].named);
     free(g->def);
+    for (size_t i = 0; i < ECGC_OID_LOCKS; i++)
+        pthread_mutex_destroy(&g->oid_mu[i]);
     pthread_mutex_destroy(&g->mu);
     pthread_cond_destroy(&g->cv);
     free(g);
@@ -1175,6 +1182,51 @@ int ecgc_list_retired_locked(eng *db, uint8_t (**oids_out)[16], size_t *n_out)
     *oids_out = oids;
     *n_out = n;
     return 0;
+}
+
+void ecgc_oid_lock(tier *t, uint32_t volume, const uint8_t oid[16])
+{
+    struct ecgc_tier *g = t ? t->gc : NULL;
+    if (!g || !oid)
+        return;
+    pthread_mutex_lock(&g->oid_mu[oid_hash(volume, oid, ECGC_OID_LOCKS)]);
+}
+
+void ecgc_oid_unlock(tier *t, uint32_t volume, const uint8_t oid[16])
+{
+    struct ecgc_tier *g = t ? t->gc : NULL;
+    if (!g || !oid)
+        return;
+    pthread_mutex_unlock(&g->oid_mu[oid_hash(volume, oid, ECGC_OID_LOCKS)]);
+}
+
+bool ecgc_oid_is_live(eng *db, const uint8_t oid[16])
+{
+    if (!db || !oid)
+        return false;
+    bool listed = false, retired = false;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++) {
+        part *p = db->parts[i];
+        struct ecpart *ep = atomic_load_explicit(&p->ec, memory_order_acquire);
+        if (ep && !ep->test_mark && !p->dropped && !p->retired && memcmp(ep->rec.oid, oid, 16) == 0) {
+            listed = true;
+            break;
+        }
+    }
+    struct ecgc_eng *e = eng_gc(db);
+    for (size_t i = 0; e && i < e->n; i++) {
+        if (e->r[i].object && memcmp(e->r[i].oid, oid, 16) == 0) {
+            retired = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (!listed || retired)
+        return false;
+    if (ecgcmk_pending_has(db, oid))
+        return false;
+    return true;
 }
 
 /* ------------------------------------------------------------ the sweep (D6, single server) */

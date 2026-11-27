@@ -276,9 +276,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         } else {
             struct cs_put_meta m;
             if (cs_put_meta_decode(p, n, &m) == 0) {
-                uint8_t back[CS_PUT_META_LEN];
-                cs_put_meta_encode(&m, back);
-                if (n != CS_PUT_META_LEN || memcmp(back, p, n) != 0 || m.pos >= chunk_npos(&m.g))
+                uint8_t back[CS_PUT_META_MAX];
+                size_t bl = cs_put_meta_encode(&m, back);
+                if (bl != n || memcmp(back, p, n) != 0 || m.pos >= chunk_npos(&m.g))
                     abort();
                 (void)cs_put_total(&m);
             }
@@ -454,6 +454,10 @@ void fuzz_seeds(const char *dir)
     memset(pm.vuuid, 0x11, 16), memset(pm.oid, 0x22, 16);
     if (chunk_geom_make(&pm.g, 4, 2, 4096, 100000) != 0)
         abort();
-    cs_put_meta_encode(&pm, cb);
-    put_frame(dir, "seed-cs-putmeta", 9, 2, cb, CS_PUT_META_LEN);
+    size_t pml = cs_put_meta_encode(&pm, cb);
+    put_frame(dir, "seed-cs-putmeta", 9, 2, cb, pml);
+    pm.flags = CS_PUT_F_REPLACE;
+    pm.hdr_epoch = 4;
+    pml = cs_put_meta_encode(&pm, cb);
+    put_frame(dir, "seed-cs-putmeta-replace", 9, 2, cb, pml);
 }

@@ -76,6 +76,12 @@ int ecgc_collect_oids_locked(eng *db, const uint8_t *oids, size_t noids, char (*
 int ecgc_list_retired_locked(eng *db, uint8_t (**oids_out)[16], size_t *n_out);
 void ecgc_note_unlinked(struct tier *t, uint64_t n);
 
+/* R12 (r12-repair, D9): per-oid serialization between cluster MK_GC chunk deletes and leader chunk repair, and
+ * live/not-retired/not-GC-pending check. Lock order: ecgcmk.wmu > oid_mu > db->lock > ecgc_tier.mu / gcmk->mu. */
+void ecgc_oid_lock(struct tier *t, uint32_t volume, const uint8_t oid[16]);
+void ecgc_oid_unlock(struct tier *t, uint32_t volume, const uint8_t oid[16]);
+bool ecgc_oid_is_live(eng *db, const uint8_t oid[16]);
+
 /* tests */
 typedef struct ecgc_counters {
     uint64_t queued;    /* objects queued */

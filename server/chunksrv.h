@@ -76,12 +76,17 @@ enum {
 #define CS_OBJLIST_BYTES_MAX (4u << 20) /* payload byte budget of one CS_OP_OBJLIST page */
 #define CS_OBJLIST_HDR 21u            /* vuuid 16, u32 n, u8 more */
 #define CS_OBJLIST_ENTRY_HDR 60u      /* oid 16, k 2, m 2, cell 4, len 8, positions 4, epoch 8, sver 8, nsums 8 */
-#define CS_PUT_MAGIC 0x54505343u /* "CSPT" */
-/* magic 4, volume 4, epoch 8, vuuid 16, oid 16, pos 2, k 2, m 2, cell 4, len 8, then xxh64 of those 66 bytes: the data
- * links carry no frame check by default (`--peer-check none`), and the receiver raises a durable fence from the epoch
- * here, so the meta checks itself (as a request does, below) */
+#define CS_PUT_MAGIC 0x54505343u    /* "CSPT" (v1: 74 bytes, flags == 0) */
+#define CS_PUT_MAGIC_V2 0x32505343u /* "CSP2" (v2: 86 bytes, flags + hdr_epoch) */
+/* magic 4, volume 4, epoch 8, vuuid 16, oid 16, pos 2, k 2, m 2, cell 4, len 8, then xxh64 of those 66 bytes (v1);
+ * v2 adds u32 flags, u64 hdr_epoch before the trailing xxh64 (78 + 8 = 86 bytes). The data links carry no frame check
+ * by default (`--peer-check none`), and the receiver raises a durable fence from the epoch here, so the meta checks
+ * itself (as a request does, below). */
 #define CS_PUT_META_LEN 74u
-#define CS_CHECK_LEN 8u /* the xxh64 that ends a request and a put meta */
+#define CS_PUT_META_V2_LEN 86u
+#define CS_PUT_META_MAX CS_PUT_META_V2_LEN
+#define CS_PUT_F_REPLACE 1u /* R12 (E14, §5.9): replace damaged chunk at hdr_epoch under fence epoch + read-back */
+#define CS_CHECK_LEN 8u     /* the xxh64 that ends a request and a put meta */
 
 /* A request: [u64 rid][u8 op][u32 volume][u64 epoch] and the op's body:
  *   READ   vuuid 16, oid 16, u16 pos, u64 off, u32 len (1 .. CS_READ_MAX)
@@ -121,10 +126,12 @@ struct cs_resp {
 };
 struct cs_put_meta {
     uint32_t volume;
-    uint64_t epoch;
+    uint64_t epoch; /* fence epoch (and header epoch when flags == 0) */
     uint8_t vuuid[16], oid[16];
     uint16_t pos;
     chunk_geom g;
+    uint32_t flags;     /* 0 (v1) or CS_PUT_F_REPLACE (v2) */
+    uint64_t hdr_epoch; /* v2: chunk header's writer epoch (0 for v1) */
 };
 
 size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap); /* bytes written, 0 if cap is too small */
@@ -133,12 +140,13 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r);       /* 0 or
 /* An answer is rid 8, op 1, rc 4, an xxh64 check 8, then the body; this writes the check of the n bytes at p (an answer
  * built whole; tests and fuzz seeds build theirs with it). */
 void cs_resp_seal(uint8_t *p, size_t n);
-void cs_put_meta_encode(const struct cs_put_meta *m, uint8_t out[CS_PUT_META_LEN]);
+size_t cs_put_meta_encode(const struct cs_put_meta *m, uint8_t *out); /* CS_PUT_META_LEN (v1) or CS_PUT_META_V2_LEN */
 int cs_put_meta_decode(const uint8_t *p, size_t n, struct cs_put_meta *m); /* 0, or -1 (a geometry that cannot be too) */
 uint64_t cs_put_total(const struct cs_put_meta *m);                       /* the file's bytes: sums, then cells */
 uint64_t cs_sums_hash(const uint64_t *sums, uint64_t n);                  /* xxh64 of the table, little endian */
 /* PUT_OK's body: xxh64 of the put meta as the receiver decoded it, then cs_sums_hash of its sums (8 bytes, little
  * endian), so a put whose identity changed on the way is never taken as the sender's (the sender compares) */
+uint64_t cs_put_answer_hash_len(const uint8_t *meta, size_t meta_len, uint64_t sums_hash);
 uint64_t cs_put_answer_hash(const uint8_t meta[CS_PUT_META_LEN], uint64_t sums_hash);
 int chunksrv_st(int rc); /* CHUNK_ST_* of an answer's rc: OK, ABSENT, DAMAGED, IOERR, DOWN (-1: none of those) */
 

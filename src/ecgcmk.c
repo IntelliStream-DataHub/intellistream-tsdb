@@ -1106,7 +1106,7 @@ static bool maybe_pause_before_del(eng *db)
 }
 #endif
 
-static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], uint64_t mk_pos)
+static int delete_cluster_object_locked(eng *db, coldvol *cv, const uint8_t oid[16], uint64_t mk_pos)
 {
     struct ecgcmk *g = db->gcmk;
     if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
@@ -1158,6 +1158,17 @@ static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], ui
     if (!cv->ops->writable(cv->ctx))
         return TSDB_ERR_UNAVAILABLE;
     return 0;
+}
+
+static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], uint64_t mk_pos)
+{
+    struct ecgcmk *g = db->gcmk;
+    if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
+        return TSDB_ERR_STOPPED;
+    ecgc_oid_lock(db->tier, db->tier_vol, oid);
+    int rc = delete_cluster_object_locked(db, cv, oid, mk_pos);
+    ecgc_oid_unlock(db->tier, db->tier_vol, oid);
+    return rc;
 }
 
 static void process_pending(eng *db, coldvol *cv)

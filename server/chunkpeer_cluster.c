@@ -27,6 +27,7 @@
 #include "../src/internal.h"
 #include "../src/tier.h"
 #include "chunksrv.h"
+#include "chunkrepair.h"
 #include "cluster.h"
 #include "crashpt.h"
 #include "creport.h"
@@ -75,6 +76,7 @@ static void cp_reconcile_srv(void *arg, uint32_t volume, uint32_t pos, uint64_t 
  * separate repair/rebuild track. */
 static int cp_damaged_srv(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16], uint16_t pos,
                           uint64_t bad_cells);
+static void cp_on_read_damaged(void *arg, uint32_t volume, const uint8_t oid[16], unsigned pos, uint32_t node);
 static void cp_read_pace(void *arg, uint32_t volume, size_t bytes);
 static void cp_release_gc_crash(void) { crash_point(CP_RELEASE_GC); }
 static void cp_gc_kick(uint32_t volume)
@@ -281,9 +283,9 @@ static int net_put(void *arg, uint32_t node, const struct cs_put_meta *m, int fd
          * the hash of this meta and sum */
         rc = chunksrv_put_remote(cs, node, m, fd, base, sum, timeout_ms);
         if (rc == 0) {
-            uint8_t meta[CS_PUT_META_LEN];
-            cs_put_meta_encode(m, meta);
-            *answered = cs_put_answer_hash(meta, sum);
+            uint8_t meta[CS_PUT_META_MAX];
+            size_t ml = cs_put_meta_encode(m, meta);
+            *answered = cs_put_answer_hash_len(meta, ml, sum);
         }
     }
     if (hold_hook_ms > 0) /* TSDB_CHUNKPEER_TEST=holdput=MS: a put in flight across tsdbd's shutdown (test_cluster) */
@@ -430,6 +432,7 @@ int chunkpeer_cluster_start(const char *stage_dir)
     }
 #endif
     ecgc_env_init();
+    chunkrepair_env_init();
     atomic_store_explicit(&ecgcmk_release_crash_hook, cp_release_gc_crash, memory_order_release);
     cluster_set_gc_kick(cp_gc_kick);
     G.net = (struct chunkpeer_net){.call = net_call, .put = net_put, .arg = &G};
@@ -437,6 +440,8 @@ int chunkpeer_cluster_start(const char *stage_dir)
     G.view_arg = &G;
     G.node_state = cp_node_state;
     G.note_missing = sreconcile_note_missing;
+    G.on_damaged = cp_on_read_damaged;
+    G.on_damaged_arg = NULL;
     snprintf(G.stage_dir, sizeof G.stage_dir, "%s", stage_dir);
     tier_set_cluster(attach, &G, g_ec_cfg.cache_bytes >> 20);
     (void)creport_metric_collector("tsdb_chunk_scrub_reports_received_total", CREPORT_COUNTER,
@@ -806,10 +811,11 @@ static int cp_gcpending_srv(void *arg, uint32_t volume, uint8_t (**oids_out)[16]
     return 0;
 }
 
-/* Leader-side handler for CS_OP_DAMAGED (R12, r12-chunk; D9): validates leadership and whether the reported object is
- * live in the volume's manifest (unknown/retired objects are left for E14 orphan GC), logs the damage, and increments
- * tsdb_chunk_scrub_reports_received_total. Active leader-driven cell repair / rebuild orchestration belongs to the
- * separate repair/rebuild track. */
+static void cp_repair_enqueue(uint32_t volume, const uint8_t oid[16], unsigned pos, uint32_t node);
+
+/* Leader-side handler for CS_OP_DAMAGED (R12, r12-chunk / r12-repair; D5, D9): validates leadership and whether the
+ * reported object is live in the volume's manifest (unknown/retired/pending-MK_GC objects are left for E14 orphan GC),
+ * logs the damage, increments tsdb_chunk_scrub_reports_received_total, and enqueues `(volume, oid, pos)` for repair. */
 static int cp_damaged_srv(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16], uint16_t pos,
                           uint64_t bad_cells)
 {
@@ -824,6 +830,7 @@ static int cp_damaged_srv(void *arg, uint32_t peer, uint32_t volume, const uint8
         return TSDB_ERR_UNAVAILABLE;
     const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
     bool allowed = cv && cv->redundancy == META_RED_EC && c->self != 0 && cv->leader == c->self;
+    bool target_match = allowed && pos < cv->nstripe && cv->stripe[pos] == peer;
     cluster_copy_put(c);
     if (!allowed)
         return TSDB_ERR_UNAVAILABLE;
@@ -832,21 +839,7 @@ static int cp_damaged_srv(void *arg, uint32_t peer, uint32_t volume, const uint8
     if (!e)
         return TSDB_ERR_UNAVAILABLE;
 
-    bool live = false;
-    size_t np = 0;
-    part **ps = db_snapshot(e, INT64_MIN, INT64_MAX, &np);
-    if (!ps) {
-        tsdb_cvol_unref(&e);
-        return TSDB_ERR_NOMEM;
-    }
-    for (size_t i = 0; i < np; i++) {
-        struct ecpart *ep = atomic_load_explicit(&ps[i]->ec, memory_order_acquire);
-        if (ep && !ep->test_mark && memcmp(ep->rec.oid, oid, 16) == 0) {
-            live = true;
-            break;
-        }
-    }
-    db_release(ps, np);
+    bool live = ecgc_oid_is_live(e, oid);
     tsdb_cvol_unref(&e);
 
     uint64_t cnt = cp_dmg_inc(volume);
@@ -857,6 +850,8 @@ static int cp_damaged_srv(void *arg, uint32_t peer, uint32_t volume, const uint8
                 "tsdbd: volume %" PRIu32 ": CHUNK_DAMAGED from node %" PRIu32 " oid=%s pos=%u bad_cells=0x%" PRIx64
                 " (live, reports=%" PRIu64 ")\n",
                 volume, peer, hex, (unsigned)pos, bad_cells, cnt);
+        if (target_match)
+            cp_repair_enqueue(volume, oid, pos, peer);
     } else {
         /* D9: unknown or retired object is never repaired or deleted by scrub; left for E14 orphan GC. */
         fprintf(stderr,
@@ -865,6 +860,23 @@ static int cp_damaged_srv(void *arg, uint32_t peer, uint32_t volume, const uint8
                 volume, peer, hex, (unsigned)pos, bad_cells, cnt);
     }
     return 0;
+}
+
+static void cp_on_read_damaged(void *arg, uint32_t volume, const uint8_t oid[16], unsigned pos, uint32_t node)
+{
+    (void)arg;
+    if (!cvol_led(volume))
+        return;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return;
+    const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+    bool ok = cv && cv->redundancy == META_RED_EC && c->self != 0 && cv->leader == c->self && pos < cv->nstripe &&
+              cv->stripe[pos] == node && cv->stripe_pos[pos].state != META_STRIPE_FILLING;
+    cluster_copy_put(c);
+    if (!ok)
+        return;
+    cp_repair_enqueue(volume, oid, pos, node);
 }
 
 static int vol_settled_margin(const struct cluster_copy *c, const struct cluster_copy_vol *v)
@@ -1076,9 +1088,10 @@ static void sf_op_notify_reopen(void *arg, uint32_t volume, const uint8_t oid[16
 static struct {
     struct sfill *sf;
     struct sreconcile *rec;
+    struct chunkrepair *cr;
     pthread_t thr;
     pthread_mutex_t mu;
-    pthread_mutex_t rec_mu; /* protects SF.rec lookup from RPC handlers and report merge */
+    pthread_mutex_t rec_mu; /* protects SF.rec / SF.cr lookup from RPC handlers and report merge */
     pthread_mutex_t rep_mu; /* serializes merged HBS_FILL publication from sfill + sreconcile */
     pthread_cond_t cv;
     bool started;
@@ -1088,6 +1101,212 @@ static struct {
     .rec_mu = PTHREAD_MUTEX_INITIALIZER,
     .rep_mu = PTHREAD_MUTEX_INITIALIZER,
 };
+
+static void cp_repair_enqueue(uint32_t volume, const uint8_t oid[16], unsigned pos, uint32_t node)
+{
+    pthread_mutex_lock(&SF.rec_mu);
+    if (SF.cr)
+        (void)chunkrepair_enqueue(SF.cr, volume, oid, pos, node);
+    pthread_mutex_unlock(&SF.rec_mu);
+}
+
+static int cp_repair_lookup_live(void *arg, uint32_t volume, const uint8_t oid[16], struct chunkrepair_obj *out)
+{
+    (void)arg;
+    memset(out, 0, sizeof *out);
+    tsdb *db = atomic_load_explicit(&G_db, memory_order_acquire);
+    if (!db || !cvol_led(volume) || !cluster_lease_valid())
+        return TSDB_ERR_UNAVAILABLE;
+    eng *e = tsdb_cvol_ref(db, volume);
+    if (!e)
+        return TSDB_ERR_UNAVAILABLE;
+    if (!ecgc_oid_is_live(e, oid)) {
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_NOTFOUND;
+    }
+    const uint8_t *vu = tier_vuuid(e);
+    if (!vu) {
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    memcpy(out->vuuid, vu, 16);
+
+    size_t np = 0;
+    part **ps = db_snapshot(e, INT64_MIN, INT64_MAX, &np);
+    if (!ps) {
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_NOMEM;
+    }
+    int rc = TSDB_ERR_NOTFOUND;
+    for (size_t i = 0; i < np; i++) {
+        struct ecpart *ep = atomic_load_explicit(&ps[i]->ec, memory_order_acquire);
+        if (!ep || ep->test_mark || memcmp(ep->rec.oid, oid, 16) != 0)
+            continue;
+        const ec_record *r = &ep->rec;
+        if (chunk_geom_make(&out->g, r->k, r->m, r->cell_bytes, r->object_len) != 0) {
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        memcpy(out->oid, r->oid, 16);
+        out->positions = r->positions;
+        out->writer_epoch = r->writer_epoch;
+        out->stripe_version = r->stripe_version;
+        out->nsums = r->nsums;
+        if (r->nsums > 0) {
+            out->sums = malloc((size_t)r->nsums * sizeof(uint64_t));
+            if (!out->sums) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            memcpy(out->sums, r->sums, (size_t)r->nsums * sizeof(uint64_t));
+        }
+        rc = 0;
+        break;
+    }
+    db_release(ps, np);
+    tsdb_cvol_unref(&e);
+    return rc;
+}
+
+static int cp_repair_vol_view(void *arg, uint32_t volume, struct chunkrepair_vol_view *out)
+{
+    (void)arg;
+    memset(out, 0, sizeof *out);
+    if (!cvol_led(volume) || !cluster_lease_valid())
+        return TSDB_ERR_UNAVAILABLE;
+    uint64_t le = 0;
+    if (repld_leading(volume, &le) != 1 || le == 0)
+        return TSDB_ERR_UNAVAILABLE;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return TSDB_ERR_UNAVAILABLE;
+    const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+    int rc = TSDB_ERR_UNAVAILABLE;
+    if (cv && cv->redundancy == META_RED_EC && c->self != 0 && cv->leader == c->self && cv->nstripe > 0 &&
+        cv->nstripe <= CHUNK_POS_MAX) {
+        out->fence_epoch = le; /* leader's own pinned epoch (E14: deposed leader gets fenced) */
+        out->stripe_version = cv->stripe_version;
+        out->k = cv->ec_k;
+        out->m = cv->ec_m;
+        out->nstripe = cv->nstripe;
+        out->is_leader = true;
+        memcpy(out->stripe, cv->stripe, cv->nstripe * sizeof(uint32_t));
+        for (uint32_t i = 0; i < cv->nstripe; i++) {
+            out->stripe_filling[i] = cv->stripe_pos[i].state == META_STRIPE_FILLING ? 1 : 0;
+            uint32_t prev = cv->stripe_pos[i].prev;
+            out->stripe_prev[i] = prev;
+            out->stripe_set_ver[i] = cv->stripe_pos[i].set_ver;
+            if (prev != 0) {
+                const struct cluster_copy_member *pm = cluster_copy_member(c, prev);
+                out->stripe_prev_up[i] = (pm && (pm->state == META_UP || pm->state == META_DRAINING)) ? 1 : 0;
+            }
+        }
+        rc = 0;
+    }
+    cluster_copy_put(c);
+    return rc;
+}
+
+static bool cp_repair_is_filled(void *arg, uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver,
+                                const uint8_t oid[16])
+{
+    (void)arg;
+    return chunkpeer_is_filled(node, volume, pos, set_ver, oid);
+}
+
+static int cp_repair_check_and_put(void *arg, uint32_t node, const struct cs_put_meta *m, int fd, uint64_t base,
+                                   uint64_t sum, bool skip_live_check)
+{
+    (void)arg;
+    tsdb *db = atomic_load_explicit(&G_db, memory_order_acquire);
+    if (!db)
+        return TSDB_ERR_UNAVAILABLE;
+    /* Re-verify leadership and live/not-retired/not-pending-MK_GC under the per-oid GC lock, then release BOTH the GC
+     * lock and engine reference before network I/O so a slow/hung target node can neither stall tsdb_cvol_replace
+     * (demote/transfer/install) nor block ecgcmk on a hash-stripe collision. Any delete racing after unlock is
+     * prevented from resurrecting the chunk by the chunk server's atomic replace_only check under st->mu at open and
+     * right before renameat (D9). */
+    if (!skip_live_check) {
+        if (!cvol_led(m->volume) || !cluster_lease_valid())
+            return TSDB_ERR_UNAVAILABLE;
+        eng *e = tsdb_cvol_ref(db, m->volume);
+        if (!e)
+            return TSDB_ERR_UNAVAILABLE;
+        tier *t = e->tier;
+        if (t)
+            ecgc_oid_lock(t, m->volume, m->oid);
+        bool live = ecgc_oid_is_live(e, m->oid);
+        if (t)
+            ecgc_oid_unlock(t, m->volume, m->oid);
+        tsdb_cvol_unref(&e);
+        if (!live)
+            return TSDB_ERR_NOTFOUND;
+    }
+    int base_tmo = G.timeout_ms > 0 ? G.timeout_ms : 30000;
+    uint64_t mb = cs_put_total(m) >> 20;
+    int extra_ms = mb > 270u ? 270000 : (int)(mb * 1000u); /* bounded <= 270000 ms before cast to int */
+    int tmo = base_tmo + extra_ms;
+    uint64_t answered = 0;
+    int rc = net_put(NULL, node, m, fd, base, sum, tmo, &answered);
+    if (rc == 0) {
+        uint8_t enc[CS_PUT_META_MAX];
+        size_t encl = cs_put_meta_encode(m, enc);
+        if (answered != cs_put_answer_hash_len(enc, encl, sum))
+            rc = TSDB_ERR_IO;
+    }
+    return rc;
+}
+
+static void cp_repair_collect_results(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct chunkrepair_stats st;
+    memset(&st, 0, sizeof st);
+    bool have = false;
+    pthread_mutex_lock(&SF.rec_mu);
+    if (SF.cr) {
+        chunkrepair_get_stats(SF.cr, &st);
+        have = true;
+    }
+    pthread_mutex_unlock(&SF.rec_mu);
+    if (!have)
+        return;
+    for (int i = 0; i < CHUNKREPAIR_RES_COUNT; i++) {
+        struct creport_label lbl = {"result", chunkrepair_res_name(i)};
+        creport_sink_put_u64(sink, &lbl, 1, st.results[i]);
+    }
+}
+
+static void cp_repair_collect_bytes(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct chunkrepair_stats st;
+    memset(&st, 0, sizeof st);
+    bool have = false;
+    pthread_mutex_lock(&SF.rec_mu);
+    if (SF.cr) {
+        chunkrepair_get_stats(SF.cr, &st);
+        have = true;
+    }
+    pthread_mutex_unlock(&SF.rec_mu);
+    if (have)
+        creport_sink_put_u64(sink, NULL, 0, st.bytes_repaired);
+}
+
+static void cp_repair_collect_qdepth(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    size_t d = 0;
+    bool have = false;
+    pthread_mutex_lock(&SF.rec_mu);
+    if (SF.cr) {
+        d = chunkrepair_queue_depth(SF.cr);
+        have = true;
+    }
+    pthread_mutex_unlock(&SF.rec_mu);
+    if (have)
+        creport_sink_put_u64(sink, NULL, 0, (uint64_t)d);
+}
 
 static void cp_reconcile_srv(void *arg, uint32_t volume, uint32_t pos, uint64_t stripe_version)
 {
@@ -1745,10 +1964,41 @@ int sfill_cluster_start(struct tsdb *db, const char *state_dir)
         sfill_free(sf);
         return -1;
     }
+    struct chunkrepair_cfg crcfg;
+    memset(&crcfg, 0, sizeof crcfg);
+    snprintf(crcfg.stage_dir, sizeof crcfg.stage_dir, "%s", G.stage_dir[0] ? G.stage_dir : "/tmp");
+    crcfg.nworkers = CHUNKREPAIR_DEFAULT_WORKERS;
+    crcfg.queue_max = CHUNKREPAIR_QUEUE_MAX;
+    struct chunkrepair_ops crops = {
+        .lookup_live = cp_repair_lookup_live,
+        .vol_view = cp_repair_vol_view,
+        .read_cell = sf_op_read_cell,
+        .check_and_put = cp_repair_check_and_put,
+        .is_filled = cp_repair_is_filled,
+        .notify_reopen = sf_op_notify_reopen,
+        .arg = NULL,
+    };
+    struct chunkrepair *cr = chunkrepair_new(&crcfg, &crops);
+    if (!cr) {
+        sreconcile_stop(rec);
+        sfill_free(sf);
+        sreconcile_free(rec);
+        return -1;
+    }
     pthread_mutex_lock(&SF.rec_mu);
     SF.sf = sf;
     SF.rec = rec;
+    SF.cr = cr;
     pthread_mutex_unlock(&SF.rec_mu);
+
+    (void)creport_metric_collector("tsdb_chunk_repairs_total", CREPORT_COUNTER,
+                                   "Volume leader chunk repair outcomes by result.", cp_repair_collect_results, NULL);
+    (void)creport_metric_collector("tsdb_chunk_repair_bytes_total", CREPORT_COUNTER,
+                                   "Total chunk bytes written by volume leader chunk repairs.", cp_repair_collect_bytes,
+                                   NULL);
+    (void)creport_metric_collector("tsdb_chunk_repair_queue_depth", CREPORT_GAUGE,
+                                   "Damaged chunks currently queued or actively being repaired on this leader.",
+                                   cp_repair_collect_qdepth, NULL);
 
     pthread_mutex_lock(&SF.mu);
     tsdb_cond_init_mono(&SF.cv);
@@ -1756,10 +2006,15 @@ int sfill_cluster_start(struct tsdb *db, const char *state_dir)
     pthread_mutex_unlock(&SF.mu);
     if (pthread_create(&SF.thr, NULL, sf_watch_main, NULL) != 0) {
         pthread_cond_destroy(&SF.cv);
+        creport_metric_collector_del("tsdb_chunk_repairs_total");
+        creport_metric_collector_del("tsdb_chunk_repair_bytes_total");
+        creport_metric_collector_del("tsdb_chunk_repair_queue_depth");
         pthread_mutex_lock(&SF.rec_mu);
         SF.sf = NULL;
         SF.rec = NULL;
+        SF.cr = NULL;
         pthread_mutex_unlock(&SF.rec_mu);
+        chunkrepair_free(cr);
         sreconcile_stop(rec);
         sfill_free(sf);
         sreconcile_free(rec);
@@ -1780,15 +2035,22 @@ void sfill_cluster_stop(void)
     pthread_join(SF.thr, NULL);
     pthread_cond_destroy(&SF.cv);
 
+    creport_metric_collector_del("tsdb_chunk_repairs_total");
+    creport_metric_collector_del("tsdb_chunk_repair_bytes_total");
+    creport_metric_collector_del("tsdb_chunk_repair_queue_depth");
+
     pthread_mutex_lock(&SF.rec_mu);
     struct sfill *sf = SF.sf;
     struct sreconcile *rec = SF.rec;
+    struct chunkrepair *cr = SF.cr;
     SF.sf = NULL;
     SF.rec = NULL;
+    SF.cr = NULL;
     pthread_mutex_unlock(&SF.rec_mu);
 
-    /* Order: stop reconcile coordinator (no new tasks queued), free sfill (drains/drops tasks calling on_task_done
-     * while rec is still alive), then free rec. */
+    /* Order: free chunkrepair workers, stop reconcile coordinator (no new tasks queued), free sfill (drains/drops
+     * tasks calling on_task_done while rec is still alive), then free rec. */
+    chunkrepair_free(cr);
     sreconcile_stop(rec);
     sfill_free(sf);
     sreconcile_free(rec);

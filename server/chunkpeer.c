@@ -254,7 +254,8 @@ struct put_batch {
     int rc[CHUNK_POS_MAX];
     uint64_t answered[CHUNK_POS_MAX];
     uint64_t sum_hash[CHUNK_POS_MAX];
-    uint8_t meta[CHUNK_POS_MAX][CS_PUT_META_LEN];
+    uint8_t meta[CHUNK_POS_MAX][CS_PUT_META_MAX];
+    size_t meta_len[CHUNK_POS_MAX];
     put_pos_job jobs[CHUNK_POS_MAX];
 };
 
@@ -264,7 +265,7 @@ static void put_pos_run(put_batch *b, unsigned i)
     memcpy(m.vuuid, b->vuuid, 16);
     memcpy(m.oid, b->oid, 16);
     uint64_t sum = cs_sums_hash(b->sums + chunk_sums_base(b->g, i), chunk_pos_cells(b->g, i)), answered = 0;
-    cs_put_meta_encode(&m, b->meta[i]);
+    b->meta_len[i] = cs_put_meta_encode(&m, b->meta[i]);
     b->sum_hash[i] = sum;
     b->rc[i] = b->cp->net.put(b->cp->net.arg, b->stripe[i], &m, b->fds[i], 0, sum, timeout_of(b->cp), &answered);
     b->answered[i] = answered;
@@ -285,7 +286,7 @@ static int put_check_pos(pctx *p, const put_batch *b, unsigned i)
 {
     int r = b->rc[i];
     /* the answer covers the identity the member took (volume, epoch, position, oid) as well as the sums */
-    if (r == 0 && b->answered[i] != cs_put_answer_hash(b->meta[i], b->sum_hash[i]) &&
+    if (r == 0 && b->answered[i] != cs_put_answer_hash_len(b->meta[i], b->meta_len[i], b->sum_hash[i]) &&
         chunkpeer_mutant != CP_MUT_NOSUMCMP) {
         fprintf(stderr, "tsdbd: volume %" PRIu32 ": member %" PRIu32 " answered the put of position %u with "
                         "another sum than the chunk's: the put fails\n", p->volume, b->stripe[i], i);
@@ -886,6 +887,8 @@ struct cold_obj {
     bool avoided[CHUNK_POS_MAX]; /* skipped at open because its peer was in read-avoid */
     uint64_t *sums[CHUNK_POS_MAX]; /* each position's own table (status OK) */
     uint64_t *rec;               /* the object record's sums, or NULL */
+    void (*on_damaged)(void *arg, uint32_t volume, const uint8_t oid[16], unsigned pos, uint32_t node);
+    void *on_damaged_arg;
 };
 
 static void req_init(struct cs_req *r, uint8_t op, uint32_t volume, uint64_t epoch, const uint8_t vuuid[16],
@@ -1743,6 +1746,8 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
     o->volume = p->volume;
     o->epoch = v.epoch;
     o->positions = positions;
+    o->on_damaged = p->cp->on_damaged;
+    o->on_damaged_arg = p->cp->on_damaged_arg;
     memcpy(o->vuuid, p->vuuid, 16);
     memcpy(o->oid, oid, 16);
 
@@ -1860,6 +1865,8 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
             o->st[i] = a[j].st;
             o->sums[i] = a[j].sums;
             ok += o->st[i] == CHUNK_ST_OK;
+            if (o->st[i] == CHUNK_ST_DAMAGED && o->on_damaged)
+                o->on_damaged(o->on_damaged_arg, o->volume, o->oid, i, o->node[i]);
         }
     }
     if (ok == 0) {
@@ -1951,6 +1958,12 @@ static int p_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsign
     } else if (rc == TSDB_ERR_UNAVAILABLE && (rctx.had_hedge_timeout || rctx.had_avoid) &&
                chunkpeer_mutant == CP_MUT_HEDGECORRUPT) {
         rc = TSDB_ERR_CORRUPT;
+    }
+    if (o->on_damaged) {
+        for (unsigned p = 0; p < o->npos; p++) {
+            if (rep->st[p] == CHUNK_ST_DAMAGED)
+                o->on_damaged(o->on_damaged_arg, o->volume, o->oid, p, o->node[p]);
+        }
     }
     return rc;
 }
@@ -2652,12 +2665,12 @@ int chunkpeer_local_put(struct chunksrv *cs, uint32_t from, const struct cs_put_
     if (!cs)
         return TSDB_ERR_UNAVAILABLE;
     static _Atomic uint64_t file_ids = 1ull << 62; /* apart from any peerlink's */
-    uint8_t meta[CS_PUT_META_LEN];
-    cs_put_meta_encode(m, meta);
+    uint8_t meta[CS_PUT_META_MAX];
+    size_t meta_len = cs_put_meta_encode(m, meta);
     uint64_t total = cs_put_total(m);
     reply a = {0};
     struct cs_put *put = NULL;
-    int rc = chunksrv_put_begin(cs, from, atomic_fetch_add(&file_ids, 1), meta, sizeof meta, total, take_reply, &a,
+    int rc = chunksrv_put_begin(cs, from, atomic_fetch_add(&file_ids, 1), meta, meta_len, total, take_reply, &a,
                                 &put);
     if (rc == 0) {
         size_t cap = 1u << 20;

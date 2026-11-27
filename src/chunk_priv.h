@@ -138,6 +138,11 @@ int chunk_store_list_names(chunk_store *st, uint32_t volume, chunk_list_fn fn, v
  * may be below the volume's), the fence is checked and raised at fence_epoch (the healer's). */
 int chunk_wr_open_heal(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t hdr_epoch,
                        uint64_t fence_epoch, chunk_wr **out);
+/* R12 (E14, §5.9): backend-level replace-put for chunk repair. Prefers the store already holding (volume, oid, pos)
+ * (even if corrupt) so the atomic rename replaces it in place, falling back to chunk_be_place. Writes hdr_epoch under
+ * fence_epoch (bypassing the 95% regular-put cap) and returns a ref-counted chunk_store in *st_out for read-back. */
+int chunk_be_wr_open_replace(chunk_backend *be, const chunk_ident *id, const chunk_geom *g, uint64_t hdr_epoch,
+                             uint64_t fence_epoch, chunk_wr **out, chunk_store **st_out);
 /* R15 r15-full: configure the single-server tier regular-put fs cap (0 = off; 95 = CHUNK_STORE_PUT_MAX_PCT). */
 void chunk_be_set_put_cap(chunk_backend *be, unsigned max_pct);
 /* R15 r15-full: true if be has a put cap and any open store exceeds it (sampled at most 1/s per store). */

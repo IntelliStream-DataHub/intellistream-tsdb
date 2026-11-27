@@ -349,9 +349,10 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     return -1;
 }
 
-void cs_put_meta_encode(const struct cs_put_meta *m, uint8_t out[CS_PUT_META_LEN])
+size_t cs_put_meta_encode(const struct cs_put_meta *m, uint8_t *out)
 {
-    put32(out, CS_PUT_MAGIC);
+    bool v2 = m->flags != 0;
+    put32(out, v2 ? CS_PUT_MAGIC_V2 : CS_PUT_MAGIC);
     put32(out + 4, m->volume);
     put64(out + 8, m->epoch);
     memcpy(out + 16, m->vuuid, 16);
@@ -361,16 +362,30 @@ void cs_put_meta_encode(const struct cs_put_meta *m, uint8_t out[CS_PUT_META_LEN
     put16(out + 52, m->g.m);
     put32(out + 54, m->g.cell);
     put64(out + 58, m->g.len);
-    put64(out + 66, xh(out, 66));
+    if (!v2) {
+        put64(out + 66, xh(out, 66));
+        return CS_PUT_META_LEN;
+    }
+    put32(out + 66, m->flags);
+    put64(out + 70, m->hdr_epoch);
+    put64(out + 78, xh(out, 78));
+    return CS_PUT_META_V2_LEN;
 }
 
 int cs_put_meta_decode(const uint8_t *p, size_t n, struct cs_put_meta *m)
 {
     memset(m, 0, sizeof *m);
-    if (n != CS_PUT_META_LEN || get32(p) != CS_PUT_MAGIC)
+    bool v2 = false;
+    if (n == CS_PUT_META_LEN && get32(p) == CS_PUT_MAGIC) {
+        if (get64(p + 66) != xh(p, 66) && chunksrv_mutant != CS_MUT_NOMETACHECK)
+            return -1;
+    } else if (n == CS_PUT_META_V2_LEN && get32(p) == CS_PUT_MAGIC_V2) {
+        if (get64(p + 78) != xh(p, 78) && chunksrv_mutant != CS_MUT_NOMETACHECK)
+            return -1;
+        v2 = true;
+    } else {
         return -1;
-    if (get64(p + 66) != xh(p, 66) && chunksrv_mutant != CS_MUT_NOMETACHECK)
-        return -1;
+    }
     m->volume = get32(p + 4);
     m->epoch = get64(p + 8);
     memcpy(m->vuuid, p + 16, 16);
@@ -378,7 +393,15 @@ int cs_put_meta_decode(const uint8_t *p, size_t n, struct cs_put_meta *m)
     m->pos = get16(p + 48);
     if (chunk_geom_make(&m->g, get16(p + 50), get16(p + 52), get32(p + 54), get64(p + 58)) != 0)
         return -1;
-    return m->pos < chunk_npos(&m->g) ? 0 : -1;
+    if (m->pos >= chunk_npos(&m->g))
+        return -1;
+    if (v2) {
+        m->flags = get32(p + 66);
+        m->hdr_epoch = get64(p + 70);
+        if (m->flags != CS_PUT_F_REPLACE || m->hdr_epoch == 0 || m->hdr_epoch > m->epoch)
+            return -1;
+    }
+    return 0;
 }
 
 uint64_t cs_put_total(const struct cs_put_meta *m)
@@ -398,7 +421,7 @@ uint64_t cs_sums_hash(const uint64_t *sums, uint64_t n)
     return pl_xxh_final(&h);
 }
 
-uint64_t cs_put_answer_hash(const uint8_t meta[CS_PUT_META_LEN], uint64_t sums_hash)
+uint64_t cs_put_answer_hash_len(const uint8_t *meta, size_t meta_len, uint64_t sums_hash)
 {
     if (chunksrv_mutant == CS_MUT_SUMSONLY) /* planted: the identity the receiver took is not covered */
         return sums_hash;
@@ -406,9 +429,14 @@ uint64_t cs_put_answer_hash(const uint8_t meta[CS_PUT_META_LEN], uint64_t sums_h
     uint8_t b[8];
     put64(b, sums_hash);
     pl_xxh_init(&h);
-    pl_xxh_update(&h, meta, CS_PUT_META_LEN);
+    pl_xxh_update(&h, meta, meta_len);
     pl_xxh_update(&h, b, 8);
     return pl_xxh_final(&h);
+}
+
+uint64_t cs_put_answer_hash(const uint8_t meta[CS_PUT_META_LEN], uint64_t sums_hash)
+{
+    return cs_put_answer_hash_len(meta, CS_PUT_META_LEN, sums_hash);
 }
 
 /* the receive-side flip of the tests (chunksrv_test_flip) */
@@ -435,8 +463,8 @@ static uint8_t *flip_take(int where, const void *p, size_t n)
         return NULL;
     memcpy(c, p, n);
     c[flip_off] ^= flip_mask;
-    if (flip_rehash && where == CS_FLIP_META && n == CS_PUT_META_LEN)
-        put64(c + 66, xh(c, 66));
+    if (flip_rehash && where == CS_FLIP_META && (n == CS_PUT_META_LEN || n == CS_PUT_META_V2_LEN))
+        put64(c + n - CS_CHECK_LEN, xh(c, n - CS_CHECK_LEN));
     else if (flip_rehash && where == CS_FLIP_REQ && n > CS_CHECK_LEN)
         put64(c + n - CS_CHECK_LEN, xh(c, n - CS_CHECK_LEN));
     else if (flip_rehash && where == CS_FLIP_RESP && n >= RESP_HDR)
@@ -1506,11 +1534,13 @@ struct cs_put {
     uint64_t file;
     struct cs_put_meta m;
     chunk_wr *w;
+    chunk_store *st; /* ref-counted store for CS_PUT_F_REPLACE read-back */
     uint64_t total, got, ncells, cell_i;
     uint64_t *sums;
     uint8_t *cell;     /* the cell being assembled */
     uint64_t cell_have, cell_len;
-    uint8_t meta[CS_PUT_META_LEN]; /* as received and checked: PUT_OK's hash covers it */
+    uint8_t meta[CS_PUT_META_MAX]; /* as received and checked: PUT_OK's hash covers it */
+    size_t meta_len;
     int rc;            /* the first failure (answered) */
     bool answered;
     cs_reply_fn reply;
@@ -1524,7 +1554,7 @@ static void put_answer(struct cs_put *p, int rc)
     p->answered = true;
     uint8_t b[8] = {0};
     if (rc == 0)
-        put64(b, cs_put_answer_hash(p->meta, cs_sums_hash(p->sums, p->ncells)));
+        put64(b, cs_put_answer_hash_len(p->meta, p->meta_len, cs_sums_hash(p->sums, p->ncells)));
     reply_rc(p->reply, p->arg, p->file, CS_OP_PUT, rc, b, rc == 0 ? 8 : 0);
     if (rc == 0) {
         STAT(p->cs, puts_ok);
@@ -1539,6 +1569,8 @@ static void put_free(struct cs_put *p)
 {
     if (p->w)
         chunk_wr_abort(p->w);
+    if (p->st)
+        chunk_store_unref(p->st);
     free(p->sums);
     free(p->cell);
     free(p);
@@ -1559,8 +1591,10 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
     /* The meta's own check comes first: the fence raise below is durable, and nothing is raised from a meta that
      * fails it (the data's checks, the cells against their sums, come later and cannot vouch for the epoch). */
     int rc = cs_put_meta_decode(meta, meta_len, &p->m) == 0 && total == cs_put_total(&p->m) ? 0 : TSDB_ERR_INVALID;
-    if (rc == 0)
-        memcpy(p->meta, meta, CS_PUT_META_LEN);
+    if (rc == 0) {
+        memcpy(p->meta, meta, meta_len);
+        p->meta_len = meta_len;
+    }
     free(flipped);
     if (rc == 0 && !cs->be)
         rc = TSDB_ERR_UNAVAILABLE;
@@ -1578,7 +1612,18 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
         chunk_ident id = {.volume = p->m.volume, .pos = p->m.pos};
         memcpy(id.vuuid, p->m.vuuid, 16);
         memcpy(id.oid, p->m.oid, 16);
-        rc = chunk_be_wr_open(cs->be, -1, &id, &p->m.g, act_epoch(cs, p->m.volume, p->m.epoch), &p->w);
+        uint64_t fence = act_epoch(cs, p->m.volume, p->m.epoch);
+        if (p->m.flags & CS_PUT_F_REPLACE) {
+            rc = chunk_be_wr_open_replace(cs->be, &id, &p->m.g, p->m.hdr_epoch, fence, &p->w, &p->st);
+            if (rc == TSDB_ERR_NOTFOUND) {
+                char hex[33];
+                chunk_oid_hex(p->m.oid, hex);
+                fprintf(stderr, "tsdbd: chunk replace refused: volume %" PRIu32 " oid=%s pos=%u not found (deleted)\n",
+                        p->m.volume, hex, (unsigned)p->m.pos);
+            }
+        } else {
+            rc = chunk_be_wr_open(cs->be, -1, &id, &p->m.g, fence, &p->w);
+        }
     }
     if (rc != 0) {
         put_answer(p, rc);
@@ -1650,6 +1695,36 @@ void chunksrv_put_end(struct cs_put *p, int status)
                 put_answer(p, 0);
             rc = chunk_wr_commit(p->w);
             p->w = NULL; /* commit releases the writer, whatever it returns */
+            if (rc == TSDB_ERR_NOTFOUND && (p->m.flags & CS_PUT_F_REPLACE)) {
+                char hex[33];
+                chunk_oid_hex(p->m.oid, hex);
+                fprintf(stderr, "tsdbd: chunk replace refused: volume %" PRIu32 " oid=%s pos=%u not found (deleted)\n",
+                        p->m.volume, hex, (unsigned)p->m.pos);
+            }
+        }
+        if (rc == 0 && (p->m.flags & CS_PUT_F_REPLACE)) {
+            /* R12 (§5.9): read back and scrub the replaced chunk before acknowledging PUT_OK. */
+            chunk_ident id = {.volume = p->m.volume, .pos = p->m.pos};
+            memcpy(id.vuuid, p->m.vuuid, 16);
+            memcpy(id.oid, p->m.oid, 16);
+            chunk_rd *rd = NULL;
+            rc = p->st ? chunk_rd_open(p->st, &id, &rd) : TSDB_ERR_IO;
+            if (rc == 0) {
+                const chunk_hdr *h = chunk_rd_hdr(rd);
+                const uint64_t *rsums = chunk_rd_sums(rd);
+                uint64_t nbad = 0;
+                bool match = h->epoch == p->m.hdr_epoch && h->g.k == p->m.g.k && h->g.m == p->m.g.m &&
+                             h->g.cell == p->m.g.cell && h->g.len == p->m.g.len && rsums != NULL;
+                for (uint64_t i = 0; match && i < p->ncells; i++)
+                    if (rsums[i] != p->sums[i])
+                        match = false;
+                int s_rc = match ? chunk_rd_scrub(rd, &nbad) : TSDB_ERR_CORRUPT;
+                chunk_rd_close(rd);
+                if (!match || s_rc != 0 || nbad != 0)
+                    rc = TSDB_ERR_IO;
+            } else {
+                rc = TSDB_ERR_IO;
+            }
         }
         if (rc == 0) {
             STATN(p->cs, put_bytes, p->total);
@@ -2437,8 +2512,8 @@ int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_
         nanosleep(&(struct timespec){0, 10 * 1000000L}, NULL);
     if (!(plink_up(lc) && plink_up(lb)))
         return TSDB_ERR_UNAVAILABLE;
-    uint8_t meta[CS_PUT_META_LEN];
-    cs_put_meta_encode(m, meta);
+    uint8_t meta[CS_PUT_META_MAX];
+    size_t meta_len = cs_put_meta_encode(m, meta);
     struct jarg *ja = calloc(1, sizeof *ja);
     int dfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (!ja || dfd < 0) {
@@ -2456,7 +2531,7 @@ int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_
     }
     *ja = (struct jarg){.cs = cs, .pd = pd, .fd = dfd};
     struct pl_job job = {.file = rid, .fd = dfd, .base = base, .length = cs_put_total(m), .meta = meta,
-                         .meta_len = sizeof meta, .done = put_job_done, .arg = ja};
+                         .meta_len = meta_len, .done = put_job_done, .arg = ja};
     if (plink_bulk_send(lb, &job) != PL_OK) {
         close(dfd);
         free(ja);
@@ -2492,7 +2567,7 @@ int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_
     if (ret == 0) {
         if (pd->rc != 0)
             ret = pd->rc;
-        else if (pd->body_len != 8 || get64(pd->body) != cs_put_answer_hash(meta, sum)) {
+        else if (pd->body_len != 8 || get64(pd->body) != cs_put_answer_hash_len(meta, meta_len, sum)) {
             fprintf(stderr, "tsdbd: chunk put to node %" PRIu32 ": the answer's sum is not the chunk's\n", peer);
             ret = TSDB_ERR_IO;
         }

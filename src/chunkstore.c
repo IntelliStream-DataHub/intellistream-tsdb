@@ -1108,11 +1108,12 @@ struct chunk_wr {
     uint8_t hdr[CHUNK_HDR_BYTES];
     uint64_t ncells, next, written;
     uint64_t *sums;
-    int err; /* a failed cell poisons the writer: commit refuses */
+    int err;          /* a failed cell poisons the writer: commit refuses */
+    bool replace_only;/* R12 (D9): refuse open and commit unless target chunk file already exists */
 };
 
 static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t epoch, uint64_t fence,
-                   bool heal, chunk_wr **out)
+                   bool heal, bool replace_only, chunk_wr **out)
 {
     if (st->read_only)
         return TSDB_ERR_READONLY;
@@ -1124,9 +1125,11 @@ static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, 
      * CHUNK_ERR_FENCED/IO rather than CHUNK_ERR_FULL. */
     unsigned cap = atomic_load_explicit(&st->put_max_pct, memory_order_acquire);
     bool cap_full = !heal && cap > 0 && store_put_cap_active() && store_sample_fs(st) > cap;
+    char target_name[80];
+    chunk_name(target_name, sizeof target_name, id->oid, id->pos);
     pthread_mutex_lock(&st->mu);
     vol_state *v;
-    int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, id->volume, true, &v);
+    int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, id->volume, !replace_only, &v);
     if (rc == 0 && fence < v->epoch && chunk_mutant != CHUNK_MUT_NOFENCE)
         rc = CHUNK_ERR_FENCED;
     if (rc == 0 && v->unsure)
@@ -1135,6 +1138,8 @@ static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, 
         rc = CHUNK_ERR_FULL;
     if (rc == 0 && fence > v->epoch && !(heal && chunk_mutant == CHUNK_MUT_REPLACE_LATE)) /* planted: raised later */
         rc = epoch_store(st, v, fence); /* before it acts on a higher one (E14) */
+    if (rc == 0 && replace_only && faccessat(v->dirfd, target_name, F_OK, 0) != 0)
+        rc = errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
     int vdirfd = rc == 0 ? v->dirfd : -1;
     pthread_mutex_unlock(&st->mu);
     if (rc)
@@ -1147,6 +1152,7 @@ static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, 
     w->g = *g;
     w->epoch = epoch;
     w->fence = fence;
+    w->replace_only = replace_only;
     w->vdirfd = vdirfd;
     w->fd = -1;
     w->ncells = chunk_pos_cells(g, id->pos);
@@ -1188,13 +1194,13 @@ static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, 
 
 int chunk_wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t epoch, chunk_wr **out)
 {
-    return wr_open(st, id, g, epoch, epoch, false, out);
+    return wr_open(st, id, g, epoch, epoch, false, false, out);
 }
 
 int chunk_wr_open_heal(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t hdr_epoch,
                        uint64_t fence_epoch, chunk_wr **out)
 {
-    return wr_open(st, id, g, hdr_epoch, fence_epoch, true, out);
+    return wr_open(st, id, g, hdr_epoch, fence_epoch, true, false, out);
 }
 
 static int wr_cell(chunk_wr *w, const void *data, size_t len, uint64_t sum)
@@ -1271,6 +1277,8 @@ int chunk_wr_commit(chunk_wr *w)
     else if ((rc = vol_get(st, w->id.volume, true, &v)) == 0 && w->fence < v->epoch &&
              chunk_mutant != CHUNK_MUT_NOFENCE)
         rc = CHUNK_ERR_FENCED; /* the epoch moved on while the chunk was being written */
+    if (rc == 0 && w->replace_only && faccessat(w->vdirfd, w->name, F_OK, 0) != 0)
+        rc = errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO; /* D9: deleted before commit; never resurrect */
     if (rc == 0 && renameat(w->vdirfd, w->tmp, w->vdirfd, w->name) != 0)
         rc = TSDB_ERR_IO;
     pthread_mutex_unlock(&st->mu);
@@ -2373,6 +2381,84 @@ int chunk_be_wr_open(chunk_backend *be, int store, const chunk_ident *id, const 
         return rc;
     rc = chunk_wr_open(st, id, g, epoch, out);
     chunk_store_unref(st);
+    return rc;
+}
+
+/* Returns 1 if the chunk file exists on `st`, 0 if absent (ENOENT / no volume dir), or TSDB_ERR_IO on I/O error. */
+static int store_has_chunk_file(chunk_store *st, const chunk_ident *id)
+{
+    pthread_mutex_lock(&st->mu);
+    vol_state *v;
+    int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, id->volume, false, &v);
+    int vfd = rc == 0 ? v->dirfd : -1;
+    pthread_mutex_unlock(&st->mu);
+    if (rc == TSDB_ERR_NOTFOUND)
+        return 0;
+    if (rc != 0)
+        return rc;
+    char name[80];
+    chunk_name(name, sizeof name, id->oid, id->pos);
+    if (faccessat(vfd, name, F_OK, 0) == 0)
+        return 1;
+    return errno == ENOENT ? 0 : TSDB_ERR_IO;
+}
+
+int chunk_be_wr_open_replace(chunk_backend *be, const chunk_ident *id, const chunk_geom *g, uint64_t hdr_epoch,
+                             uint64_t fence_epoch, chunk_wr **out, chunk_store **st_out)
+{
+    if (st_out)
+        *st_out = NULL;
+    int rc = chunk_be_prepare(be, id->volume, fence_epoch);
+    if (rc)
+        return rc;
+    int bn = chunk_be_nstores(be);
+    int primary = bn > 0 ? chunk_be_place(be, id->oid, id->pos) : -1;
+    chunk_store *st = NULL;
+    bool saw_down = false, saw_ioerr = false;
+    if (primary >= 0 && primary < bn) {
+        chunk_store *cand = chunk_be_store_ref(be, primary);
+        if (!cand) {
+            saw_down = true;
+        } else {
+            int h = store_has_chunk_file(cand, id);
+            if (h == 1)
+                st = cand;
+            else {
+                if (h < 0)
+                    saw_ioerr = true;
+                chunk_store_unref(cand);
+            }
+        }
+    }
+    for (int i = 0; !st && i < bn; i++) {
+        if (i == primary)
+            continue;
+        chunk_store *cand = chunk_be_store_ref(be, i);
+        if (!cand) {
+            saw_down = true;
+        } else {
+            int h = store_has_chunk_file(cand, id);
+            if (h == 1)
+                st = cand;
+            else {
+                if (h < 0)
+                    saw_ioerr = true;
+                chunk_store_unref(cand);
+            }
+        }
+    }
+    if (!st) {
+        /* D9: never create a chunk on replace-put; preserve I/O error (retryable) over DOWN (UNAVAILABLE) over
+         * genuinely absent on every open store (already deleted -> NOTFOUND). */
+        if (saw_ioerr)
+            return TSDB_ERR_IO;
+        return saw_down ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_NOTFOUND;
+    }
+    rc = wr_open(st, id, g, hdr_epoch, fence_epoch, true, true, out);
+    if (rc == 0 && st_out)
+        *st_out = st;
+    else
+        chunk_store_unref(st);
     return rc;
 }
 
