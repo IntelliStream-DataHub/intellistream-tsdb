@@ -593,7 +593,7 @@ static void test_drain_caps_fault_replace(void)
     s.rebuild_max = 1;
     struct meta_entry e;
     meta_entry_init(&e);
-    meta_op_settings(&e, &s);
+    meta_op_settings(&e, &s, sm.settings_version);
     int res[2] = {0};
     CHECK(apply_entry(&sm, &e, res, 2) == META_OK && res[0] == META_OK, "set rebuild_max=1: %d", res[0]);
 
@@ -872,7 +872,7 @@ static void test_r13_capability_class_and_fill(void)
     st.log_on_hdd = 1;
     struct meta_entry e;
     meta_entry_init(&e);
-    meta_op_settings(&e, &st);
+    meta_op_settings(&e, &st, sm.settings_version);
     int res[2] = {0};
     CHECK(apply_entry(&sm, &e, res, 2) == META_OK && res[0] == META_OK, "enable log_on_hdd");
     set_role(&sm, 1, META_ROLE_BOTH); /* node 1 HDD-only now has META_CAP_COMPUTE via log_on_hdd */

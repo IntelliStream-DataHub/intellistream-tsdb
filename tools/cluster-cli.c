@@ -20,6 +20,7 @@
 #include "raft/raft.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
@@ -58,6 +59,8 @@ static const char cl_help[] =
     "       tsdb cluster status volumes [--json] PEER --secret-file F\n"
     "       tsdb cluster status volume V [--json] PEER --secret-file F\n"
     "       tsdb cluster status disks [--json] PEER --secret-file F\n"
+    "       tsdb cluster settings show [--json] PEER --secret-file F\n"
+    "       tsdb cluster settings set PEER [--version N] KEY=VALUE... --secret-file F\n"
     "       tsdb cluster user add|passwd|drop|grant|revoke|list|import PEER ... --secret-file F\n"
     "       tsdb cluster help [VERB]\n"
     "\n"
@@ -111,6 +114,9 @@ static const char cl_help[] =
     "  status PEER         what that server knows: its role, the leader, quorum, settings, every member (up or\n"
     "                      down, incarnation, when it was last heard), health summary, volumes and users. Views:\n"
     "                      `status volumes`, `status volume V`, `status disks`. `--json` on each (`help status`).\n"
+    "  settings show PEER  show current cluster settings and settings_version (marks live vs init-only; `--json`).\n"
+    "  settings set PEER KEY=VALUE...  change one or more live cluster settings in one atomic CAS proposal (init-only\n"
+    "                      keys such as lease_ms and replication are refused per D25; `help settings`).\n"
     "\n"
     "  user ...            users and grants of the whole cluster, kept by the group (`tsdb cluster user` says how).\n"
     "                      init --superuser NAME --password-file F makes the first superuser.\n"
@@ -150,15 +156,16 @@ static const char cl_help[] =
     "    --young-high-pct N      data dir fill % at which a member reports FULL [90] (10 to 99, > --young-move-pct)\n"
     "    --balance-mb-s MB       balancer move rate, MB/s [0: = rebuild-mb-s]\n"
     "    --rebuild-concurrency N EC objects filled in flight per server [4] (1 to 64)\n"
-    "    --scrub-days N          scrub every chunk and young part every N days [14] (1 to 365) (stored, not acted on yet)\n"
-    "    --scrub-mb-s MB         scrub pace per disk, MB/s [50] (stored, not acted on yet)\n"
-    "    --scrub-out-count N     damaged chunks per store per UTC day before OUT [8] (stored, not acted on yet)\n"
-    "    --log-on-hdd on|off     allow log replicas on HDD-only members [off] (stored, not acted on yet)\n"
-    "    --young-warn-pct N      fast disk fill % warning alert [75] (1 to 98, <= move < high) (stored, not acted on yet)\n"
-    "    --young-move-pct N      fast disk fill % move-off mark [80] (1 to 98, >= warn, < high) (stored, not acted on yet)\n"
-    "    --disk-stall-s S        disk probe stall before DOWN, s [10] (1 to 3600) (stored, not acted on yet)\n"
-    "  The settings are fixed here and shown by status; they cannot be changed on a running cluster.\n"
-    "  A setting marked (stored, not acted on yet) is kept and shown, and nothing uses it.\n";
+    "    --scrub-days N          scrub every chunk every N days [14] (1 to 365)\n"
+    "    --scrub-mb-s MB         scrub pace per disk, MB/s [50]\n"
+    "    --scrub-out-count N     damaged chunks per store per UTC day before OUT [8]\n"
+    "    --log-on-hdd on|off     allow log replicas on HDD-only members [off]\n"
+    "    --young-warn-pct N      fast disk fill % warning alert [75] (1 to 98, <= move < high)\n"
+    "    --young-move-pct N      fast disk fill % move-off mark [80] (1 to 98, >= warn, < high)\n"
+    "    --disk-stall-s S        disk probe stall before DOWN, s [10] (1 to 3600)\n"
+    "  Live operational settings can be changed on a running cluster with `tsdb cluster settings set` (`help settings`);\n"
+    "  init-only settings (replication, min_isr, voters, lease/fence/heartbeat/commit timing, failover, read_barrier)\n"
+    "  stay fixed for the life of the cluster.\n";
 
 static const char help_secret[] =
     "usage: tsdb cluster secret FILE\n"
@@ -324,6 +331,28 @@ static const char help_status_disks[] =
     "  young_high_pct, chunk_mark_pct, days_to_mark (retired_bytes, index_bytes, days_to_mark are reserved/null).\n"
     "  disks[] keys: node, store_id, class, uses, state, size_bytes, sync_us, young_bytes, chunk_bytes.\n"
     "  Exit codes: 0 ok, 1 failed, 2 usage.\n";
+
+static const char help_settings_show[] =
+    "usage: tsdb cluster settings show [--json] PEER --secret-file F\n"
+    "\n"
+    "  Show all cluster settings, their current values, settings_version, and whether each key is live or init-only.\n"
+    "  --json top-level keys: view, cluster_uuid, settings_version, settings, live_keys, init_only_keys.\n"
+    "  Exit codes: 0 ok, 1 failed (e.g. uninitialised or connection error), 2 usage.\n";
+
+static const char help_settings_set[] =
+    "usage: tsdb cluster settings set PEER [--version N] KEY=VALUE... --secret-file F\n"
+    "\n"
+    "  Update one or more live cluster settings atomically in a single proposal, guarded by settings_version CAS.\n"
+    "  Use --version N to assert an exact expected settings_version (default: current version read before proposing).\n"
+    "  Live-changeable keys (D25): rebuild_mb_s, rebuild_max, transfer_wait_ms, leader_balance_s, repl_retain_mb,\n"
+    "    repl_retain_s, repl_retain_down_gb, rebuild_after_s, opening_hold_s, failstop_out_s, out_guard_pct,\n"
+    "    out_guard_hold_s, balance_mb_s, rebuild_concurrency, scrub_days, scrub_mb_s, scrub_out_count, log_on_hdd,\n"
+    "    young_warn_pct, young_move_pct, young_high_pct, disk_stall_s.\n"
+    "  Init-only keys (refused with D25 reason): replication, min_isr, voters, heartbeat_ms, node_timeout_ms,\n"
+    "    isr_lag_ms, voter_replace_s, volumes_per_server, failover, read_barrier, lease_s, lease_ms, drift_ppm,\n"
+    "    unanswered_ms, commit_interval_ms, idle_seal_ms.\n"
+    "  Changes take effect live on every member without restart. On concurrent modification, returns STALE (retry).\n"
+    "  Exit codes: 0 ok, 1 refused or STALE, 2 usage.\n";
 
 static const char help_user[] =
     "usage: tsdb cluster user add|passwd|drop|grant|revoke|list|import PEER ... --secret-file F\n"
@@ -1549,9 +1578,9 @@ static void print_status_summary_json(const struct cluster_status *st)
         char u[33];
         hex16(m.uuid, u);
         printf("  \"cluster\": {\"uuid\": \"%s\", \"initialised\": %s, \"mode\": \"%s\", \"restore_gen\": %" PRIu64
-               "},\n",
+               ", \"settings_version\": %" PRIu64 "},\n",
                u, m.initialised ? "true" : "false", m.mode == META_MODE_SHARED ? "shared" : "replicated",
-               m.restore_gen);
+               m.restore_gen, m.settings_version);
     } else {
         fputs("  \"cluster\": null,\n", stdout);
     }
@@ -2128,7 +2157,7 @@ struct cl_ctx {
     int raw_argc;
     char **raw_argv;
 
-    const char *pos[8]; /* positional arguments after verb words */
+    const char *pos[48]; /* positional arguments after verb words */
     int npos;
 
     const char *secret_file;
@@ -2136,6 +2165,7 @@ struct cl_ctx {
     size_t slen;
 
     const char *peer;
+    char resolved_peer[META_ADDR_MAX + 1];
     char target[META_ADDR_MAX + 1]; /* updated on NOTLEADER follow */
     int op;
 
@@ -2155,10 +2185,12 @@ struct cl_ctx {
     uint32_t hold_for_s, hold_flags, drain_flags, repl_flags;
     int have_hold_for;
 
-    /* status */
+    /* status / settings */
     int status_view;
     int json;
     const char *vol_arg;
+    uint64_t set_ver;
+    int have_set_ver;
 };
 
 typedef int (*cl_parse_flag_fn)(struct cl_ctx *ctx, int argc, char **argv, int *idx);
@@ -2430,6 +2462,26 @@ static int parse_flag_status(struct cl_ctx *ctx, int argc, char **argv, int *idx
     (void)argc;
     if (!strcmp(argv[*idx], "--json")) {
         ctx->json = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_flag_settings_set(struct cl_ctx *ctx, int argc, char **argv, int *idx)
+{
+    int i = *idx;
+    if (!strcmp(argv[i], "--version") && i + 1 < argc) {
+        const char *vs = argv[i + 1];
+        char *end = NULL;
+        errno = 0;
+        unsigned long long v = strtoull(vs, &end, 10);
+        if (!vs[0] || !isdigit((unsigned char)vs[0]) || *end || errno == ERANGE || v == 0) {
+            fprintf(stderr, "tsdb cluster settings set: --version %s: expected a positive integer\n", vs);
+            return -1;
+        }
+        ctx->set_ver = (uint64_t)v;
+        ctx->have_set_ver = 1;
+        *idx = i + 1;
         return 1;
     }
     return 0;
@@ -2711,6 +2763,163 @@ static int enc_status_disks(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t
     return 0;
 }
 
+static int enc_settings_show(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
+{
+    (void)req;
+    (void)cap;
+    ctx->peer = ctx->pos[0];
+    *req_len = 0;
+    return 0;
+}
+
+static int parse_setting_kv(const char *arg, size_t *idx_out, uint32_t *val_out)
+{
+    const char *eq = strchr(arg, '=');
+    if (!eq || eq == arg || !eq[1]) {
+        fprintf(stderr, "tsdb cluster settings set: '%s': expected KEY=VALUE\n", arg);
+        return -1;
+    }
+    char key[64];
+    size_t klen = (size_t)(eq - arg);
+    if (klen >= sizeof key) {
+        fprintf(stderr, "tsdb cluster settings set: unknown setting '%.*s'\n", (int)klen, arg);
+        return -1;
+    }
+    memcpy(key, arg, klen);
+    key[klen] = '\0';
+    int idx = meta_settings_find(key);
+    if (idx < 0) {
+        fprintf(stderr, "tsdb cluster settings set: unknown setting '%s'\n", key);
+        return -1;
+    }
+    const struct meta_setting_info *in = meta_settings_info((size_t)idx);
+    const char *vs = eq + 1;
+    if (in->type == META_SET_BOOL) {
+        if (!strcmp(vs, "on") || !strcmp(vs, "1") || !strcmp(vs, "true"))
+            *val_out = 1;
+        else if (!strcmp(vs, "off") || !strcmp(vs, "0") || !strcmp(vs, "false"))
+            *val_out = 0;
+        else {
+            fprintf(stderr, "tsdb cluster settings set: %s=%s: expected on|off (or 1|0)\n", key, vs);
+            return -1;
+        }
+    } else if (in->type == META_SET_FAILOVER) {
+        if (!strcmp(vs, "lease"))
+            *val_out = META_FAILOVER_LEASE;
+        else if (!strcmp(vs, "attested"))
+            *val_out = META_FAILOVER_ATTESTED;
+        else if (!strcmp(vs, "bmc"))
+            *val_out = META_FAILOVER_BMC;
+        else {
+            fprintf(stderr, "tsdb cluster settings set: %s=%s: expected lease|attested|bmc\n", key, vs);
+            return -1;
+        }
+    } else {
+        char *end = NULL;
+        errno = 0;
+        unsigned long v = strtoul(vs, &end, 10);
+        if (!vs[0] || !isdigit((unsigned char)vs[0]) || *end || errno == ERANGE || v > UINT32_MAX) {
+            fprintf(stderr, "tsdb cluster settings set: %s=%s: expected a non-negative integer\n", key, vs);
+            return -1;
+        }
+        *val_out = (uint32_t)v;
+    }
+    *idx_out = (size_t)idx;
+    return 0;
+}
+
+static int fetch_meta_state(const char *addr, const uint8_t *secret, size_t slen, struct meta_state *m_out,
+                            uint32_t *self_out, uint32_t *leader_out, char *err, size_t errn)
+{
+    int rc = 0;
+    uint8_t *reply = NULL;
+    size_t len = 0;
+    if (cluster_admin(addr, secret, slen, CLUSTER_OP_STATUS, NULL, 0, 30000, &rc, &reply, &len, err, errn) != 0)
+        return -1;
+    if (rc != 0) {
+        snprintf(err, errn, "status: %s", cluster_strerror(rc));
+        free(reply);
+        return -1;
+    }
+    struct cluster_status st;
+    if (cluster_status_parse(reply, len, &st) != 0) {
+        snprintf(err, errn, "status reply does not decode");
+        free(reply);
+        return -1;
+    }
+    int ok = st.image_len && meta_snapshot_decode(m_out, st.image, st.image_len) == META_OK;
+    if (self_out)
+        *self_out = st.self;
+    if (leader_out)
+        *leader_out = st.leader;
+    cluster_status_free(&st);
+    free(reply);
+    if (!ok || !m_out->initialised) {
+        snprintf(err, errn, "cluster is not initialised");
+        return -1;
+    }
+    return 0;
+}
+
+static int enc_settings_set(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
+{
+    size_t idxs[48];
+    uint32_t vals[48];
+    int nk = ctx->npos - 1;
+    if (nk < 1 || nk > 47)
+        return cl_usage();
+    for (int i = 0; i < nk; i++) {
+        if (parse_setting_kv(ctx->pos[1 + i], &idxs[i], &vals[i]) != 0)
+            return 2;
+    }
+    if (cap < 8 + 4 * META_SETTINGS_WORDS) {
+        fprintf(stderr, "tsdb cluster settings set: internal buffer too small\n");
+        return 1;
+    }
+    ctx->peer = ctx->pos[0];
+    struct meta_state m;
+    meta_init(&m);
+    uint32_t self_id = 0, leader_id = 0;
+    char err[1024];
+    if (fetch_meta_state(ctx->peer, ctx->secret, ctx->slen, &m, &self_id, &leader_id, err, sizeof err) != 0) {
+        fprintf(stderr, "tsdb cluster settings set: %s\n", err);
+        meta_free(&m);
+        return 1;
+    }
+    /* When talking to a follower that knows the leader, read the leader's current settings_version directly so an
+     * operator pointing at a follower does not get spurious STALE from follower replication lag. */
+    if (leader_id && leader_id != self_id) {
+        const struct meta_member *lm = meta_member(&m, leader_id);
+        if (lm && lm->peer[0]) {
+            snprintf(ctx->resolved_peer, sizeof ctx->resolved_peer, "%s", lm->peer);
+            struct meta_state ml;
+            meta_init(&ml);
+            if (fetch_meta_state(ctx->resolved_peer, ctx->secret, ctx->slen, &ml, NULL, NULL, err, sizeof err) == 0) {
+                meta_free(&m);
+                m = ml;
+                ctx->peer = ctx->resolved_peer;
+            } else {
+                meta_free(&ml);
+            }
+        }
+    }
+    if (ctx->have_set_ver && ctx->set_ver != m.settings_version) {
+        fprintf(stderr,
+                "tsdb cluster settings set: STALE: expected settings version %" PRIu64
+                ", cluster is at version %" PRIu64 "; retry\n",
+                ctx->set_ver, m.settings_version);
+        meta_free(&m);
+        return 1;
+    }
+    struct meta_settings s = m.set;
+    uint64_t ver = m.settings_version;
+    for (int i = 0; i < nk; i++)
+        meta_settings_set(&s, idxs[i], vals[i]);
+    *req_len = cluster_settings_set_encode(ver, &s, req);
+    meta_free(&m);
+    return 0;
+}
+
 /* ---- reply printers ---- */
 
 static int prt_init(struct cl_ctx *ctx, const uint8_t *reply, size_t len)
@@ -2793,6 +3002,84 @@ static int prt_status(struct cl_ctx *ctx, const uint8_t *reply, size_t len)
     return rc;
 }
 
+static int prt_settings_show(struct cl_ctx *ctx, const uint8_t *reply, size_t len)
+{
+    struct cluster_status st;
+    if (cluster_status_parse(reply, len, &st) != 0) {
+        fprintf(stderr, "tsdb cluster settings show: the reply does not decode\n");
+        return 1;
+    }
+    struct meta_state m;
+    meta_init(&m);
+    int ok = st.image_len && meta_snapshot_decode(&m, st.image, st.image_len) == META_OK;
+    cluster_status_free(&st);
+    if (!ok || !m.initialised) {
+        fprintf(stderr, "tsdb cluster settings show: cluster is not initialised\n");
+        meta_free(&m);
+        return 1;
+    }
+    size_t nset = meta_settings_count();
+    if (ctx->json) {
+        char u[33];
+        hex16(m.uuid, u);
+        fputs("{\n", stdout);
+        fputs("  \"view\": \"settings\",\n", stdout);
+        printf("  \"cluster_uuid\": \"%s\",\n", u);
+        printf("  \"settings_version\": %" PRIu64 ",\n", m.settings_version);
+        fputs("  \"settings\": {\n", stdout);
+        for (size_t i = 0; i < nset; i++) {
+            const struct meta_setting_info *in = meta_settings_info(i);
+            uint32_t v = meta_settings_get(&m.set, i);
+            printf("    \"%s\": ", in->name);
+            if (in->type == META_SET_BOOL)
+                fputs(v ? "true" : "false", stdout);
+            else if (in->type == META_SET_FAILOVER)
+                printf("\"%s\"", v == META_FAILOVER_BMC ? "bmc" : v == META_FAILOVER_ATTESTED ? "attested" : "lease");
+            else
+                printf("%" PRIu32, v);
+            printf("%s\n", i + 1 < nset ? "," : "");
+        }
+        fputs("  },\n", stdout);
+        fputs("  \"live_keys\": [", stdout);
+        int first = 1;
+        for (size_t i = 0; i < nset; i++) {
+            const struct meta_setting_info *in = meta_settings_info(i);
+            if (!in->live)
+                continue;
+            printf("%s\"%s\"", first ? "" : ", ", in->name);
+            first = 0;
+        }
+        fputs("],\n", stdout);
+        fputs("  \"init_only_keys\": [", stdout);
+        first = 1;
+        for (size_t i = 0; i < nset; i++) {
+            const struct meta_setting_info *in = meta_settings_info(i);
+            if (in->live)
+                continue;
+            printf("%s\"%s\"", first ? "" : ", ", in->name);
+            first = 0;
+        }
+        fputs("]\n", stdout);
+        fputs("}\n", stdout);
+    } else {
+        printf("settings_version %" PRIu64 "\n", m.settings_version);
+        for (size_t i = 0; i < nset; i++) {
+            const struct meta_setting_info *in = meta_settings_info(i);
+            uint32_t v = meta_settings_get(&m.set, i);
+            if (in->type == META_SET_BOOL)
+                printf("%-22s %-10s %s\n", in->name, v ? "on" : "off", in->live ? "live" : "init-only");
+            else if (in->type == META_SET_FAILOVER)
+                printf("%-22s %-10s %s\n", in->name,
+                       v == META_FAILOVER_BMC ? "bmc" : v == META_FAILOVER_ATTESTED ? "attested" : "lease",
+                       in->live ? "live" : "init-only");
+            else
+                printf("%-22s %-10" PRIu32 " %s\n", in->name, v, in->live ? "live" : "init-only");
+        }
+    }
+    meta_free(&m);
+    return 0;
+}
+
 /* ---- the verb table: longest word prefixes first (or matched by best nwords) ---- */
 
 static const struct cl_verb cl_verbs[] = {
@@ -2832,6 +3119,10 @@ static const struct cl_verb cl_verbs[] = {
      help_status_disks},
     {{"status", NULL, NULL}, 1, 1, 1, 0, CLUSTER_OP_STATUS, 30000, parse_flag_status, enc_status_summary, prt_status,
      help_status},
+    {{"settings", "show", NULL}, 2, 1, 1, 0, CLUSTER_OP_STATUS, 30000, parse_flag_status, enc_settings_show,
+     prt_settings_show, help_settings_show},
+    {{"settings", "set", NULL}, 2, 2, 48, CL_VF_PRINT_ERR_BODY | CL_VF_SECRET_IN_ENCODE, CLUSTER_OP_SETTINGS, 30000,
+     parse_flag_settings_set, enc_settings_set, prt_text_reply, help_settings_set},
 };
 
 static const size_t cl_nverbs = sizeof cl_verbs / sizeof cl_verbs[0];
@@ -2959,6 +3250,29 @@ int cluster_cli(int argc, char **argv)
         if (!v) {
             v = find_verb_exact(argc, argv, 1);
             arg_start = 2;
+        }
+    } else if (!strcmp(argv[1], "settings")) {
+        /* Allow `--json` (or `--secret-file F`) before `show` (`settings --json show PEER`). */
+        int scan = 2;
+        while (scan < argc) {
+            if (!strcmp(argv[scan], "--json")) {
+                scan++;
+            } else if (!strcmp(argv[scan], "--secret-file") && scan + 1 < argc) {
+                scan += 2;
+            } else {
+                break;
+            }
+        }
+        if (scan < argc && (!strcmp(argv[scan], "show") || !strcmp(argv[scan], "set"))) {
+            for (size_t k = 0; k < cl_nverbs; k++) {
+                if (cl_verbs[k].nwords == 2 && !strcmp(cl_verbs[k].words[0], "settings") &&
+                    !strcmp(cl_verbs[k].words[1], argv[scan])) {
+                    v = &cl_verbs[k];
+                    arg_start = 2;
+                    skip_idx = scan;
+                    break;
+                }
+            }
         }
     } else {
         v = find_verb_exact(argc, argv, 1);

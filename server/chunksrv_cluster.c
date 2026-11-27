@@ -49,10 +49,16 @@ static struct {
     uint64_t rate;
     int checked; /* the owner check ran */
     int last_up; /* stores up last reported (-1: never) */
-    uint32_t scrub_days;
+    _Atomic uint32_t scrub_days;
     uint32_t scrub_mb_s;
     uint32_t scrub_out_count;
     uint32_t scrub_interval_ms;
+    int scrub_days_ov;
+    int scrub_mb_s_ov;
+    int scrub_out_count_ov;
+    uint32_t applied_scrub_days;
+    uint32_t applied_scrub_mb_s;
+    uint32_t applied_scrub_out_count;
 } G;
 
 /* ---- R12 chunk scrub: CHUNK_DAMAGED delivery, heartbeat section, Prometheus metrics ---- */
@@ -246,7 +252,8 @@ static size_t cscrub_sec_format(uint32_t member_id, const void *val, char *buf, 
     if (!val || !buf || cap == 0)
         return 0;
     const struct cscrub_sec_val *v = val;
-    uint64_t warn_s = (uint64_t)(G.scrub_days ? G.scrub_days : CHUNKSCRUB_DEFAULT_DAYS) * 2ull * 86400ull;
+    uint32_t sd = atomic_load_explicit(&G.scrub_days, memory_order_relaxed);
+    uint64_t warn_s = (uint64_t)(sd ? sd : CHUNKSCRUB_DEFAULT_DAYS) * 2ull * 86400ull;
     size_t off = 0;
     for (uint32_t i = 0; i < v->n && off + 1 < cap; i++) {
         const struct cscrub_sec_row *r = &v->rows[i];
@@ -580,10 +587,24 @@ static void *cc_main(void *arg)
                     int nst = chunksrv_stores(cs, NULL, false);
                     fprintf(stderr, "tsdbd: chunk server up as node %" PRIu32 ", %d stores\n", me.id, nst);
                     if (nst > 0) {
+                        uint32_t sd = atomic_load_explicit(&G.scrub_days, memory_order_relaxed), sm = G.scrub_mb_s,
+                                 so = G.scrub_out_count;
+                        const struct cluster_copy *ic = cluster_copy_get();
+                        if (ic) {
+                            if (!G.scrub_days_ov && ic->scrub_days > 0) {
+                                sd = ic->scrub_days;
+                                atomic_store_explicit(&G.scrub_days, sd, memory_order_relaxed);
+                            }
+                            if (!G.scrub_mb_s_ov && ic->scrub_mb_s > 0)
+                                sm = ic->scrub_mb_s;
+                            if (!G.scrub_out_count_ov && ic->scrub_out_count > 0)
+                                so = ic->scrub_out_count;
+                            cluster_copy_put(ic);
+                        }
                         struct chunksrv_scrub_cfg scfg = {
-                            .scrub_days = G.scrub_days,
-                            .scrub_mb_s = G.scrub_mb_s,
-                            .scrub_out_count = G.scrub_out_count,
+                            .scrub_days = sd,
+                            .scrub_mb_s = sm,
+                            .scrub_out_count = so,
                             .pass_interval_ms = G.scrub_interval_ms,
                             .on_damage = cc_on_damage,
                             .on_out = cc_on_out,
@@ -591,6 +612,9 @@ static void *cc_main(void *arg)
                         };
                         if (chunksrv_scrub_start(cs, &scfg) != 0)
                             fprintf(stderr, "tsdbd: chunk scrub: could not start store scrubbers\n");
+                        G.applied_scrub_days = sd;
+                        G.applied_scrub_mb_s = sm;
+                        G.applied_scrub_out_count = so;
                     }
                 } else if (G.cs) {
                     fprintf(stderr, "tsdbd: chunk server: cannot make its links (tried again)\n");
@@ -605,7 +629,19 @@ static void *cc_main(void *arg)
                 const struct cluster_copy *c = cluster_copy_get();
                 if (c) {
                     set_peers(cs, c, self);
-                    disk_probe_set_stall_s(c->disk_stall_s);
+                    uint32_t nd = (!G.scrub_days_ov && c->scrub_days > 0) ? c->scrub_days : G.applied_scrub_days;
+                    uint32_t nm = (!G.scrub_mb_s_ov && c->scrub_mb_s > 0) ? c->scrub_mb_s : G.applied_scrub_mb_s;
+                    uint32_t no =
+                        (!G.scrub_out_count_ov && c->scrub_out_count > 0) ? c->scrub_out_count : G.applied_scrub_out_count;
+                    if (nd != G.applied_scrub_days || nm != G.applied_scrub_mb_s || no != G.applied_scrub_out_count) {
+                        if (!G.scrub_days_ov && nd > 0)
+                            atomic_store_explicit(&G.scrub_days, nd, memory_order_relaxed);
+                        chunksrv_scrub_update_cfg(cs, G.scrub_days_ov ? 0 : nd, G.scrub_mb_s_ov ? 0 : nm,
+                                                  G.scrub_out_count_ov ? 0 : no);
+                        G.applied_scrub_days = nd;
+                        G.applied_scrub_mb_s = nm;
+                        G.applied_scrub_out_count = no;
+                    }
                     cluster_copy_put(c);
                     seen = b;
                     have = 1;
@@ -665,21 +701,33 @@ int chunksrv_cluster_start_ex(const char *const *paths, const int *prefs, const 
     }
     G.rate = rate;
     G.last_up = -1;
-    G.scrub_days = CHUNKSCRUB_DEFAULT_DAYS;
+    atomic_store_explicit(&G.scrub_days, CHUNKSCRUB_DEFAULT_DAYS, memory_order_relaxed);
     G.scrub_mb_s = CHUNKSCRUB_DEFAULT_MB_S;
     G.scrub_out_count = CHUNKSCRUB_DEFAULT_OUT_COUNT;
     G.scrub_interval_ms = 0;
+    G.scrub_days_ov = 0;
+    G.scrub_mb_s_ov = 0;
+    G.scrub_out_count_ov = 0;
+    G.applied_scrub_days = 0;
+    G.applied_scrub_mb_s = 0;
+    G.applied_scrub_out_count = 0;
 #ifdef TSDB_TEST_HOOKS
     const char *te = getenv("TSDB_CHUNKSCRUB_TEST");
     if (te) {
         const char *p;
         unsigned v = 0;
-        if ((p = strstr(te, "days=")) != NULL && sscanf(p, "days=%u", &v) == 1 && v > 0)
-            G.scrub_days = v;
-        if ((p = strstr(te, "mb_s=")) != NULL && sscanf(p, "mb_s=%u", &v) == 1 && v > 0)
+        if ((p = strstr(te, "days=")) != NULL && sscanf(p, "days=%u", &v) == 1 && v > 0) {
+            atomic_store_explicit(&G.scrub_days, v, memory_order_relaxed);
+            G.scrub_days_ov = 1;
+        }
+        if ((p = strstr(te, "mb_s=")) != NULL && sscanf(p, "mb_s=%u", &v) == 1 && v > 0) {
             G.scrub_mb_s = v;
-        if ((p = strstr(te, "out_count=")) != NULL && sscanf(p, "out_count=%u", &v) == 1 && v > 0)
+            G.scrub_mb_s_ov = 1;
+        }
+        if ((p = strstr(te, "out_count=")) != NULL && sscanf(p, "out_count=%u", &v) == 1 && v > 0) {
             G.scrub_out_count = v;
+            G.scrub_out_count_ov = 1;
+        }
         if ((p = strstr(te, "interval_ms=")) != NULL && sscanf(p, "interval_ms=%u", &v) == 1 && v > 0)
             G.scrub_interval_ms = v;
     }

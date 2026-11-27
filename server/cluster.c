@@ -535,6 +535,33 @@ static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
     return r->bad || v[9] > 255 || v[10] > 255 || v[34] > 255 ? -1 : 0;
 }
 
+size_t cluster_settings_set_encode(uint64_t expected_version, const struct meta_settings *s, uint8_t *out)
+{
+    for (int j = 0; j < 8; j++)
+        out[j] = (uint8_t)(expected_version >> (8 * j));
+    uint8_t tmp[4 * (META_SETTINGS_WORDS + 1)];
+    cluster_settings_encode(s, 0, tmp);
+    memcpy(out + 8, tmp, 4 * META_SETTINGS_WORDS);
+    return 8 + 4 * META_SETTINGS_WORDS;
+}
+
+int cluster_settings_set_decode(const uint8_t *p, size_t n, uint64_t *expected_version, struct meta_settings *s)
+{
+    if (!p || n != 8 + 4 * META_SETTINGS_WORDS)
+        return -1;
+    struct rd r = {p, n, 0, 0};
+    uint64_t ver = get64(&r);
+    uint8_t tmp[4 * (META_SETTINGS_WORDS + 1)];
+    memcpy(tmp, p + 8, 4 * META_SETTINGS_WORDS);
+    memset(tmp + 4 * META_SETTINGS_WORDS, 0, 4);
+    struct rd sr = {tmp, sizeof tmp, 0, 0};
+    int mode = 0;
+    if (r.bad || settings_decode(&sr, s, &mode) != 0)
+        return -1;
+    *expected_version = ver;
+    return 0;
+}
+
 void cluster_status_free(struct cluster_status *st)
 {
     for (uint32_t i = 0; st->heard && i < st->nheard; i++) {
@@ -1193,6 +1220,7 @@ struct pend {
     uint32_t volume; /* a VOLUME_ADD: its number + 1, the reply's body once committed (0: none) */
     struct upend *user; /* a USER_PUT or USER_DEL (malloc'ed; NULL: none) */
     int is_out;      /* 1 for an automatic MEMBER_STATE OUT proposal (fires CP_OUT_PROPOSED on commit) */
+    int is_settings; /* 1 for a CLUSTER_OP_SETTINGS proposal (formats applied version or STALE message) */
     char *text;      /* optional reply text sent on rc == 0 (malloc'ed; NULL: empty body; r9-ops) */
 };
 
@@ -1308,6 +1336,7 @@ static struct {
     uint32_t pend_volume; /* set around propose() by a VOLUME_ADD: its number + 1 (struct pend) */
     struct upend *pend_user; /* set around propose() by a USER_PUT or USER_DEL (struct pend owns it after) */
     char *pend_text;         /* set around propose() by cl_propose_reply (struct pend owns it after) */
+    int pend_settings;       /* set around propose() by admin_settings_set (struct pend owns it after) */
     struct uwait *uwait;     /* applied user ops waiting for the members (users_duty) */
     size_t nuwait, capuwait;
     uint64_t users_floor;    /* a Raft leader's commit index heard in this run (cluster_users_caught_up); 0: none */
@@ -2127,7 +2156,9 @@ enum cl_mutant {
     CLM_COPYNODEADLINE = 36, /* cluster_copy_caught_up ignores the deadline of the floor it heard (a stalled loop) */
     CLM_COPYNOFLOOR = 37,    /* cluster_copy_caught_up does not compare the published copy with the floor */
     CLM_NOGASP = 38,         /* cluster_failstop_beat skips sending the fail-stop last-gasp heartbeat (test_cluster failgasp) */
-    CLM_FAILSTOPPROMO = 39   /* promo_step skips promote_safe_ns for a META_DOWN_FAILSTOP old leader (test_cluster failgasp) */
+    CLM_FAILSTOPPROMO = 39,  /* promo_step skips promote_safe_ns for a META_DOWN_FAILSTOP old leader (test_cluster failgasp) */
+    CLM_SETTINGSANY = 40,    /* admin_settings_set skips D25 init-only whitelist (test_cluster settings) */
+    CLM_SETTINGSNOCAS = 41   /* admin_settings_set skips settings_version CAS (test_cluster settings) */
 };
 static int cl_mutant(void)
 {
@@ -2176,6 +2207,8 @@ static int cl_mutant(void)
             : !strcmp(e, "copynofloor")   ? CLM_COPYNOFLOOR
             : !strcmp(e, "nogasp")        ? CLM_NOGASP
             : !strcmp(e, "failstoppromo") ? CLM_FAILSTOPPROMO
+            : !strcmp(e, "settingsany")   ? CLM_SETTINGSANY
+            : !strcmp(e, "settingsnocas") ? CLM_SETTINGSNOCAS
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -2483,12 +2516,112 @@ static void cluster_metrics_publish(uint64_t now);
 static _Atomic uint32_t g_young_high_pct; /* 0 until cluster settings are initialised */
 static void refresh_self_full(void);
 
+#define CLUSTER_SETTINGS_WATCH_MAX 16
+struct sw_slot {
+    cluster_settings_watch_fn fn;
+    void *arg;
+    uint64_t seen_ver;
+};
+static pthread_mutex_t g_sw_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_sw_cv = PTHREAD_COND_INITIALIZER;
+static int g_sw_busy;
+static pthread_t g_sw_owner;
+static struct sw_slot g_sw[CLUSTER_SETTINGS_WATCH_MAX];
+static int g_set_seen;
+static uint64_t g_set_ver;
+static struct meta_settings g_set_last;
+
+int cluster_add_settings_watch(cluster_settings_watch_fn fn, void *arg)
+{
+    if (!fn)
+        return -1;
+    pthread_mutex_lock(&g_sw_mu);
+    for (int i = 0; i < CLUSTER_SETTINGS_WATCH_MAX; i++) {
+        if (g_sw[i].fn == fn && g_sw[i].arg == arg) {
+            g_sw[i].seen_ver = 0;
+            pthread_mutex_unlock(&g_sw_mu);
+            return 0;
+        }
+    }
+    for (int i = 0; i < CLUSTER_SETTINGS_WATCH_MAX; i++) {
+        if (!g_sw[i].fn) {
+            g_sw[i] = (struct sw_slot){fn, arg, 0};
+            pthread_mutex_unlock(&g_sw_mu);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_sw_mu);
+    return -1;
+}
+
+void cluster_del_settings_watch(cluster_settings_watch_fn fn, void *arg)
+{
+    if (!fn)
+        return;
+    pthread_mutex_lock(&g_sw_mu);
+    for (int i = 0; i < CLUSTER_SETTINGS_WATCH_MAX; i++) {
+        if (g_sw[i].fn == fn && g_sw[i].arg == arg) {
+            g_sw[i] = (struct sw_slot){0};
+            break;
+        }
+    }
+    while (g_sw_busy > 0 && !pthread_equal(g_sw_owner, pthread_self()))
+        pthread_cond_wait(&g_sw_cv, &g_sw_mu);
+    pthread_mutex_unlock(&g_sw_mu);
+}
+
+static void settings_watch_duty(void)
+{
+    if (!C.sm.initialised || !C.sm.settings_version)
+        return;
+    uint64_t ver = C.sm.settings_version;
+    struct meta_settings snap = C.sm.set;
+    struct {
+        cluster_settings_watch_fn fn;
+        void *arg;
+    } todo[CLUSTER_SETTINGS_WATCH_MAX];
+    int ntodo = 0;
+    pthread_mutex_lock(&g_sw_mu);
+    for (int i = 0; i < CLUSTER_SETTINGS_WATCH_MAX; i++) {
+        if (g_sw[i].fn && g_sw[i].seen_ver != ver) {
+            g_sw[i].seen_ver = ver;
+            todo[ntodo].fn = g_sw[i].fn;
+            todo[ntodo].arg = g_sw[i].arg;
+            ntodo++;
+        }
+    }
+    if (ntodo > 0) {
+        g_sw_busy++;
+        g_sw_owner = pthread_self();
+    }
+    pthread_mutex_unlock(&g_sw_mu);
+    if (ntodo == 0)
+        return;
+    for (int i = 0; i < ntodo; i++)
+        todo[i].fn(todo[i].arg, ver, &snap);
+    pthread_mutex_lock(&g_sw_mu);
+    if (--g_sw_busy == 0)
+        pthread_cond_broadcast(&g_sw_cv);
+    pthread_mutex_unlock(&g_sw_mu);
+}
+
 static void copy_publish(void)
 {
     if (cc_retired.v)
         cc_reclaim();
     if (!C.sm.initialised || (C.hold_copy && access(C.holdcopyfile, F_OK) == 0))
         return;
+    if (!g_set_seen) {
+        g_set_seen = 1;
+        g_set_ver = C.sm.settings_version;
+        g_set_last = C.sm.set;
+    } else if (C.sm.settings_version != g_set_ver) {
+        char diff[512];
+        meta_settings_diff_fmt(&g_set_last, &C.sm.set, diff, sizeof diff);
+        say("settings updated (version %" PRIu64 "): %s", C.sm.settings_version, diff[0] ? diff : "(unchanged)");
+        g_set_ver = C.sm.settings_version;
+        g_set_last = C.sm.set;
+    }
     if (C.sm.set.young_high_pct >= 10 && C.sm.set.young_high_pct <= 99 &&
         atomic_load_explicit(&g_young_high_pct, memory_order_relaxed) != C.sm.set.young_high_pct) {
         atomic_store_explicit(&g_young_high_pct, C.sm.set.young_high_pct, memory_order_release);
@@ -2497,7 +2630,8 @@ static void copy_publish(void)
     uint32_t self = cl_mutant() == CLM_SELFONE ? 1 : C.have_node ? C.id : 0;
     struct cc_snap *cur = atomic_load(&cc_cur.v); /* ours: the published reference is the cluster thread's */
     if (cur && cur->pub.applied == C.sm.applied && cur->pub.applied_term == C.sm.applied_term &&
-        cur->pub.restore_gen == C.sm.restore_gen && cur->pub.self == self)
+        cur->pub.restore_gen == C.sm.restore_gen && cur->pub.settings_version == C.sm.settings_version &&
+        cur->pub.self == self)
         return;
     uint32_t nv = C.sm.nvolumes, nm = C.sm.nmembers;
     size_t bytes = sizeof(struct cc_snap) + (size_t)nv * sizeof(struct cluster_copy_vol) +
@@ -2549,7 +2683,8 @@ static void copy_publish(void)
             memcpy(mem[i].disks, m->disks, mem[i].ndisks * sizeof mem[i].disks[0]);
     }
     s->pub = (struct cluster_copy){.applied = C.sm.applied, .applied_term = C.sm.applied_term,
-                                   .restore_gen = C.sm.restore_gen, .self = self, .nmembers = nm, .nvolumes = nv,
+                                   .restore_gen = C.sm.restore_gen, .settings_version = C.sm.settings_version,
+                                   .self = self, .nmembers = nm, .nvolumes = nv,
                                    .rebuild_mb_s = C.sm.set.rebuild_mb_s,
                                    .balance_mb_s = C.sm.set.balance_mb_s,
                                    .rebuild_concurrency = C.sm.set.rebuild_concurrency,
@@ -2569,6 +2704,7 @@ static void copy_publish(void)
     cc_swap(s);
     atomic_fetch_add_explicit(&cc_builds, 1, memory_order_release);
     pace_configure(&(struct pace_cfg){(uint64_t)C.sm.set.rebuild_mb_s << 20, (uint64_t)C.sm.set.balance_mb_s << 20});
+    settings_watch_duty();
     cluster_metrics_publish(iso_now_ns());
 }
 
@@ -3436,10 +3572,11 @@ static void pend_add(uint64_t conn, uint32_t reqid, uint32_t member, uint64_t in
         if (!C.pend)
             oom();
     }
-    C.pend[C.npend++] =
-        (struct pend){conn, reqid, member, index, term, C.pend_join, C.pend_volume, C.pend_user, is_out, C.pend_text};
+    C.pend[C.npend++] = (struct pend){conn,        reqid,         member, index, term, C.pend_join,
+                                      C.pend_volume, C.pend_user, is_out, C.pend_settings, C.pend_text};
     C.pend_user = NULL;
     C.pend_text = NULL;
+    C.pend_settings = 0;
 }
 
 static void send_join(struct conn *d, uint32_t id);
@@ -3486,8 +3623,25 @@ static void pend_applied(uint64_t index, uint64_t term, int rc0)
                 admin_reply(p->conn, p->reqid, 0, nb, 4);
             } else if (p->conn) {
                 int rcode = p->join && rc == 0 ? CLUSTER_ERR_UNREACHABLE : rc;
-                const char *txt = rcode == 0 ? p->text : NULL;
-                admin_reply(p->conn, p->reqid, rcode, txt, txt ? strlen(txt) : 0);
+                if (p->is_settings) {
+                    char sb[600];
+                    if (rcode == 0) {
+                        int n = snprintf(sb, sizeof sb, "settings updated (version %" PRIu64 "): %s",
+                                         C.sm.settings_version, p->text && p->text[0] ? p->text : "(unchanged)");
+                        admin_reply(p->conn, p->reqid, 0, sb, n > 0 ? ((size_t)n < sizeof sb ? (size_t)n : sizeof sb - 1) : 0);
+                    } else if (rcode == META_ERR_STALE) {
+                        int n = snprintf(sb, sizeof sb,
+                                         "STALE: settings changed concurrently (current version is %" PRIu64 "); retry",
+                                         C.sm.settings_version);
+                        admin_reply(p->conn, p->reqid, rcode, sb,
+                                    n > 0 ? ((size_t)n < sizeof sb ? (size_t)n : sizeof sb - 1) : 0);
+                    } else {
+                        admin_reply(p->conn, p->reqid, rcode, NULL, 0);
+                    }
+                } else {
+                    const char *txt = rcode == 0 ? p->text : NULL;
+                    admin_reply(p->conn, p->reqid, rcode, txt, txt ? strlen(txt) : 0);
+                }
             }
             free(p->text);
             if (d && rc != 0)
@@ -6571,6 +6725,56 @@ static void admin_volume_gc_resume(struct conn *c, uint32_t reqid, struct rd *r)
     propose(&e, c->serial, reqid, 0);
 }
 
+/* R14 (D25): CLUSTER_OP_SETTINGS on the Raft leader. Enforces settings_version CAS, D25 live-only whitelist,
+ * and value ranges both here at the proposer and again at meta_apply. */
+static void admin_settings_set(struct conn *c, uint32_t reqid, struct rd *r)
+{
+    uint64_t expected_ver = 0;
+    struct meta_settings s;
+    if (cluster_settings_set_decode(r->p + r->off, r->len - r->off, &expected_ver, &s) != 0) {
+        static const char msg[] = "settings set: malformed request body";
+        admin_reply(c->serial, reqid, META_ERR_INVALID, msg, sizeof msg - 1);
+        return;
+    }
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised) {
+        const char *lp = leader_peer();
+        admin_reply(c->serial, reqid, C.sm.initialised || C.have_node ? CLUSTER_ERR_NOTLEADER : CLUSTER_ERR_STATE,
+                    lp, strlen(lp));
+        return;
+    }
+    char why[256];
+    if (cl_mutant() != CLM_SETTINGSNOCAS && expected_ver != C.sm.settings_version) {
+        int n = snprintf(why, sizeof why, "STALE: settings version %" PRIu64 " != current %" PRIu64 "; retry",
+                         expected_ver, C.sm.settings_version);
+        admin_reply(c->serial, reqid, META_ERR_STALE, why, n > 0 ? ((size_t)n < sizeof why ? (size_t)n : sizeof why - 1) : 0);
+        return;
+    }
+    if (cl_mutant() != CLM_SETTINGSANY && !meta_settings_live_ok(&C.sm.set, &s, why, sizeof why)) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, why, strlen(why));
+        return;
+    }
+    if (!meta_settings_valid_why(&s, why, sizeof why)) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, why, strlen(why));
+        return;
+    }
+    char diff[512];
+    meta_settings_diff_fmt(&C.sm.set, &s, diff, sizeof diff);
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_settings(&e, &s, expected_ver);
+    free(C.pend_text);
+    C.pend_text = diff[0] ? strdup(diff) : NULL;
+    if (diff[0] && !C.pend_text)
+        oom();
+    C.pend_settings = 1;
+    iso_err rc = propose(&e, c->serial, reqid, 0);
+    if (rc != ISO_OK) {
+        free(C.pend_text);
+        C.pend_text = NULL;
+        C.pend_settings = 0;
+    }
+}
+
 /* R4's admin ops (cluster_int.h): only the Raft leader hands them on; a follower answers NOTLEADER with the leader's
  * peer address, as every op that proposes does (the CLI follows none of them) */
 static void r4_admin(struct conn *c, uint32_t reqid, struct rd *r,
@@ -6613,6 +6817,7 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_NODE_REPLACE: r4_admin(c, reqid, r, cnode_replace_admin); break;
     case CLUSTER_OP_NODE_DESTROYED: r4_admin(c, reqid, r, cnode_destroyed_admin); break;
     case CLUSTER_OP_VOLUME_MOVE_POS: r4_admin(c, reqid, r, cnode_move_pos_admin); break;
+    case CLUSTER_OP_SETTINGS: admin_settings_set(c, reqid, r); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -9322,12 +9527,13 @@ static void *cluster_main(void *arg)
             leader_duties(now);
             watch_duty(now);
             vol_watch_duty();
+            settings_watch_duty();
             users_duty(now);
             seeds_refresh(now);
             if (atomic_load(&C.copy_drive) && C.r && raft_get_role(C.r) == RAFT_LEADER && C.sm.initialised) {
                 struct meta_entry e; /* copy_hold: an entry that changes nothing, one more applied batch */
                 meta_entry_init(&e);
-                meta_op_settings(&e, settings());
+                meta_op_settings(&e, settings(), C.sm.settings_version);
                 if (propose(&e, 0, 0, 0) == ISO_OK)
                     atomic_fetch_sub(&C.copy_drive, 1);
             }
@@ -9446,6 +9652,13 @@ int cluster_start(const struct cluster_cfg *cfg)
     atomic_store_explicit(&g_hb_fill_pct, 0xff, memory_order_relaxed);
     atomic_store_explicit(&g_young_high_pct, 0, memory_order_relaxed);
     atomic_store_explicit(&g_self_full, 0, memory_order_relaxed);
+    g_set_seen = 0;
+    g_set_ver = 0;
+    memset(&g_set_last, 0, sizeof g_set_last);
+    pthread_mutex_lock(&g_sw_mu);
+    for (int i = 0; i < CLUSTER_SETTINGS_WATCH_MAX; i++)
+        g_sw[i].seen_ver = 0;
+    pthread_mutex_unlock(&g_sw_mu);
     if (cfg->witness)
         atomic_store_explicit(&g_hb_opening, 0, memory_order_relaxed);
     if (cfg->secret_len < CLUSTER_SECRET_MIN || cfg->secret_len > CLUSTER_SECRET_MAX) {
@@ -9737,6 +9950,13 @@ void cluster_stop(void)
     atomic_store_explicit(&g_hb_fill_pct, 0xff, memory_order_relaxed);
     atomic_store_explicit(&g_young_high_pct, 0, memory_order_relaxed);
     atomic_store_explicit(&g_self_full, 0, memory_order_relaxed);
+    g_set_seen = 0;
+    g_set_ver = 0;
+    memset(&g_set_last, 0, sizeof g_set_last);
+    pthread_mutex_lock(&g_sw_mu);
+    for (int i = 0; i < CLUSTER_SETTINGS_WATCH_MAX; i++)
+        g_sw[i].seen_ver = 0;
+    pthread_mutex_unlock(&g_sw_mu);
     if (C.copy_hold)
         pthread_join(C.copy_hold_th, NULL);
     if (C.copy_probe)

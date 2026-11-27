@@ -276,8 +276,11 @@ cgroup, so `nice` does not keep your work out of its way.
   `store_id`, `nvme`/`ssd`/`hdd`, `log`/`chunk`, size, sync_us, `UP`/`DOWN`/`OUT`/`DESTROYED`), declared `role`
   (`both`/`compute`/`storage`) and computed `capability`, ops `STORE_ADD`/`STORE_CLASS`/`STORE_STATE`/`MEMBER_ROLE`,
   R12/R13 settings (`META_SETTINGS_WORDS = 38`: `scrub_days`, `scrub_mb_s`, `scrub_out_count`, `log_on_hdd`,
-  `young_warn_pct`, `young_move_pct`, `disk_stall_s`), `cluster_member_disks()`; snapshot version 10 and
-  entry magic "TME7": a state directory or log of another version is refused naming both, never upgraded);
+  `young_warn_pct`, `young_move_pct`, `disk_stall_s`), `cluster_member_disks()`; R14 (`r14-settings`, D25):
+  `settings_version` in `meta_state` (1 at INIT, +1 per `META_OP_SETTINGS`), CAS + D25 init-only whitelist and range
+  validation at both proposer (`CLUSTER_OP_SETTINGS` = 21) and `meta_apply`, live settings watch on consumers,
+  `tsdb cluster settings show|set`, `test_cluster settings`, `make settings-mutants` (`settingsany`, `settingsnocas`);
+  snapshot version 11 and entry magic "TME8": a state directory or log of another version is refused naming both, never upgraded);
   R9 operator ops (`server/cnode.c`: Raft leader handlers for `node hold|out|drain|replace|destroyed` and
   `volume move --pos`, answered after commit, plus `cnode_duty` DRAINING->OUT, replace completion/abandon, and live
   OUT leader handoff; `test_cluster nodehold nodeout nodedrain nodereplace nodedestroyed posmove`; `make ops-mutants`

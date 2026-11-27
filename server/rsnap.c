@@ -1114,9 +1114,16 @@ void rsnap_tick(struct rvol *rv)
     }
     v->tick_ms = now;
     int cur_margin = snap_pace_margin(&rv->rec);
+    uint64_t cur_rate = (uint64_t)(rv->rec.rebuild_mb_s ? rv->rec.rebuild_mb_s : 200) << 20;
+    int samelink_rate_changed = 0;
     for (struct rjob *j = S.jobs; j; j = j->next) {
         if (j->dead || j->vol != rv->number)
             continue;
+        if (j->role == R_SRC && j->rate != cur_rate) {
+            j->rate = cur_rate;
+            if (G.mutant == RM_SNAPSAMELINK)
+                samelink_rate_changed = 1;
+        }
         if (j->margin != cur_margin) {
             j->margin = cur_margin;
             if (j->pace_id)
@@ -1151,6 +1158,10 @@ void rsnap_tick(struct rvol *rv)
             src_abort(j, "it is 6 hours old");
     }
     pthread_mutex_unlock(&S.mu);
+    if (samelink_rate_changed) {
+        peerlink_set_kind_rate(G.pl, PL_KIND_SNAP, cur_rate);
+        peerlink_set_kind_rate(G.pl, PL_KIND_BULK, cur_rate);
+    }
 }
 
 /* repld_close: the volume's driver is closed here for good (its replica removed, or set aside for a fresh one), so

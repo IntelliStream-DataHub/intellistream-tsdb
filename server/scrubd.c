@@ -39,7 +39,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SCRUBD_DEFAULT_MB_S 20u
+#define SCRUBD_DEFAULT_MB_S 20u /* fallback before cluster settings load; cluster scrub_mb_s (E25) takes over */
 #define SCRUBD_DEFAULT_INTERVAL_MS 3600000u /* 1 hour between completed passes on idle volumes (tests override) */
 #define SCRUBD_STEP_BYTES (1024u << 10)
 #define SCRUBD_SAVE_INTERVAL_S 10u
@@ -73,6 +73,7 @@ static struct {
     char dir[4096];
     uint32_t rate_mb_s;
     uint32_t interval_ms;
+    int rate_override;
     struct scrub_vol vols[CLUSTER_REPORT_VOLS];
     uint32_t nvols;
     /* Lock-free O(1) maps indexed by volume number (< SCRUBD_VOL_MAP_MAX) for hot/cross-lock callers. */
@@ -397,6 +398,22 @@ static void scrubd_collect_metric(void *ctx, struct creport_sink *sink)
 
 /* ---- scrubber thread ---- */
 
+static void scrubd_on_settings(void *arg, uint64_t version, const struct meta_settings *s)
+{
+    (void)arg;
+    (void)version;
+    if (!s)
+        return;
+    /* E25: pace young-part and .ec scrub by cluster scrub_mb_s; keep the 1 h idle gap between passes
+     * (scrub_days is the max-age deadline for completing a pass, never an idle sleep between young passes). */
+    pthread_mutex_lock(&S.mu);
+    if (S.started && !S.stop && !S.rate_override && s->scrub_mb_s > 0 && S.rate_mb_s != s->scrub_mb_s) {
+        S.rate_mb_s = s->scrub_mb_s;
+        pthread_cond_broadcast(&S.cv);
+    }
+    pthread_mutex_unlock(&S.mu);
+}
+
 static void *scrubd_main(void *arg)
 {
     (void)arg;
@@ -406,7 +423,7 @@ static void *scrubd_main(void *arg)
         pthread_mutex_lock(&S.mu);
         int stopping = S.stop;
         uint32_t rate_mb_s = S.rate_mb_s;
-        uint32_t interval_ms = S.interval_ms;
+        uint64_t interval_ms = S.interval_ms;
         pthread_mutex_unlock(&S.mu);
         if (stopping)
             break;
@@ -666,6 +683,7 @@ int scrubd_start(tsdb *t, const char *dir)
     S.nvols = 0;
     S.rate_mb_s = SCRUBD_DEFAULT_MB_S;
     S.interval_ms = SCRUBD_DEFAULT_INTERVAL_MS;
+    S.rate_override = 0;
     for (uint32_t i = 0; i < SCRUBD_VOL_MAP_MAX; i++) {
         atomic_store_explicit(&S.dmg_map[i], 0, memory_order_relaxed);
         atomic_store_explicit(&S.min_isr_held[i], 0, memory_order_relaxed);
@@ -677,8 +695,10 @@ int scrubd_start(tsdb *t, const char *dir)
     if (te) {
         const char *p;
         unsigned v = 0;
-        if ((p = strstr(te, "mb_s=")) != NULL && sscanf(p, "mb_s=%u", &v) == 1 && v > 0)
+        if ((p = strstr(te, "mb_s=")) != NULL && sscanf(p, "mb_s=%u", &v) == 1 && v > 0) {
             S.rate_mb_s = v;
+            S.rate_override = 1;
+        }
         if ((p = strstr(te, "interval_ms=")) != NULL && sscanf(p, "interval_ms=%u", &v) == 1 && v > 0)
             S.interval_ms = v;
     }
@@ -718,11 +738,13 @@ int scrubd_start(tsdb *t, const char *dir)
     pthread_mutex_lock(&S.mu);
     S.started = 1;
     pthread_mutex_unlock(&S.mu);
+    (void)cluster_add_settings_watch(scrubd_on_settings, NULL);
     return 0;
 }
 
 void scrubd_stop(void)
 {
+    cluster_del_settings_watch(scrubd_on_settings, NULL);
     pthread_mutex_lock(&S.mu);
     if (!S.started) {
         pthread_mutex_unlock(&S.mu);

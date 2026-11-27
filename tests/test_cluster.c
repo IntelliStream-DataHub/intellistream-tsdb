@@ -33383,6 +33383,495 @@ static void scen_logbackduring(void)
            A, B, rows);
 }
 
+/* R14 (r14-settings, D25): live cluster settings via `tsdb cluster settings show|set`, settings_version CAS,
+ * D25 init-only whitelist, live consumer updates (rebuild_mb_s on active R4 snapshot, scrubd without TSDB_SCRUB_TEST,
+ * live disk_stall_s probe threshold under outagefs), and per-member change logging.
+ * Catches planted mutants `settingsany` (whitelist ignored) and `settingsnocas` (CAS ignored). */
+static void scen_settings(void)
+{
+    scenario("settings");
+
+    const char *ofs = NULL;
+    int use_ofs = (outagefs_skip(&ofs) == NULL);
+    char d0a[PATH_MAX], d0b[PATH_MAX], ctl[104];
+    disk_meta dm_b;
+    memset(&dm_b, 0, sizeof dm_b);
+    int unlink_ctl = 0;
+    static char xa0[PATH_MAX * 2 + 128];
+    static char pe0[PATH_MAX * 3 + 256];
+    int mports[3] = {0, 0, 0};
+
+#ifdef TSDB_EC
+#define SETTINGS_EC_XARGS " --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1"
+#else
+#define SETTINGS_EC_XARGS ""
+#endif
+    if (use_ofs) {
+        snprintf(d0a, sizeof d0a, "%s/set_d0a", base);
+        snprintf(d0b, sizeof d0b, "%s/set_d0b", base);
+        disk_make(d0a, "nvme");
+        disk_make(d0b, "nvme");
+        if (disk_load(d0b, &dm_b) != 0)
+            die("settings: disk_load d0b failed");
+        if ((size_t)snprintf(ctl, sizeof ctl, "%s/set_ofs.ctl", base) >= sizeof ctl - 4) {
+            snprintf(ctl, sizeof ctl, "/tmp/tsdb-set-%d.ctl", (int)getpid());
+            unlink_ctl = 1;
+        }
+        unlink(ctl);
+        no_auto_disk[0] = 1;
+        omit_dir[0] = 1;
+        snprintf(xa0, sizeof xa0, "--disk %s:nvme --disk %s:nvme --metrics-port auto" SETTINGS_EC_XARGS, d0a, d0b);
+        /* Do NOT override down= (disk_stall_s) or out_count=/mb_s=/days= (chunk scrub) or TSDB_SCRUB_TEST (scrubd):
+         * real cluster settings govern all three; only chunk scrub pass interval is shortened for test speed. */
+        snprintf(pe0, sizeof pe0,
+                 "LD_PRELOAD=%s OUTAGEFS_ROOTS=%s:%s OUTAGEFS_CTL=%s "
+                 "TSDBD_TEST_HEALTH=read=200,write=300,recover=1000,fast=500 "
+                 "TSDB_CHUNKSCRUB_TEST=interval_ms=200",
+                 ofs, d0a, d0b, ctl);
+        xargs[0] = xa0;
+        penv[0] = pe0;
+    } else {
+        xargs[0] = "--metrics-port auto" SETTINGS_EC_XARGS;
+        penv[0] = "TSDB_CHUNKSCRUB_TEST=interval_ms=200";
+    }
+    xargs[1] = "--metrics-port auto" SETTINGS_EC_XARGS;
+    xargs[2] = "--metrics-port auto" SETTINGS_EC_XARGS;
+    penv[1] = "TSDB_CHUNKSCRUB_TEST=interval_ms=200";
+    penv[2] = "TSDB_CHUNKSCRUB_TEST=interval_ms=200";
+#undef SETTINGS_EC_XARGS
+
+    init_retain_s = 2;
+    init_rebuild_mb_s = 1;
+    init_node_timeout_ms = 15000;
+    init_isr_lag_ms = 500;
+    for (int i = 0; i < 3; i++) {
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    init_rebuild_mb_s = 0;
+    init_node_timeout_ms = 0;
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    if (use_ofs) {
+        char cout[256];
+        for (uint64_t t0 = now_ms(); outagefs_cmd(ctl, "state", cout, sizeof cout) != 0; usleep(50000))
+            if (now_ms() - t0 > 10000)
+                die("settings: outagefs control socket %s not ready", ctl);
+    }
+
+    /* 1. Verify `settings show --json` validates cleanly with initial version 1 and rebuild_mb_s 1. */
+    char args[PATH_MAX + 256], out[16384];
+    snprintf(args, sizeof args, "cluster settings show --json 127.0.0.1:%d --secret-file %s", pports[0], secret_path);
+    int rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 0 || !strstr(out, "\"view\": \"settings\"") || !strstr(out, "\"settings_version\": 1") ||
+        !strstr(out, "\"rebuild_mb_s\": 1") || !strstr(out, "\"live_keys\": [") ||
+        !strstr(out, "\"init_only_keys\": ["))
+        die("settings: settings show --json failed (rc=%d):\n%s", rc, out);
+
+    /* 2. Init-only keys refused naming D25's reason (catches `settingsany`), out-of-range refused, unknown exits 2. */
+    snprintf(args, sizeof args, "cluster settings set 127.0.0.1:%d lease_ms=5000 --secret-file %s", pports[0],
+             secret_path);
+    rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 1 || !strstr(out, "init-only") || !strstr(out, "D25"))
+        die("settings: lease_ms=5000 was not refused with D25 reason (rc=%d):\n%s", rc, out);
+
+    snprintf(args, sizeof args, "cluster settings set 127.0.0.1:%d replication=5 --secret-file %s", pports[1],
+             secret_path);
+    rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 1 || !strstr(out, "init-only") || !strstr(out, "D25"))
+        die("settings: replication=5 was not refused with D25 reason (rc=%d):\n%s", rc, out);
+
+    snprintf(args, sizeof args, "cluster settings set 127.0.0.1:%d rebuild_max=99 --secret-file %s", pports[0],
+             secret_path);
+    rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 1 || !strstr(out, "out of range"))
+        die("settings: rebuild_max=99 was not refused as out of range (rc=%d):\n%s", rc, out);
+
+    snprintf(args, sizeof args, "cluster settings set 127.0.0.1:%d bogus_key=1 --secret-file %s", pports[0],
+             secret_path);
+    rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 2)
+        die("settings: bogus_key=1 returned rc=%d (want 2):\n%s", rc, out);
+
+    /* Confirm refused changes left settings_version == 1 and lease_ms unchanged. */
+    snprintf(args, sizeof args, "cluster settings show --json 127.0.0.1:%d --secret-file %s", pports[0], secret_path);
+    rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 0 || !strstr(out, "\"settings_version\": 1") || !strstr(out, "\"lease_ms\": 2000"))
+        die("settings: refused changes mutated state:\n%s", out);
+    printf("  init-only keys (lease_ms, replication) and out-of-range values refused; settings show --json valid\n");
+
+    /* 3. Live rebuild_mb_s acceleration: start an R4 snapshot throttled to 1 MB/s, raise rebuild_mb_s=50 mid-flight,
+     *    and verify transfer rate jumps sharply within 2 s. */
+    uint32_t vnum = 0;
+    rc = vol_add(0, "svol", 3, &vnum);
+    if (rc != 0)
+        die("settings: vol_add svol: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "svol", i, 1, 0);
+    await_isr(0, "svol", 3, 20000, "svol 3/3 ISR");
+
+    struct meta_volume mv;
+    if (!vol_rec(0, "svol", &mv))
+        die("settings: missing svol record");
+    int L = server_of(mv.leader);
+    int R = (L + 1) % 3;
+    int P = (L + 2) % 3; /* third live server to target CLI against (may be follower) */
+
+    /* Write ~4M random rows (~14-16 MB compressed -> ~14-16 s transfer at 1 MB/s). */
+    tsdbc *c = client(L);
+    tsdb_sid sid = rep_series(c, "set.s0", "svol", 30000);
+    int64_t t = 1000;
+    snap_rows(c, sid, &t, 4000000);
+    await_isr(0, "svol", 3, 20000, "svol synced before kill R");
+
+    stop(R, SIGKILL);
+    await_isr(0, "svol", 2, 15000, "svol ISR shrunk after kill R");
+    struct timespec s1 = {1, 0};
+    for (int r = 0; r < 7; r++) {
+        snap_rows(c, sid, &t, 100);
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("settings: flush: %s", ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    snap_rows(c, sid, &t, 1);
+    tsdbc_close(c);
+
+    start(R);
+    mports[R] = th_mport;
+    char needle[128], line[4096];
+    snprintf(needle, sizeof needle, "snapshot made for node %" PRIu32 ":", ids[R]);
+    await_log(L, needle, 30000, "leader never made snapshot for R");
+    log_line(L, needle, line, sizeof line);
+    uint64_t snap_bytes = 0;
+    const char *fp = strstr(line, " files, ");
+    if (fp)
+        snap_bytes = strtoull(fp + 8, NULL, 10);
+    if (snap_bytes < (4u << 20))
+        die("settings: unexpected snapshot size %" PRIu64 " from: %s", snap_bytes, line);
+
+    /* Wait until snapshot transfer is actively underway on R, then sample baseline rate while throttled to 1 MB/s. */
+    uint64_t b0 = 0, t0 = 0, b1 = 0, t1 = 0;
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 20000; usleep(100000)) {
+        struct view v;
+        view(0, &v);
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[R], vnum);
+        if (vp && vp->role == CREPORT_REBUILD_SNAP_DST && vp->bytes_done > 0) {
+            b0 = vp->bytes_done;
+            t0 = now_ms();
+            view_free(&v);
+            break;
+        }
+        view_free(&v);
+    }
+    if (!t0)
+        die("settings: snapshot never started transferring to node %" PRIu32, ids[R]);
+
+    for (uint64_t w1 = now_ms(); now_ms() - w1 < 1500; usleep(100000)) {
+        struct view v;
+        view(0, &v);
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[R], vnum);
+        if (vp && vp->role == CREPORT_REBUILD_SNAP_DST) {
+            b1 = vp->bytes_done;
+            t1 = now_ms();
+            if (t1 - t0 >= 1000 && b1 > b0) {
+                view_free(&v);
+                break;
+            }
+        }
+        view_free(&v);
+    }
+    double slow_mbs = (t1 > t0 && b1 >= b0) ? ((double)(b1 - b0) / (1024.0 * 1024.0)) / ((double)(t1 - t0) / 1000.0)
+                                            : 0.0;
+    if (b1 >= snap_bytes - (2u << 20))
+        die("settings: snapshot transferred too fast before settings change (%" PRIu64 "/%" PRIu64 " bytes, %.2f MB/s)",
+            b1, snap_bytes, slow_mbs);
+
+    /* Raise rebuild_mb_s=50 along with scrub_mb_s=25 and disk_stall_s=2 (down from 10 s default) in one proposal. */
+    snprintf(args, sizeof args,
+             "cluster settings set 127.0.0.1:%d rebuild_mb_s=50 scrub_mb_s=25 disk_stall_s=2 --secret-file %s",
+             pports[P], secret_path);
+    uint64_t t_set = now_ms();
+    rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 0 || !strstr(out, "settings updated (version 2)"))
+        die("settings: settings set rebuild_mb_s=50 failed (rc=%d):\n%s", rc, out);
+
+    /* Condition-wait (generous 5 s bound; normally accelerates in < 1 s) until transfer finishes or rate rises past
+     * the 1 MB/s cap. At 1 MB/s the remaining > 2 MB would take > 10 s, so an unapplied change fails decisively. */
+    uint64_t b2 = b1, t2 = t_set;
+    int snap_done = 0, accelerated = 0;
+    double fast_mbs = 0.0;
+    char recv_needle[128];
+    snprintf(recv_needle, sizeof recv_needle, "snapshot received from node %" PRIu32 ":", ids[L]);
+    while (now_ms() - t_set < 5000) {
+        usleep(100000);
+        if (log_has(R, recv_needle)) {
+            b2 = snap_bytes;
+            t2 = now_ms();
+            snap_done = 1;
+            fast_mbs = (t2 > t_set && b2 > b1)
+                           ? ((double)(b2 - b1) / (1024.0 * 1024.0)) / ((double)(t2 - t_set) / 1000.0)
+                           : 0.0;
+            if (fast_mbs >= 3.0)
+                accelerated = 1;
+            break;
+        }
+        struct view v;
+        view(0, &v);
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[R], vnum);
+        if (vp && vp->role == CREPORT_REBUILD_SNAP_DST && vp->bytes_done > b2) {
+            b2 = vp->bytes_done;
+            t2 = now_ms();
+            fast_mbs = ((double)(b2 - b1) / (1024.0 * 1024.0)) / ((double)(t2 - t_set) / 1000.0);
+            if (fast_mbs >= 3.0 && fast_mbs >= slow_mbs * 2.0) {
+                accelerated = 1;
+                view_free(&v);
+                break;
+            }
+        }
+        view_free(&v);
+    }
+    if (!accelerated)
+        die("settings: rebuild_mb_s=50 did not accelerate live snapshot (before %.2f MB/s, after %.2f MB/s, "
+            "b1=%" PRIu64 " b2=%" PRIu64 " total=%" PRIu64 " done=%d)",
+            slow_mbs, fast_mbs, b1, b2, snap_bytes, snap_done);
+    printf("  live rebuild_mb_s 1->50 accelerated snapshot from %.2f MB/s to %.2f MB/s within %" PRIu64 " ms\n",
+           slow_mbs, fast_mbs, t2 - t_set);
+
+    await_isr(0, "svol", 3, 25000, "svol back to 3/3 ISR after accelerated snapshot");
+
+    /* Verify scrubd ran on R's newly installed svol snapshot WITHOUT any TSDB_SCRUB_TEST override
+     * (L already completed an empty pass when svol was created and sleeps SCRUBD_DEFAULT_INTERVAL_MS = 1 h;
+     * R's snapshot install has a fresh dir_ino with young parts so scrubd scans it immediately at cluster scrub_mb_s). */
+    char mkey_b[96], mkey_p[96], mbuf[65536];
+    snprintf(mkey_b, sizeof mkey_b, "\ntsdb_young_scrub_bytes_total{volume=\"%" PRIu32 "\"} ", vnum);
+    snprintf(mkey_p, sizeof mkey_p, "\ntsdb_young_scrub_parts_total{volume=\"%" PRIu32 "\"} ", vnum);
+    int64_t sb = 0, sp = 0;
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 15000; usleep(100000)) {
+        metrics_get(mports[R], mbuf, sizeof mbuf);
+        if (metrics_find_i64(mbuf, mkey_b, &sb) && sb > 0 && metrics_find_i64(mbuf, mkey_p, &sp) && sp >= 1)
+            break;
+    }
+    if (sb <= 0 || sp < 1)
+        die("settings: scrubd without TSDB_SCRUB_TEST did not scrub svol (bytes=%" PRId64 " parts=%" PRId64 ")", sb, sp);
+    printf("  scrubd (no TSDB_SCRUB_TEST override) verified %" PRId64 " bytes across %" PRId64 " young part(s)\n", sb,
+           sp);
+
+    /* 4. Verify every member logged the settings update concisely. */
+    for (int i = 0; i < 3; i++)
+        await_log(i, "settings updated (version 2): ", 10000, "member did not log settings update");
+    for (int i = 0; i < 3; i++) {
+        if (!log_has(i, "rebuild_mb_s 1->50"))
+            die("settings: server %d log missing rebuild_mb_s 1->50", i);
+    }
+
+    /* 5. Two CLIs racing with the same settings_version (2): exactly one succeeds, one gets STALE (catches settingsnocas). */
+    char args_a[PATH_MAX + 256], args_b[PATH_MAX + 256], out_a[4096], out_b[4096];
+    snprintf(args_a, sizeof args_a,
+             "cluster settings set 127.0.0.1:%d --version 2 balance_mb_s=30 --secret-file %s", pports[0], secret_path);
+    snprintf(args_b, sizeof args_b,
+             "cluster settings set 127.0.0.1:%d --version 2 balance_mb_s=40 --secret-file %s", pports[1], secret_path);
+    FILE *pa = cli_start(args_a);
+    FILE *pb = cli_start(args_b);
+    int rca = cli_finish(pa, out_a, sizeof out_a);
+    int rcb = cli_finish(pb, out_b, sizeof out_b);
+    if (!((rca == 0 && rcb == 1) || (rca == 1 && rcb == 0)))
+        die("settings: two racing CLIs did not produce 1 ok + 1 STALE (rca=%d rcb=%d)\nA: %s\nB: %s", rca, rcb, out_a,
+            out_b);
+    const char *loser_out = (rca != 0) ? out_a : out_b;
+    const char *want_bal = (rca == 0) ? "\"balance_mb_s\": 30" : "\"balance_mb_s\": 40";
+    if (!strstr(loser_out, "STALE") || !strstr(loser_out, "retry"))
+        die("settings: racing loser did not report STALE/retry:\n%s", loser_out);
+
+    /* Verify final settings show --json matches version 3 and all applied values. */
+    snprintf(args, sizeof args, "cluster settings show --json 127.0.0.1:%d --secret-file %s", pports[0], secret_path);
+    rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 0 || !strstr(out, "\"settings_version\": 3") || !strstr(out, "\"rebuild_mb_s\": 50") ||
+        !strstr(out, "\"scrub_mb_s\": 25") || !strstr(out, "\"disk_stall_s\": 2") || !strstr(out, want_bal))
+        die("settings: final settings show --json mismatch (rc=%d):\n%s", rc, out);
+
+    /* Regression check: CLI --version that differs from the version read (e.g. 99 vs 3) must be refused with STALE
+     * and never forge a CAS against a different base struct. */
+    snprintf(args, sizeof args, "cluster settings set 127.0.0.1:%d --version 99 balance_mb_s=77 --secret-file %s",
+             pports[1], secret_path);
+    rc = cli_run(args, NULL, out, sizeof out);
+    if (rc != 1 || !strstr(out, "STALE"))
+        die("settings: mismatched --version 99 was not refused with STALE (rc=%d):\n%s", rc, out);
+
+    /* Deterministic server-side CAS check (always catches settingsnocas even if racing CLIs did not overlap):
+     * send CLUSTER_OP_SETTINGS directly with stale expected_version=1 while cluster is at version 3. */
+    {
+        struct view v;
+        view(0, &v);
+        struct meta_settings ns = v.m.set;
+        view_free(&v);
+        ns.balance_mb_s = 77;
+        uint8_t sbody[8 + 4 * META_SETTINGS_WORDS], *srep = NULL;
+        size_t srlen = 0, slen = cluster_settings_set_encode(1, &ns, sbody);
+        int src = admin(0, CLUSTER_OP_SETTINGS, sbody, slen, 1, &srep, &srlen);
+        free(srep);
+        if (src != META_ERR_STALE)
+            die("settings: stale server CLUSTER_OP_SETTINGS (ver=1 at ver=3) returned %s (want META_ERR_STALE)",
+                cluster_strerror(src));
+    }
+    printf("  two racing CLIs: one applied (version 3), one returned STALE; server CAS & --version mismatch verified\n");
+
+#ifdef TSDB_EC
+    /* 6. End-to-end live chunk-scrubber settings (chunksrv_cluster.c -> chunksrv_scrub_update_cfg):
+     *    create an ec=2+1 volume across the 3 nodes (while all disks are UP), settle 3 partitions (3 chunks on
+     *    server 2's store), corrupt 2 chunks (<= default scrub_out_count=8, store stays UP), lower scrub_out_count=1
+     *    live, then corrupt the 3rd chunk and verify server 2 marks store 0 DOWN locally citing scrub_out_count=1. */
+    {
+        uint32_t ecnum = 0;
+        char ecmsg[256] = "";
+        for (uint64_t w0 = now_ms(); (rc = vol_add_ec(0, "ecset", 0, 2, 1, &ecnum, ecmsg, sizeof ecmsg)) != 0;
+             usleep(100000))
+            if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - w0 > 20000)
+                die("settings: vol_add_ec ecset: %s (%s)", cluster_strerror(rc), ecmsg);
+        struct meta_volume emv = {0};
+        for (uint64_t w0 = now_ms(); !vol_rec(0, "ecset", &emv) || !emv.leader; usleep(50000))
+            if (now_ms() - w0 > 20000)
+                die("settings: ecset never got a leader");
+        for (uint32_t k = 0; k < emv.nrep; k++) {
+            int rs = server_of(emv.rep[k].node);
+            if (rs >= 0)
+                await_open_gen(0, "ecset", rs, 1, 0);
+        }
+        if (!vol_rec(0, "ecset", &emv) || !emv.leader)
+            die("settings: ecset lost leader");
+        int EL = server_of(emv.leader);
+        tsdbc *ec = client(EL);
+        tsdb_sid esid = ecb_series(ec, "ecset.s0", "ecset");
+        const int64_t day0 = 1704067200000LL;
+        for (int d = 0; d < 3; d++) {
+            int64_t ts[100];
+            float val[100];
+            for (int k = 0; k < 100; k++) {
+                ts[k] = day0 + (int64_t)d * 86400000LL + (int64_t)k * 1000LL;
+                val[k] = (float)(d * 100 + k) * 0.25f;
+            }
+            for (uint64_t w0 = now_ms(); (rc = tsdbc_insert_series(ec, esid, ts, val, 100)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - w0 > 20000)
+                    die("settings: insert into ecset day %d: %s", d, ers(rc));
+            if ((rc = tsdbc_flush(ec)) != 0)
+                die("settings: flush ecset day %d: %s", d, ers(rc));
+        }
+        tsdbc_close(ec);
+
+        int csrv = -1;
+        char csdir[PATH_MAX], cdir[PATH_MAX + 64];
+        for (uint64_t w0 = now_ms(); csrv < 0; usleep(150000)) {
+            for (int cand = 1; cand <= 2; cand++) {
+                server_dir(cand, csdir, sizeof csdir);
+                if (count_chunk_files_in(csdir, ecnum) >= 3) {
+                    csrv = cand;
+                    break;
+                }
+            }
+            if (csrv < 0 && now_ms() - w0 > 30000)
+                die("settings: ecset did not settle 3 chunks on server 1 or 2 within 30 s");
+        }
+
+        snprintf(cdir, sizeof cdir, "%s/chunks/s%" PRIu32, csdir, ecnum);
+        char cpaths[3][PATH_MAX + 128];
+        int nc = 0;
+        DIR *cd = opendir(cdir);
+        if (!cd)
+            die("settings: opendir %s: %s", cdir, strerror(errno));
+        for (struct dirent *de; nc < 3 && (de = readdir(cd)) != NULL;) {
+            size_t l = strlen(de->d_name);
+            if (l > 6 && strcmp(de->d_name + l - 6, ".chunk") == 0)
+                snprintf(cpaths[nc++], sizeof cpaths[0], "%s/%s", cdir, de->d_name);
+        }
+        closedir(cd);
+        if (nc < 3)
+            die("settings: expected 3 chunk files in %s, found %d", cdir, nc);
+
+        /* Corrupt 2 chunks: with default scrub_out_count=8, scrubber detects both but keeps store UP. */
+        for (int k = 0; k < 2; k++) {
+            int fd = open(cpaths[k], O_RDWR);
+            if (fd < 0)
+                die("settings: open %s: %s", cpaths[k], strerror(errno));
+            uint8_t b = 0;
+            if (pread(fd, &b, 1, CHUNK_HDR_BYTES + 10) != 1)
+                die("settings: pread %s", cpaths[k]);
+            b ^= 0xffu;
+            if (pwrite(fd, &b, 1, CHUNK_HDR_BYTES + 10) != 1)
+                die("settings: pwrite %s", cpaths[k]);
+            close(fd);
+        }
+        int64_t cdmg = 0;
+        for (uint64_t w0 = now_ms(); now_ms() - w0 < 15000; usleep(100000)) {
+            metrics_get(mports[csrv], mbuf, sizeof mbuf);
+            if (metrics_find_i64(mbuf, "\ntsdb_chunk_scrub_damaged_total{store=\"0\"} ", &cdmg) && cdmg >= 2)
+                break;
+        }
+        if (cdmg < 2)
+            die("settings: chunk scrubber on server %d did not detect 2 damaged chunks (got %" PRId64 ")", csrv, cdmg);
+        if (log_has(csrv, "marking store DOWN locally"))
+            die("settings: server %d marked store DOWN with only 2 damaged chunks (default scrub_out_count=8)", csrv);
+
+        /* Lower scrub_out_count=1 live, then corrupt the 3rd chunk: live update must mark store DOWN locally. */
+        snprintf(args, sizeof args, "cluster settings set 127.0.0.1:%d scrub_out_count=1 --secret-file %s", pports[0],
+                 secret_path);
+        rc = cli_run(args, NULL, out, sizeof out);
+        if (rc != 0 || !strstr(out, "settings updated (version 4)"))
+            die("settings: settings set scrub_out_count=1 failed (rc=%d):\n%s", rc, out);
+        await_log(csrv, "settings updated (version 4): ", 10000, "target chunk server did not log version 4");
+        usleep(300000); /* allow chunksrv_cluster cc_main (100 ms poll) to apply chunksrv_scrub_update_cfg */
+
+        int fd = open(cpaths[2], O_RDWR);
+        if (fd < 0)
+            die("settings: open %s: %s", cpaths[2], strerror(errno));
+        uint8_t b = 0;
+        if (pread(fd, &b, 1, CHUNK_HDR_BYTES + 10) != 1)
+            die("settings: pread %s", cpaths[2]);
+        b ^= 0xffu;
+        if (pwrite(fd, &b, 1, CHUNK_HDR_BYTES + 10) != 1)
+            die("settings: pwrite %s", cpaths[2]);
+        close(fd);
+        await_log(csrv, "(exceeds scrub_out_count=1): marking store DOWN locally", 15000,
+                  "live scrub_out_count=1 did not reach chunk scrubber");
+        printf("  live chunk scrub_out_count 8->1 reached chunksrv (server %d) and marked store DOWN on 3rd damaged chunk\n",
+               csrv);
+    }
+#endif
+
+    /* 7. Live disk_stall_s (10 s init default -> 2 s live): hang server 0's second NVMe disk via outagefs and verify
+     *    its health probe transitions to DOWN within 6 s (strictly below the 10 s init default so live propagation
+     *    from disk_on_settings -> disk_probe_set_stall_s is proven). */
+    if (use_ofs) {
+        char cmd[PATH_MAX + 32], cout[256];
+        snprintf(cmd, sizeof cmd, "hang %s", d0b);
+        if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+            die("settings: outagefs '%s' failed: %s", cmd, cout);
+        uint64_t t_hang = now_ms(), down_ms = 0;
+        int saw_down = 0;
+        for (; now_ms() - t_hang < 6000; usleep(100000)) {
+            int64_t ms_b = -1;
+            if (disk_metric_state(mports[0], dm_b.store_id, "nvme", &ms_b) && ms_b == 1) {
+                down_ms = now_ms() - t_hang;
+                saw_down = 1;
+                break;
+            }
+        }
+        snprintf(cmd, sizeof cmd, "heal %s", d0b);
+        if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+            die("settings: outagefs '%s' failed: %s", cmd, cout);
+        if (!saw_down)
+            die("settings: live disk_stall_s=2 did not mark hung disk DOWN within 6 s (init default 10 s still active?)");
+        printf("  live disk_stall_s 10->2 marked hung disk DOWN in %" PRIu64 " ms\n", down_ms);
+    }
+
+    stop_all();
+    if (unlink_ctl)
+        unlink(ctl);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -33444,7 +33933,7 @@ int main(int argc, char **argv)
                {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass},
                {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio},
                {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring},
-               {"hddadd", scen_hddadd}};
+               {"hddadd", scen_hddadd}, {"settings", scen_settings}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

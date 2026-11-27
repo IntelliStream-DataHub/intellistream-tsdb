@@ -1877,6 +1877,14 @@ static void disk_on_health_change(void *ctx, int dom_idx, int old_state, int new
         cb(cb_ctx, disk_idx, store_id, path, disk_class, uses, old_state, new_state);
 }
 
+static void disk_on_settings(void *arg, uint64_t version, const struct meta_settings *s)
+{
+    (void)arg;
+    (void)version;
+    if (s && s->disk_stall_s > 0)
+        disk_probe_set_stall_s(s->disk_stall_s);
+}
+
 int disk_probe_start(disk_probe_cb cb, void *ctx, char *err, size_t errlen)
 {
     uint32_t stall_s = 10;
@@ -1952,6 +1960,7 @@ int disk_probe_start(disk_probe_cb cb, void *ctx, char *err, size_t errlen)
             return -1;
         }
     }
+    (void)cluster_add_settings_watch(disk_on_settings, NULL);
     return 0;
 }
 
@@ -2126,6 +2135,7 @@ void disk_probe_chunk_failed(int chunk_slot, int err_code)
 
 void disk_probe_stop(void)
 {
+    cluster_del_settings_watch(disk_on_settings, NULL);
     pthread_mutex_lock(&g_mu);
     if (!G.probe_h) {
         pthread_mutex_unlock(&g_mu);

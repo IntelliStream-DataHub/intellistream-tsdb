@@ -72,6 +72,7 @@ for hargs in "" "help" "help status" "help status volumes" "help status volume" 
              "help init" "help node" "help node add" "help node hold" "help node out" "help node drain" \
              "help node replace" "help node destroyed" "help volume" "help volume add" "help volume move" \
              "help volume transfer" "help volume force-leader" "help volume gc resume" "help replica reset" \
+             "help settings" "help settings show" "help settings set" \
              "help secret" "help user"; do
     # shellcheck disable=SC2086
     out=$("$T" cluster $hargs 2>"$scratch/err"); rc=$?
@@ -93,7 +94,8 @@ done
 
 # Wrong verb / missing args must exit 2 with empty stdout.
 for bad in "bogus" "help bogus" "help status volumes extra" "status" "status --json" "status volumes" \
-           "status volume" "status volume 1" "status disks" "node nope" "volume nope" "replica nope"; do
+           "status volume" "status volume 1" "status disks" "node nope" "volume nope" "replica nope" \
+           "settings" "settings nope" "settings show" "settings set" "settings set 127.0.0.1:1"; do
     # shellcheck disable=SC2086
     out=$("$T" cluster $bad 2>"$scratch/err"); rc=$?
     [ "$rc" -eq 2 ] || fail "tsdb cluster $bad: exit $rc, want 2"
@@ -511,5 +513,55 @@ case $out in *"volume 99 does not exist"*) ;; *) fail "unexpected replica reset 
 
 out=$("$T" cluster volume gc resume "$p2" repv --secret-file "$sec" 2>&1); rc=$?
 [ "$rc" -eq 1 ] || fail "volume gc resume on replicas vol: exit $rc, want 1"
+
+# ---- 6. R14 live settings (settings show [--json], settings set, init-only refusal, CAS STALE) ----
+
+hset=$("$T" cluster help settings)
+for want in "settings show" "settings set" "view, cluster_uuid, settings_version, settings, live_keys, init_only_keys"; do
+    case $hset in *"$want"*) ;; *) fail "help settings missing '$want'" ;; esac
+done
+
+set_txt=$("$T" cluster settings show "$p2" --secret-file "$sec") || fail "settings show text failed"
+printf '%s\n' "$set_txt" | grep -q '^settings_version 1$' || fail "settings show missing settings_version 1:\n$set_txt"
+printf '%s\n' "$set_txt" | grep -qE '^rebuild_mb_s[[:space:]]+150[[:space:]]+live$' || fail "settings show missing rebuild_mb_s live:\n$set_txt"
+printf '%s\n' "$set_txt" | grep -qE '^lease_ms[[:space:]]+2000[[:space:]]+init-only$' || fail "settings show missing lease_ms init-only:\n$set_txt"
+
+for cmd in \
+    "settings show --json $p1 --secret-file $sec" \
+    "settings --json show $p2 --secret-file $sec" \
+    "settings show $p1 --json --secret-file $sec"; do
+    # shellcheck disable=SC2086
+    "$T" cluster $cmd | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("view", "cluster_uuid", "settings_version", "settings", "live_keys", "init_only_keys"):
+    assert k in d, f"missing key {k}"
+assert d["view"] == "settings" and d["settings_version"] == 1
+assert d["settings"]["rebuild_mb_s"] == 150 and d["settings"]["lease_ms"] == 2000
+assert "rebuild_mb_s" in d["live_keys"] and "lease_ms" in d["init_only_keys"]
+assert "lease_ms" not in d["live_keys"] and "rebuild_mb_s" not in d["init_only_keys"]
+' || fail "tsdb cluster $cmd JSON check failed"
+done
+
+out=$("$T" cluster settings set "$p2" rebuild_mb_s=80 scrub_mb_s=30 --secret-file "$sec") || fail "settings set via follower failed"
+case $out in *"settings updated (version 2):"*rebuild_mb_s*150-\>80*) ;; *) fail "unexpected settings set output: $out" ;; esac
+
+out=$("$T" cluster settings set "$p2" lease_ms=5000 --secret-file "$sec" 2>&1); rc=$?
+[ "$rc" -eq 1 ] || fail "settings set lease_ms: exit $rc, want 1"
+case $out in *"init-only"*"D25"*) ;; *) fail "unexpected lease_ms refusal: $out" ;; esac
+
+out=$("$T" cluster settings set "$p2" --version 1 rebuild_mb_s=90 --secret-file "$sec" 2>&1); rc=$?
+[ "$rc" -eq 1 ] || fail "settings set stale --version 1: exit $rc, want 1"
+case $out in *"STALE"*) ;; *) fail "unexpected stale refusal: $out" ;; esac
+
+out=$("$T" cluster settings set "$p2" --version 99 rebuild_mb_s=90 --secret-file "$sec" 2>&1); rc=$?
+[ "$rc" -eq 1 ] || fail "settings set mismatched --version 99: exit $rc, want 1"
+case $out in *"STALE"*) ;; *) fail "unexpected version-99 refusal: $out" ;; esac
+
+out=$("$T" cluster settings show --json "$p1" --secret-file "$sec") || fail "settings show after refused --version failed"
+case $out in *'"settings_version": 2'*'"rebuild_mb_s": 80'*) ;; *) fail "refused --version mutated settings: $out" ;; esac
+
+"$T" cluster settings set "$p1" unknown_setting=1 --secret-file "$sec" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ] || fail "settings set unknown_setting: exit $rc, want 2"
 
 echo "test_cluster_cli: ok"

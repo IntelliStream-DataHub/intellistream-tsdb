@@ -677,7 +677,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs 
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
     nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio \
-    ecbackduring ecbackafterwhole logbackduring hddadd
+    ecbackduring ecbackafterwhole logbackduring hddadd settings
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
 	CRASHFS_SO=$(B)/libcrashfs.so OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1341,6 +1341,11 @@ placeclass-mutants: $(B)/test_place $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
 	$(MUT) --name test_place_r13 --list "loghdd mixstripe placefull" -- ./$(B)/test_place --mutant @M@
 	$(MUT) --name placeclass --uring --list "loghdd mixstripe placefull" -- env TSDB_PLACE_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ placeclass
+# R14 (r14-settings) live cluster settings whitelist and CAS planted bugs (server/meta.c, server/cluster.c)
+settings-mutants: $(B)/test_meta_mut $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
+	$(MUT) --name test_meta_settings --list "settingsany settingsnocas" -- ./$(B)/test_meta_mut @D@ --mutant @M@ --seeds 4 --seconds 6
+	$(MUT) --name settings --uring --list "settingsany settingsnocas" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb $(if $(filter Darwin,$(UNAME_S)),,OUTAGEFS_LIB=$(B)/liboutagefs.so )./$(B)/test_cluster @D@ settings
 
 # TIERS catalog, db_id binding, device isolation and crashfs mutants (src/tiers.c, src/volumes.c, tests/test_tiers.c)
 tiers-mutants: $(B)/test_tiers $(CRASHFS_SO)
@@ -2532,4 +2537,4 @@ test: check-ci-groups
 check-ci-groups:
 	tests/check_ci_groups.sh
 
-.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper test-release-hooks tsan-par test-cluster-cli
+.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper test-release-hooks tsan-par test-cluster-cli settings-mutants

@@ -834,7 +834,7 @@ static void test_replica_set(void)
             meta_settings_default(&st);
             uint32_t *f[4] = {&st.rebuild_mb_s, &st.rebuild_max, &st.transfer_wait_ms, &st.leader_balance_s};
             *f[b[i].field] = b[i].val;
-            meta_op_settings(&e, &st);
+            meta_op_settings(&e, &st, m.settings_version);
             CHECK(apply1(&m, &e, res, 8) == META_OK && (res[0] == META_OK) == b[i].ok);
             const uint32_t *got[4] = {&m.set.rebuild_mb_s, &m.set.rebuild_max, &m.set.transfer_wait_ms,
                                       &m.set.leader_balance_s};
@@ -843,7 +843,7 @@ static void test_replica_set(void)
         meta_settings_default(&st);
         st.leader_balance_s = 30;
         st.rebuild_max = 5;
-        meta_op_settings(&e, &st);
+        meta_op_settings(&e, &st, m.settings_version);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && m.set.leader_balance_s == 30 &&
               m.set.rebuild_max == 5);
     }
@@ -855,7 +855,7 @@ static void test_replica_set(void)
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 10);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 11);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -881,8 +881,10 @@ static void test_replica_set(void)
     {
         meta_op_replica_reset(&e, 2, 3, 3, 7200);
         meta_entry_finish(&e);
-        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME7", 4) == 0);
+        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME8", 4) == 0);
         uint64_t h = meta_hash(&m);
+        memcpy(e.buf, "TME7", 4);
+        CHECK(meta_entry_older(e.buf, e.len));
         memcpy(e.buf, "TME1", 4);
         CHECK(meta_entry_older(e.buf, e.len) && !meta_entry_older(e.buf, 3));
         CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
@@ -1462,7 +1464,7 @@ static void test_r9_meta(void)
                                  &st.out_guard_pct,       &st.out_guard_hold_s, &st.repl_retain_down_gb,
                                  &st.young_high_pct,      &st.balance_mb_s,   &st.rebuild_concurrency};
             *ptrs[cases[i].f] = cases[i].v;
-            meta_op_settings(&e, &st);
+            meta_op_settings(&e, &st, m.settings_version);
             CHECK(apply1(&m, &e, res, 8) == META_OK && (res[0] == META_OK) == cases[i].ok);
         }
         /* set non-defaults, plus active DOWN & hold & FILLING, and verify snapshot v7 round-trip + v6 refusal */
@@ -1476,7 +1478,7 @@ static void test_r9_meta(void)
         st.young_high_pct = 85;
         st.balance_mb_s = 100;
         st.rebuild_concurrency = 8;
-        meta_op_settings(&e, &st);
+        meta_op_settings(&e, &st, m.settings_version);
         meta_op_member_state(&e, 2, META_DOWN, 2, META_DOWN_FAILSTOP, 9000, 9100);
         meta_op_node_hold(&e, 2, clk + 3600000, clk);
         meta_op_node_replace(&e, 2, 10);
@@ -1486,7 +1488,7 @@ static void test_r9_meta(void)
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == 10);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -1864,7 +1866,7 @@ static void test_r10_meta(void)
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == 10);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -2574,7 +2576,7 @@ static void test_r13_meta(void)
             else if (cases[i].f == 4) st.young_warn_pct = cases[i].v;
             else if (cases[i].f == 5) st.young_move_pct = cases[i].v;
             else st.disk_stall_s = cases[i].v;
-            meta_op_settings(&e, &st);
+            meta_op_settings(&e, &st, m.settings_version);
             CHECK(apply1(&m, &e, res, 8) == META_OK && (res[0] == META_OK) == cases[i].ok);
         }
         /* Cross-field ordering: warn <= move < high (E53) */
@@ -2582,16 +2584,16 @@ static void test_r13_meta(void)
         st.young_warn_pct = 99;
         st.young_move_pct = 95;
         st.young_high_pct = 50;
-        meta_op_settings(&e, &st);
+        meta_op_settings(&e, &st, m.settings_version);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
         meta_settings_default(&st);
         st.young_warn_pct = 80;
         st.young_move_pct = 80;
         st.young_high_pct = 81;
-        meta_op_settings(&e, &st);
+        meta_op_settings(&e, &st, m.settings_version);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
         meta_settings_default(&st);
-        meta_op_settings(&e, &st);
+        meta_op_settings(&e, &st, m.settings_version);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     }
 
@@ -2745,7 +2747,7 @@ static void test_r13_meta(void)
         struct meta_settings st = m.set;
         st.log_on_hdd = 1;
         meta_copy(&prev, &m);
-        meta_op_settings(&e, &st);
+        meta_op_settings(&e, &st, m.settings_version);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
         CHECK(meta_member(&m, 3)->capability == META_CAP_BOTH);
         CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
@@ -2761,7 +2763,7 @@ static void test_r13_meta(void)
         /* Turn log_on_hdd back off: node 3 drops META_CAP_COMPUTE (existing replica stays, new ones refused) */
         st.log_on_hdd = 0;
         meta_copy(&prev, &m);
-        meta_op_settings(&e, &st);
+        meta_op_settings(&e, &st, m.settings_version);
         meta_op_member_role(&e, 3, META_ROLE_BOTH);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
         CHECK(meta_member(&m, 3)->capability == META_CAP_STORAGE);
@@ -2848,13 +2850,13 @@ static void test_r13_meta(void)
         st.young_warn_pct = 70;
         st.young_move_pct = 78;
         st.disk_stall_s = 15;
-        meta_op_settings(&e, &st);
+        meta_op_settings(&e, &st, m.settings_version);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
 
         uint8_t *img = NULL;
         size_t len = 0;
         CHECK(meta_snapshot_encode(&m, &img, &len) == META_OK);
-        CHECK(meta_snapshot_version(img, len) == 10);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -2961,8 +2963,9 @@ static void test_r13_meta(void)
             v1->rep[v1->nrep++] = (struct meta_replica){.node = 3, .learner = 1, .rid = 99999};
             v1->set_version++;
             CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
-            /* Allowed when log_on_hdd=1 and capability reflects it */
+            /* Allowed when log_on_hdd=1 (with settings_version raised) and capability reflects it */
             bad.set.log_on_hdd = 1;
+            bad.settings_version++;
             ((struct meta_member *)meta_member(&bad, 3))->capability = META_CAP_BOTH;
             ((struct meta_member *)meta_member(&bad, 1))->capability = META_CAP_BOTH;
             CHECK(meta_check_step(&m, &bad, why, sizeof why) == 0);
@@ -3040,6 +3043,149 @@ static void test_r13_meta(void)
 
             meta_free(&mrole);
         }
+    }
+
+    meta_entry_free(&e);
+    meta_free(&m);
+}
+
+/* R14 (r14-settings, D25): settings_version CAS, init-only whitelist, ranges, snapshot v11 round-trip. */
+static void test_r14_settings(void)
+{
+    struct meta_state m, prev;
+    struct meta_entry e;
+    int res[8];
+    char why[256];
+    meta_init(&m);
+    meta_entry_init(&e);
+
+    uint8_t uuid[16] = {14, 25};
+    struct meta_settings s;
+    meta_settings_default(&s);
+    struct meta_member mb1;
+    member(&mb1, 1);
+    CHECK(m.settings_version == 0);
+    meta_op_init(&e, uuid, &s, &mb1, META_MODE_REPLICATED, META_LEVEL);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(m.settings_version == 1);
+
+    /* 1. Valid live change raises settings_version and updates values. */
+    struct meta_settings ns = m.set;
+    ns.rebuild_mb_s = 75;
+    ns.rebuild_max = 6;
+    ns.transfer_wait_ms = 4000;
+    ns.leader_balance_s = 45;
+    ns.repl_retain_mb = 2048;
+    ns.repl_retain_s = 900;
+    ns.scrub_days = 7;
+    ns.scrub_mb_s = 30;
+    ns.scrub_out_count = 12;
+    ns.young_warn_pct = 70;
+    ns.young_move_pct = 78;
+    ns.young_high_pct = 88;
+    ns.disk_stall_s = 20;
+    ns.balance_mb_s = 40;
+    meta_copy(&prev, &m);
+    meta_op_settings(&e, &ns, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(m.settings_version == 2 && m.set.rebuild_mb_s == 75 && m.set.scrub_mb_s == 30 && m.set.disk_stall_s == 20 &&
+          m.set.balance_mb_s == 40 && m.set.young_high_pct == 88);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+
+    /* 2. CAS: stale versions (0, 1, 3) refused with META_ERR_STALE (catches MUT(72) settingsnocas). */
+    ns.rebuild_mb_s = 100;
+    meta_op_settings(&e, &ns, 0);
+    meta_op_settings(&e, &ns, 1);
+    meta_op_settings(&e, &ns, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE && res[1] == META_ERR_STALE &&
+          res[2] == META_ERR_STALE);
+    CHECK(m.settings_version == 2 && m.set.rebuild_mb_s == 75);
+
+    /* Two ops in the same entry with the same version: first applies (2 -> 3), second sees STALE! */
+    struct meta_settings ns1 = m.set, ns2 = m.set;
+    ns1.rebuild_mb_s = 90;
+    ns2.rebuild_mb_s = 110;
+    meta_op_settings(&e, &ns1, 2);
+    meta_op_settings(&e, &ns2, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_STALE);
+    CHECK(m.settings_version == 3 && m.set.rebuild_mb_s == 90);
+
+    /* 3. Init-only keys: EVERY non-live key refused at meta_apply (catches MUT(71) settingsany). */
+    size_t nset = meta_settings_count();
+    int ninit_only = 0;
+    for (size_t i = 0; i < nset; i++) {
+        const struct meta_setting_info *in = meta_settings_info(i);
+        if (in->live)
+            continue;
+        ninit_only++;
+        struct meta_settings bad = m.set;
+        uint32_t cur = meta_settings_get(&bad, i);
+        uint32_t alt = (in->type == META_SET_BOOL) ? (cur ? 0u : 1u)
+                       : (cur < in->max_val)       ? (cur + 1u)
+                                                   : (cur > in->min_val ? cur - 1u : cur);
+        if (!strcmp(in->name, "min_isr") && alt > bad.replication)
+            alt = bad.replication > 1 ? bad.replication - 1 : 1;
+        if (!strcmp(in->name, "replication") && alt < bad.min_isr)
+            alt = bad.min_isr + 1;
+        CHECK(alt != cur);
+        meta_settings_set(&bad, i, alt);
+        CHECK(meta_settings_valid(&bad)); /* valid in range, but init-only! */
+        CHECK(!meta_settings_live_ok(&m.set, &bad, why, sizeof why) && strstr(why, in->name) != NULL &&
+              strstr(why, "D25") != NULL);
+        uint64_t ver_before = m.settings_version;
+        meta_op_settings(&e, &bad, ver_before);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        CHECK(m.settings_version == ver_before && meta_settings_get(&m.set, i) == cur);
+    }
+    CHECK(ninit_only == 16);
+
+    /* 4. Out-of-range live values refused with META_ERR_INVALID (while repl_retain_mb/s == 0 remain valid). */
+    {
+        struct meta_settings ok0 = m.set;
+        ok0.repl_retain_mb = 0;
+        ok0.repl_retain_s = 0;
+        CHECK(meta_settings_valid(&ok0));
+        struct meta_settings bad = m.set;
+        bad.rebuild_max = 17;
+        meta_op_settings(&e, &bad, m.settings_version);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        bad = m.set;
+        bad.disk_stall_s = 0;
+        meta_op_settings(&e, &bad, m.settings_version);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        bad = m.set;
+        bad.rebuild_mb_s = 0;
+        meta_op_settings(&e, &bad, m.settings_version);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        bad = m.set;
+        bad.young_warn_pct = 85;
+        bad.young_move_pct = 80;
+        meta_op_settings(&e, &bad, m.settings_version);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        CHECK(m.settings_version == 3);
+    }
+
+    /* 5. Snapshot v11 round-trip preserves settings_version, refuses v10 by name. */
+    {
+        uint8_t *img = NULL;
+        size_t len = 0;
+        CHECK(meta_snapshot_encode(&m, &img, &len) == META_OK);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 11);
+        struct meta_state back;
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
+        CHECK(back.settings_version == 3 && back.set.rebuild_mb_s == 90 && back.set.disk_stall_s == 20);
+        uint8_t *v10 = malloc(len);
+        memcpy(v10, img, len);
+        uint32_t ten = 10;
+        memcpy(v10 + 4, &ten, 4);
+        uint32_t crc = iso_crc32c(0, v10, len - 4);
+        memcpy(v10 + len - 4, &crc, 4);
+        CHECK(meta_snapshot_version(v10, len) == 10 && meta_snapshot_decode(&back, v10, len) == META_ERR_FORMAT);
+        free(v10);
+        free(img);
+        meta_free(&back);
     }
 
     meta_entry_free(&e);
@@ -3271,97 +3417,137 @@ static void test_shared(void)
     /* failover = attested: a grant away from a node that is not heard needs an attestation; bmc a power-off */
     struct meta_settings s;
     meta_settings_default(&s);
-    /* settings below what the replication driver can act on are refused (r3d-isr review M5) */
-    s.isr_lag_ms = META_ISR_LAG_MIN_MS - 1;
-    meta_op_settings(&e, &s);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
-    s.isr_lag_ms = META_ISR_LAG_MIN_MS;
-    s.idle_seal_ms = META_IDLE_SEAL_MIN_MS - 1;
-    meta_op_settings(&e, &s);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    /* settings below what the replication driver can act on are refused at INIT and SETTINGS (r3d-isr review M5) */
+    {
+        struct meta_state m_bad;
+        meta_init(&m_bad);
+        struct meta_member mb1;
+        member(&mb1, 1);
+        uint8_t u_bad[16] = {9};
+        s.isr_lag_ms = META_ISR_LAG_MIN_MS - 1;
+        meta_op_init(&e, u_bad, &s, &mb1, META_MODE_SHARED, META_LEVEL);
+        CHECK(apply1(&m_bad, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        s.isr_lag_ms = META_ISR_LAG_MIN_MS;
+        s.idle_seal_ms = META_IDLE_SEAL_MIN_MS - 1;
+        meta_op_init(&e, u_bad, &s, &mb1, META_MODE_SHARED, META_LEVEL);
+        CHECK(apply1(&m_bad, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        meta_free(&m_bad);
+    }
+    /* failover is init-only (D25): changing it on a running cluster via SETTINGS is refused; re-init fresh shared
+     * states with META_FAILOVER_ATTESTED and META_FAILOVER_BMC to test attestation enforcement. */
     meta_settings_default(&s);
     s.failover = META_FAILOVER_ATTESTED;
-    meta_op_settings(&e, &s);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    v = meta_volume(&m, 0);
-    someone = v->leader == 1 ? 2 : 1;
-    g = sgrant(meta_volume(&m, 0), someone, v->epoch + 2, META_GR_UNHEARD);
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
-    g.reason = META_GR_FENCED;
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
-    /* the reason is the proposer's label: every other move to another node needs it too (ha-s1 review 3) */
-    for (int rsn = META_GR_UNHEARD; rsn <= META_GR_LAST; rsn++) {
-        if (rsn == META_GR_PLANNED || rsn == META_GR_REFUSED)
-            continue;
-        g.reason = (uint8_t)rsn;
-        meta_op_volume_leader(&e, &g);
-        CHECK(apply1(&m, &e, res, 8) == META_OK &&
-              res[0] == (rsn == META_GR_RESIGNED ? META_ERR_INVALID : META_ERR_ATTEST)); /* shared: no resigning */
-    }
-    g.reason = META_GR_UNHEARD; /* kind NONE with a name and a time is no attestation */
-    snprintf(g.att.who, sizeof g.att.who, "olav");
-    g.att.ms = 1234;
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
-    g.reason = META_GR_RESIGNED; /* not even with a full attestation */
-    g.att.kind = META_ATT_OPERATOR;
-    meta_op_volume_leader(&e, &g);
+    meta_op_settings(&e, &s, m.settings_version);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
-    memset(&g.att, 0, sizeof g.att);
-    g.reason = META_GR_PLANNED; /* a planned move of a live owner needs none */
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    v = meta_volume(&m, 0);
-    someone = v->leader == 1 ? 2 : 1;
-    g = sgrant(meta_volume(&m, 0), someone, v->epoch + 2, META_GR_REFUSED); /* a claimant refused: it never held the lock */
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    v = meta_volume(&m, 0);
-    someone = v->leader == 1 ? 2 : 1;
-    g = sgrant(meta_volume(&m, 0), someone, v->epoch + 2, META_GR_UNHEARD);
-    g.att.kind = META_ATT_OPERATOR;
-    snprintf(g.att.who, sizeof g.att.who, "olav");
-    g.att.ms = 1234;
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    s.failover = META_FAILOVER_BMC;
-    meta_op_settings(&e, &s);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    v = meta_volume(&m, 0);
-    someone = v->leader == 1 ? 2 : 1;
-    g = sgrant(meta_volume(&m, 0), someone, v->epoch + 2, META_GR_UNHEARD);
-    g.att.kind = META_ATT_OPERATOR; /* an operator's word is not a power-off */
-    snprintf(g.att.who, sizeof g.att.who, "olav");
-    g.att.ms = 1234;
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
-    g.att.kind = META_ATT_BMC;
-    g.att.incarnation = 0; /* a member's incarnation is 0 here: the power-off covers it */
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    meta_op_member_state(&e, 1, META_UP, 5, META_DOWN_NONE, 0, 0);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    v = meta_volume(&m, 0);
-    if (v->leader != 1) {
-        g = sgrant(meta_volume(&m, 0), 1, v->epoch + 2, META_GR_PLANNED);
+    {
+        struct meta_state ma;
+        meta_init(&ma);
+        uint8_t ua[16] = {3};
+        struct meta_member m1, m2, m3;
+        member(&m1, 1);
+        member(&m2, 2);
+        member(&m3, 3);
+        meta_op_init(&e, ua, &s, &m1, META_MODE_SHARED, META_LEVEL);
+        meta_op_member_add(&e, &m2);
+        meta_op_member_add(&e, &m3);
+        uint32_t n3[3] = {1, 2, 3};
+        vol_add(&e, META_VOL_SHARED, 0, "s0", 1, n3, 3);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK && res[3] == META_OK);
+        v = meta_volume(&ma, 0);
+        someone = v->leader == 1 ? 2 : 1;
+        g = sgrant(meta_volume(&ma, 0), someone, v->epoch + 2, META_GR_UNHEARD);
         meta_op_volume_leader(&e, &g);
-        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-        v = meta_volume(&m, 0);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
+        g.reason = META_GR_FENCED;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
+        /* the reason is the proposer's label: every other move to another node needs it too (ha-s1 review 3) */
+        for (int rsn = META_GR_UNHEARD; rsn <= META_GR_LAST; rsn++) {
+            if (rsn == META_GR_PLANNED || rsn == META_GR_REFUSED)
+                continue;
+            g.reason = (uint8_t)rsn;
+            meta_op_volume_leader(&e, &g);
+            CHECK(apply1(&ma, &e, res, 8) == META_OK &&
+                  res[0] == (rsn == META_GR_RESIGNED ? META_ERR_INVALID : META_ERR_ATTEST)); /* shared: no resigning */
+        }
+        g.reason = META_GR_UNHEARD; /* kind NONE with a name and a time is no attestation */
+        snprintf(g.att.who, sizeof g.att.who, "olav");
+        g.att.ms = 1234;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
+        g.reason = META_GR_RESIGNED; /* not even with a full attestation */
+        g.att.kind = META_ATT_OPERATOR;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        memset(&g.att, 0, sizeof g.att);
+        g.reason = META_GR_PLANNED; /* a planned move of a live owner needs none */
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK);
+        v = meta_volume(&ma, 0);
+        someone = v->leader == 1 ? 2 : 1;
+        g = sgrant(meta_volume(&ma, 0), someone, v->epoch + 2, META_GR_REFUSED); /* a claimant refused: it never held the lock */
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK);
+        v = meta_volume(&ma, 0);
+        someone = v->leader == 1 ? 2 : 1;
+        g = sgrant(meta_volume(&ma, 0), someone, v->epoch + 2, META_GR_UNHEARD);
+        g.att.kind = META_ATT_OPERATOR;
+        snprintf(g.att.who, sizeof g.att.who, "olav");
+        g.att.ms = 1234;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_free(&ma);
     }
-    someone = 2;
-    g = sgrant(meta_volume(&m, 0), someone, v->epoch + 2, META_GR_FENCED); /* the owner (1) came back as incarnation 5: a power-off of
-                                                           * an older one proves nothing */
-    g.att.kind = META_ATT_BMC;
-    snprintf(g.att.who, sizeof g.att.who, "bmc1");
-    g.att.ms = 99;
-    g.att.incarnation = 4;
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
-    g.att.incarnation = 5;
-    meta_op_volume_leader(&e, &g);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    {
+        struct meta_state mb;
+        meta_init(&mb);
+        uint8_t ub[16] = {4};
+        struct meta_member m1, m2, m3;
+        member(&m1, 1);
+        member(&m2, 2);
+        member(&m3, 3);
+        s.failover = META_FAILOVER_BMC;
+        meta_op_init(&e, ub, &s, &m1, META_MODE_SHARED, META_LEVEL);
+        meta_op_member_add(&e, &m2);
+        meta_op_member_add(&e, &m3);
+        uint32_t n3[3] = {1, 2, 3};
+        vol_add(&e, META_VOL_SHARED, 0, "s0", 1, n3, 3);
+        CHECK(apply1(&mb, &e, res, 8) == META_OK && res[0] == META_OK && res[3] == META_OK);
+        v = meta_volume(&mb, 0);
+        someone = v->leader == 1 ? 2 : 1;
+        g = sgrant(meta_volume(&mb, 0), someone, v->epoch + 2, META_GR_UNHEARD);
+        g.att.kind = META_ATT_OPERATOR; /* an operator's word is not a power-off */
+        snprintf(g.att.who, sizeof g.att.who, "olav");
+        g.att.ms = 1234;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&mb, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
+        g.att.kind = META_ATT_BMC;
+        g.att.incarnation = 0; /* a member's incarnation is 0 here: the power-off covers it */
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&mb, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_member_state(&e, 1, META_UP, 5, META_DOWN_NONE, 0, 0);
+        CHECK(apply1(&mb, &e, res, 8) == META_OK && res[0] == META_OK);
+        v = meta_volume(&mb, 0);
+        if (v->leader != 1) {
+            g = sgrant(meta_volume(&mb, 0), 1, v->epoch + 2, META_GR_PLANNED);
+            meta_op_volume_leader(&e, &g);
+            CHECK(apply1(&mb, &e, res, 8) == META_OK && res[0] == META_OK);
+            v = meta_volume(&mb, 0);
+        }
+        someone = 2;
+        g = sgrant(meta_volume(&mb, 0), someone, v->epoch + 2, META_GR_FENCED); /* the owner (1) came back as incarnation 5: a power-off of
+                                                               * an older one proves nothing */
+        g.att.kind = META_ATT_BMC;
+        snprintf(g.att.who, sizeof g.att.who, "bmc1");
+        g.att.ms = 99;
+        g.att.incarnation = 4;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&mb, &e, res, 8) == META_OK && res[0] == META_ERR_ATTEST);
+        g.att.incarnation = 5;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&mb, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_free(&mb);
+    }
 
     /* the owner is granted its own volume at an epoch it holds already: refused (it would not raise the epoch) */
     v = meta_volume(&m, 0);
@@ -4493,6 +4679,12 @@ static void check_named(struct msim *s, struct snode *nd, const struct meta_stat
                              " and was applied", nd->id, e->index, rd32(b), rd32(b + 24 + i * 4), rd64(b + ro));
             }
         }
+        if (kind == META_OP_SETTINGS && n >= 8 && ok) {
+            uint64_t expected_ver = rd64(b);
+            if (expected_ver != at.settings_version)
+                sim_fail(s, "node %u, index %" PRIu64 ": SETTINGS named version %" PRIu64 " at %" PRIu64
+                         " and was applied", nd->id, e->index, expected_ver, at.settings_version);
+        }
         if (kind == META_OP_MEMBER_STATE && n >= 30 && ok) {
             const struct meta_member *mb = meta_member(&at, rd32(b));
             uint8_t st = b[4];
@@ -5340,8 +5532,24 @@ static void propose(struct msim *s, struct snode *nd)
                     }
                 }
             }
-        } else if (what == 11 && rnd(s, 0, 5) == 0) {
-            meta_op_name_group(&e);
+        } else if (what == 11) {
+            unsigned sact = (unsigned)rnd(s, 0, 5);
+            if (sact == 0) {
+                meta_op_name_group(&e);
+            } else {
+                /* R14: exercise live settings CAS (valid, stale -> catches settingsnocas, init-only -> catches settingsany). */
+                struct meta_settings ns = m->set;
+                uint64_t ver = m->settings_version;
+                if (sact == 1 && ver > 0)
+                    ver = ver - 1; /* stale version */
+                else if (sact == 2)
+                    ns.lease_ms = ns.lease_ms + 100; /* init-only: must be refused */
+                else {
+                    ns.rebuild_mb_s = (uint32_t)rnd(s, 10, 400);
+                    ns.scrub_mb_s = (uint32_t)rnd(s, 5, 100);
+                }
+                meta_op_settings(&e, &ns, ver);
+            }
         } else if (what == 14 && m->nmembers > 0) {
             /* R13: STORE_ADD (including duplicate store_id across members -> storeaddtwice), STORE_CLASS, STORE_STATE
              * (including UP->OUT and DESTROYED->UP -> storedestroyedback), MEMBER_ROLE (including wider than UP disks
@@ -5718,6 +5926,10 @@ int main(int argc, char **argv)
                 mutant = 69;
             else if (!strcmp(mn, "storedestroyedback"))
                 mutant = 70;
+            else if (!strcmp(mn, "settingsany"))
+                mutant = 71;
+            else if (!strcmp(mn, "settingsnocas"))
+                mutant = 72;
             else
                 mutant = atoi(mn);
         } else if (!strcmp(argv[i], "--sim-only")) /* the simulator's checker alone, to see it catch a planted bug */
@@ -5751,6 +5963,7 @@ int main(int argc, char **argv)
         test_r9_meta();
         test_r10_meta();
         test_r13_meta();
+        test_r14_settings();
         test_shared();
         test_users();
         test_users_limits();

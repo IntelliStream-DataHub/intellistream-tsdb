@@ -87,6 +87,8 @@ enum cluster_admin_op {
     CLUSTER_OP_NODE_REPLACE = 18,
     CLUSTER_OP_NODE_DESTROYED = 19,
     CLUSTER_OP_VOLUME_MOVE_POS = 20,
+    /* R14 (D25): body u64 expected_version + META_SETTINGS_WORDS u32 (cluster_settings_set_encode); on Raft leader. */
+    CLUSTER_OP_SETTINGS = 21,
 };
 enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
 enum { CLUSTER_HOLD_RELEASE = 1 };                      /* CLUSTER_OP_NODE_HOLD's flags */
@@ -338,6 +340,12 @@ struct cluster_vol_rec {
 typedef void (*cluster_vol_watch_fn)(void *arg, uint32_t self, const struct cluster_vol_rec *v, uint32_t n);
 void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg);
 
+/* R14 (D25): settings watch called on the cluster thread once settings are initialised and on every settings_version
+ * change (must not block). Safe to register before or after cluster_start(). Returns 0, or -1 if table is full. */
+typedef void (*cluster_settings_watch_fn)(void *arg, uint64_t version, const struct meta_settings *s);
+int cluster_add_settings_watch(cluster_settings_watch_fn fn, void *arg);
+void cluster_del_settings_watch(cluster_settings_watch_fn fn, void *arg);
+
 /* ---- the whole metadata copy as one snapshot (S2-1: TOPOLOGY, STATUS, MOVED; s2e's routing, r3e, R8 read it)
  * The cluster thread builds a new snapshot after every applied batch, snapshot install and copy swap (whatever moved
  * `applied`, its term or the restore generation) and publishes it by an atomic pointer swap. cluster_copy_get() (any
@@ -386,7 +394,7 @@ struct cluster_copy_vol {
     uint64_t mixed_sv_lo, mixed_sv_hi;
 };
 struct cluster_copy {
-    uint64_t applied, applied_term, restore_gen;
+    uint64_t applied, applied_term, restore_gen, settings_version;
     uint32_t self; /* this server's member id (0: none yet) */
     uint32_t nmembers, nvolumes;
     uint32_t rebuild_mb_s;        /* R9/R13: rebuild rate, MB/s (default 200) */
@@ -667,5 +675,8 @@ int cluster_volume_move_pos_decode(const uint8_t *p, size_t n, uint32_t *volume,
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);
+/* The SETTINGS body: u64 expected_version + META_SETTINGS_WORDS u32 (8 + 4 * META_SETTINGS_WORDS bytes). */
+size_t cluster_settings_set_encode(uint64_t expected_version, const struct meta_settings *s, uint8_t *out);
+int cluster_settings_set_decode(const uint8_t *p, size_t n, uint64_t *expected_version, struct meta_settings *s);
 
 #endif

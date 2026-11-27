@@ -251,6 +251,32 @@ struct meta_settings {
 #define META_SETTINGS_WORDS 38 /* the words of the INIT body before the mode (cluster_settings_encode) */
 void meta_settings_default(struct meta_settings *s);
 
+/* Metadata descriptor and validation helpers for cluster settings (R14, D25). */
+enum meta_setting_type {
+    META_SET_U32 = 0,
+    META_SET_BOOL = 1,
+    META_SET_FAILOVER = 2,
+};
+struct meta_setting_info {
+    const char *name;
+    uint8_t type;       /* enum meta_setting_type */
+    uint8_t live;       /* 1: changeable live via META_OP_SETTINGS (D25); 0: init-only */
+    uint32_t min_val;
+    uint32_t max_val;
+    const char *reason; /* non-NULL when live == 0: D25 reason it is init-only */
+};
+size_t meta_settings_count(void);
+const struct meta_setting_info *meta_settings_info(size_t i);
+int meta_settings_find(const char *name); /* index in 0..count-1 (accepts "voters_max" alias), or -1 */
+uint32_t meta_settings_get(const struct meta_settings *s, size_t i);
+void meta_settings_set(struct meta_settings *s, size_t i, uint32_t v);
+int meta_settings_valid(const struct meta_settings *s);
+int meta_settings_valid_why(const struct meta_settings *s, char *why, size_t wn);
+/* 1 if no init-only setting differs between cur and next (D25); else 0 with D25 reason in why. */
+int meta_settings_live_ok(const struct meta_settings *cur, const struct meta_settings *next, char *why, size_t wn);
+/* Formats changed keys ("k a->b, ..."); returns count of keys that differ between old_s and new_s. */
+int meta_settings_diff_fmt(const struct meta_settings *old_s, const struct meta_settings *new_s, char *buf, size_t cap);
+
 struct meta_member {
     uint32_t id;
     uint8_t state; /* enum meta_member_state */
@@ -465,6 +491,7 @@ struct meta_state {
     uint32_t level;     /* the operation level the cluster runs at (INIT) */
     uint64_t restore_gen; /* raised by `tsdb cluster restore`; never goes down */
     struct meta_settings set;
+    uint64_t settings_version; /* 0 before INIT, 1 at INIT, +1 on every applied META_OP_SETTINGS (R14 D25 CAS) */
     uint32_t next_member; /* ids are never reused */
     uint32_t nmembers, members_cap;
     struct meta_member *members; /* ascending by id */
@@ -667,7 +694,9 @@ void meta_op_member_addr(struct meta_entry *e, uint32_t id, uint64_t incarnation
 /* STALE for an incarnation below the member's. claim_ok 0 -> 1 (the record's flag before, this one after) clears the
  * member's CLAIM_FAILED blocks; no other change of flags does. */
 void meta_op_member_flags(struct meta_entry *e, uint32_t id, uint64_t incarnation, uint8_t flags);
-void meta_op_settings(struct meta_entry *e, const struct meta_settings *s);
+/* Proposed whole, conditional on expected_version == m->settings_version (CAS; else META_ERR_STALE) and only changing
+ * D25 live-changeable keys within valid ranges (else META_ERR_INVALID). Raises settings_version by 1. */
+void meta_op_settings(struct meta_entry *e, const struct meta_settings *s, uint64_t expected_version);
 void meta_op_volume_add(struct meta_entry *e, const struct meta_volume_add *a);
 void meta_op_volume_leader(struct meta_entry *e, const struct meta_grant *g);
 /* The leader a replicated VOLUME_LEADER with g's basis, fences and replies must name (repl_meta_promote over v);
@@ -759,8 +788,8 @@ void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const
 int meta_snapshot_encode(const struct meta_state *m, uint8_t **out, size_t *len);
 /* The snapshot format (meta.c has its history). Until 1.0 a change of the state's layout bumps it, and an image of
  * another version is refused (a preview cluster is initialised again, never upgraded). */
-#define META_SNAP_VERSION 10
-/* 1 when the entry is one of a build of metadata snapshot version 9 or older (its magic): meta_apply says
+#define META_SNAP_VERSION 11
+/* 1 when the entry is one of a build of metadata snapshot version 10 or older (its magic): meta_apply says
  * META_ERR_FORMAT for it, and the caller names both versions (the cluster is initialised again, never upgraded). */
 int meta_entry_older(const void *data, size_t len);
 /* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not META_SNAP_VERSION,

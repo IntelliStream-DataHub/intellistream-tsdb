@@ -1056,6 +1056,65 @@ static void test_fd_exhaustion_e15(void)
     printf("  fd_exhaustion_e15: ok (EMFILE -> be_rd_open=IO, scrub_open=NOMEM)\n");
 }
 
+/* 9. Live settings update (R14, r14-settings): chunk_scrub_update_cfg accelerates a 1 MB/s pass to 200 MB/s live
+ *    and lowers scrub_out_count live from 8 to 3. */
+static void test_live_update_cfg(void)
+{
+    struct test_world w;
+    /* 12 chunks x 512 KiB = 6 MiB on store 0 -> ~6 s at 1 MB/s, < 200 ms at 200 MB/s. */
+    world_make(&w, "livecfg", 12, 128u << 10, 512u << 10);
+    struct rep_log rl = {.mu = PTHREAD_MUTEX_INITIALIZER};
+
+    chunk_scrub_cfg cfg = {
+        .store_idx = 0,
+        .scrub_days = 14,
+        .scrub_mb_s = 1,
+        .scrub_out_count = 8,
+        .pass_interval_ms = 50,
+        .be = w.be,
+        .on_damage = on_damage_rec,
+        .on_out = on_out_rec,
+        .ctx = &rl,
+    };
+    chunk_scrub *sc = chunk_scrub_start(chunk_be_store(w.be, 0), &cfg);
+    CHECK(sc != NULL, "livecfg: chunk_scrub_start");
+
+    /* Wait until scrubbing has started at 1 MB/s, then raise scrub_mb_s live to 200 and lower scrub_out_count to 3. */
+    chunk_scrub_stats st;
+    memset(&st, 0, sizeof st);
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 5000; usleep(25000)) {
+        chunk_scrub_get_stats(sc, &st);
+        if (st.bytes_total > 0)
+            break;
+    }
+    CHECK(st.bytes_total > 0 && st.passes_done == 0,
+          "livecfg: expected active slow pass before update (bytes=%" PRIu64 " passes=%" PRIu64 ")", st.bytes_total,
+          st.passes_done);
+
+    uint64_t t_upd = now_ms();
+    chunk_scrub_update_cfg(sc, 7, 200, 3);
+    CHECK(wait_passes(sc, 1, 3000), "livecfg: pass 1 did not finish quickly after scrub_mb_s 1->200");
+    uint64_t dt_ms = now_ms() - t_upd;
+
+    /* Flip 4 chunks (exceeds new scrub_out_count=3, below old 8) and verify store goes DOWN_DAMAGED live. */
+    for (size_t i = 0; i < 4; i++) {
+        char p[PATH_MAX + 96];
+        chunk_path(&w, 0, &w.objs[i], (unsigned)w.objs[i].pos_on_st0, p, sizeof p);
+        CHECK(flip_file_byte(p, CHUNK_HDR_BYTES + 10) == 0, "livecfg: corrupt chunk %zu", i);
+    }
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 5000; usleep(25000)) {
+        chunk_scrub_get_stats(sc, &st);
+        if (st.marked_down)
+            break;
+    }
+    CHECK(st.marked_down, "livecfg: lowered scrub_out_count=3 did not mark store DOWN after 4 damaged chunks");
+
+    chunk_scrub_stop(sc);
+    world_free(&w);
+    printf("  live_update_cfg: ok (1->200 MB/s finished in %" PRIu64 " ms; out_count 8->3 triggered on 4 damaged)\n",
+           dt_ms);
+}
+
 int main(int argc, char **argv)
 {
     g_self_exe = argv[0];
@@ -1129,6 +1188,7 @@ int main(int argc, char **argv)
     test_multivol_transient_err();
     test_schedule_and_age();
     test_fd_exhaustion_e15();
+    test_live_update_cfg();
 
     rm_rf(scratch_base);
 #ifdef __linux__

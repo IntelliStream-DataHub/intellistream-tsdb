@@ -34,7 +34,8 @@
  * D23); 8: member `replaced_by` for `node replace OLD NEW` failover resume (r9-ops, D22); 9: R10 redundancy conversion
  * record (`conv`, `conv_cancel_gen`), `retired_ver` on `stripe_pos`, and leader live-object counts per `stripe_version`
  * (E2, §6.4, D26, D28); 10: R13 member disks, declared role, computed capability, store ops, and R12/R13 scrub/disk
- * settings (E20, E25, E49, E52, E53, E57). A preview cluster is initialised again, not upgraded (the plan's D9): an
+ * settings (E20, E25, E49, E52, E53, E57); 11: R14 live settings version (settings_version CAS and D25 whitelist on
+ * META_OP_SETTINGS). A preview cluster is initialised again, not upgraded (the plan's D9): an
  * image of another version is refused, and its reader names both (meta_snapshot_version). */
 #define SNAP_VERSION META_SNAP_VERSION
 
@@ -47,13 +48,31 @@ int meta_mutant;
 #define MUT(n) 0
 #endif
 
-#define ENTRY_MAGIC 0x37454d54u    /* "TME7": entries of snapshot version 10 (R13 disks, roles, store states, settings) */
+static int meta_settings_env_mutant(int n)
+{
+#ifdef TSDB_TEST_HOOKS
+    static int init, val;
+    if (!__atomic_load_n(&init, __ATOMIC_ACQUIRE)) {
+        const char *e = getenv("TSDB_CLUSTER_MUTANT");
+        int v = !e ? 0 : !strcmp(e, "settingsany") ? 71 : !strcmp(e, "settingsnocas") ? 72 : 0;
+        __atomic_store_n(&val, v, __ATOMIC_RELAXED);
+        __atomic_store_n(&init, 1, __ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&val, __ATOMIC_RELAXED) == n;
+#else
+    (void)n;
+    return 0;
+#endif
+}
+
+#define ENTRY_MAGIC 0x38454d54u    /* "TME8": entries of snapshot version 11 (R14 settings_version CAS) */
 #define ENTRY_MAGIC_V1 0x31454d54u /* "TME1": entries of the builds of versions 1-4, refused by name */
 #define ENTRY_MAGIC_V2 0x32454d54u /* "TME2": entries of the builds of version 5, refused by name */
 #define ENTRY_MAGIC_V3 0x33454d54u /* "TME3": entries of the builds of version 6, refused by name */
 #define ENTRY_MAGIC_V4 0x34454d54u /* "TME4": entries of the builds of version 7, refused by name */
 #define ENTRY_MAGIC_V5 0x35454d54u /* "TME5": entries of the builds of version 8, refused by name */
 #define ENTRY_MAGIC_V6 0x36454d54u /* "TME6": entries of the builds of version 9, refused by name */
+#define ENTRY_MAGIC_V7 0x37454d54u /* "TME7": entries of the builds of version 10, refused by name */
 #define SNAP_MAGIC 0x31534d54u     /* "TMS1" */
 
 uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c */
@@ -946,22 +965,189 @@ static void get_settings(struct rd *r, struct meta_settings *s)
     s->disk_stall_s = get32(r);
 }
 
-static int settings_valid(const struct meta_settings *s)
+struct meta_setting_slot {
+    struct meta_setting_info info;
+    size_t off;
+    uint8_t width; /* 1 for uint8_t, 4 for uint32_t */
+};
+
+#define SET_U32(fld, lv, mn, mx, rsn)                                                                                \
+    {{ #fld, META_SET_U32, (lv), (mn), (mx), (rsn) }, offsetof(struct meta_settings, fld), 4}
+#define SET_BOOL(fld, lv, rsn)                                                                                       \
+    {{ #fld, META_SET_BOOL, (lv), 0, 1, (rsn) }, offsetof(struct meta_settings, fld), 1}
+#define SET_FO(fld, lv, rsn)                                                                                         \
+    {{ #fld, META_SET_FAILOVER, (lv), 0, META_FAILOVER_BMC, (rsn) }, offsetof(struct meta_settings, fld), 1}
+
+static const struct meta_setting_slot set_table[] = {
+    /* Init-only settings (D25: replication/quorum layout, lease/fence/commit/liveness timing) */
+    SET_U32(replication,         0, 1, META_REPLICAS_MAX, "cluster replication factor is fixed at init"),
+    SET_U32(min_isr,             0, 1, META_REPLICAS_MAX, "default min_isr is fixed at init"),
+    SET_U32(node_timeout_ms,     0, 0, UINT32_MAX,        "lease and liveness timing rests on it"),
+    SET_U32(heartbeat_ms,        0, 0, UINT32_MAX,        "lease and liveness timing rests on it"),
+    SET_U32(isr_lag_ms,          0, META_ISR_LAG_MIN_MS, UINT32_MAX, "replication ISR liveness timing is fixed at init"),
+    SET_U32(voter_replace_s,     0, 0, UINT32_MAX,        "Raft voter quorum timing is fixed at init"),
+    SET_U32(voters,              0, 0, UINT32_MAX,        "Raft voter quorum sizing is fixed at init"),
+    SET_U32(volumes_per_server,  0, 0, UINT32_MAX,        "initial volume layout is fixed at init"),
+    SET_FO(failover,             0,                       "failover and fencing mode is fixed at init"),
+    SET_BOOL(read_barrier,       0,                       "read fence consistency mode is fixed at init"),
+    SET_U32(lease_s,             0, 1, UINT32_MAX,        "lease and fence timing rests on it"),
+    SET_U32(lease_ms,            0, 1, UINT32_MAX,        "lease and fence timing rests on it"),
+    SET_U32(drift_ppm,           0, 0, 999999,            "lease and fence timing rests on it"),
+    SET_U32(unanswered_ms,       0, 0, UINT32_MAX,        "promotion and fence timing rests on it"),
+    SET_U32(commit_interval_ms,  0, 1, UINT32_MAX,        "replication commit timing rests on it"),
+    SET_U32(idle_seal_ms,        0, META_IDLE_SEAL_MIN_MS, UINT32_MAX, "replication WAL sealing timing is fixed at init"),
+    /* Live-changeable settings (D25 + R9/R12/R13 operational tuning) */
+    SET_U32(rebuild_mb_s,        1, 1, UINT32_MAX,        NULL),
+    SET_U32(rebuild_max,         1, 1, 16,                NULL),
+    SET_U32(transfer_wait_ms,    1, 100, 60000,           NULL),
+    SET_U32(leader_balance_s,    1, 0, 86400,             NULL),
+    SET_U32(repl_retain_mb,      1, 0, UINT32_MAX,        NULL),
+    SET_U32(repl_retain_s,       1, 0, UINT32_MAX,        NULL),
+    SET_U32(repl_retain_down_gb, 1, 0, UINT32_MAX,        NULL),
+    SET_U32(rebuild_after_s,     1, 1, UINT32_MAX,        NULL),
+    SET_U32(opening_hold_s,      1, 0, 86400,             NULL),
+    SET_U32(failstop_out_s,      1, 1, UINT32_MAX,        NULL),
+    SET_U32(out_guard_pct,       1, 1, 100,               NULL),
+    SET_U32(out_guard_hold_s,    1, 1, 86400,             NULL),
+    SET_U32(balance_mb_s,        1, 0, UINT32_MAX,        NULL),
+    SET_U32(rebuild_concurrency, 1, 1, 64,                NULL),
+    SET_U32(scrub_days,          1, 1, 365,               NULL),
+    SET_U32(scrub_mb_s,          1, 1, UINT32_MAX,        NULL),
+    SET_U32(scrub_out_count,     1, 1, UINT32_MAX,        NULL),
+    SET_BOOL(log_on_hdd,         1,                       NULL),
+    SET_U32(young_warn_pct,      1, 1, 98,                NULL),
+    SET_U32(young_move_pct,      1, 1, 98,                NULL),
+    SET_U32(young_high_pct,      1, 10, 99,               NULL),
+    SET_U32(disk_stall_s,        1, 1, 3600,              NULL),
+};
+#undef SET_U32
+#undef SET_BOOL
+#undef SET_FO
+
+_Static_assert(sizeof set_table / sizeof set_table[0] == META_SETTINGS_WORDS,
+               "set_table must cover every field of struct meta_settings");
+
+size_t meta_settings_count(void) { return sizeof set_table / sizeof set_table[0]; }
+
+const struct meta_setting_info *meta_settings_info(size_t i)
 {
-    return s->replication >= 1 && s->replication <= META_REPLICAS_MAX && s->min_isr >= 1 &&
-           s->min_isr <= s->replication && s->failover <= META_FAILOVER_BMC && s->read_barrier <= 1 &&
-           s->lease_s >= 1 && s->lease_ms >= 1 && s->drift_ppm < 1000000 && s->commit_interval_ms >= 1 &&
-           s->isr_lag_ms >= META_ISR_LAG_MIN_MS && s->idle_seal_ms >= META_IDLE_SEAL_MIN_MS &&
-           s->rebuild_after_s >= 1 && s->rebuild_mb_s >= 1 && s->rebuild_max >= 1 && s->rebuild_max <= 16 &&
-           s->transfer_wait_ms >= 100 && s->transfer_wait_ms <= 60000 && s->leader_balance_s <= 86400 &&
-           s->opening_hold_s <= 86400 && s->failstop_out_s >= 1 && s->out_guard_pct >= 1 && s->out_guard_pct <= 100 &&
-           s->out_guard_hold_s >= 1 && s->out_guard_hold_s <= 86400 && s->young_high_pct >= 10 &&
-           s->young_high_pct <= 99 && s->rebuild_concurrency >= 1 && s->rebuild_concurrency <= 64 &&
-           s->scrub_days >= 1 && s->scrub_days <= 365 && s->scrub_mb_s >= 1 && s->scrub_out_count >= 1 &&
-           s->log_on_hdd <= 1 && s->young_warn_pct >= 1 && s->young_move_pct >= 1 &&
-           s->young_warn_pct <= s->young_move_pct && s->young_move_pct < s->young_high_pct &&
-           s->disk_stall_s >= 1 && s->disk_stall_s <= 3600;
+    return i < meta_settings_count() ? &set_table[i].info : NULL;
 }
+
+int meta_settings_find(const char *name)
+{
+    if (!name || !*name)
+        return -1;
+    if (!strcmp(name, "voters_max"))
+        name = "voters";
+    for (size_t i = 0; i < meta_settings_count(); i++)
+        if (!strcmp(set_table[i].info.name, name))
+            return (int)i;
+    return -1;
+}
+
+uint32_t meta_settings_get(const struct meta_settings *s, size_t i)
+{
+    if (!s || i >= meta_settings_count())
+        return 0;
+    const uint8_t *p = (const uint8_t *)s + set_table[i].off;
+    if (set_table[i].width == 1)
+        return *p;
+    uint32_t v;
+    memcpy(&v, p, sizeof v);
+    return v;
+}
+
+void meta_settings_set(struct meta_settings *s, size_t i, uint32_t v)
+{
+    if (!s || i >= meta_settings_count())
+        return;
+    uint8_t *p = (uint8_t *)s + set_table[i].off;
+    if (set_table[i].width == 1) {
+        *p = (uint8_t)v;
+        return;
+    }
+    memcpy(p, &v, sizeof v);
+}
+
+int meta_settings_valid_why(const struct meta_settings *s, char *why, size_t wn)
+{
+    for (size_t i = 0; i < meta_settings_count(); i++) {
+        const struct meta_setting_info *in = &set_table[i].info;
+        uint32_t v = meta_settings_get(s, i);
+        if (v < in->min_val || v > in->max_val) {
+            if (why && wn)
+                snprintf(why, wn, "%s=%u is out of range (%u..%u)", in->name, (unsigned)v, (unsigned)in->min_val,
+                         (unsigned)in->max_val);
+            return 0;
+        }
+    }
+    if (s->min_isr > s->replication) {
+        if (why && wn)
+            snprintf(why, wn, "min_isr (%u) exceeds replication (%u)", (unsigned)s->min_isr, (unsigned)s->replication);
+        return 0;
+    }
+    if (s->young_warn_pct > s->young_move_pct || s->young_move_pct >= s->young_high_pct) {
+        if (why && wn)
+            snprintf(why, wn, "young_warn_pct (%u) <= young_move_pct (%u) < young_high_pct (%u) required",
+                     (unsigned)s->young_warn_pct, (unsigned)s->young_move_pct, (unsigned)s->young_high_pct);
+        return 0;
+    }
+    return 1;
+}
+
+int meta_settings_valid(const struct meta_settings *s) { return meta_settings_valid_why(s, NULL, 0); }
+
+int meta_settings_live_ok(const struct meta_settings *cur, const struct meta_settings *next, char *why, size_t wn)
+{
+    for (size_t i = 0; i < meta_settings_count(); i++) {
+        const struct meta_setting_info *in = &set_table[i].info;
+        if (in->live)
+            continue;
+        if (meta_settings_get(cur, i) != meta_settings_get(next, i)) {
+            if (why && wn)
+                snprintf(why, wn, "%s is init-only (D25: %s)", in->name,
+                         in->reason ? in->reason : "fixed at cluster init");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void fmt_setting_val(const struct meta_setting_info *in, uint32_t v, char *out, size_t cap)
+{
+    if (in->type == META_SET_BOOL)
+        snprintf(out, cap, "%s", v ? "on" : "off");
+    else if (in->type == META_SET_FAILOVER)
+        snprintf(out, cap, "%s", v == META_FAILOVER_BMC ? "bmc" : v == META_FAILOVER_ATTESTED ? "attested" : "lease");
+    else
+        snprintf(out, cap, "%u", (unsigned)v);
+}
+
+int meta_settings_diff_fmt(const struct meta_settings *old_s, const struct meta_settings *new_s, char *buf, size_t cap)
+{
+    int nchg = 0;
+    size_t pos = 0;
+    if (buf && cap)
+        buf[0] = '\0';
+    for (size_t i = 0; i < meta_settings_count(); i++) {
+        uint32_t ov = meta_settings_get(old_s, i), nv = meta_settings_get(new_s, i);
+        if (ov == nv)
+            continue;
+        nchg++;
+        if (buf && cap && pos + 1 < cap) {
+            char a[24], b[24];
+            fmt_setting_val(&set_table[i].info, ov, a, sizeof a);
+            fmt_setting_val(&set_table[i].info, nv, b, sizeof b);
+            int w = snprintf(buf + pos, cap - pos, "%s%s %s->%s", pos ? ", " : "", set_table[i].info.name, a, b);
+            if (w > 0)
+                pos += (size_t)w < cap - pos ? (size_t)w : cap - pos - 1;
+        }
+    }
+    return nchg;
+}
+
+static int settings_valid(const struct meta_settings *s) { return meta_settings_valid(s); }
 
 static void put_disk(struct wr *w, const struct meta_disk *d)
 {
@@ -1195,10 +1381,11 @@ void meta_op_member_flags(struct meta_entry *e, uint32_t id, uint64_t incarnatio
     op_end(e, st);
 }
 
-void meta_op_settings(struct meta_entry *e, const struct meta_settings *s)
+void meta_op_settings(struct meta_entry *e, const struct meta_settings *s, uint64_t expected_version)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_SETTINGS);
+    put64(&w, expected_version);
     put_settings(&w, s);
     op_end(e, st);
 }
@@ -1990,6 +2177,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             return rc;
         memcpy(m->uuid, uuid, 16);
         m->set = s;
+        m->settings_version = 1;
         m->mode = mode;
         m->level = level;
         m->initialised = 1;
@@ -2162,13 +2350,21 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         return META_OK;
     }
     case META_OP_SETTINGS: {
+        uint64_t expected_ver = get64(r);
         struct meta_settings s;
         get_settings(r, &s);
         if (r->bad)
             return META_ERR_FORMAT;
+        int skip_cas = MUT(72) || meta_settings_env_mutant(72); /* settingsnocas */
+        int skip_any = MUT(71) || meta_settings_env_mutant(71); /* settingsany */
+        if (!skip_cas && expected_ver != m->settings_version)
+            return META_ERR_STALE;
         if (!settings_valid(&s))
             return META_ERR_INVALID;
+        if (!skip_any && !meta_settings_live_ok(&m->set, &s, NULL, 0))
+            return META_ERR_INVALID;
         m->set = s;
+        m->settings_version++;
         for (uint32_t i = 0; i < m->nmembers; i++)
             m->members[i].capability = member_compute_cap(&m->members[i], m->set.log_on_hdd);
         return META_OK;
@@ -3370,7 +3566,8 @@ int meta_entry_older(const void *data, size_t len)
     struct rd r = {data, len, 0, 0};
     uint32_t magic = get32(&r);
     return (magic == ENTRY_MAGIC_V1 || magic == ENTRY_MAGIC_V2 || magic == ENTRY_MAGIC_V3 ||
-            magic == ENTRY_MAGIC_V4 || magic == ENTRY_MAGIC_V5 || magic == ENTRY_MAGIC_V6) &&
+            magic == ENTRY_MAGIC_V4 || magic == ENTRY_MAGIC_V5 || magic == ENTRY_MAGIC_V6 ||
+            magic == ENTRY_MAGIC_V7) &&
            !r.bad;
 }
 
@@ -3529,6 +3726,7 @@ static void encode_body(struct wr *w, const struct meta_state *m)
     put32(w, m->level);
     put64(w, m->restore_gen);
     put_settings(w, &m->set);
+    put64(w, m->settings_version);
     put32(w, m->next_member);
     put32(w, m->nmembers);
     for (uint32_t i = 0; i < m->nmembers; i++)
@@ -3771,6 +3969,9 @@ static int decode_body(struct rd *r, struct meta_state *m)
     if (m->mode > META_MODE_SHARED || m->level > META_LEVEL) /* a level this build does not apply: never guess */
         return -1;
     get_settings(r, &m->set);
+    m->settings_version = get64(r);
+    if (m->initialised ? m->settings_version == 0 : m->settings_version != 0)
+        return -1;
     m->next_member = get32(r);
     uint32_t n = get32(r);
     if (r->bad || n > (r->len - r->off) / 8)
@@ -4370,6 +4571,19 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
         FAIL("the deployment's mode changed");
     if (next->level < prev->level || next->restore_gen < prev->restore_gen)
         FAIL("the level or the restore generation went down");
+    if (next->settings_version < prev->settings_version)
+        FAIL("settings_version went down (%llu -> %llu)", (unsigned long long)prev->settings_version,
+             (unsigned long long)next->settings_version);
+    if (prev->initialised) {
+        char swhy[160];
+        if (!meta_settings_valid_why(&next->set, swhy, sizeof swhy))
+            FAIL("invalid settings: %s", swhy);
+        if (!meta_settings_live_ok(&prev->set, &next->set, swhy, sizeof swhy))
+            FAIL("init-only setting changed after init: %s", swhy);
+        if (meta_settings_diff_fmt(&prev->set, &next->set, NULL, 0) > 0 &&
+            next->settings_version <= prev->settings_version)
+            FAIL("settings changed without raising settings_version (%llu)", (unsigned long long)next->settings_version);
+    }
     for (uint32_t i = 0; i < prev->nvolumes; i++) {
         const struct meta_volume *a = &prev->volumes[i], *b = meta_volume(next, a->number);
         if (!b)

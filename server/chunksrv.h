@@ -241,6 +241,7 @@ struct chunksrv_scrub_cfg {
     void *ctx;
 };
 int chunksrv_scrub_start(struct chunksrv *cs, const struct chunksrv_scrub_cfg *cfg);
+void chunksrv_scrub_update_cfg(struct chunksrv *cs, uint32_t scrub_days, uint32_t scrub_mb_s, uint32_t scrub_out_count);
 void chunksrv_scrub_reconcile(struct chunksrv *cs);
 void chunksrv_scrub_stop(struct chunksrv *cs);
 int chunksrv_scrub_stats(struct chunksrv *cs, int store_idx, chunk_scrub_stats *out);

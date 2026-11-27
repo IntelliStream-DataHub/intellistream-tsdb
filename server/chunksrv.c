@@ -1001,6 +1001,25 @@ int chunksrv_scrub_start(struct chunksrv *cs, const struct chunksrv_scrub_cfg *c
     return 0;
 }
 
+void chunksrv_scrub_update_cfg(struct chunksrv *cs, uint32_t scrub_days, uint32_t scrub_mb_s, uint32_t scrub_out_count)
+{
+    if (!cs)
+        return;
+    pthread_mutex_lock(&cs->smu);
+    if (scrub_days > 0)
+        cs->scrub_cfg.scrub_days = scrub_days;
+    if (scrub_mb_s > 0)
+        cs->scrub_cfg.scrub_mb_s = scrub_mb_s;
+    if (scrub_out_count > 0)
+        cs->scrub_cfg.scrub_out_count = scrub_out_count;
+    for (int i = 0; i < cs->nscrubs && i < CHUNKSRV_DIRS_MAX; i++) {
+        if (cs->scrubs[i])
+            chunk_scrub_update_cfg(cs->scrubs[i], cs->scrub_cfg.scrub_days, cs->scrub_cfg.scrub_mb_s,
+                                   cs->scrub_cfg.scrub_out_count);
+    }
+    pthread_mutex_unlock(&cs->smu);
+}
+
 void chunksrv_scrub_stop(struct chunksrv *cs)
 {
     if (!cs)
