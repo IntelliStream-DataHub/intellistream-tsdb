@@ -660,11 +660,11 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs opening fa
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
-    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics full fullnonisr
+    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics full fullnonisr ecrebuild
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
-test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margins $(B)/test_pout $(B)/test_pace $(B)/test_place $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb
+test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margins $(B)/test_pout $(B)/test_pace $(B)/test_place $(B)/test_sfill $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb
 	./$(B)/test_peerlink $(SCRATCH)
 	for c in header full; do ./$(B)/test_peerlink $(SCRATCH) --quick --check $$c --only $(PL_KINDS_TESTS) || exit 1; done # every link kind at the other check levels
 	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall donestatus statusneg updownleak noidcheck" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
@@ -676,6 +676,8 @@ test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margin
 	$(MUT) --name test_pace --list "pacefifo nohalve" -- ./$(B)/test_pace --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_place
 	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier" -- ./$(B)/test_place --mutant @M@ # each planted bug must fail it
+	./$(B)/test_sfill $(SCRATCH)
+	$(if $(EC_OBJ),$(MUT) --name test_sfill --list "fillnocheck fillfewerk fillsurvivortrust" -- ./$(B)/test_sfill --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_plrdma $(SCRATCH)
 	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte settleready noauth keepqueue seqbump nobackoff noipoib cmnoauth cmnofallback" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_replwire
@@ -1064,7 +1066,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1157,10 +1159,10 @@ $(B)/pout.o: server/pout.c $(R9_PLACE_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/balance.o: server/balance.c $(R9_PLACE_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
-$(B)/sfill.o: server/sfill.c server/sfill.h | $(B)
-	$(CC) $(CFLAGS) -c -o $@ $<
-$(B)/sreconcile.o: server/sreconcile.c server/sfill.h | $(B)
-	$(CC) $(CFLAGS) -c -o $@ $<
+$(B)/sfill.o: server/sfill.c server/sfill.h server/pace.h server/crashpt.h src/chunk.h src/chunk_priv.h src/compat.h src/internal.h $(EC_HDR) | $(B)
+	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -c -o $@ $<
+$(B)/sreconcile.o: server/sreconcile.c server/sfill.h src/chunk.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/pace.o: server/pace.c server/pace.h src/compat.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/cnode.o: server/cnode.c $(R4_CL_HDR) | $(B)
@@ -1182,6 +1184,12 @@ place-soak: $(B)/sim_place
 place-mutants: $(B)/sim_place
 	@echo "place-mutants: not built yet (see r9-simplace)" >&2
 	@exit 1
+# R9 checked stripe fill worker unit tests and planted mutants (server/sfill.c, tests/test_sfill.c; track r9-fill)
+$(B)/test_sfill: tests/test_sfill.c server/sfill.h server/pace.h src/chunk.h src/chunk_priv.h $(B)/sfill.o $(B)/pace.o $(B)/crashpt.o $(LIB) | $(B)
+	$(CC) $(CFLAGS) -Iinclude -Iserver -Isrc -o $@ tests/test_sfill.c $(B)/sfill.o $(B)/pace.o $(B)/crashpt.o $(LIB) $(LDLIBS)
+sfill-mutants: $(B)/test_sfill
+	@$(if $(EC_OBJ),true,echo "sfill-mutants: this build has no erasure codec (NO_EC=1): test_sfill skips, nothing to plant"; false)
+	$(MUT) --name test_sfill --list "fillnocheck fillfewerk fillsurvivortrust" -- ./$(B)/test_sfill --mutant @M@ @D@
 # R9 placement unit tests (server/place.c, track r9-plan)
 $(B)/test_place: tests/test_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/test_place.c $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o

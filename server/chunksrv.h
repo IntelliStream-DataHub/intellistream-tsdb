@@ -45,13 +45,26 @@ struct peerlink;
 struct plink;
 
 /* ---------------------------------------------------------------- wire (exported for the tests and the fuzzer) */
-enum { CS_T_REQ = 1, CS_T_RESP = 2 }; /* driver frame types on a CHUNK link */
-enum { CS_OP_READ = 1, CS_OP_SUMS = 2, CS_OP_LIST = 3, CS_OP_DEL = 4, CS_OP_EPOCH = 5, CS_OP_PUT = 6 /* answers only */ };
+enum { CS_T_REQ = 1, CS_T_RESP = 2 }; /* driver frame types on a CHUNK / CHUNKR link */
+enum {
+    CS_OP_READ = 1,
+    CS_OP_SUMS = 2,
+    CS_OP_LIST = 3,
+    CS_OP_DEL = 4,
+    CS_OP_EPOCH = 5,
+    CS_OP_PUT = 6,     /* answers only */
+    CS_OP_OBJLIST = 7, /* R9 (D11): paged list of committed .ec object records with stripe_version < max_version */
+    CS_OP_REOPEN = 8,  /* R9 (D11): notify a log replica to eccache_reopen(volume, oid) after a chunk fill */
+};
 
-#define CS_READ_MAX (4u << 20)   /* bytes of one CS_OP_READ */
-#define CS_SUMS_MAX 65536u       /* sums of one CS_OP_SUMS */
-#define CS_LIST_MAX 4096u        /* entries of one CS_OP_LIST */
-#define CS_LIST_ENTRY 52u        /* oid 16, pos 2, size 8, epoch 8, vuuid 16, status 1, store 1 */
+#define CS_READ_MAX (4u << 20)        /* bytes of one CS_OP_READ */
+#define CS_SUMS_MAX 65536u            /* sums of one CS_OP_SUMS */
+#define CS_LIST_MAX 4096u             /* entries of one CS_OP_LIST */
+#define CS_LIST_ENTRY 52u             /* oid 16, pos 2, size 8, epoch 8, vuuid 16, status 1, store 1 */
+#define CS_OBJLIST_MAX 1024u          /* entries of one CS_OP_OBJLIST */
+#define CS_OBJLIST_BYTES_MAX (4u << 20) /* payload byte budget of one CS_OP_OBJLIST page */
+#define CS_OBJLIST_HDR 21u            /* vuuid 16, u32 n, u8 more */
+#define CS_OBJLIST_ENTRY_HDR 60u      /* oid 16, k 2, m 2, cell 4, len 8, positions 4, epoch 8, sver 8, nsums 8 */
 #define CS_PUT_MAGIC 0x54505343u /* "CSPT" */
 /* magic 4, volume 4, epoch 8, vuuid 16, oid 16, pos 2, k 2, m 2, cell 4, len 8, then xxh64 of those 66 bytes: the data
  * links carry no frame check by default (`--peer-check none`), and the receiver raises a durable fence from the epoch
@@ -132,10 +145,36 @@ int chunksrv_check_owner(struct chunksrv *cs, const uint8_t cluster[16], uint32_
 int chunksrv_stores(struct chunksrv *cs, int *up, bool log);
 chunk_backend *chunksrv_backend(struct chunksrv *cs);
 
+/* One committed .ec object record returned by CS_OP_OBJLIST (R9 D11). */
+struct cs_objlist_item {
+    uint8_t oid[16];
+    chunk_geom g;
+    uint32_t positions;
+    uint64_t writer_epoch;
+    uint64_t stripe_version;
+    uint64_t nsums;
+    uint64_t *sums; /* nsums entries, malloc'ed */
+};
+int cs_objlist_resp_decode(const uint8_t *body, size_t body_len, uint8_t vuuid_out[16],
+                           struct cs_objlist_item **items_out, uint32_t *n_out, bool *more_out);
+void cs_objlist_items_free(struct cs_objlist_item *items, uint32_t n);
+
 /* D9: the authoritative epoch of a volume, for an unsure store: 1 with *epoch set while the metadata copy is caught
  * up (cluster_copy_caught_up) and holds the volume, else 0. r8f sets it; without one an unsure store stays refused. */
 typedef int (*chunksrv_epoch_fn)(void *arg, uint32_t volume, uint64_t *epoch);
 void chunksrv_epoch_source(struct chunksrv *cs, chunksrv_epoch_fn fn, void *arg);
+/* R9 (D11): server-side handler for CS_OP_OBJLIST (served by the volume's lease-holding leader). */
+typedef int (*chunksrv_objlist_fn)(void *arg, uint32_t volume, uint64_t max_version, bool has_cursor,
+                                   const uint8_t cursor_oid[16], uint32_t max_entries, size_t max_bytes,
+                                   uint8_t vuuid_out[16], struct cs_objlist_item **items_out, uint32_t *n_out,
+                                   bool *more_out);
+void chunksrv_set_objlist(struct chunksrv *cs, chunksrv_objlist_fn fn, void *arg);
+/* R9 (D11): server-side handler for CS_OP_REOPEN (calls eccache_reopen(tier, volume, oid) on log replicas). */
+typedef void (*chunksrv_reopen_fn)(void *arg, uint32_t volume, const uint8_t oid[16]);
+void chunksrv_set_reopen(struct chunksrv *cs, chunksrv_reopen_fn fn, void *arg);
+/* R9 (D18): optional send-side byte pacer for CS_OP_READ responses served over PL_KIND_CHUNKR (kind 8). */
+typedef void (*chunksrv_read_pace_fn)(void *arg, uint32_t volume, size_t bytes);
+void chunksrv_set_read_pacer(struct chunksrv *cs, chunksrv_read_pace_fn fn, void *arg);
 
 /* One answer frame (a CS_T_RESP payload) to the requester. */
 typedef void (*cs_reply_fn)(void *arg, const uint8_t *p, size_t n);
@@ -186,6 +225,10 @@ void chunksrv_set_rate(struct chunksrv *cs, uint64_t bytes_per_s);
  * empty), or TSDB_ERR_UNAVAILABLE (no link, or no answer within timeout_ms). */
 int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, int timeout_ms, int32_t *rc,
                   uint8_t **body, size_t *body_len);
+/* Like chunksrv_call, selecting the peerlink kind (PL_KIND_CHUNK for foreground/OBJLIST/REOPEN, PL_KIND_CHUNKR for
+ * rebuild reads). */
+int chunksrv_call_kind(struct chunksrv *cs, uint32_t peer, int kind, const struct cs_req *r, int timeout_ms,
+                       int32_t *rc, uint8_t **body, size_t *body_len);
 /* Puts a chunk on member `peer`: fd[base, base + cs_put_total) holds its sums table and cells (the staged put; the
  * fd is dup'ed, the caller may close it at return). 0 once the peer answered PUT_OK with the same sum; else its
  * refusal (CHUNK_ERR_FENCED, CORRUPT for a cell that failed its sum, ...), TSDB_ERR_IO for a sum that differs, or

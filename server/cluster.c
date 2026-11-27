@@ -2325,6 +2325,7 @@ static void copy_publish(void)
         o->gc_suspended = v->gc_suspended;
         o->nstripe = v->nstripe < META_STRIPE_MAX ? v->nstripe : META_STRIPE_MAX;
         memcpy(o->stripe, v->stripe, o->nstripe * sizeof o->stripe[0]);
+        memcpy(o->stripe_pos, v->stripe_pos, o->nstripe * sizeof o->stripe_pos[0]);
         o->stripe_version = v->stripe_version;
     }
     for (uint32_t i = 0; i < nm; i++) {
@@ -2336,6 +2337,7 @@ static void copy_publish(void)
     }
     s->pub = (struct cluster_copy){.applied = C.sm.applied, .applied_term = C.sm.applied_term,
                                    .restore_gen = C.sm.restore_gen, .self = self, .nmembers = nm, .nvolumes = nv,
+                                   .rebuild_concurrency = C.sm.set.rebuild_concurrency,
                                    .members = mem, .volumes = vols};
     s->bytes = bytes;
     atomic_init(&s->refs, 1);
@@ -2644,6 +2646,24 @@ void cluster_set_fill_pct(uint8_t pct)
 uint8_t cluster_get_fill_pct(void) { return atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed); }
 uint32_t cluster_young_high_pct(void) { return atomic_load_explicit(&g_young_high_pct, memory_order_acquire); }
 int cluster_self_full(void) { return atomic_load_explicit(&g_self_full, memory_order_acquire); }
+
+/* R9 (D10, D11; filled by r9-fill): HBS_FILL entries published by sfill for the heartbeat path */
+static pthread_mutex_t g_hb_fills_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct cluster_fill_report g_hb_fills[CLUSTER_REPORT_FILLS];
+static uint32_t g_hb_nfills;
+
+void cluster_set_fills(const struct cluster_fill_report *fills, uint32_t nfills)
+{
+    if (!fills)
+        nfills = 0;
+    if (nfills > CLUSTER_REPORT_FILLS)
+        nfills = CLUSTER_REPORT_FILLS;
+    pthread_mutex_lock(&g_hb_fills_mu);
+    if (nfills > 0)
+        memcpy(g_hb_fills, fills, nfills * sizeof g_hb_fills[0]);
+    g_hb_nfills = nfills;
+    pthread_mutex_unlock(&g_hb_fills_mu);
+}
 
 /* R9 (D4, r9-out): count of times automatic OUT proceeded past the mass-OUT guard bound (for metrics). */
 static _Atomic uint64_t g_out_guard_passed;
@@ -6252,6 +6272,14 @@ static void put_sections(struct buf *b, uint64_t now)
     at = sec_begin(b, HBS_STORES);
     put32(b, atomic_load_explicit(&g_chunk_stores, memory_order_relaxed));
     sec_end(b, at);
+    if (rep.nfills == 0) {
+        pthread_mutex_lock(&g_hb_fills_mu);
+        uint32_t nf = g_hb_nfills <= CLUSTER_REPORT_FILLS ? g_hb_nfills : CLUSTER_REPORT_FILLS;
+        if (nf > 0)
+            memcpy(rep.fills, g_hb_fills, nf * sizeof rep.fills[0]);
+        rep.nfills = nf;
+        pthread_mutex_unlock(&g_hb_fills_mu);
+    }
     if (rep.nfills > CLUSTER_REPORT_FILLS)
         rep.nfills = 0;
     at = sec_begin(b, HBS_FILL);
@@ -8530,6 +8558,7 @@ void cluster_stop(void)
     close(C.lfd);
     close(C.stop_pipe[0]);
     close(C.stop_pipe[1]);
+    cluster_set_fills(NULL, 0);
 }
 
 /* ------------------------------------------------------------------ cluster_int.h (R4's files) */

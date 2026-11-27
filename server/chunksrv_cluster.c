@@ -68,7 +68,9 @@ static void set_peers(struct chunksrv *cs, const struct cluster_copy *c, uint32_
     size_t nk = 0;
     for (uint32_t i = 0; i < c->nmembers; i++) {
         const struct cluster_copy_member *m = &c->members[i];
-        if (m->id == self || m->state >= META_OUT)
+        /* R9 (D2): OUT is reversible (a returning member keeps its node id and reconnects), while DESTROYED is final;
+         * only DESTROYED or removed members are retired via chunksrv_keep_peers. */
+        if (m->id == self || m->state >= META_DESTROYED)
             continue;
         if (keep)
             keep[nk++] = m->id;
@@ -276,6 +278,7 @@ static void *cc_main(void *arg)
                 if (G.cs && chunksrv_listen(G.cs, &nc) == 0) {
                     cluster_set_peerlink_kind(PL_KIND_CHUNK, chunksrv_peerlink(G.cs));
                     cluster_set_peerlink_kind(PL_KIND_CHUNKB, chunksrv_peerlink(G.cs));
+                    cluster_set_peerlink_kind(PL_KIND_CHUNKR, chunksrv_peerlink(G.cs));
                     self = me.id;
                     cs = G.cs;
                     atomic_store(&G.pub, cs);
@@ -357,6 +360,7 @@ void chunksrv_cluster_stop(void)
         /* the cluster thread is stopped (tsdbd stops it first): nothing hands a socket over any more */
         cluster_set_peerlink_kind(PL_KIND_CHUNK, NULL);
         cluster_set_peerlink_kind(PL_KIND_CHUNKB, NULL);
+        cluster_set_peerlink_kind(PL_KIND_CHUNKR, NULL);
     }
 }
 

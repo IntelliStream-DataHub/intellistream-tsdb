@@ -1392,6 +1392,230 @@ static void test_slow_disk(void)
     chunksrv_close(b);
 }
 
+/* ---------------------------------------------------------------- R9 OBJLIST, REOPEN, and PL_KIND_CHUNKR */
+struct mock_objlist_ctx {
+    struct cs_objlist_item items[5];
+    uint32_t n;
+    int force_rc;
+    uint32_t reopen_calls;
+    uint32_t reopen_vol;
+    uint8_t reopen_oid[16];
+    pthread_mutex_t mu;
+    uint32_t pace_calls;
+    uint32_t pace_vol;
+    size_t pace_bytes;
+};
+
+static int mock_objlist_fn(void *arg, uint32_t volume, uint64_t max_version, bool has_cursor,
+                           const uint8_t cursor_oid[16], uint32_t max_entries, size_t max_bytes,
+                           uint8_t vuuid_out[16], struct cs_objlist_item **items_out, uint32_t *n_out,
+                           bool *more_out)
+{
+    struct mock_objlist_ctx *ctx = arg;
+    (void)volume;
+    if (ctx->force_rc != 0)
+        return ctx->force_rc;
+    memcpy(vuuid_out, VUUID, 16);
+    uint32_t idxs[5], nmatch = 0;
+    for (uint32_t i = 0; i < ctx->n; i++) {
+        if (max_version != 0 && ctx->items[i].stripe_version >= max_version)
+            continue;
+        if (has_cursor && memcmp(ctx->items[i].oid, cursor_oid, 16) <= 0)
+            continue;
+        idxs[nmatch++] = i;
+    }
+    size_t bytes = CS_OBJLIST_HDR;
+    uint32_t take = 0;
+    for (uint32_t i = 0; i < nmatch && take < max_entries; i++) {
+        size_t need = CS_OBJLIST_ENTRY_HDR + (size_t)(ctx->items[idxs[i]].nsums * 8);
+        if (take > 0 && bytes + need > max_bytes)
+            break;
+        bytes += need;
+        take++;
+    }
+    *more_out = take < nmatch;
+    struct cs_objlist_item *out = take ? calloc(take, sizeof *out) : NULL;
+    for (uint32_t i = 0; i < take; i++) {
+        const struct cs_objlist_item *src = &ctx->items[idxs[i]];
+        out[i] = *src;
+        out[i].sums = malloc((size_t)src->nsums * sizeof(uint64_t));
+        memcpy(out[i].sums, src->sums, (size_t)src->nsums * sizeof(uint64_t));
+    }
+    *items_out = out;
+    *n_out = take;
+    return 0;
+}
+
+static void mock_reopen_fn(void *arg, uint32_t volume, const uint8_t oid[16])
+{
+    struct mock_objlist_ctx *ctx = arg;
+    pthread_mutex_lock(&ctx->mu);
+    ctx->reopen_calls++;
+    ctx->reopen_vol = volume;
+    memcpy(ctx->reopen_oid, oid, 16);
+    pthread_mutex_unlock(&ctx->mu);
+}
+
+static void mock_read_pace_fn(void *arg, uint32_t volume, size_t bytes)
+{
+    struct mock_objlist_ctx *ctx = arg;
+    pthread_mutex_lock(&ctx->mu);
+    ctx->pace_calls++;
+    ctx->pace_vol = volume;
+    ctx->pace_bytes += bytes;
+    pthread_mutex_unlock(&ctx->mu);
+}
+
+static void test_objlist_reopen_chunkr(void)
+{
+    char dir[PATH_MAX], st[PATH_MAX + 16], err[256];
+    fresh("objlist", dir, sizeof dir);
+    mkstore(dir, 0, 2, true, st, sizeof st);
+    struct chunksrv *b = open1(st);
+    struct chunksrv *a = chunksrv_open(NULL, 0, err, sizeof err);
+    CHECK(a && b);
+    if (!a || !b)
+        return;
+
+    /* Without objlist handler, CS_OP_OBJLIST returns TSDB_ERR_UNAVAILABLE. */
+    struct cs_req r = {.rid = 11, .op = CS_OP_OBJLIST, .volume = 1, .off = 5, .len = 2};
+    cap cp = {0};
+    CHECK(fake_req(b, &r, &cp) == TSDB_ERR_UNAVAILABLE);
+
+    struct mock_objlist_ctx ctx;
+    memset(&ctx, 0, sizeof ctx);
+    pthread_mutex_init(&ctx.mu, NULL);
+    ctx.n = 5;
+    for (uint32_t i = 0; i < 5; i++) {
+        memset(ctx.items[i].oid, 0, 16);
+        ctx.items[i].oid[15] = (uint8_t)(i + 1);
+        CHECK(chunk_geom_make(&ctx.items[i].g, 3, 2, 4096, 4096 * 3 * 2 + 17) == 0);
+        ctx.items[i].positions = 0x1fu;
+        ctx.items[i].writer_epoch = 3 + i;
+        ctx.items[i].stripe_version = i < 4 ? 1 : 5; /* item 4 is at version 5, filtered out by max_version=5 */
+        ctx.items[i].nsums = chunk_sums_total(&ctx.items[i].g);
+        ctx.items[i].sums = malloc((size_t)ctx.items[i].nsums * sizeof(uint64_t));
+        for (uint64_t s = 0; s < ctx.items[i].nsums; s++)
+            ctx.items[i].sums[s] = 0x10000000ull * (i + 1) + s;
+    }
+    chunksrv_set_objlist(b, mock_objlist_fn, &ctx);
+    chunksrv_set_reopen(b, mock_reopen_fn, &ctx);
+    chunksrv_set_read_pacer(b, mock_read_pace_fn, &ctx);
+
+    /* Paginated OBJLIST with max_version=5 (r.off) and page size 2: expects 2 + 2 = 4 items (item 4 filtered out). */
+    uint32_t got_total = 0;
+    bool has_cur = false;
+    uint8_t cur[16] = {0};
+    for (int pg = 0; pg < 5; pg++) {
+        struct cs_req lr = {.rid = 20 + (uint64_t)pg, .op = CS_OP_OBJLIST, .volume = 1, .off = 5, .len = 2,
+                            .has_cursor = has_cur};
+        memcpy(lr.oid, cur, 16);
+        CHECK(fake_req(b, &lr, &cp) == 0);
+        uint8_t vu[16] = {0};
+        struct cs_objlist_item *dec = NULL;
+        uint32_t ndec = 0;
+        bool more = false;
+        CHECK(cs_objlist_resp_decode(cp.body, cp.body_len, vu, &dec, &ndec, &more) == 0);
+        CHECK(memcmp(vu, VUUID, 16) == 0);
+        CHECK(ndec == 2);
+        for (uint32_t j = 0; j < ndec; j++) {
+            uint32_t idx = got_total + j;
+            CHECK(memcmp(dec[j].oid, ctx.items[idx].oid, 16) == 0);
+            CHECK(dec[j].writer_epoch == ctx.items[idx].writer_epoch);
+            CHECK(dec[j].stripe_version == ctx.items[idx].stripe_version);
+            CHECK(dec[j].positions == ctx.items[idx].positions);
+            CHECK(dec[j].nsums == ctx.items[idx].nsums);
+            CHECK(memcmp(dec[j].sums, ctx.items[idx].sums, (size_t)dec[j].nsums * sizeof(uint64_t)) == 0);
+        }
+        got_total += ndec;
+        if (ndec > 0) {
+            memcpy(cur, dec[ndec - 1].oid, 16);
+            has_cur = true;
+        }
+        cs_objlist_items_free(dec, ndec);
+        if (!more)
+            break;
+    }
+    CHECK(got_total == 4);
+
+    /* Error propagation from objlist callback (e.g. OOM). */
+    ctx.force_rc = TSDB_ERR_NOMEM;
+    CHECK(fake_req(b, &r, &cp) == TSDB_ERR_NOMEM);
+    ctx.force_rc = 0;
+
+    /* CS_OP_REOPEN invokes reopen callback with exact volume & oid. */
+    struct cs_req rr = {.rid = 30, .op = CS_OP_REOPEN, .volume = 7};
+    memcpy(rr.oid, ctx.items[2].oid, 16);
+    CHECK(fake_req(b, &rr, &cp) == 0);
+    CHECK(ctx.reopen_calls == 1 && ctx.reopen_vol == 7 && memcmp(ctx.reopen_oid, ctx.items[2].oid, 16) == 0);
+    free(cp.body);
+
+    /* Real peerlink: PL_KIND_CHUNKR routes through dedicated rebuild pool + invokes read_pacer with (volume, len),
+     * while foreground PL_KIND_CHUNK does NOT invoke read_pacer. */
+    static const uint8_t secret[32] = {5};
+    struct chunksrv_net_cfg ca = {.self_id = 1, .secret = secret, .secret_len = sizeof secret, .rate = 0};
+    memcpy(ca.uuid, CLUSTER, 16);
+    struct chunksrv_net_cfg cb = ca;
+    cb.self_id = 2;
+    ca.ident[0] = 1, cb.ident[0] = 2;
+    CHECK(chunksrv_listen(a, &ca) == 0 && chunksrv_listen(b, &cb) == 0);
+    int pa = peerlink_listen(chunksrv_peerlink(a), 0), pb = peerlink_listen(chunksrv_peerlink(b), 0);
+    CHECK(pa > 0 && pb > 0);
+    char addr[64];
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pb);
+    CHECK(chunksrv_set_peer(a, 2, addr) == 0);
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pa);
+    CHECK(chunksrv_set_peer(b, 1, addr) == 0);
+
+    cdata c;
+    cdata_make(&c, 4, 0, 4096, 4096 * 3 * 2 + 19, 123);
+    int fd = chunksrv_stage(dir, &c.m.g, c.m.pos, c.cells, c.sums);
+    CHECK(fd >= 0);
+    CHECK(chunksrv_put_remote(a, 2, &c.m, fd, 0, cs_sums_hash(c.sums, c.ncells), 10000) == 0);
+    close(fd);
+
+    /* Foreground PL_KIND_CHUNK read: succeeds, read_pacer NOT called. */
+    struct cs_req rd;
+    req_of(&rd, CS_OP_READ, &c, 4);
+    rd.off = 0;
+    rd.len = (uint32_t)c.len;
+    int32_t prc = -1;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    CHECK(chunksrv_call(a, 2, &rd, 10000, &prc, &body, &bl) == 0 && prc == 0 && bl == c.len &&
+          memcmp(body, c.cells, c.len) == 0);
+    free(body);
+    body = NULL;
+    pthread_mutex_lock(&ctx.mu);
+    CHECK(ctx.pace_calls == 0);
+    pthread_mutex_unlock(&ctx.mu);
+
+    /* Rebuild PL_KIND_CHUNKR read: succeeds, read_pacer called with (volume=1, bytes=c.len). */
+    prc = -1;
+    CHECK(chunksrv_call_kind(a, 2, PL_KIND_CHUNKR, &rd, 10000, &prc, &body, &bl) == 0 && prc == 0 && bl == c.len &&
+          memcmp(body, c.cells, c.len) == 0);
+    free(body);
+    body = NULL;
+    pthread_mutex_lock(&ctx.mu);
+    CHECK(ctx.pace_calls == 1 && ctx.pace_vol == c.m.volume && ctx.pace_bytes == c.len);
+    pthread_mutex_unlock(&ctx.mu);
+
+    /* Remote CS_OP_REOPEN over real peerlink. */
+    prc = -1;
+    CHECK(chunksrv_call(a, 2, &rr, 10000, &prc, &body, &bl) == 0 && prc == 0);
+    free(body);
+    pthread_mutex_lock(&ctx.mu);
+    CHECK(ctx.reopen_calls == 2);
+    pthread_mutex_unlock(&ctx.mu);
+
+    cdata_free(&c);
+    for (uint32_t i = 0; i < 5; i++)
+        free(ctx.items[i].sums);
+    chunksrv_close(a);
+    chunksrv_close(b);
+    pthread_mutex_destroy(&ctx.mu);
+}
+
 int main(int argc, char **argv)
 {
     const char *mutant = NULL, *base = "/tmp";
@@ -1459,6 +1683,7 @@ int main(int argc, char **argv)
     test_crashfs();
     test_eio();
     test_net();
+    test_objlist_reopen_chunkr();
     test_slow_disk();
 out:
     if (fails == 0) {

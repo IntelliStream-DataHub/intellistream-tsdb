@@ -245,10 +245,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         if (w == 0) {
             struct cs_req r;
             if (cs_req_decode(p, n, &r) == 0) {
-                if (r.op < CS_OP_READ || r.op > CS_OP_EPOCH || r.pos >= CHUNK_POS_MAX)
+                if (r.op < CS_OP_READ || r.op > CS_OP_REOPEN || r.op == CS_OP_PUT || r.pos >= CHUNK_POS_MAX)
                     abort();
-                uint32_t max = r.op == CS_OP_READ ? CS_READ_MAX : r.op == CS_OP_SUMS ? CS_SUMS_MAX : CS_LIST_MAX;
-                if ((r.op == CS_OP_READ || r.op == CS_OP_SUMS || r.op == CS_OP_LIST) && (r.len == 0 || r.len > max))
+                uint32_t max = r.op == CS_OP_READ      ? CS_READ_MAX
+                               : r.op == CS_OP_SUMS    ? CS_SUMS_MAX
+                               : r.op == CS_OP_OBJLIST ? CS_OBJLIST_MAX
+                                                       : CS_LIST_MAX;
+                if ((r.op == CS_OP_READ || r.op == CS_OP_SUMS || r.op == CS_OP_LIST || r.op == CS_OP_OBJLIST) &&
+                    (r.len == 0 || r.len > max))
                     abort();
                 uint8_t back[128];
                 if (cs_req_encode(&r, back, sizeof back) != n || memcmp(back, p, n) != 0)
@@ -257,7 +261,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         } else if (w == 1) {
             struct cs_resp r;
             if (cs_resp_decode(p, n, &r) == 0) {
-                if (r.rc > 0 || r.op < CS_OP_READ || r.op > CS_OP_PUT)
+                if (r.rc > 0 || r.op < CS_OP_READ || r.op > CS_OP_REOPEN)
                     abort();
                 if (r.body_len && (r.body < p || r.body + r.body_len != p + n))
                     abort();

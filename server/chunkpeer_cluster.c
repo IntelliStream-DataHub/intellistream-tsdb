@@ -16,11 +16,19 @@
 #include "chunkpeer.h"
 
 #include "../include/tsdb.h"
+#include "../src/compat.h"
+#include "../src/cvol.h"
+#include "../src/eccache.h"
+#include "../src/ecpart.h"
 #include "../src/feed.h"
+#include "../src/internal.h"
 #include "../src/tier.h"
 #include "chunksrv.h"
 #include "cluster.h"
+#include "cvol.h"
+#include "margins.h"
 #include "meta.h"
+#include "pace.h"
 #include "repld.h"
 #include "sfill.h"
 
@@ -37,6 +45,7 @@
 #ifdef TSDB_EC
 
 static struct chunkpeer G;
+static _Atomic(tsdb *) G_db;
 static pthread_t src_th;
 static atomic_bool src_stop, src_started;
 /* the source thread lives until chunkpeer_cluster_stop: one that returned early (its work is done once the chunk server
@@ -44,6 +53,13 @@ static atomic_bool src_stop, src_started;
  * every other end of tsdbd (a fail-stop's exit(1)): status 66 instead of 1 (test_cluster exitthreads) */
 static pthread_mutex_t src_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t src_cv = PTHREAD_COND_INITIALIZER;
+
+static int cp_objlist_srv(void *arg, uint32_t volume, uint64_t max_version, bool has_cursor,
+                          const uint8_t cursor_oid[16], uint32_t max_entries, size_t max_bytes,
+                          uint8_t vuuid_out[16], struct cs_objlist_item **items_out, uint32_t *n_out,
+                          bool *more_out);
+static void cp_reopen_srv(void *arg, uint32_t volume, const uint8_t oid[16]);
+static void cp_read_pace(void *arg, uint32_t volume, size_t bytes);
 
 static uint32_t self_id(const struct cluster_copy *c) { return c ? c->self : 0; }
 
@@ -239,6 +255,9 @@ static void *src_main(void *arg)
         if (cs) {
             G.local = cs;
             chunksrv_epoch_source(cs, chunkpeer_epoch_source, &G);
+            chunksrv_set_objlist(cs, cp_objlist_srv, NULL);
+            chunksrv_set_reopen(cs, cp_reopen_srv, NULL);
+            chunksrv_set_read_pacer(cs, cp_read_pace, NULL);
             fprintf(stderr, "tsdbd: chunk peer: the epoch source is set\n");
             pthread_mutex_lock(&src_mu);
             while (!atomic_load(&src_stop))
@@ -321,6 +340,581 @@ int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir)
     return rc;
 }
 
+/* ---------------------------------------------------------------- R9 OBJLIST/REOPEN servers & sfill cluster glue */
+
+static int ec_rec_oid_cmp(const void *a, const void *b)
+{
+    const ec_record *const *ra = a;
+    const ec_record *const *rb = b;
+    return memcmp((*ra)->oid, (*rb)->oid, 16);
+}
+
+static void rec_heap_sift_up(const ec_record **h, size_t i)
+{
+    while (i > 0) {
+        size_t p = (i - 1) / 2;
+        if (memcmp(h[p]->oid, h[i]->oid, 16) >= 0)
+            break;
+        const ec_record *tmp = h[p];
+        h[p] = h[i];
+        h[i] = tmp;
+        i = p;
+    }
+}
+
+static void rec_heap_sift_down(const ec_record **h, size_t n, size_t i)
+{
+    for (;;) {
+        size_t l = 2 * i + 1, r = l + 1, big = i;
+        if (l < n && memcmp(h[l]->oid, h[big]->oid, 16) > 0)
+            big = l;
+        if (r < n && memcmp(h[r]->oid, h[big]->oid, 16) > 0)
+            big = r;
+        if (big == i)
+            break;
+        const ec_record *tmp = h[i];
+        h[i] = h[big];
+        h[big] = tmp;
+        i = big;
+    }
+}
+
+static int cp_objlist_srv(void *arg, uint32_t volume, uint64_t max_version, bool has_cursor,
+                          const uint8_t cursor_oid[16], uint32_t max_entries, size_t max_bytes,
+                          uint8_t vuuid_out[16], struct cs_objlist_item **items_out, uint32_t *n_out,
+                          bool *more_out)
+{
+    (void)arg;
+    *items_out = NULL;
+    *n_out = 0;
+    *more_out = false;
+    if (max_entries == 0 || max_entries > CS_OBJLIST_MAX)
+        return TSDB_ERR_INVALID;
+    tsdb *db = atomic_load_explicit(&G_db, memory_order_acquire);
+    if (!db)
+        return TSDB_ERR_UNAVAILABLE;
+
+    /* Serve OBJLIST only from the volume's lease-holding leader (cvol_led && cluster_lease_valid): a non-leader
+     * replica's engine apply can lag committed MK_COLD markers, so serving an incomplete list from a lagging replica
+     * could cause the filler to report whole with objects missing. (Note: any in-flight settle at version < V is
+     * fenced by the r9-whole settle barrier in the parallel track.) */
+    if (!cvol_led(volume) || !cluster_lease_valid())
+        return TSDB_ERR_UNAVAILABLE;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return TSDB_ERR_UNAVAILABLE;
+    const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+    bool allowed = cv && cv->redundancy == META_RED_EC && c->self != 0 && cv->leader == c->self;
+    cluster_copy_put(c);
+    if (!allowed)
+        return TSDB_ERR_UNAVAILABLE;
+
+    eng *e = tsdb_cvol_ref(db, volume);
+    if (!e)
+        return TSDB_ERR_UNAVAILABLE;
+    const uint8_t *vu = tier_vuuid(e);
+    if (!vu) {
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    memcpy(vuuid_out, vu, 16);
+
+    size_t np = 0;
+    part **ps = db_snapshot(e, INT64_MIN, INT64_MAX, &np);
+    if (!ps) {
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_NOMEM;
+    }
+
+    /* Bounded top-K selection (keep at most max_entries + 1 smallest unique oids above cursor) so each page
+     * uses O(K) memory and avoids sorting all N parts of a large volume. */
+    size_t keep = (size_t)max_entries + 1;
+    const ec_record **recs = malloc(keep * sizeof *recs);
+    if (!recs) {
+        db_release(ps, np);
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t nu = 0;
+    for (size_t i = 0; i < np; i++) {
+        struct ecpart *ep = atomic_load_explicit(&ps[i]->ec, memory_order_acquire);
+        if (!ep || ep->test_mark)
+            continue;
+        if (max_version != 0 && ep->rec.stripe_version >= max_version)
+            continue;
+        if (has_cursor && memcmp(ep->rec.oid, cursor_oid, 16) <= 0)
+            continue;
+        if (nu == keep && memcmp(ep->rec.oid, recs[0]->oid, 16) >= 0)
+            continue;
+        bool dup = false;
+        for (size_t j = 0; j < nu; j++)
+            if (memcmp(recs[j]->oid, ep->rec.oid, 16) == 0) {
+                dup = true;
+                break;
+            }
+        if (dup)
+            continue;
+        if (nu < keep) {
+            recs[nu] = &ep->rec;
+            rec_heap_sift_up(recs, nu++);
+        } else {
+            recs[0] = &ep->rec;
+            rec_heap_sift_down(recs, nu, 0);
+        }
+    }
+    if (nu > 1)
+        qsort(recs, nu, sizeof *recs, ec_rec_oid_cmp);
+
+    size_t take = 0;
+    size_t bytes = CS_OBJLIST_HDR;
+    for (size_t i = 0; i < nu && take < max_entries; i++) {
+        size_t need = CS_OBJLIST_ENTRY_HDR + (size_t)(recs[i]->nsums * 8);
+        if (take > 0 && bytes + need > max_bytes)
+            break;
+        if (bytes + need > CS_OBJLIST_BYTES_MAX + CS_OBJLIST_HDR) {
+            if (take == 0) {
+                free(recs);
+                db_release(ps, np);
+                tsdb_cvol_unref(&e);
+                return TSDB_ERR_INVALID;
+            }
+            break;
+        }
+        bytes += need;
+        take++;
+    }
+    *more_out = take < nu;
+
+    struct cs_objlist_item *out = take ? calloc(take, sizeof *out) : NULL;
+    if (take && !out) {
+        free(recs);
+        db_release(ps, np);
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < take; i++) {
+        const ec_record *r = recs[i];
+        memcpy(out[i].oid, r->oid, 16);
+        if (chunk_geom_make(&out[i].g, r->k, r->m, r->cell_bytes, r->object_len) != 0) {
+            cs_objlist_items_free(out, (uint32_t)(i + 1));
+            free(recs);
+            db_release(ps, np);
+            tsdb_cvol_unref(&e);
+            return TSDB_ERR_CORRUPT;
+        }
+        out[i].positions = r->positions;
+        out[i].writer_epoch = r->writer_epoch;
+        out[i].stripe_version = r->stripe_version;
+        out[i].nsums = r->nsums;
+        if (r->nsums > 0) {
+            out[i].sums = malloc((size_t)r->nsums * sizeof(uint64_t));
+            if (!out[i].sums) {
+                cs_objlist_items_free(out, (uint32_t)(i + 1));
+                free(recs);
+                db_release(ps, np);
+                tsdb_cvol_unref(&e);
+                return TSDB_ERR_NOMEM;
+            }
+            memcpy(out[i].sums, r->sums, (size_t)r->nsums * sizeof(uint64_t));
+        }
+    }
+    free(recs);
+    db_release(ps, np);
+    tsdb_cvol_unref(&e);
+    *items_out = out;
+    *n_out = (uint32_t)take;
+    return 0;
+}
+
+static void cp_reopen_srv(void *arg, uint32_t volume, const uint8_t oid[16])
+{
+    (void)arg;
+    tsdb *db = atomic_load_explicit(&G_db, memory_order_acquire);
+    if (!db)
+        return;
+    eng *e = tsdb_cvol_ref(db, volume);
+    if (e) {
+        if (e->tier)
+            eccache_reopen(e->tier, volume, oid);
+        tsdb_cvol_unref(&e);
+    }
+}
+
+static int vol_settled_margin(const struct cluster_copy *c, const struct cluster_copy_vol *v)
+{
+    uint32_t destroyed[256];
+    size_t ndest = 0;
+    for (uint32_t i = 0; i < c->nmembers && ndest < 256; i++)
+        if (c->members[i].state == META_DESTROYED)
+            destroyed[ndest++] = c->members[i].id;
+    struct margins mg;
+    margins_of(c, v, destroyed, ndest, false, MARGIN_MUT_NONE, &mg);
+    int settled = mg.settled;
+    /* margins_of counts every UP/DRAINING stripe member, including a FILLING target that does not yet hold settled
+     * objects; discount each FILLING position whose current holder was counted UP unless its prev holder is still UP. */
+    for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+        if (v->stripe_pos[p].state != META_STRIPE_FILLING)
+            continue;
+        const struct cluster_copy_member *cur = cluster_copy_member(c, v->stripe[p]);
+        bool cur_up = cur && (cur->state == META_UP || cur->state == META_DRAINING);
+        if (!cur_up)
+            continue;
+        const struct cluster_copy_member *pm =
+            v->stripe_pos[p].prev ? cluster_copy_member(c, v->stripe_pos[p].prev) : NULL;
+        bool prev_up = pm && (pm->state == META_UP || pm->state == META_DRAINING);
+        if (!prev_up)
+            settled--;
+    }
+    return settled < 0 ? 0 : settled;
+}
+
+static void cp_read_pace(void *arg, uint32_t volume, size_t bytes)
+{
+    (void)arg;
+    int margin = 2;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (c) {
+        const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+        if (cv && cv->redundancy == META_RED_EC && cv->nstripe > 0)
+            margin = vol_settled_margin(c, cv);
+        cluster_copy_put(c);
+    }
+    (void)pace_take_capped(PACE_SEND, bytes, margin, 1000000000ull);
+}
+
+/* ---- sfill_ops for cluster tsdbd */
+
+static int sf_op_objlist(void *arg, uint32_t volume, uint64_t max_version, bool has_cursor,
+                         const uint8_t cursor_oid[16], uint32_t max_entries,
+                         uint8_t vuuid_out[16], struct sfill_obj **items_out, uint32_t *n_out, bool *more_out)
+{
+    (void)arg;
+    *items_out = NULL;
+    *n_out = 0;
+    *more_out = false;
+    uint32_t leader = 0;
+    uint32_t self = 0;
+
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return TSDB_ERR_UNAVAILABLE;
+    self = c->self;
+    const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+    if (cv && cv->redundancy == META_RED_EC && cv->leader != 0) {
+        const struct cluster_copy_member *lm = cluster_copy_member(c, cv->leader);
+        if (lm && (lm->state == META_UP || lm->state == META_DRAINING))
+            leader = cv->leader;
+    }
+    cluster_copy_put(c);
+    if (leader == 0)
+        return TSDB_ERR_UNAVAILABLE;
+
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return TSDB_ERR_UNAVAILABLE;
+    struct cs_objlist_item *raw = NULL;
+    uint32_t n = 0;
+    bool more = false;
+    int rc = chunkpeer_objlist_page(cs, self, leader, volume, max_version, has_cursor, cursor_oid,
+                                    max_entries, 5000, vuuid_out, &raw, &n, &more);
+    if (rc == 0) {
+        struct sfill_obj *out = n ? calloc(n, sizeof *out) : NULL;
+        if (n && !out) {
+            cs_objlist_items_free(raw, n);
+            rc = TSDB_ERR_NOMEM;
+        } else {
+            for (uint32_t j = 0; j < n; j++) {
+                memcpy(out[j].oid, raw[j].oid, 16);
+                out[j].g = raw[j].g;
+                out[j].positions = raw[j].positions;
+                out[j].writer_epoch = raw[j].writer_epoch;
+                out[j].stripe_version = raw[j].stripe_version;
+                out[j].nsums = raw[j].nsums;
+                out[j].sums = raw[j].sums;
+                raw[j].sums = NULL; /* transferred ownership */
+            }
+            free(raw);
+            *items_out = out;
+            *n_out = n;
+            *more_out = more;
+        }
+    }
+    chunksrv_cluster_release();
+    return rc;
+}
+
+static int sf_op_read_cell(void *arg, uint32_t node, uint32_t volume, uint64_t epoch,
+                           const uint8_t vuuid[16], const uint8_t oid[16], unsigned pos,
+                           uint64_t off, void *buf, size_t len)
+{
+    (void)arg;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return CHUNK_ST_DOWN;
+    const struct cluster_copy *c = cluster_copy_get();
+    uint32_t self = self_id(c);
+    cluster_copy_put(c);
+    int st = chunkpeer_read_rebuild(cs, self, node, volume, epoch, vuuid, oid, pos, off, buf, len, 5000);
+    chunksrv_cluster_release();
+    return st;
+}
+
+static int sf_op_vol_view(void *arg, uint32_t volume, uint64_t *epoch_out,
+                          uint32_t stripe_out[CHUNK_POS_MAX], unsigned *nstripe_out,
+                          bool *prev_up_out, uint32_t prev_node)
+{
+    (void)arg;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return -1;
+    const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+    int rc = -1;
+    if (cv && cv->redundancy == META_RED_EC && cv->nstripe > 0 && cv->nstripe <= CHUNK_POS_MAX) {
+        *epoch_out = cv->epoch;
+        *nstripe_out = cv->nstripe;
+        memcpy(stripe_out, cv->stripe, cv->nstripe * sizeof(uint32_t));
+        bool pup = false;
+        if (prev_node != 0) {
+            const struct cluster_copy_member *pm = cluster_copy_member(c, prev_node);
+            pup = pm && (pm->state == META_UP || pm->state == META_DRAINING);
+        }
+        *prev_up_out = pup;
+        rc = 0;
+    }
+    cluster_copy_put(c);
+    return rc;
+}
+
+static chunk_backend *sf_op_be_hold(void *arg)
+{
+    (void)arg;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return NULL;
+    chunk_backend *be = chunksrv_backend(cs);
+    if (!be) {
+        chunksrv_cluster_release();
+        return NULL;
+    }
+    return be;
+}
+
+static void sf_op_be_release(void *arg, chunk_backend *be)
+{
+    (void)arg;
+    if (be)
+        chunksrv_cluster_release();
+}
+
+static void sf_op_notify_reopen(void *arg, uint32_t volume, const uint8_t oid[16])
+{
+    (void)arg;
+    uint32_t reps[META_REPLICAS_MAX];
+    uint32_t nreps = 0;
+    uint32_t self = 0;
+
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return;
+    self = c->self;
+    const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+    if (cv && cv->redundancy == META_RED_EC) {
+        for (uint32_t i = 0; i < cv->nrep && nreps < META_REPLICAS_MAX; i++) {
+            uint32_t id = cv->rep[i].node;
+            const struct cluster_copy_member *m = cluster_copy_member(c, id);
+            if (m && (m->state == META_UP || m->state == META_DRAINING))
+                reps[nreps++] = id;
+        }
+    }
+    cluster_copy_put(c);
+    if (nreps == 0)
+        return;
+
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return;
+    for (uint32_t i = 0; i < nreps; i++)
+        (void)chunkpeer_notify_reopen(cs, self, reps[i], volume, oid, 2000);
+    chunksrv_cluster_release();
+}
+
+static void sf_op_on_report(void *arg, const struct sfill_report *reps, uint32_t nreps)
+{
+    (void)arg;
+    struct cluster_fill_report cf[CLUSTER_REPORT_FILLS];
+    uint32_t n = nreps <= CLUSTER_REPORT_FILLS ? nreps : CLUSTER_REPORT_FILLS;
+    bool any_whole = false;
+    for (uint32_t i = 0; i < n; i++) {
+        cf[i] = (struct cluster_fill_report){
+            .volume = reps[i].volume,
+            .pos = reps[i].pos,
+            .version = reps[i].stripe_version,
+            .done = reps[i].done,
+            .total = reps[i].total,
+            .whole = reps[i].whole,
+        };
+        if (reps[i].whole)
+            any_whole = true;
+    }
+    cluster_set_fills(n ? cf : NULL, n);
+    if (any_whole)
+        cluster_beat_soon();
+}
+
+static struct {
+    struct sfill *sf;
+    pthread_t thr;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool started;
+    bool stop;
+} SF = {.mu = PTHREAD_MUTEX_INITIALIZER};
+
+struct sf_key {
+    uint32_t vol;
+    uint32_t pos;
+};
+
+static void *sf_watch_main(void *arg)
+{
+    (void)arg;
+    unsigned long seen = 0;
+    bool have = false;
+    struct sf_key *active = NULL;
+    uint32_t nactive = 0, cap_active = 0;
+    struct sf_key *next_active = NULL;
+    uint32_t cap_next = 0;
+
+    for (;;) {
+        pthread_mutex_lock(&SF.mu);
+        bool stop = SF.stop;
+        pthread_mutex_unlock(&SF.mu);
+        if (stop)
+            break;
+
+        unsigned long b = cluster_copy_builds();
+        if (!have || b != seen) {
+            const struct cluster_copy *c = cluster_copy_get();
+            if (c) {
+                uint32_t nnext = 0;
+                if (c->self != 0) {
+                    for (uint32_t vi = 0; vi < c->nvolumes; vi++) {
+                        const struct cluster_copy_vol *v = &c->volumes[vi];
+                        if (v->redundancy != META_RED_EC || v->nstripe == 0)
+                            continue;
+                        int margin = vol_settled_margin(c, v);
+                        for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+                            if (v->stripe[p] == c->self && v->stripe_pos[p].state == META_STRIPE_FILLING) {
+                                struct sfill_job_cfg cfg = {
+                                    .volume = v->number,
+                                    .pos = p,
+                                    .stripe_version = v->stripe_version,
+                                    .prev_node = v->stripe_pos[p].prev,
+                                    .leader = v->leader,
+                                    .ec_k = v->ec_k,
+                                    .ec_m = v->ec_m,
+                                    .margin = margin,
+                                    .concurrency = c->rebuild_concurrency,
+                                };
+                                if (nnext == cap_next) {
+                                    uint32_t ncap = cap_next ? cap_next * 2 : 32;
+                                    struct sf_key *nv = realloc(next_active, (size_t)ncap * sizeof *nv);
+                                    if (!nv)
+                                        continue;
+                                    next_active = nv;
+                                    cap_next = ncap;
+                                }
+                                if (sfill_start(SF.sf, &cfg) == 0)
+                                    next_active[nnext++] = (struct sf_key){.vol = v->number, .pos = p};
+                            }
+                        }
+                    }
+                }
+                cluster_copy_put(c);
+
+                /* Stop any previously active job no longer FILLING on this node. */
+                for (uint32_t i = 0; i < nactive; i++) {
+                    bool still = false;
+                    for (uint32_t j = 0; j < nnext; j++)
+                        if (next_active[j].vol == active[i].vol && next_active[j].pos == active[i].pos) {
+                            still = true;
+                            break;
+                        }
+                    if (!still)
+                        sfill_stop(SF.sf, active[i].vol, active[i].pos);
+                }
+                /* Swap reusable active/next_active buffers in O(1) without allocating. */
+                struct sf_key *tmp = active;
+                uint32_t tmp_cap = cap_active;
+                active = next_active;
+                cap_active = cap_next;
+                nactive = nnext;
+                next_active = tmp;
+                cap_next = tmp_cap;
+                seen = b;
+                have = true;
+            }
+        }
+
+        pthread_mutex_lock(&SF.mu);
+        if (!SF.stop) {
+            struct timespec ts;
+            tsdb_cond_deadline_ns(&ts, 100 * 1000000LL);
+            pthread_cond_timedwait(&SF.cv, &SF.mu, &ts);
+        }
+        pthread_mutex_unlock(&SF.mu);
+    }
+    free(active);
+    free(next_active);
+    return NULL;
+}
+
+int sfill_cluster_start(struct tsdb *db)
+{
+    if (SF.started)
+        return 0;
+    atomic_store_explicit(&G_db, db, memory_order_release);
+    struct sfill_ops ops = {
+        .objlist = sf_op_objlist,
+        .read_cell = sf_op_read_cell,
+        .vol_view = sf_op_vol_view,
+        .local_be_hold = sf_op_be_hold,
+        .local_be_release = sf_op_be_release,
+        .notify_reopen = sf_op_notify_reopen,
+        .on_report = sf_op_on_report,
+        .arg = NULL,
+    };
+    SF.sf = sfill_new_with_ops(&ops);
+    if (!SF.sf)
+        return -1;
+    tsdb_cond_init_mono(&SF.cv);
+    SF.stop = false;
+    if (pthread_create(&SF.thr, NULL, sf_watch_main, NULL) != 0) {
+        pthread_cond_destroy(&SF.cv);
+        sfill_free(SF.sf);
+        SF.sf = NULL;
+        return -1;
+    }
+    SF.started = true;
+    return 0;
+}
+
+void sfill_cluster_stop(void)
+{
+    if (!SF.started)
+        return;
+    pthread_mutex_lock(&SF.mu);
+    SF.stop = true;
+    pthread_cond_signal(&SF.cv);
+    pthread_mutex_unlock(&SF.mu);
+    pthread_join(SF.thr, NULL);
+    pthread_cond_destroy(&SF.cv);
+    sfill_free(SF.sf);
+    SF.sf = NULL;
+    SF.started = false;
+    cluster_set_fills(NULL, 0);
+}
+
 #else /* a build without the erasure codec: no cluster tier; an ec volume's open is refused by its META */
 
 int chunkpeer_cluster_start(const char *stage_dir)
@@ -336,5 +930,11 @@ int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir)
     (void)vdir;
     return 0;
 }
+int sfill_cluster_start(struct tsdb *db)
+{
+    (void)db;
+    return 0;
+}
+void sfill_cluster_stop(void) {}
 
 #endif

@@ -96,11 +96,25 @@ int chunkpeer_local_call(struct chunksrv *cs, uint32_t from, const struct cs_req
 int chunkpeer_local_put(struct chunksrv *cs, uint32_t from, const struct cs_put_meta *m, int fd, uint64_t base,
                         uint64_t *answered);
 
+/* R9 (D11): OBJLIST client, PL_KIND_CHUNKR (kind 8) rebuild read, and CS_OP_REOPEN cache-reopen notify. */
+int chunkpeer_objlist_page(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume, uint64_t max_version,
+                           bool has_cursor, const uint8_t cursor_oid[16], uint32_t max_entries, int timeout_ms,
+                           uint8_t vuuid_out[16], struct cs_objlist_item **items_out, uint32_t *n_out, bool *more_out);
+int chunkpeer_read_rebuild(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume, uint64_t epoch,
+                           const uint8_t vuuid[16], const uint8_t oid[16], unsigned pos, uint64_t off, void *buf,
+                           size_t len, int timeout_ms);
+int chunkpeer_notify_reopen(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume,
+                            const uint8_t oid[16], int timeout_ms);
+
 /* tsdbd's instance (chunkpeer_cluster.c): over chunksrv_cluster() and the metadata copy; installs chunksrv's epoch
  * source and tier.c's cluster attach hook. Before tsdb_open. */
 int chunkpeer_cluster_start(const char *stage_dir);
 void chunkpeer_cluster_stop(void); /* the epoch source's installer, if it still waits; after chunksrv_cluster_stop */
 struct chunkpeer *chunkpeer_cluster(void);
+/* R9 (r9-fill): tsdbd's checked stripe fill worker and OBJLIST/REOPEN server handlers (chunkpeer_cluster.c). */
+struct tsdb;
+int sfill_cluster_start(struct tsdb *db);
+void sfill_cluster_stop(void);
 /* cvol.c, before a cluster volume's engine opens (writer or replica): an ec volume in the copy gets requires=tier,ec in
  * its META (synced), so that it attaches the peer cold ops; 0 for any other volume, else the line and an error. */
 int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir);

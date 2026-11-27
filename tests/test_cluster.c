@@ -23938,6 +23938,377 @@ static void scen_fullnonisr(void)
 }
 
 
+struct saved_chunk {
+    char name[128];
+    uint8_t *data;
+    size_t len;
+};
+
+static int load_vol_chunks(const char *sdir, uint32_t vol, struct saved_chunk *out, int cap)
+{
+    char vdir[PATH_MAX + 128];
+    snprintf(vdir, sizeof vdir, "%s/s%" PRIu32, sdir, vol);
+    DIR *d = opendir(vdir);
+    if (!d)
+        return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && n < cap) {
+        size_t nl = strlen(de->d_name);
+        if (de->d_name[0] != 'o' || nl < 8 || strcmp(de->d_name + nl - 6, ".chunk") != 0)
+            continue;
+        char fp[PATH_MAX + 256];
+        snprintf(fp, sizeof fp, "%s/%s", vdir, de->d_name);
+        int fd = open(fp, O_RDONLY);
+        if (fd < 0)
+            continue;
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > 0) {
+            uint8_t *buf = malloc((size_t)st.st_size);
+            if (!buf) {
+                close(fd);
+                closedir(d);
+                die("ecrebuild: out of memory reading %s", fp);
+            }
+            size_t got = 0;
+            while (got < (size_t)st.st_size) {
+                ssize_t r = read(fd, buf + got, (size_t)st.st_size - got);
+                if (r <= 0)
+                    break;
+                got += (size_t)r;
+            }
+            if (got == (size_t)st.st_size) {
+                snprintf(out[n].name, sizeof out[n].name, "%s", de->d_name);
+                out[n].data = buf;
+                out[n].len = got;
+                n++;
+            } else {
+                free(buf);
+            }
+        }
+        close(fd);
+    }
+    closedir(d);
+    return n;
+}
+
+/* Flip byte 0 of cell 0 (offset 96 = CHUNK_HDR_BYTES) in every chunk file of volume `vol` in `sdir`. */
+static int rot_vol_chunks(const char *sdir, uint32_t vol)
+{
+    char vdir[PATH_MAX + 128];
+    snprintf(vdir, sizeof vdir, "%s/s%" PRIu32, sdir, vol);
+    DIR *d = opendir(vdir);
+    if (!d)
+        return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        size_t nl = strlen(de->d_name);
+        if (de->d_name[0] != 'o' || nl < 8 || strcmp(de->d_name + nl - 6, ".chunk") != 0)
+            continue;
+        char fp[PATH_MAX + 256];
+        snprintf(fp, sizeof fp, "%s/%s", vdir, de->d_name);
+        int fd = open(fp, O_RDWR);
+        if (fd < 0)
+            continue;
+        uint8_t b = 0;
+        if (pread(fd, &b, 1, 96) == 1) {
+            b ^= 0xffu;
+            if (pwrite(fd, &b, 1, 96) == 1 && fsync(fd) == 0)
+                n++;
+        }
+        close(fd);
+    }
+    closedir(d);
+    return n;
+}
+
+/* ecrebuild (r9-fill): 4+2 on 7 nodes with rebuild_after_s=6. Settles >= 2 objects, saves original bytes of victim V's
+ * chunks, rots cell 0 on a surviving holder R_srv, arms CP_FILL_WRITTEN on 7th node S, kills V for good -> OUT ->
+ * STRIPE_SET(S, FILLING) -> S writes first rebuilt chunk and crashes at fill-written (status 99) -> S restarts,
+ * resumes idempotently, finishes remaining objects -> whole=1 -> STRIPE_WHOLE commits. Verifies every rebuilt chunk
+ * file on S is byte-for-byte identical to V's saved original (despite the rotted survivor!), then stops R_srv and one
+ * more original holder to prove live reads succeed via S after CS_OP_REOPEN (`eccache_reopen`). */
+static void scen_ecrebuild(void)
+{
+    scenario("ecrebuild");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    epoll_after_two = 1;
+    init_rebuild_after_s = 6;
+    for (int i = 0; i < 7; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want_v = 5;
+    await_view(0, p_voters, &want_v, "five voters of seven members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    int voter_srv[7] = {0};
+    for (int i = 0; i < 7; i++)
+        voter_srv[i] = is_voter(&v, ids[i]) != 0;
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    static char sdirs[7][PATH_MAX + 96];
+    for (int i = 0; i < 7; i++) {
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
+        chunk_store_make(sdirs[i], uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i],
+                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-cache-mb 16", sdirs[i]);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with chunk stores");
+
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ecrebuild: vol_add_ec 4+2: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("ecrebuild: twin t42: %s", cluster_strerror(rc));
+
+    struct meta_volume e, tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecrebuild: e42 has no leader");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecrebuild: t42 has no leader");
+    int L = server_of(e.leader), Lt = server_of(tv.leader);
+    if (L < 0 || Lt < 0)
+        die("ecrebuild: bad leaders L=%d Lt=%d", L, Lt);
+    await_isr(L, "e42", 3, 30000, "e42 full ISR before writes");
+
+    /* Write two days so >= 2 .ec objects settle (allowing crash after chunk 1 and resume on chunk 2+). */
+    const int64_t day0 = 1704067200000LL;
+    tsdbc *c = client(L), *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecr.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+    ecb_write_day(c, ide, day0);
+    ecb_write_day(ct, idt, day0);
+    ecb_write_day(c, ide, day0 + 2 * 86400000LL);
+    ecb_write_day(ct, idt, day0 + 2 * 86400000LL);
+
+    int nec = 0;
+    for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) < 2; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("ecrebuild: only %d .ec part(s) settled within 120 s (need >= 2)", nec);
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("ecrebuild: live .part files still remain: %s", live);
+    nec = ecb_ec_parts(L, num);
+
+    struct ecb_sum twin[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++)
+        if ((rc = ecb_read(ct, idt[s], &twin[s])) != 0 || twin[s].n != 4 * ECB_ROWS)
+            die("ecrebuild: twin read series %d: %s (%" PRIu64 " rows)", s, ers(rc), twin[s].n);
+    tsdbc_close(ct);
+
+    /* Find 7th node S (spare not in e.stripe[]), victim V (holder != L, != ml, preferably non-rep/non-voter),
+     * rotted survivor R_srv (another holder != V, != S), and extra stoppable holder W (for post-fill read check). */
+    int S = -1;
+    for (int i = 0; i < 7; i++) {
+        int in_s = 0;
+        for (uint32_t p = 0; p < e.nstripe; p++)
+            in_s |= (e.stripe[p] == ids[i]);
+        if (!in_s) {
+            S = i;
+            break;
+        }
+    }
+    if (S < 0)
+        die("ecrebuild: no spare 7th server");
+    int ml = leader_of(L);
+    int V = -1;
+    uint32_t vpos = UINT32_MAX;
+    for (int pass = 0; pass < 4 && V < 0; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && V < 0; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == L || s == ml || s == S)
+                continue;
+            bool rep = ecb_is_rep(&e, s);
+            bool vot = voter_srv[s] != 0;
+            bool match = (pass == 0 && !rep && !vot) || (pass == 1 && !rep && vot) ||
+                         (pass == 2 && rep && !vot) || (pass == 3 && rep && vot);
+            if (match) {
+                V = s;
+                vpos = p;
+            }
+        }
+    }
+    if (V < 0)
+        die("ecrebuild: could not pick victim holder");
+
+    int R_srv = -1;
+    uint32_t rpos = UINT32_MAX;
+    for (int pass = 0; pass < 2 && R_srv < 0; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && R_srv < 0; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == V || s == S)
+                continue;
+            if ((pass == 0 && s != L && s != ml) || pass == 1) {
+                R_srv = s;
+                rpos = p;
+            }
+        }
+    }
+    if (R_srv < 0)
+        die("ecrebuild: could not pick surviving holder to rot");
+
+    /* Save original chunk files from V BEFORE killing V! */
+    struct saved_chunk orig[32];
+    memset(orig, 0, sizeof orig);
+    int norig = load_vol_chunks(sdirs[V], num, orig, 32);
+    if (norig < 2)
+        die("ecrebuild: victim srv %d holds only %d chunk(s) of vol %" PRIu32 " (expected >= 2)", V, norig, num);
+
+    /* Rot cell 0 of every chunk on surviving holder R_srv! */
+    int nrot = rot_vol_chunks(sdirs[R_srv], num);
+    if (nrot < norig)
+        die("ecrebuild: only rotted %d chunk(s) on survivor srv %d (expected >= %d)", nrot, R_srv, norig);
+    printf("  ecrebuild: %d .ec objects settled; victim srv %d (pos %" PRIu32 ", %d chunks saved), rotted srv %d (pos %" PRIu32 "), spare srv %d\n",
+           nec, V, vpos, norig, R_srv, rpos, S);
+
+    /* Arm CP_FILL_WRITTEN on spare S so it crashes right after writing its first rebuilt chunk! */
+    penv[S] = "TSDB_CRASH_AT=fill-written:1";
+    restart_xargs(S, xa[S]);
+    await_view(L, p_n_placeable, &seven, "spare S back UP with fill-written armed");
+
+    /* Kill victim V for good! */
+    stop(V, SIGKILL);
+
+    /* Read series 0 while V is DOWN so L's eccache caches the objects degraded (exercises CS_OP_REOPEN after fill). */
+    {
+        struct ecb_sum a;
+        if ((rc = ecb_read(c, ide[0], &a)) != 0 || a.n != twin[0].n || a.h != twin[0].h)
+            die("ecrebuild: degraded read while V down: %s (rows %" PRIu64 "/%" PRIu64 ")", ers(rc), a.n, twin[0].n);
+    }
+
+    /* Wait for V -> META_OUT (rebuild_after_s = 6 s) and S to crash at CP_FILL_WRITTEN (status 99)! */
+    struct state_want out_w = {ids[V], META_OUT, 1};
+    await_view(L, p_member_state, &out_w, "victim V marked META_OUT after rebuild_after_s");
+
+    int cst = 0;
+    for (uint64_t t0 = now_ms();;) {
+        pid_t w = waitpid(pids[S], &cst, WNOHANG);
+        if (w == pids[S]) {
+            pids[S] = 0;
+            break;
+        }
+        if (now_ms() - t0 > 45000)
+            die("ecrebuild: spare S did not hit CP_FILL_WRITTEN within 45 s");
+        usleep(50000);
+    }
+    if (!WIFEXITED(cst) || WEXITSTATUS(cst) != CRASH_EXIT_STATUS)
+        die("ecrebuild: spare S exited with status 0x%x (expected %d from CP_FILL_WRITTEN)", cst, CRASH_EXIT_STATUS);
+    if (!log_has(S, "crash point fill-written"))
+        die("ecrebuild: spare S log missing 'crash point fill-written'");
+
+    /* Verify S wrote at least 1 chunk durably before crashing and pos is still FILLING. */
+    struct saved_chunk partial[32];
+    memset(partial, 0, sizeof partial);
+    int npart = load_vol_chunks(sdirs[S], num, partial, 32);
+    for (int i = 0; i < npart; i++)
+        free(partial[i].data);
+    if (npart < 1)
+        die("ecrebuild: spare S wrote 0 chunks before CP_FILL_WRITTEN");
+
+    /* Restart S cleanly (no crash point): fill must resume, skip already-held chunk, finish the rest, and commit STRIPE_WHOLE! */
+    penv[S] = NULL;
+    start(S);
+    struct meta_volume e2 = {0};
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(L, "e42", &e2) && e2.stripe[vpos] == ids[S] &&
+            e2.stripe_pos[vpos].state == META_STRIPE_WHOLE && e2.stripe_version >= 2)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("ecrebuild: pos %" PRIu32 " on S (node %" PRIu32 ") did not reach STRIPE_WHOLE within 60 s "
+                "(cur holder %" PRIu32 " state %u ver %" PRIu64 ")",
+                vpos, ids[S], e2.stripe[vpos], e2.stripe_pos[vpos].state, e2.stripe_version);
+    }
+
+    /* Compare EVERY rebuilt chunk on S byte-for-byte against the original saved from V! */
+    struct saved_chunk rebuilt[32];
+    memset(rebuilt, 0, sizeof rebuilt);
+    int nreb = load_vol_chunks(sdirs[S], num, rebuilt, 32);
+    if (nreb < norig)
+        die("ecrebuild: spare S holds only %d rebuilt chunk(s) (expected >= %d)", nreb, norig);
+    for (int i = 0; i < norig; i++) {
+        int found = -1;
+        for (int j = 0; j < nreb; j++)
+            if (strcmp(orig[i].name, rebuilt[j].name) == 0) {
+                found = j;
+                break;
+            }
+        if (found < 0)
+            die("ecrebuild: missing rebuilt chunk %s on S", orig[i].name);
+        if (rebuilt[found].len != orig[i].len || memcmp(rebuilt[found].data, orig[i].data, orig[i].len) != 0)
+            die("ecrebuild: rebuilt chunk %s on S differs from V's original (%zu vs %zu bytes)",
+                orig[i].name, rebuilt[found].len, orig[i].len);
+    }
+    for (int i = 0; i < norig; i++)
+        free(orig[i].data);
+    for (int i = 0; i < nreb; i++)
+        free(rebuilt[i].data);
+
+    /* Stop one healthy non-S, non-L, non-ml stripe holder W (and also R_srv when quorum permits):
+     * because W is killed and R_srv's cell 0 is rotted (fails xxh64 even if R_srv stays up), at most 3 non-S chunks
+     * have valid cell 0 (< k=4), so reading ALL series from e42 MUST use S's newly rebuilt chunks and proves
+     * CS_OP_REOPEN (`eccache_reopen`). */
+    ml = leader_of(L);
+    int W = -1;
+    for (int pass = 0; pass < 2 && W < 0; pass++) {
+        for (uint32_t p = 0; p < e2.nstripe && W < 0; p++) {
+            int s = server_of(e2.stripe[p]);
+            if (s < 0 || s == L || s == S || s == ml || s == V || s == R_srv)
+                continue;
+            if (pass == 0 && voter_srv[s])
+                continue;
+            if (voter_srv[V] + voter_srv[s] <= 2)
+                W = s;
+        }
+    }
+    if (W < 0)
+        die("ecrebuild: could not pick healthy stripe holder W to stop for post-rebuild read proof");
+    stop(W, SIGKILL);
+    int voters_down = voter_srv[V] + voter_srv[W];
+    if (R_srv != L && R_srv != ml && voters_down + voter_srv[R_srv] <= 2)
+        stop(R_srv, SIGKILL);
+
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0)
+            die("ecrebuild: post-rebuild read series %d failed: %s", s, ers(rc));
+        if (a.n != twin[s].n || a.h != twin[s].h)
+            die("ecrebuild: post-rebuild series %d mismatch: %" PRIu64 " rows (%" PRIx64 "), twin %" PRIu64 " (%" PRIx64 ")",
+                s, a.n, a.h, twin[s].n, twin[s].h);
+    }
+    tsdbc_close(c);
+
+    epoll_after_two = 0;
+    stop_all();
+    printf("  ecrebuild: 4+2 on 7 nodes -> V killed, R_srv rotted, S crashed at fill-written & resumed -> "
+           "STRIPE_WHOLE committed (ver %" PRIu64 "), %d/%d rebuilt chunks bit-exact, all %d series read cleanly\n",
+           e2.stripe_version, norig, norig, ECB_SERIES);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -23990,7 +24361,7 @@ int main(int argc, char **argv)
                {"replfault", scen_replfault}, {"pace", scen_pace},
                {"downkeep", scen_downkeep}, {"downbudget", scen_downbudget}, {"holdkeep", scen_holdkeep},
                {"outmove", scen_outmove}, {"ecout", scen_ecout}, {"metrics", scen_metrics},
-               {"full", scen_full}, {"fullnonisr", scen_fullnonisr}};
+               {"full", scen_full}, {"fullnonisr", scen_fullnonisr}, {"ecrebuild", scen_ecrebuild}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

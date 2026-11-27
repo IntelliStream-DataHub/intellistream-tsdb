@@ -12,6 +12,7 @@
 #include "../include/tsdb.h"
 #include "../src/compat.h"
 #include "../src/eccold.h"
+#include "peerlink.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -2210,4 +2211,78 @@ int chunkpeer_local_put(struct chunksrv *cs, uint32_t from, const struct cs_put_
     }
     free(a.body);
     return rc;
+}
+
+/* ---------------------------------------------------------------- R9 fill transport helpers (D11, PL_KIND_CHUNKR) */
+
+int chunkpeer_objlist_page(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume, uint64_t max_version,
+                           bool has_cursor, const uint8_t cursor_oid[16], uint32_t max_entries, int timeout_ms,
+                           uint8_t vuuid_out[16], struct cs_objlist_item **items_out, uint32_t *n_out, bool *more_out)
+{
+    *items_out = NULL;
+    *n_out = 0;
+    *more_out = false;
+    if (!cs || node == 0 || max_entries == 0 || max_entries > CS_OBJLIST_MAX)
+        return TSDB_ERR_INVALID;
+    struct cs_req r;
+    req_init(&r, CS_OP_OBJLIST, volume, 0, NULL, has_cursor ? cursor_oid : NULL, 0);
+    r.off = max_version;
+    r.has_cursor = has_cursor;
+    r.len = max_entries;
+    int32_t arc = 0;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int rc = (self && node == self)
+                 ? chunkpeer_local_call(cs, self, &r, &arc, &body, &bl)
+                 : chunksrv_call_kind(cs, node, PL_KIND_CHUNK, &r, timeout_ms, &arc, &body, &bl);
+    if (rc == 0 && arc != 0)
+        rc = arc;
+    if (rc == 0)
+        rc = cs_objlist_resp_decode(body, bl, vuuid_out, items_out, n_out, more_out);
+    free(body);
+    return rc;
+}
+
+int chunkpeer_read_rebuild(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume, uint64_t epoch,
+                           const uint8_t vuuid[16], const uint8_t oid[16], unsigned pos, uint64_t off, void *buf,
+                           size_t len, int timeout_ms)
+{
+    if (!cs || node == 0 || len == 0 || len > CS_READ_MAX)
+        return CHUNK_ST_IOERR;
+    struct cs_req r;
+    req_init(&r, CS_OP_READ, volume, epoch, vuuid, oid, pos);
+    r.off = off;
+    r.len = (uint32_t)len;
+    int32_t arc = 0;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int trc = (self && node == self)
+                  ? chunkpeer_local_call(cs, self, &r, &arc, &body, &bl)
+                  : chunksrv_call_kind(cs, node, PL_KIND_CHUNKR, &r, timeout_ms, &arc, &body, &bl);
+    int st = st_of(trc, arc);
+    if (st == CHUNK_ST_OK) {
+        if (bl != len)
+            st = CHUNK_ST_DAMAGED;
+        else
+            memcpy(buf, body, len);
+    }
+    free(body);
+    return st;
+}
+
+int chunkpeer_notify_reopen(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume,
+                            const uint8_t oid[16], int timeout_ms)
+{
+    if (!cs || node == 0 || !oid)
+        return TSDB_ERR_INVALID;
+    struct cs_req r;
+    req_init(&r, CS_OP_REOPEN, volume, 0, NULL, oid, 0);
+    int32_t arc = 0;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int rc = (self && node == self)
+                 ? chunkpeer_local_call(cs, self, &r, &arc, &body, &bl)
+                 : chunksrv_call_kind(cs, node, PL_KIND_CHUNK, &r, timeout_ms, &arc, &body, &bl);
+    free(body);
+    return rc ? rc : arc;
 }

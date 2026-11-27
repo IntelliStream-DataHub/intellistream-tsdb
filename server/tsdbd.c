@@ -7973,6 +7973,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "tsdbd: %s\n", cerr); /* D11: a store of another owner, or one another process holds */
             return 1;
         }
+        if (!witness && sfill_cluster_start(db) != 0) {
+            fprintf(stderr, "tsdbd: cannot start the stripe fill worker\n");
+            return 1;
+        }
         crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
         tsdb_wipe(secret, sizeof secret);
         fprintf(stderr, "tsdbd: cluster peer port on %s:%d (advertised as %s)\n", peer_addr ? peer_addr : addr,
@@ -8007,6 +8011,7 @@ int main(int argc, char **argv)
     eng_set_wal_sync_observer(NULL);
     if (cluster_on) {
         cluster_stop();
+        sfill_cluster_stop(); /* stops fill workers while chunk server & db are still open */
         creport_reset();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         chunksrv_cluster_stop(); /* likewise for the chunk links; freed below */

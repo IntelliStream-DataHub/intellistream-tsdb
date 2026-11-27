@@ -112,6 +112,8 @@ static size_t req_body_len(uint8_t op)
     case CS_OP_LIST: return 1 + 16 + 2 + 4;
     case CS_OP_DEL: return ID_LEN;
     case CS_OP_EPOCH: return 0;
+    case CS_OP_OBJLIST: return 8 + 1 + 16 + 4;
+    case CS_OP_REOPEN: return 16;
     default: return (size_t)-1;
     }
 }
@@ -139,6 +141,13 @@ size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap)
         memcpy(b + 1, r->oid, 16);
         put16(b + 17, r->pos);
         put32(b + 19, r->len);
+    } else if (r->op == CS_OP_OBJLIST) {
+        put64(b, r->off);
+        b[8] = r->has_cursor;
+        memcpy(b + 9, r->oid, 16);
+        put32(b + 25, r->len);
+    } else if (r->op == CS_OP_REOPEN) {
+        memcpy(b, r->oid, 16);
     }
     put64(out + REQ_HDR + bl, xh(out, REQ_HDR + bl));
     return REQ_HDR + bl + CS_CHECK_LEN;
@@ -181,8 +190,97 @@ int cs_req_decode(const uint8_t *p, size_t n, struct cs_req *r)
         r->len = get32(b + 19);
         if (r->len == 0 || r->len > CS_LIST_MAX || r->pos >= CHUNK_POS_MAX)
             return -1;
+    } else if (r->op == CS_OP_OBJLIST) {
+        if (b[8] > 1)
+            return -1;
+        r->off = get64(b);
+        r->has_cursor = b[8];
+        memcpy(r->oid, b + 9, 16);
+        r->len = get32(b + 25);
+        if (r->len == 0 || r->len > CS_OBJLIST_MAX)
+            return -1;
+    } else if (r->op == CS_OP_REOPEN) {
+        memcpy(r->oid, b, 16);
     }
     return 0;
+}
+
+static int objlist_body_valid(const uint8_t *b, size_t bl)
+{
+    if (bl < CS_OBJLIST_HDR || bl > CS_OBJLIST_BYTES_MAX + CS_OBJLIST_HDR + 1024u)
+        return -1;
+    uint32_t n = get32(b + 16);
+    if (n > CS_OBJLIST_MAX || b[20] > 1)
+        return -1;
+    size_t off = CS_OBJLIST_HDR;
+    for (uint32_t i = 0; i < n; i++) {
+        if (off + CS_OBJLIST_ENTRY_HDR > bl)
+            return -1;
+        const uint8_t *e = b + off;
+        chunk_geom g;
+        if (chunk_geom_make(&g, get16(e + 16), get16(e + 18), get32(e + 20), get64(e + 24)) != 0)
+            return -1;
+        uint64_t ns = get64(e + 52);
+        if (ns != chunk_sums_total(&g))
+            return -1;
+        off += CS_OBJLIST_ENTRY_HDR;
+        if (ns > (bl - off) / 8)
+            return -1;
+        off += (size_t)(ns * 8);
+    }
+    return off == bl ? 0 : -1;
+}
+
+int cs_objlist_resp_decode(const uint8_t *body, size_t body_len, uint8_t vuuid_out[16],
+                           struct cs_objlist_item **items_out, uint32_t *n_out, bool *more_out)
+{
+    *items_out = NULL;
+    *n_out = 0;
+    *more_out = false;
+    if (objlist_body_valid(body, body_len) != 0)
+        return TSDB_ERR_CORRUPT;
+    if (vuuid_out)
+        memcpy(vuuid_out, body, 16);
+    uint32_t n = get32(body + 16);
+    *more_out = body[20] != 0;
+    if (n == 0)
+        return 0;
+    struct cs_objlist_item *it = calloc(n, sizeof *it);
+    if (!it)
+        return TSDB_ERR_NOMEM;
+    size_t off = CS_OBJLIST_HDR;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *e = body + off;
+        memcpy(it[i].oid, e, 16);
+        (void)chunk_geom_make(&it[i].g, get16(e + 16), get16(e + 18), get32(e + 20), get64(e + 24));
+        it[i].positions = get32(e + 32);
+        it[i].writer_epoch = get64(e + 36);
+        it[i].stripe_version = get64(e + 44);
+        it[i].nsums = get64(e + 52);
+        off += CS_OBJLIST_ENTRY_HDR;
+        if (it[i].nsums > 0) {
+            it[i].sums = malloc((size_t)it[i].nsums * sizeof(uint64_t));
+            if (!it[i].sums) {
+                cs_objlist_items_free(it, i + 1);
+                return TSDB_ERR_NOMEM;
+            }
+            for (uint64_t j = 0; j < it[i].nsums; j++)
+                it[i].sums[j] = get64(body + off + (size_t)(j * 8));
+            off += (size_t)(it[i].nsums * 8);
+        }
+    }
+    *items_out = it;
+    *n_out = n;
+    return 0;
+}
+
+void cs_objlist_items_free(struct cs_objlist_item *items, uint32_t n)
+{
+    if (!items)
+        return;
+    for (uint32_t i = 0; i < n; i++)
+        free(items[i].sums);
+    free(items);
 }
 
 int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
@@ -197,7 +295,7 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     r->body_len = n - RESP_HDR;
     if (get64(p + 13) != resp_check(p, n) && chunksrv_mutant != CS_MUT_NORESPCHECK)
         return -1;
-    if (r->op < CS_OP_READ || r->op > CS_OP_PUT || r->rc > 0)
+    if (r->op < CS_OP_READ || r->op > CS_OP_REOPEN || r->rc > 0)
         return -1;
     if (r->rc != 0)
         return r->body_len == 0 ? 0 : -1;
@@ -212,6 +310,8 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     case CS_OP_DEL: return bl == 0 ? 0 : -1;
     case CS_OP_EPOCH: return bl == 9 && b[8] <= 1 ? 0 : -1;
     case CS_OP_PUT: return bl == 8 ? 0 : -1;
+    case CS_OP_OBJLIST: return objlist_body_valid(b, bl);
+    case CS_OP_REOPEN: return bl == 0 ? 0 : -1;
     }
     return -1;
 }
@@ -329,6 +429,7 @@ int chunksrv_st(int rc)
 struct cs_job {
     struct cs_job *next;
     int commit;          /* 1: put is to be committed; 0: a request frame */
+    int kind;            /* PL_KIND_CHUNK or PL_KIND_CHUNKR */
     struct cs_put *put;
     struct plink *l;
     uint64_t gen;
@@ -356,8 +457,8 @@ struct cs_pend {
 struct cs_peer {
     uint32_t id;
     char addr[128];
-    struct plink *lc, *lb; /* the dialed CHUNK and CHUNKB links */
-    bool gone;             /* the member left: its links are stopped (plink_stop) */
+    struct plink *lc, *lb, *lr; /* the dialed CHUNK, CHUNKB, and CHUNKR links */
+    bool gone;                  /* the member left: its links are stopped (plink_stop) */
 };
 
 /* A CHUNKB callback as a job for the put thread of its peer: OPEN, DATA and END in the link's order. */
@@ -395,6 +496,12 @@ struct chunksrv {
     char **paths;
     _Atomic(chunksrv_epoch_fn) src;
     _Atomic(void *) src_arg;
+    _Atomic(chunksrv_objlist_fn) objlist;
+    _Atomic(void *) objlist_arg;
+    _Atomic(chunksrv_reopen_fn) reopen;
+    _Atomic(void *) reopen_arg;
+    _Atomic(chunksrv_read_pace_fn) read_pace;
+    _Atomic(void *) read_pace_arg;
     struct chunksrv_stats st;
 
     /* the network half (chunksrv_listen) */
@@ -408,6 +515,16 @@ struct chunksrv {
     bool closing;
     pthread_t *workers;
     int nworkers;
+    /* Dedicated worker pool for PL_KIND_CHUNKR (kind 8) rebuild reads so send-side pacing never stalls
+     * foreground PL_KIND_CHUNK reads, sums, deletes, or put commits. */
+    pthread_mutex_t rqmu;
+    pthread_cond_t rqcv;
+    struct cs_job *rqh, *rqt;
+    size_t rqbytes;
+    struct plink **rpaused;
+    size_t nrpaused, crpaused;
+    pthread_t *rworkers;
+    int nrworkers;
     pthread_mutex_t cmu; /* pending calls, peers, link contexts */
     struct cs_pend *pend[CS_PEND_BUCKETS];
     struct cs_peer *peers;
@@ -438,6 +555,8 @@ struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_
     }
     pthread_mutex_init(&cs->qmu, NULL);
     pthread_cond_init(&cs->qcv, NULL);
+    pthread_mutex_init(&cs->rqmu, NULL);
+    pthread_cond_init(&cs->rqcv, NULL);
     pthread_mutex_init(&cs->cmu, NULL);
     uint64_t r;
     if (chunk_random(&r, sizeof r) != 0) { /* a restarted client's ids never meet a late answer to its previous life */
@@ -478,6 +597,8 @@ void chunksrv_close(struct chunksrv *cs)
     free(cs->paths);
     pthread_mutex_destroy(&cs->qmu);
     pthread_cond_destroy(&cs->qcv);
+    pthread_mutex_destroy(&cs->rqmu);
+    pthread_cond_destroy(&cs->rqcv);
     pthread_mutex_destroy(&cs->cmu);
     free(cs);
 }
@@ -533,6 +654,24 @@ void chunksrv_epoch_source(struct chunksrv *cs, chunksrv_epoch_fn fn, void *arg)
 {
     atomic_store(&cs->src_arg, arg);
     atomic_store(&cs->src, fn);
+}
+
+void chunksrv_set_objlist(struct chunksrv *cs, chunksrv_objlist_fn fn, void *arg)
+{
+    atomic_store(&cs->objlist_arg, arg);
+    atomic_store(&cs->objlist, fn);
+}
+
+void chunksrv_set_reopen(struct chunksrv *cs, chunksrv_reopen_fn fn, void *arg)
+{
+    atomic_store(&cs->reopen_arg, arg);
+    atomic_store(&cs->reopen, fn);
+}
+
+void chunksrv_set_read_pacer(struct chunksrv *cs, chunksrv_read_pace_fn fn, void *arg)
+{
+    atomic_store(&cs->read_pace_arg, arg);
+    atomic_store(&cs->read_pace, fn);
 }
 
 /* Each counter is read on its own (relaxed, as STAT writes them): a plain struct copy races the workers. */
@@ -635,7 +774,7 @@ static void ident_of(const struct cs_req *r, chunk_ident *id)
     id->pos = r->pos;
 }
 
-static void do_read(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn reply, void *arg)
+static void do_read(struct chunksrv *cs, int kind, const struct cs_req *r, cs_reply_fn reply, void *arg)
 {
     chunk_ident id;
     ident_of(r, &id);
@@ -654,6 +793,11 @@ static void do_read(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn rep
     if (rd)
         chunk_rd_close(rd);
     if (rc == 0) {
+        if (kind == PL_KIND_CHUNKR) {
+            chunksrv_read_pace_fn pfn = atomic_load(&cs->read_pace);
+            if (pfn)
+                pfn(atomic_load(&cs->read_pace_arg), r->volume, r->len);
+        }
         put64(b, r->rid);
         b[8] = CS_OP_READ;
         put32(b + 9, 0);
@@ -810,10 +954,90 @@ static void do_list(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn rep
     free(b);
 }
 
-static int chunksrv_handle_req(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, cs_reply_fn reply, void *arg)
+static void do_objlist(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn reply, void *arg)
+{
+    chunksrv_objlist_fn fn = atomic_load(&cs->objlist);
+    if (!fn) {
+        reply_rc(reply, arg, r->rid, CS_OP_OBJLIST, TSDB_ERR_UNAVAILABLE, NULL, 0);
+        return;
+    }
+    uint8_t vuuid[16] = {0};
+    struct cs_objlist_item *items = NULL;
+    uint32_t n = 0;
+    bool more = false;
+    int rc = fn(atomic_load(&cs->objlist_arg), r->volume, r->off, r->has_cursor, r->oid, r->len,
+                CS_OBJLIST_BYTES_MAX, vuuid, &items, &n, &more);
+    if (rc != 0) {
+        cs_objlist_items_free(items, n);
+        reply_rc(reply, arg, r->rid, CS_OP_OBJLIST, rc, NULL, 0);
+        return;
+    }
+    if (n > CS_OBJLIST_MAX) {
+        cs_objlist_items_free(items, n);
+        reply_rc(reply, arg, r->rid, CS_OP_OBJLIST, TSDB_ERR_INVALID, NULL, 0);
+        return;
+    }
+    size_t bl = CS_OBJLIST_HDR;
+    for (uint32_t i = 0; i < n; i++) {
+        if (items[i].nsums > (CS_OBJLIST_BYTES_MAX / 8)) {
+            cs_objlist_items_free(items, n);
+            reply_rc(reply, arg, r->rid, CS_OP_OBJLIST, TSDB_ERR_INVALID, NULL, 0);
+            return;
+        }
+        bl += CS_OBJLIST_ENTRY_HDR + (size_t)(items[i].nsums * 8);
+    }
+    uint8_t *b = malloc(bl);
+    if (!b) {
+        cs_objlist_items_free(items, n);
+        reply_rc(reply, arg, r->rid, CS_OP_OBJLIST, TSDB_ERR_NOMEM, NULL, 0);
+        return;
+    }
+    memcpy(b, vuuid, 16);
+    put32(b + 16, n);
+    b[20] = more ? 1 : 0;
+    size_t off = CS_OBJLIST_HDR;
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t *e = b + off;
+        memcpy(e, items[i].oid, 16);
+        put16(e + 16, items[i].g.k);
+        put16(e + 18, items[i].g.m);
+        put32(e + 20, items[i].g.cell);
+        put64(e + 24, items[i].g.len);
+        put32(e + 32, items[i].positions);
+        put64(e + 36, items[i].writer_epoch);
+        put64(e + 44, items[i].stripe_version);
+        put64(e + 52, items[i].nsums);
+        off += CS_OBJLIST_ENTRY_HDR;
+        for (uint64_t j = 0; j < items[i].nsums; j++)
+            put64(b + off + (size_t)(j * 8), items[i].sums[j]);
+        off += (size_t)(items[i].nsums * 8);
+    }
+    cs_objlist_items_free(items, n);
+    reply_rc(reply, arg, r->rid, CS_OP_OBJLIST, 0, b, bl);
+    free(b);
+}
+
+static void do_reopen(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn reply, void *arg)
+{
+    chunksrv_reopen_fn fn = atomic_load(&cs->reopen);
+    if (fn)
+        fn(atomic_load(&cs->reopen_arg), r->volume, r->oid);
+    reply_rc(reply, arg, r->rid, CS_OP_REOPEN, 0, NULL, 0);
+}
+
+static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, const struct cs_req *r, cs_reply_fn reply,
+                               void *arg)
 {
     (void)peer;
     STAT(cs, requests);
+    if (r->op == CS_OP_OBJLIST) {
+        do_objlist(cs, r, reply, arg);
+        return 0;
+    }
+    if (r->op == CS_OP_REOPEN) {
+        do_reopen(cs, r, reply, arg);
+        return 0;
+    }
     if (!cs->be) {
         reply_rc(reply, arg, r->rid, r->op, TSDB_ERR_UNAVAILABLE, NULL, 0);
         return 0;
@@ -825,7 +1049,7 @@ static int chunksrv_handle_req(struct chunksrv *cs, uint32_t peer, const struct 
         return 0;
     }
     switch (r->op) {
-    case CS_OP_READ: do_read(cs, r, reply, arg); break;
+    case CS_OP_READ: do_read(cs, kind, r, reply, arg); break;
     case CS_OP_SUMS: do_sums(cs, r, reply, arg); break;
     case CS_OP_LIST: do_list(cs, r, reply, arg); break;
     case CS_OP_DEL: {
@@ -855,7 +1079,7 @@ int chunksrv_handle(struct chunksrv *cs, uint32_t peer, const uint8_t *p, size_t
         STAT(cs, malformed);
         return -1;
     }
-    return chunksrv_handle_req(cs, peer, &r, reply, arg);
+    return chunksrv_handle_req(cs, PL_KIND_CHUNK, peer, &r, reply, arg);
 }
 
 /* ---------------------------------------------------------------- puts */
@@ -1085,7 +1309,7 @@ static void *worker_main(void *arg)
             chunksrv_put_end(j->put, 0);
         } else {
             struct rctx c = {.l = j->l, .gen = j->gen};
-            chunksrv_handle_req(cs, j->peer, &j->req, reply_link, &c);
+            chunksrv_handle_req(cs, j->kind, j->peer, &j->req, reply_link, &c);
         }
         free(j);
         pthread_mutex_lock(&cs->qmu);
@@ -1094,9 +1318,65 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
+static void rq_push(struct chunksrv *cs, struct cs_job *j, struct plink *pause_l)
+{
+    pthread_mutex_lock(&cs->rqmu);
+    j->next = NULL;
+    if (cs->rqt)
+        cs->rqt->next = j;
+    else
+        cs->rqh = j;
+    cs->rqt = j;
+    cs->rqbytes += j->n;
+    if (pause_l && cs->rqbytes > CS_QUEUE_BYTES) {
+        if (cs->nrpaused == cs->crpaused) {
+            size_t nc = cs->crpaused ? 2 * cs->crpaused : 8;
+            struct plink **v = realloc(cs->rpaused, nc * sizeof *v);
+            if (v)
+                cs->rpaused = v, cs->crpaused = nc;
+        }
+        if (cs->nrpaused < cs->crpaused) {
+            cs->rpaused[cs->nrpaused++] = pause_l;
+            plink_pause(pause_l, 1);
+        }
+    }
+    pthread_cond_signal(&cs->rqcv);
+    pthread_mutex_unlock(&cs->rqmu);
+}
+
+static void *rworker_main(void *arg)
+{
+    struct chunksrv *cs = arg;
+    pthread_mutex_lock(&cs->rqmu);
+    for (;;) {
+        while (!cs->rqh && !cs->closing)
+            pthread_cond_wait(&cs->rqcv, &cs->rqmu);
+        if (cs->closing)
+            break;
+        struct cs_job *j = cs->rqh;
+        cs->rqh = j->next;
+        if (!cs->rqh)
+            cs->rqt = NULL;
+        cs->rqbytes -= j->n;
+        if (cs->nrpaused && cs->rqbytes < CS_QUEUE_BYTES / 2) {
+            for (size_t i = 0; i < cs->nrpaused; i++)
+                plink_pause(cs->rpaused[i], 0);
+            cs->nrpaused = 0;
+        }
+        pthread_mutex_unlock(&cs->rqmu);
+        struct rctx c = {.l = j->l, .gen = j->gen};
+        chunksrv_handle_req(cs, j->kind, j->peer, &j->req, reply_link, &c);
+        free(j);
+        pthread_mutex_lock(&cs->rqmu);
+    }
+    pthread_mutex_unlock(&cs->rqmu);
+    return NULL;
+}
+
 static void on_link_chunk(void *arg, struct plink *l, int up)
 {
-    if (up || plink_kind(l) != PL_KIND_CHUNK)
+    int kind = plink_kind(l);
+    if (up || (kind != PL_KIND_CHUNK && kind != PL_KIND_CHUNKR))
         return;
     struct chunksrv *cs = arg;
     uint64_t gen = plink_gen(l);
@@ -1116,7 +1396,8 @@ static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p,
 {
     struct chunksrv *cs = arg;
     int kind = plink_kind(l);
-    uint8_t *flipped = kind == PL_KIND_CHUNK && (type == CS_T_REQ || type == CS_T_RESP)
+    bool is_rpc = kind == PL_KIND_CHUNK || kind == PL_KIND_CHUNKR;
+    uint8_t *flipped = is_rpc && (type == CS_T_REQ || type == CS_T_RESP)
                            ? flip_take(type == CS_T_REQ ? CS_FLIP_REQ : CS_FLIP_RESP, p, n)
                            : NULL;
     if (flipped)
@@ -1127,18 +1408,22 @@ static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p,
 
 static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8_t type, const uint8_t *p, size_t n)
 {
-    if (kind == PL_KIND_CHUNK && type == CS_T_REQ) {
+    bool is_rpc = kind == PL_KIND_CHUNK || kind == PL_KIND_CHUNKR;
+    if (is_rpc && type == CS_T_REQ) {
         struct cs_req r;
         if (cs_req_decode(p, n, &r) != 0)
             goto bad;
         struct cs_job *j = malloc(sizeof *j);
         if (!j)
             return; /* the requester times out */
-        *j = (struct cs_job){.l = l, .gen = plink_gen(l), .peer = plink_peer(l), .n = n, .req = r};
-        q_push(cs, j, l);
+        *j = (struct cs_job){.kind = kind, .l = l, .gen = plink_gen(l), .peer = plink_peer(l), .n = n, .req = r};
+        if (kind == PL_KIND_CHUNKR)
+            rq_push(cs, j, l);
+        else
+            q_push(cs, j, l);
         return;
     }
-    if (kind == PL_KIND_CHUNK && type == CS_T_RESP) {
+    if (is_rpc && type == CS_T_RESP) {
         struct cs_resp r;
         if (cs_resp_decode(p, n, &r) != 0)
             goto bad;
@@ -1318,12 +1603,22 @@ int chunksrv_listen(struct chunksrv *cs, const struct chunksrv_net_cfg *cfg)
         return -1;
     cs->closing = false;
     cs->nworkers = cfg->workers > 0 ? cfg->workers : 4;
+    cs->nrworkers = 2;
     cs->workers = calloc((size_t)cs->nworkers, sizeof *cs->workers);
-    if (!cs->workers)
+    cs->rworkers = calloc((size_t)cs->nrworkers, sizeof *cs->rworkers);
+    if (!cs->workers || !cs->rworkers) {
+        free(cs->workers);
+        free(cs->rworkers);
+        cs->workers = cs->rworkers = NULL;
+        cs->nworkers = cs->nrworkers = 0;
         return -1;
-    int started = 0;
+    }
+    int started = 0, rstarted = 0;
     for (; started < cs->nworkers; started++)
         if (pthread_create(&cs->workers[started], NULL, worker_main, cs) != 0)
+            break;
+    for (; started == cs->nworkers && rstarted < cs->nrworkers; rstarted++)
+        if (pthread_create(&cs->rworkers[rstarted], NULL, rworker_main, cs) != 0)
             break;
     struct pl_cfg pc = {.secret = cfg->secret, .secret_len = cfg->secret_len, .arg = cs, .on_link = on_link_chunk,
                         .on_frame = on_frame, .bulk = {.open = b_open, .data = b_data, .end = b_end},
@@ -1332,9 +1627,10 @@ int chunksrv_listen(struct chunksrv *cs, const struct chunksrv_net_cfg *cfg)
     memcpy(pc.self.uuid, cfg->uuid, 16);
     memcpy(pc.self.ident, cfg->ident, 16);
     snprintf(pc.advertise, sizeof pc.advertise, "%s", cfg->advertise);
-    cs->pl = started == cs->nworkers ? peerlink_new(&pc) : NULL;
+    cs->pl = (started == cs->nworkers && rstarted == cs->nrworkers) ? peerlink_new(&pc) : NULL;
     if (!cs->pl) {
         cs->nworkers = started;
+        cs->nrworkers = rstarted;
         cs->listening = true;
         chunksrv_unlisten(cs);
         return -1;
@@ -1356,13 +1652,22 @@ void chunksrv_unlisten(struct chunksrv *cs)
     if (!cs->listening)
         return;
     pthread_mutex_lock(&cs->qmu);
+    pthread_mutex_lock(&cs->rqmu);
     cs->closing = true;
+    pthread_cond_broadcast(&cs->rqcv);
+    pthread_mutex_unlock(&cs->rqmu);
     pthread_cond_broadcast(&cs->qcv);
     pthread_mutex_unlock(&cs->qmu);
     for (int i = 0; i < cs->nworkers; i++)
         pthread_join(cs->workers[i], NULL);
     free(cs->workers);
     cs->workers = NULL;
+    cs->nworkers = 0;
+    for (int i = 0; i < cs->nrworkers; i++)
+        pthread_join(cs->rworkers[i], NULL);
+    free(cs->rworkers);
+    cs->rworkers = NULL;
+    cs->nrworkers = 0;
     for (struct cs_lctx *x = cs->lctx; x; x = x->next) { /* their answers go out on the links: stopped first */
         pthread_mutex_lock(&x->mu);
         x->stop = true;
@@ -1386,6 +1691,15 @@ void chunksrv_unlisten(struct chunksrv *cs)
     free(cs->paused);
     cs->paused = NULL;
     cs->npaused = cs->cpaused = 0;
+    for (struct cs_job *j = cs->rqh, *nx; j; j = nx) {
+        nx = j->next;
+        free(j);
+    }
+    cs->rqh = cs->rqt = NULL;
+    cs->rqbytes = 0;
+    free(cs->rpaused);
+    cs->rpaused = NULL;
+    cs->nrpaused = cs->crpaused = 0;
     for (struct cs_lctx *x = cs->lctx, *nx; x; x = nx) { /* after the links: nothing queues any more */
         nx = x->next;
         for (struct cs_bjob *j = x->h, *jn; j; j = jn) {
@@ -1430,6 +1744,7 @@ int chunksrv_set_peer(struct chunksrv *cs, uint32_t id, const char *addr)
         snprintf(pp->addr, sizeof pp->addr, "%s", addr);
         plink_set_addr(pp->lc, addr);
         plink_set_addr(pp->lb, addr);
+        plink_set_addr(pp->lr, addr);
     } else if (!pp) {
         if (cs->npeers == cs->cpeers) {
             size_t nc = cs->cpeers ? 2 * cs->cpeers : 8;
@@ -1446,7 +1761,8 @@ int chunksrv_set_peer(struct chunksrv *cs, uint32_t id, const char *addr)
         snprintf(pp->addr, sizeof pp->addr, "%s", addr);
         pp->lc = peerlink_dial(cs->pl, id, addr, PL_KIND_CHUNK);
         pp->lb = peerlink_dial(cs->pl, id, addr, PL_KIND_CHUNKB);
-        if (pp->lc && pp->lb)
+        pp->lr = peerlink_dial(cs->pl, id, addr, PL_KIND_CHUNKR);
+        if (pp->lc && pp->lb && pp->lr)
             cs->npeers++;
         else
             rc = -1;
@@ -1467,19 +1783,24 @@ void chunksrv_keep_peers(struct chunksrv *cs, const uint32_t *ids, size_t n)
             pp->gone = true;
             plink_stop(pp->lc);
             plink_stop(pp->lb);
+            plink_stop(pp->lr);
         }
     }
     pthread_mutex_unlock(&cs->cmu);
 }
 
-static int peer_links(struct chunksrv *cs, uint32_t id, struct plink **lc, struct plink **lb)
+static int peer_links(struct chunksrv *cs, uint32_t id, struct plink **lc, struct plink **lb, struct plink **lr)
 {
     pthread_mutex_lock(&cs->cmu);
     int rc = -1;
     for (size_t i = 0; i < cs->npeers; i++)
         if (cs->peers[i].id == id && !cs->peers[i].gone) {
-            *lc = cs->peers[i].lc;
-            *lb = cs->peers[i].lb;
+            if (lc)
+                *lc = cs->peers[i].lc;
+            if (lb)
+                *lb = cs->peers[i].lb;
+            if (lr)
+                *lr = cs->peers[i].lr;
             rc = 0;
         }
     pthread_mutex_unlock(&cs->cmu);
@@ -1553,13 +1874,18 @@ static int send_until(struct plink *l, const uint8_t *p, size_t n, uint64_t dead
     }
 }
 
-int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, int timeout_ms, int32_t *rc,
-                  uint8_t **body, size_t *body_len)
+int chunksrv_call_kind(struct chunksrv *cs, uint32_t peer, int kind, const struct cs_req *r, int timeout_ms,
+                       int32_t *rc, uint8_t **body, size_t *body_len)
 {
     *body = NULL;
     *body_len = 0;
-    struct plink *lc, *lb;
-    if (!cs->pl || peer_links(cs, peer, &lc, &lb) != 0)
+    if (kind != PL_KIND_CHUNK && kind != PL_KIND_CHUNKR)
+        return TSDB_ERR_INVALID;
+    struct plink *lc = NULL, *lb = NULL, *lr = NULL;
+    if (!cs->pl || peer_links(cs, peer, &lc, &lb, &lr) != 0)
+        return TSDB_ERR_UNAVAILABLE;
+    struct plink *link = kind == PL_KIND_CHUNKR ? lr : lc;
+    if (!link)
         return TSDB_ERR_UNAVAILABLE;
     uint64_t deadline = now_ns() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 30000) * 1000000ull;
     struct cs_req q = *r;
@@ -1572,16 +1898,16 @@ int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, in
     if (!pd)
         return TSDB_ERR_NOMEM;
     uint64_t gen = 0;
-    int ret = send_until(lc, buf, n, deadline, &gen) == 0 ? 0 : TSDB_ERR_UNAVAILABLE;
+    int ret = send_until(link, buf, n, deadline, &gen) == 0 ? 0 : TSDB_ERR_UNAVAILABLE;
     pthread_mutex_lock(&cs->cmu);
     if (ret == 0) {
-        pd->link = lc;
+        pd->link = link;
         pd->gen = gen;
         if (!pd->done) {
             /* reply_link binds its response to the connection generation that carried the request; once that
              * connection drops, no answer can arrive for this rid, so fail fast instead of hanging until deadline. */
             pthread_mutex_unlock(&cs->cmu);
-            bool alive = plink_up(lc) && plink_gen(lc) == gen;
+            bool alive = plink_up(link) && plink_gen(link) == gen;
             pthread_mutex_lock(&cs->cmu);
             if (!alive && !pd->done)
                 pd->aborted = true;
@@ -1600,6 +1926,12 @@ int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, in
     pend_unref(cs, pd);
     pthread_mutex_unlock(&cs->cmu);
     return ret;
+}
+
+int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, int timeout_ms, int32_t *rc,
+                  uint8_t **body, size_t *body_len)
+{
+    return chunksrv_call_kind(cs, peer, PL_KIND_CHUNK, r, timeout_ms, rc, body, body_len);
 }
 
 struct jarg {
@@ -1627,8 +1959,8 @@ static void put_job_done(void *arg, uint64_t file, int status, uint64_t sent)
 int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_meta *m, int fd, uint64_t base,
                         uint64_t sum, int timeout_ms)
 {
-    struct plink *lc, *lb;
-    if (!cs->pl || peer_links(cs, peer, &lc, &lb) != 0)
+    struct plink *lc = NULL, *lb = NULL;
+    if (!cs->pl || peer_links(cs, peer, &lc, &lb, NULL) != 0)
         return TSDB_ERR_UNAVAILABLE;
     uint64_t deadline = now_ns() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 30000) * 1000000ull;
     while (!(plink_up(lc) && plink_up(lb)) && now_ns() < deadline) /* the answer comes back on the CHUNK link */

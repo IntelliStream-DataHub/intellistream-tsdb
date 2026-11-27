@@ -349,12 +349,14 @@ struct cluster_copy_vol {
     uint8_t redundancy, ec_k, ec_m, gc_suspended;
     uint32_t nstripe;
     uint32_t stripe[META_STRIPE_MAX];
+    struct meta_stripe_pos stripe_pos[META_STRIPE_MAX]; /* R9 (D9, D10): per-position WHOLE/FILLING + prev */
     uint64_t stripe_version;
 };
 struct cluster_copy {
     uint64_t applied, applied_term, restore_gen;
     uint32_t self; /* this server's member id (0: none yet) */
     uint32_t nmembers, nvolumes;
+    uint32_t rebuild_concurrency; /* R9 (D11, D23): objects in flight per server */
     const struct cluster_copy_member *members; /* ascending by id */
     const struct cluster_copy_vol *volumes;    /* ascending by number */
 };
@@ -428,6 +430,8 @@ void cluster_set_fill_pct(uint8_t pct);
 uint8_t cluster_get_fill_pct(void);
 uint32_t cluster_young_high_pct(void);
 int cluster_self_full(void);
+/* R9 (D10, D11; filled by r9-fill): HBS_FILL entries published by sfill for the heartbeat path. Any thread. */
+void cluster_set_fills(const struct cluster_fill_report *fills, uint32_t nfills);
 /* R9 (D5): before tsdbd exits 1 on fail-stop, ask the cluster thread to send one last heartbeat with failstop=1 to the
  * Raft leader it knows and wait at most timeout_ms (capped at 100 ms). Safe no-op when the cluster thread is not
  * running. */
