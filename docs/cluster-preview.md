@@ -582,7 +582,7 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 
 Options of `init`. Each number is a whole number above 0. The settings are fixed when the cluster is made and shown by
 `status`; changing one on a running cluster is not built (to change one, make the cluster again). Those about
-replication, leases, rebuilds and transfers are acted on; `--out-after-s`, `--volumes-per-server`, `--lease-s` and `--read-barrier` are only
+replication, leases, rebuilds and transfers are acted on; `--rebuild-after-s`, `--volumes-per-server`, `--lease-s` and `--read-barrier` are only
 stored, and `--mode shared` and `--failover` (the shared side of the cluster) are not built. Members are only `up` or `down` in the preview: `draining` and `out` are for later.
 
 | Option | Default | Meaning |
@@ -592,7 +592,7 @@ stored, and `--mode shared` and `--failover` (the shared side of the cluster) ar
 | `--node-timeout-ms MS` | 3000 | A server is marked down after this long without a heartbeat. |
 | `--heartbeat-ms MS` | 500 | How often servers report. Below `--node-timeout-ms`. |
 | `--isr-lag-ms MS` | 1000 | A copy this far behind (or silent this long) leaves the in-sync set, and comes back once it has caught up. At least 500. |
-| `--out-after-s S` | 1800 | A server down this long is marked `out`. Stored; in the preview no server is ever marked `out`. |
+| `--rebuild-after-s S` | 1800 | A server down this long is marked `out`. Stored; in the preview no server is ever marked `out`. |
 | `--voter-replace-s S` | 600 | A voter down this long is replaced by another member. |
 | `--voters N` | 5 | The most voters the group has (an even number counts as one less). |
 | `--volumes-per-server N` | 16 | Volumes led per server. |

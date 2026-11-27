@@ -60,7 +60,7 @@ static void members_of(struct fwd *f, const struct cluster_copy *c)
     uint32_t n = 0;
     for (uint32_t i = 0; i < c->nmembers; i++) {
         const struct cluster_copy_member *cm = &c->members[i];
-        if (cm->state == META_OUT || !cm->peer[0])
+        if (cm->state >= META_OUT || !cm->peer[0])
             continue;
         m[n].id = cm->id;
         snprintf(m[n].peer, sizeof m[n].peer, "%s", cm->peer);

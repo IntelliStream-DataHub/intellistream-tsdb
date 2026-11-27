@@ -265,8 +265,8 @@ cgroup, so `nice` does not keep your work out of its way.
   ops STRIPE_SET, GC_SUSPEND, GC_RESUME (`test_cluster ecadd`; an EC add is admin op VOLUME_ADD_EC, so an older server
   refuses it); `cluster_copy_caught_up_at(copy)` (D9: the copy has applied the leader's commit index heard last and that
   heartbeat's lease still holds, read on the caller's clock; `test_cluster copycaught`, mutants `copynodeadline
-  copynofloor` in `make copy-mutants`); snapshot version 6 and
-  entry magic "TME3": a state directory or log of another version is refused naming both, never upgraded).
+  copynofloor` in `make copy-mutants`); snapshot version 7 and
+  entry magic "TME4": a state directory or log of another version is refused naming both, never upgraded).
   `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
   add|status`; users: USER_PUT/DEL answered after commit with the members still behind, the uid assigned at apply,

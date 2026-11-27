@@ -5,7 +5,7 @@
  * what the server answers.
  *
  *   tsdb cluster init PEER --secret-file F [--replication 3] [--min-isr 1] [--node-timeout-ms 3000]
- *        [--heartbeat-ms 500] [--isr-lag-ms 1000] [--out-after-s 1800] [--voter-replace-s 600] [--voters 5]
+ *        [--heartbeat-ms 500] [--isr-lag-ms 1000] [--rebuild-after-s 1800] [--voter-replace-s 600] [--voters 5]
  *        [--volumes-per-server 16]
  *   tsdb cluster node add PEER NEW_PEER --secret-file F      (PEER: any member; the CLI follows to the leader once)
  *   tsdb cluster status PEER --secret-file F                 (one line per fact, for people and scripts)
@@ -91,7 +91,7 @@ static const char cl_help[] =
     "    --node-timeout-ms MS    a server is marked down after this long without a heartbeat [3000]\n"
     "    --heartbeat-ms MS       how often servers report, below --node-timeout-ms [500]\n"
     "    --isr-lag-ms MS         a copy silent this long leaves the in-sync set [1000] (at least 500)\n"
-    "    --out-after-s S         a server down this long is marked out [1800] (stored, not acted on yet)\n"
+    "    --rebuild-after-s S     a server down this long is marked out [1800] (stored, not acted on yet)\n"
     "    --voter-replace-s S     a voter down this long is replaced by another member [600]\n"
     "    --voters N              the most voters the group has (an even number counts as one less) [5]\n"
     "    --volumes-per-server N  volumes led per server at init [16] (stored, not acted on yet)\n"
@@ -398,7 +398,7 @@ int cluster_cli(int argc, char **argv)
                 {"--node-timeout-ms", &s.node_timeout_ms},
                 {"--heartbeat-ms", &s.heartbeat_ms},
                 {"--isr-lag-ms", &s.isr_lag_ms},
-                {"--out-after-s", &s.out_after_s},
+                {"--rebuild-after-s", &s.rebuild_after_s},
                 {"--voter-replace-s", &s.voter_replace_s},
                 {"--voters", &s.voters},
                 {"--volumes-per-server", &s.volumes_per_server},

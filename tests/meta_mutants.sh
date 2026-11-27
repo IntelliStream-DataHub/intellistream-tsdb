@@ -23,7 +23,9 @@ shift
 # state untouched. The one trace left is which refusal names a grant at the epoch limit (RANGE before INVALID), an
 # order nothing relies on. The check stays as a guard should the rule change; `--mutant 47` still plants it.
 # R8's erasure-coded volumes: 50 stripeuncond, 51 minisrone, 52 gcresumeany, 53 stripeatapply, 54 forcenosuspend.
-muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49 50 51 52 53 54}
+# R9's failure handling, holds, DESTROYED and stripe fill states: 55 outfinal, 56 holdunbounded, 57 wholeanyversion,
+# 58 destroyedback, 59 downsinceapply.
+muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49 50 51 52 53 54 55 56 57 58 59}
 if [ -n "$part" ]; then
     k=${part%/*}
     n=${part#*/}
@@ -41,7 +43,9 @@ fi
 # the mutants the simulator's checker catches without the unit stage (measured: with it off 8 of the 17 are caught;
 # R4's 40-46 all, by meta_check_step or the per-op check of the replica set's version and a reset; R8's 50, 52 and 53
 # by the per-op checks of STRIPE_SET and VOLUME_ADD and meta_check_step's gc rule)
-SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 50 52 53 "
+# R9's 55-59 all caught in --sim-only: 55 by the simulator's OUT -> UP back-path check, 56-58 by meta_check_step /
+# check_named / check_one_op, 59 by ref_hash member divergence.
+SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 50 52 53 55 56 57 58 59 "
 sim=
 for n in $muts; do
     case "$SIM_MUTANTS" in *" $n "*) sim="$sim $n" ;; esac

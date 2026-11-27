@@ -129,8 +129,19 @@ enum meta_vol_kind { META_VOL_REPLICATED = 1, META_VOL_SHARED = 2 };
 /* SETTINGS.failover: how a shared volume moves off a node that is no longer heard (design-ha-modes.md M22). */
 enum meta_failover { META_FAILOVER_LEASE = 0, META_FAILOVER_ATTESTED = 1, META_FAILOVER_BMC = 2 };
 
-enum meta_member_state { META_UP = 0, META_DOWN = 1, META_DRAINING = 2, META_OUT = 3 };
+enum meta_member_state { META_UP = 0, META_DOWN = 1, META_DRAINING = 2, META_OUT = 3, META_DESTROYED = 4 };
 const char *meta_member_state_name(int s);
+/* Why a member is DOWN (R9, D3, D5): carried in MEMBER_STATE so every Raft leader computes the same timers. */
+enum meta_down_reason {
+    META_DOWN_NONE = 0,     /* not DOWN */
+    META_DOWN_TIMEOUT = 1,  /* unheard for node_timeout_ms */
+    META_DOWN_FAILSTOP = 2, /* fail-stop last beat (D5) */
+    META_DOWN_FAULT = 3,    /* local fault */
+    META_DOWN_DRAIN = 4,    /* down for drain */
+    META_DOWN_LAST = META_DOWN_DRAIN,
+};
+const char *meta_down_reason_name(int r);
+#define META_HOLD_MAX_MS 86400000ull /* 24 h: longest operator hold against automatic OUT (D3, E12) */
 /* A member's flags (MEMBER_ADD, then MEMBER_FLAGS from heartbeats): may it be a voter, may it hold volumes, can it
  * claim a volume it was granted. A witness has volumes_ok = 0; a node whose disk filled has voter_ok = 0; a node whose
  * claims failed (CLAIM_FAILED's reasons: the state disk, the storage) reports claim_ok = 0 until it is well again. */
@@ -142,7 +153,7 @@ struct meta_settings {
     uint32_t node_timeout_ms;    /* a server is down after this long without a heartbeat (3000) */
     uint32_t heartbeat_ms;       /* heartbeat period (500) */
     uint32_t isr_lag_ms;         /* a replica this far behind leaves the ISR (1000) */
-    uint32_t out_after_s;        /* a server down this long is out (1800) */
+    uint32_t rebuild_after_s;    /* a server down this long is marked out and rebuilt elsewhere (1800, D4/D23) */
     uint32_t voter_replace_s;    /* a voter down this long is replaced (600) */
     uint32_t voters;             /* the Raft group's size at most (5) */
     uint32_t volumes_per_server; /* led per server at init (16) */
@@ -163,8 +174,17 @@ struct meta_settings {
     uint32_t transfer_wait_ms;   /* a planned transfer's drain before READY (2000, 100..60000) */
     uint32_t leader_balance_s;   /* leadership goes back to rep[0] once it is up and in sync this long (0: off, the
                                   * default until the owner decides, D15; else 1..86400) */
+    /* Failure handling, rebuilds, backpressure and balancer (R9; D23): read only by the cluster layer */
+    uint32_t opening_hold_s;      /* hold from OUT while a server reports opening (3600, <= 86400) */
+    uint32_t failstop_out_s;      /* fast path to OUT after a fail-stop beat or replica fault (60, >= 1) */
+    uint32_t out_guard_pct;       /* mass-OUT guard threshold, % of non-OUT members DOWN (25, 1..100) */
+    uint32_t out_guard_hold_s;    /* upper bound of the mass-OUT guard before OUT proceeds (7200, 1..86400) */
+    uint32_t repl_retain_down_gb; /* per-server WAL retention budget for DOWN/held members, GB (64) */
+    uint32_t young_high_pct;      /* data dir fill % at which a member reports FULL (90, 10..99) */
+    uint32_t balance_mb_s;        /* balancer move rate, MB/s (0: = rebuild_mb_s) */
+    uint32_t rebuild_concurrency; /* EC objects filled in flight per server (4, 1..64) */
 };
-#define META_SETTINGS_WORDS 23 /* the words of the INIT body before the mode (cluster_settings_encode) */
+#define META_SETTINGS_WORDS 31 /* the words of the INIT body before the mode (cluster_settings_encode) */
 void meta_settings_default(struct meta_settings *s);
 
 struct meta_member {
@@ -178,6 +198,12 @@ struct meta_member {
     char bmc[META_BMC_MAX];         /* the BMC address ("" when not given) */
     uint8_t flags;                  /* enum meta_member_flags */
     uint8_t ident[16]; /* the server's own random identity (meta/IDENT): one id is one server; zero: not known */
+    /* R9 (snapshot version 7; D2, D3, D4): durable inputs for timers and holds */
+    uint64_t down_since_ms; /* proposer's wall clock (ms) when marked DOWN; 0 unless state == META_DOWN */
+    uint8_t down_reason;    /* enum meta_down_reason; META_DOWN_NONE unless state == META_DOWN */
+    uint64_t down_clock_ms; /* op_clock_ms of the MEMBER_STATE down (checker witness); 0 unless state == META_DOWN */
+    uint64_t hold_until_ms; /* proposer's wall clock (ms) until which automatic OUT is held; 0: no hold */
+    uint64_t hold_clock_ms; /* op_clock_ms of the NODE_HOLD (checker witness); 0 when hold_until_ms == 0 */
 };
 
 struct meta_replica {
@@ -215,6 +241,16 @@ struct meta_storage { /* a shared volume's storage */
  * while its young data stays on its replicas, the log group (E3). */
 enum meta_redundancy { META_RED_REPLICAS = 0, META_RED_EC = 1 };
 
+/* Per-position state of an EC volume's stripe group (R9, D9, D10). */
+enum meta_stripe_state { META_STRIPE_WHOLE = 0, META_STRIPE_FILLING = 1 };
+const char *meta_stripe_state_name(int s);
+
+struct meta_stripe_pos {
+    uint8_t state;    /* enum meta_stripe_state: WHOLE or FILLING */
+    uint32_t prev;    /* previous holder node id (0: none; copy source / return candidate while filling, D9/D13) */
+    uint64_t set_ver; /* stripe_version that set this position (1 at VOLUME_ADD, new stripe_version on STRIPE_SET) */
+};
+
 struct meta_volume {
     uint32_t number;
     char name[META_NAME_MAX];
@@ -242,14 +278,17 @@ struct meta_volume {
     struct meta_epoch *hist;
     uint32_t grant_target;  /* replicated: the target of the grant that made `epoch` (a planned transfer's; 0: none) */
     uint64_t grant_min_end; /* and the end the target had to hold (the old leader's READY end) */
-    /* erasure coding (R8; snapshot version 6). Replicas: redundancy META_RED_REPLICAS and the rest 0. */
-    uint8_t redundancy;               /* enum meta_redundancy */
-    uint8_t ec_k, ec_m;               /* EC: 1 <= k <= META_EC_K_MAX, 1 <= m <= META_EC_M_MAX */
-    uint32_t nstripe;                 /* EC: k + m */
-    uint32_t stripe[META_STRIPE_MAX]; /* EC: position -> node, distinct; never renumbered (E9) */
-    uint64_t stripe_version;          /* EC: 1 at VOLUME_ADD, + 1 by every applied STRIPE_SET and by nothing else */
-    uint8_t gc_suspended;             /* EC: orphan collection is off until GC_RESUME (E14) */
-    uint64_t gc_gen;                  /* EC: + 1 by every applied GC_RESUME (the checker's witness of a resume) */
+    /* erasure coding (R8; R9 fill states in snapshot version 7). Replicas: redundancy META_RED_REPLICAS and the rest 0. */
+    uint8_t redundancy;                         /* enum meta_redundancy */
+    uint8_t ec_k, ec_m;                         /* EC: 1 <= k <= META_EC_K_MAX, 1 <= m <= META_EC_M_MAX */
+    uint32_t nstripe;                           /* EC: k + m */
+    uint32_t stripe[META_STRIPE_MAX];           /* EC: position -> node, distinct; never renumbered (E9) */
+    struct meta_stripe_pos stripe_pos[META_STRIPE_MAX]; /* EC (R9): per-position fill state, prev holder, set_ver */
+    uint64_t stripe_version;                    /* EC: 1 at VOLUME_ADD, + 1 by every applied STRIPE_SET and by nothing else */
+    uint64_t stripe_whole_gen;                  /* EC (R9): + 1 by every applied STRIPE_WHOLE (checker witness) */
+    uint64_t stripe_whole_ver;                  /* EC (R9): version named by the last STRIPE_WHOLE (checker witness) */
+    uint8_t gc_suspended;                       /* EC: orphan collection is off until GC_RESUME (E14) */
+    uint64_t gc_gen;                            /* EC: + 1 by every applied GC_RESUME (the checker's witness of a resume) */
 };
 
 struct meta_slot_move {
@@ -373,11 +412,14 @@ enum meta_op_kind {
                                * instance rid (a learner, open generation 0): its lost directory is made again (D13) */
     /* R8 (snapshot version 6), erasure-coded volumes only (else META_ERR_INVALID): */
     META_OP_STRIPE_SET,       /* if stripe_version == v: position p of the stripe group goes to node N (a known member
-                               * that is not out and holds no other position); no live-object check yet (R9) */
+                               * neither out nor destroyed, holding no other position), with fill state and prev */
     META_OP_GC_SUSPEND,       /* orphan collection off (force-leader proposes it before its ISR_CHANGE); idempotent,
                                * and not counted by the one-touch-per-entry rule (it only ever sets a flag) */
     META_OP_GC_RESUME,        /* orphan collection on again (`tsdb cluster volume gc resume`), gc_gen + 1 */
-    META_OP_LAST = META_OP_GC_RESUME,
+    /* R9 (snapshot version 7): member holds and stripe fill whole barrier */
+    META_OP_NODE_HOLD,        /* hold member id against automatic OUT until until_ms (0: release), bounded by op_clock_ms */
+    META_OP_STRIPE_WHOLE,     /* EC: if stripe_version == v and pos is filling: mark pos whole (D10) */
+    META_OP_LAST = META_OP_STRIPE_WHOLE,
 };
 
 /* Why a volume got a new leader (grant reasons of §5.5, in its order; 7 is the replicated mode's RESIGN). */
@@ -470,7 +512,14 @@ void meta_entry_finish(struct meta_entry *e);
 void meta_op_init(struct meta_entry *e, const uint8_t uuid[16], const struct meta_settings *s,
                   const struct meta_member *first, int mode, uint32_t level);
 void meta_op_member_add(struct meta_entry *e, const struct meta_member *mb);
-void meta_op_member_state(struct meta_entry *e, uint32_t id, int state, uint64_t incarnation);
+/* `reason`, `since_ms`, `op_clock_ms`: for state == META_DOWN, reason in META_DOWN_TIMEOUT..META_DOWN_LAST and
+ * 1 <= since_ms <= op_clock_ms; for other states, reason == META_DOWN_NONE and since_ms == 0. OUT -> UP requires a
+ * new incarnation (inc > recorded); DESTROYED is allowed only from OUT and is final. */
+void meta_op_member_state(struct meta_entry *e, uint32_t id, int state, uint64_t incarnation, uint8_t reason,
+                          uint64_t since_ms, uint64_t op_clock_ms);
+/* Hold member `id` against automatic OUT until `until_ms` (0: release); refused if until_ms - op_clock_ms exceeds
+ * META_HOLD_MAX_MS, until_ms < op_clock_ms, op_clock_ms == 0 (for until_ms > 0), or the member is OUT or DESTROYED. */
+void meta_op_node_hold(struct meta_entry *e, uint32_t id, uint64_t until_ms, uint64_t op_clock_ms);
 /* Refused as STALE for an incarnation below the member's, EXISTS for a peer address another live member has. */
 void meta_op_member_addr(struct meta_entry *e, uint32_t id, uint64_t incarnation, const char *addr,
                          const char *peer);
@@ -525,7 +574,9 @@ void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, 
                           uint64_t nonce);
 void meta_op_restore(struct meta_entry *e, uint64_t gen);
 void meta_op_name_group(struct meta_entry *e); /* reserved: an empty body; applies as INVALID */
-void meta_op_stripe_set(struct meta_entry *e, uint32_t number, uint32_t pos, uint32_t node, uint64_t stripe_version);
+void meta_op_stripe_set(struct meta_entry *e, uint32_t number, uint32_t pos, uint32_t node, uint8_t state,
+                        uint32_t prev, uint64_t stripe_version);
+void meta_op_stripe_whole(struct meta_entry *e, uint32_t number, uint32_t pos, uint64_t stripe_version);
 void meta_op_gc_suspend(struct meta_entry *e, uint32_t number);
 void meta_op_gc_resume(struct meta_entry *e, uint32_t number);
 /* force-leader's operations for replicated volume v (design-cluster.md 6.2, design-cluster-data.md §5.7): for an EC
@@ -546,8 +597,8 @@ void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const
 int meta_snapshot_encode(const struct meta_state *m, uint8_t **out, size_t *len);
 /* The snapshot format (meta.c has its history). Until 1.0 a change of the state's layout bumps it, and an image of
  * another version is refused (a preview cluster is initialised again, never upgraded). */
-#define META_SNAP_VERSION 6
-/* 1 when the entry is one of a build of metadata snapshot version 5 or older (its magic): meta_apply says
+#define META_SNAP_VERSION 7
+/* 1 when the entry is one of a build of metadata snapshot version 6 or older (its magic): meta_apply says
  * META_ERR_FORMAT for it, and the caller names both versions (the cluster is initialised again, never upgraded). */
 int meta_entry_older(const void *data, size_t len);
 /* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not META_SNAP_VERSION,
@@ -562,6 +613,21 @@ uint64_t meta_hash(const struct meta_state *m);
 /* The Raft group's size for `servers` servers that are up and not out: 5 from 5 servers on (at most s->voters),
  * 3 from 3, else 1 (a group of 2 would need both). */
 uint32_t meta_voter_target(const struct meta_settings *s, uint32_t servers);
+
+/* Optional live-view overlay for meta_vol_margins (NULL: judge from m->members[].state alone, where UP and DRAINING
+ * are live and DOWN, OUT and DESTROYED are missing). When given, live(ctx, node) returns non-zero if `node` is
+ * currently reachable; a member already DOWN, OUT or DESTROYED in `m` still counts as missing. */
+struct meta_liveness {
+    int (*live)(const void *ctx, uint32_t node);
+    const void *ctx;
+};
+/* Pure volume margins for place.c and margins.c (no I/O, no locks, no clock):
+ *   young:   ISR size - min_isr for replicated/EC volumes (how many more ISR losses before writes block, D8;
+ *            0 for META_VOL_SHARED which holds no replicated copies; note margins.c's display survivability is nisr - 1)
+ *   settled: (EC only; 0 for replicas) fewest positions beyond k, counting filling positions as missing for objects
+ *            below their set_ver and DOWN/OUT/DESTROYED/unlive holders as missing. */
+void meta_vol_margins(const struct meta_state *m, const struct meta_volume *v, const struct meta_liveness *liveness,
+                      int *young, int *settled);
 
 /* The checker of the simulator and the tests: does `next` follow from `prev` by the rules in the head comment?
  * `prev` is the state at a lower applied index on the same history. Returns 0, or -1 with a sentence in `why`. */

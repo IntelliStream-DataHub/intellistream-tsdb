@@ -796,7 +796,7 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.transfer_wait_ms = 2500;
         s.leader_balance_s = 60;
     }
-    uint8_t req[128], *reply;
+    uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *reply;
     size_t len;
     size_t rl = cluster_settings_encode(&s, mode, req);
     int rc = admin(i, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
@@ -1149,7 +1149,7 @@ static void scen_life(void)
     {
         struct meta_settings s;
         meta_settings_default(&s);
-        uint8_t req[128], *reply;
+        uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *reply;
         size_t len, rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
         int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
         free(reply);
@@ -1427,7 +1427,7 @@ static void scen_initcrash(void)
     meta_settings_default(&s);
     s.node_timeout_ms = 1500;
     s.heartbeat_ms = 200;
-    uint8_t req[128], *rep = NULL;
+    uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *rep = NULL;
     size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req), len;
     char addr[META_ADDR_MAX], err[1024];
     peer_of(0, addr, sizeof addr);
@@ -5254,7 +5254,7 @@ static void scen_links(void)
         die("links: cluster_start");
     struct meta_settings s;
     meta_settings_default(&s);
-    uint8_t req[128], *rep = NULL;
+    uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *rep = NULL;
     size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req), len;
     int rc;
     if (cluster_admin(padv, secret, secret_len, CLUSTER_OP_INIT, req, rl, 10000, &rc, &rep, &len, err, sizeof err) != 0 ||
@@ -11069,7 +11069,7 @@ static void scen_lease(void)
     s.lease_ms = 1000;
     s.drift_ppm = 200000;
     s.voter_replace_s = 600;
-    uint8_t req[128], *reply;
+    uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *reply;
     size_t len;
     size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
     int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
@@ -11242,7 +11242,7 @@ static void lease_cluster(int n, uint32_t lease_ms, uint32_t drift_ppm, uint32_t
     s.lease_ms = lease_ms;
     s.drift_ppm = drift_ppm;
     s.voter_replace_s = 600;
-    uint8_t req[128], *reply;
+    uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *reply;
     size_t len;
     size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
     int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
@@ -12161,7 +12161,7 @@ static void scen_fwdlease(void)
     s.lease_ms = 1000;
     s.drift_ppm = 200000;
     s.voter_replace_s = 600;
-    uint8_t req[128], *reply;
+    uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *reply;
     size_t len;
     size_t rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
     int rc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
@@ -18045,7 +18045,7 @@ static void scen_r4stubs(void)
     struct meta_settings s;
     meta_settings_default(&s);
     s.node_timeout_ms = 1500, s.heartbeat_ms = 200, s.rebuild_max = 17;
-    uint8_t req[128], *reply = NULL;
+    uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *reply = NULL;
     size_t len = 0, rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
     int arc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
     free(reply);

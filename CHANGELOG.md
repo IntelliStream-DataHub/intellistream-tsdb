@@ -8,6 +8,16 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+- **Cluster metadata snapshot version 7 (`r9-meta`).** Bumps `META_SNAP_VERSION` from 6 to 7 (and entry magic to
+  `"TME4"`; snapshot version 6 and `"TME3"` entries are refused by name — pre-1.0 preview clusters are re-initialised,
+  not upgraded). Adds member down timers and reasons (`down_since_ms`, `down_reason`), bounded operator holds
+  (`META_OP_NODE_HOLD`, `hold_until_ms`, at most 24 h), `META_DESTROYED` (final, from `OUT` only) with reversible
+  `OUT -> UP` (new incarnation; `OUT` keeps peer address and identity reserved until `DESTROYED`), per-position EC
+  stripe fill states (`whole`/`filling`, `prev`, `set_ver`, `META_OP_STRIPE_WHOLE`), pure `meta_vol_margins`, and R9
+  cluster settings (`rebuild_after_s` renaming `out_after_s` and CLI flag `--rebuild-after-s` renaming `--out-after-s`,
+  `opening_hold_s`, `failstop_out_s`, `out_guard_pct`, `out_guard_hold_s`, `repl_retain_down_gb`, `young_high_pct`,
+  `balance_mb_s`, `rebuild_concurrency`).
+
 - **Codec format improvements (`BLK_INT_FOR`, `BLK_BOOL_PACK`, `BLK_TS_FOR_BP`, dividing decimal/binary scales).**
   No format bump (format 9 is unreleased; all existing block kinds `0..17` and scale indices decode bit-for-bit identically):
   - `BLK_INT_FOR` (kind 18) adds per-vector delta/direct frame-of-reference, 33–63-bit `pack64`, and PFOR outlier

@@ -348,13 +348,19 @@ static void test_state_machine(void)
     meta_op_replica_remove(&e, 0, 2, 1);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->nrep == 3);
 
-    /* member state follows incarnations; out is final */
-    meta_op_member_state(&e, 3, META_DOWN, 7);
-    meta_op_member_state(&e, 3, META_UP, 6);
+    /* member state follows incarnations; OUT -> UP needs a new incarnation; DESTROYED is final */
+    meta_op_member_state(&e, 3, META_DOWN, 7, META_DOWN_TIMEOUT, 1000, 1000);
+    meta_op_member_state(&e, 3, META_UP, 6, META_DOWN_NONE, 0, 0);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_STALE);
-    meta_op_member_state(&e, 3, META_OUT, 7);
-    meta_op_member_state(&e, 3, META_UP, 8);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_STATE);
+    CHECK(meta_member(&m, 3)->down_since_ms == 1000 && meta_member(&m, 3)->down_reason == META_DOWN_TIMEOUT);
+    meta_op_member_state(&e, 3, META_OUT, 7, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 3, META_UP, 7, META_DOWN_NONE, 0, 0); /* same inc: stale */
+    meta_op_member_state(&e, 3, META_UP, 8, META_DOWN_NONE, 0, 0); /* new inc: OUT -> UP allowed (D2) */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_STALE && res[2] == META_OK);
+    CHECK(meta_member(&m, 3)->state == META_UP && meta_member(&m, 3)->incarnation == 8 &&
+          meta_member(&m, 3)->down_since_ms == 0);
+    meta_op_member_state(&e, 3, META_OUT, 8, META_DOWN_NONE, 0, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_member(&m, 3)->state == META_OUT);
 
     /* member flags follow incarnations; a node without volumes_ok is no candidate (a witness) */
     meta_op_member_flags(&e, 3, 9, 0); /* out */
@@ -362,7 +368,7 @@ static void test_state_machine(void)
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE && res[1] == META_ERR_NOTFOUND);
     meta_op_member_flags(&e, 5, 0, 0x80); /* an unknown flag bit: damage, a fault */
     CHECK(apply1(&m, &e, res, 8) == META_ERR_FORMAT && meta_member(&m, 5)->flags == META_MF_ALL);
-    meta_op_member_state(&e, 5, META_UP, 3);
+    meta_op_member_state(&e, 5, META_UP, 3, META_DOWN_NONE, 0, 0);
     meta_op_member_flags(&e, 5, 2, META_MF_ALL); /* the flags of an earlier run */
     meta_op_member_flags(&e, 5, 3, META_MF_VOTER_OK);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_STALE && res[2] == META_OK);
@@ -376,21 +382,28 @@ static void test_state_machine(void)
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
 
     /* a member's addresses move with its current or a later run (the leader pairs them with MEMBER_STATE up);
-     * never those of an earlier run, nor onto another live member's peer address */
+     * never those of an earlier run, nor onto another non-DESTROYED member's peer address (OUT keeps it reserved) */
     uint64_t inc2 = meta_member(&m, 2)->incarnation;
     meta_op_member_addr(&e, 2, inc2 + 1, "10.0.1.2:5555", "10.0.1.2:5556");
-    meta_op_member_state(&e, 2, META_UP, inc2 + 1);
+    meta_op_member_state(&e, 2, META_UP, inc2 + 1, META_DOWN_NONE, 0, 0);
     meta_op_member_addr(&e, 2, inc2, "10.0.0.2:5555", "10.0.0.2:5556"); /* the earlier run's */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_ERR_STALE);
     CHECK(!strcmp(meta_member(&m, 2)->peer, "10.0.1.2:5556") && !strcmp(meta_member(&m, 2)->addr, "10.0.1.2:5555"));
+    char peer3[META_ADDR_MAX];
+    snprintf(peer3, sizeof peer3, "%s", meta_member(&m, 3)->peer);
     meta_op_member_addr(&e, 2, inc2 + 1, "x:1", "10.0.0.4:5556"); /* member 4's */
-    meta_op_member_addr(&e, 2, inc2 + 1, "x:1", "10.0.0.3:5556"); /* member 3's, but 3 is out */
-    meta_op_member_addr(&e, 3, 99, "x:1", "10.0.0.9:5556");       /* out is final */
-    meta_op_member_addr(&e, 77, 1, "x:1", "10.0.0.9:5556");
-    meta_op_member_addr(&e, 2, inc2 + 1, "", "10.0.0.9:5556");
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS && res[1] == META_OK &&
-          res[2] == META_ERR_STATE && res[3] == META_ERR_NOTFOUND && res[4] == META_ERR_INVALID);
-    CHECK(!strcmp(meta_member(&m, 2)->peer, "10.0.0.3:5556"));
+    meta_op_member_addr(&e, 2, inc2 + 1, "x:1", peer3); /* member 3 is OUT: keeps its peer reserved (D2) */
+    meta_op_member_addr(&e, 3, 8, "x:1", "198.51.100.9:5556");    /* OUT needs a new incarnation */
+    meta_op_member_addr(&e, 77, 1, "x:1", "198.51.100.9:5556");
+    meta_op_member_addr(&e, 2, inc2 + 1, "", "198.51.100.9:5556");
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS && res[1] == META_ERR_EXISTS &&
+          res[2] == META_ERR_STALE && res[3] == META_ERR_NOTFOUND && res[4] == META_ERR_INVALID);
+    /* once member 3 is DESTROYED, its peer address is freed and MEMBER_ADDR on 3 is refused */
+    meta_op_member_state(&e, 3, META_DESTROYED, 8, META_DOWN_NONE, 0, 0);
+    meta_op_member_addr(&e, 2, inc2 + 1, "x:1", peer3);
+    meta_op_member_addr(&e, 3, 99, "x:1", "198.51.100.9:5556");
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_ERR_STATE);
+    CHECK(!strcmp(meta_member(&m, 2)->peer, peer3));
 
     /* slots: a home only for slots without one; a move is pending, frozen under the old home's epoch, then made */
     uint32_t n5[3] = {2, 4, 5};
@@ -842,7 +855,7 @@ static void test_replica_set(void)
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 6);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 7);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -868,7 +881,7 @@ static void test_replica_set(void)
     {
         meta_op_replica_reset(&e, 2, 3, 3, 7200);
         meta_entry_finish(&e);
-        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME3", 4) == 0);
+        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME4", 4) == 0);
         uint64_t h = meta_hash(&m);
         memcpy(e.buf, "TME1", 4);
         CHECK(meta_entry_older(e.buf, e.len) && !meta_entry_older(e.buf, 3));
@@ -953,7 +966,7 @@ static void test_ec(void)
     char why[256];
     meta_entry_init(&e);
     init_cluster(&m, &e, META_MODE_REPLICATED, 8);
-    meta_op_member_state(&e, 8, META_OUT, 1);
+    meta_op_member_state(&e, 8, META_OUT, 1, META_DOWN_NONE, 0, 0);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     uint32_t log3[3] = {1, 2, 3}, g6[6] = {2, 3, 4, 5, 6, 7};
 
@@ -1026,28 +1039,29 @@ static void test_ec(void)
     /* STRIPE_SET: stale version, a position past the group, a node already in it, an out or unknown node, a
      * replicas volume: refused; else one position moves and the version goes up by one (mutant stripeuncond takes a
      * stale one) */
-    meta_op_stripe_set(&e, 0, 1, 1, 0);
+    meta_op_stripe_set(&e, 0, 1, 1, META_STRIPE_WHOLE, 0, 0);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
-    meta_op_stripe_set(&e, 0, 1, 1, 2);
+    meta_op_stripe_set(&e, 0, 1, 1, META_STRIPE_WHOLE, 0, 2);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
-    meta_op_stripe_set(&e, 0, 6, 1, 1);
-    meta_op_stripe_set(&e, 0, 1, 4, 1);
-    meta_op_stripe_set(&e, 0, 1, 8, 1);
-    meta_op_stripe_set(&e, 0, 1, 9, 1);
-    meta_op_stripe_set(&e, 2, 0, 4, 0);
-    meta_op_stripe_set(&e, 9, 0, 4, 1);
+    meta_op_stripe_set(&e, 0, 6, 1, META_STRIPE_WHOLE, 0, 1);
+    meta_op_stripe_set(&e, 0, 1, 4, META_STRIPE_WHOLE, 0, 1);
+    meta_op_stripe_set(&e, 0, 1, 8, META_STRIPE_WHOLE, 0, 1);
+    meta_op_stripe_set(&e, 0, 1, 9, META_STRIPE_WHOLE, 0, 1);
+    meta_op_stripe_set(&e, 2, 0, 4, META_STRIPE_WHOLE, 0, 0);
+    meta_op_stripe_set(&e, 9, 0, 4, META_STRIPE_WHOLE, 0, 1);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
           res[2] == META_ERR_INVALID && res[3] == META_ERR_INVALID && res[4] == META_ERR_INVALID &&
           res[5] == META_ERR_NOTFOUND);
     CHECK(meta_volume(&m, 0)->stripe_version == 1 && memcmp(meta_volume(&m, 0)->stripe, g6, sizeof g6) == 0);
     meta_copy(&prev, &m);
-    meta_op_stripe_set(&e, 0, 1, 1, 1);
+    meta_op_stripe_set(&e, 0, 1, 1, META_STRIPE_WHOLE, 0, 1);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v0 = meta_volume(&m, 0);
-    CHECK(v0->stripe[1] == 1 && v0->stripe[0] == 2 && v0->stripe[2] == 4 && v0->stripe_version == 2);
+    CHECK(v0->stripe[1] == 1 && v0->stripe[0] == 2 && v0->stripe[2] == 4 && v0->stripe_version == 2 &&
+          v0->stripe_pos[1].state == META_STRIPE_WHOLE && v0->stripe_pos[1].set_ver == 2);
     CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
     meta_free(&prev);
-    meta_op_stripe_set(&e, 0, 1, 1, 2); /* the same node again: the version still moves */
+    meta_op_stripe_set(&e, 0, 1, 1, META_STRIPE_WHOLE, 0, 2); /* the same node again: the version still moves */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->stripe_version == 3);
 
     /* the checker: a position moved without a bump, two positions in one bump, the version back, a repeated node */
@@ -1083,7 +1097,7 @@ static void test_ec(void)
     meta_copy(&prev, &m);
     meta_op_gc_suspend(&e, 0);
     meta_op_gc_suspend(&e, 0);
-    meta_op_stripe_set(&e, 0, 1, 1, 3);
+    meta_op_stripe_set(&e, 0, 1, 1, META_STRIPE_WHOLE, 0, 3);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK &&
           meta_volume(&m, 0)->gc_suspended && meta_volume(&m, 0)->stripe_version == 4);
     CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
@@ -1151,7 +1165,7 @@ static void test_ec(void)
         free(img);
     }
 
-    /* an entry of a build of snapshot version 5 ("TME2") is named as older and refused */
+    /* an entry of a build of snapshot version 5 ("TME2") or 6 ("TME3") is named as older and refused */
     {
         meta_op_gc_resume(&e, 0);
         meta_entry_finish(&e);
@@ -1159,9 +1173,367 @@ static void test_ec(void)
         memcpy(e.buf, "TME2", 4);
         CHECK(meta_entry_older(e.buf, e.len));
         CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
+        memcpy(e.buf, "TME3", 4);
+        CHECK(meta_entry_older(e.buf, e.len));
+        CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
         meta_entry_free(&e);
         meta_entry_init(&e);
     }
+    meta_entry_free(&e);
+    meta_free(&m);
+}
+
+/* ================================================================ R9 metadata (snapshot version 7) */
+
+struct test_live_ctx {
+    uint32_t dead_mask;
+};
+
+static int test_live_fn(const void *ctx, uint32_t node)
+{
+    const struct test_live_ctx *c = ctx;
+    return !(c->dead_mask & (1u << node));
+}
+
+static void test_r9_meta(void)
+{
+    struct meta_state m, prev;
+    struct meta_entry e;
+    int res[16];
+    char why[256];
+    meta_entry_init(&e);
+    init_cluster(&m, &e, META_MODE_REPLICATED, 8);
+
+    /* 1. Member DOWN timers & reasons: every reason accepted, invalid/future refused, cleared on UP/DRAINING/OUT */
+    CHECK(!strcmp(meta_member_state_name(META_DESTROYED), "destroyed") && !strcmp(meta_member_state_name(5), "?"));
+    CHECK(!strcmp(meta_down_reason_name(META_DOWN_TIMEOUT), "timeout") &&
+          !strcmp(meta_down_reason_name(META_DOWN_FAILSTOP), "failstop") &&
+          !strcmp(meta_down_reason_name(META_DOWN_FAULT), "fault") &&
+          !strcmp(meta_down_reason_name(META_DOWN_DRAIN), "drain") && !strcmp(meta_down_reason_name(9), "?"));
+    CHECK(!strcmp(meta_stripe_state_name(META_STRIPE_WHOLE), "whole") &&
+          !strcmp(meta_stripe_state_name(META_STRIPE_FILLING), "filling") && !strcmp(meta_stripe_state_name(2), "?"));
+
+    meta_op_member_state(&e, 2, META_DOWN, 1, META_DOWN_NONE, 1000, 1000);       /* reason none */
+    meta_op_member_state(&e, 2, META_DOWN, 1, META_DOWN_TIMEOUT, 0, 1000);       /* since 0 */
+    meta_op_member_state(&e, 2, META_DOWN, 1, META_DOWN_TIMEOUT, 2001, 2000);    /* future of op clock */
+    meta_op_member_state(&e, 2, META_UP, 1, META_DOWN_TIMEOUT, 0, 0);            /* reason on UP */
+    meta_op_member_state(&e, 2, META_UP, 1, META_DOWN_NONE, 1000, 1000);         /* since on UP */
+    meta_op_member_state(&e, 2, META_DESTROYED, 1, META_DOWN_NONE, 0, 0);        /* DESTROYED from UP */
+    CHECK(apply1(&m, &e, res, 16) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
+          res[2] == META_ERR_INVALID && res[3] == META_ERR_INVALID && res[4] == META_ERR_INVALID &&
+          res[5] == META_ERR_STATE);
+    meta_op_member_state(&e, 2, META_DOWN, 1, 9, 1000, 1000); /* unknown reason: format error */
+    CHECK(apply1(&m, &e, res, 8) == META_ERR_FORMAT);
+    meta_op_member_state(&e, 2, 9, 1, META_DOWN_NONE, 0, 0); /* unknown state: format error */
+    CHECK(apply1(&m, &e, res, 8) == META_ERR_FORMAT);
+
+    meta_copy(&prev, &m);
+    meta_op_member_state(&e, 2, META_DOWN, 1, META_DOWN_FAILSTOP, 5000, 5500);
+    meta_op_member_state(&e, 3, META_DOWN, 1, META_DOWN_FAULT, 6000, 6000);
+    meta_op_member_state(&e, 4, META_DOWN, 1, META_DOWN_DRAIN, 7000, 7100);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK);
+    CHECK(meta_member(&m, 2)->down_since_ms == 5000 && meta_member(&m, 2)->down_reason == META_DOWN_FAILSTOP &&
+          meta_member(&m, 2)->down_clock_ms == 5500); /* catches MUT(59) downsinceapply */
+    CHECK(meta_member(&m, 3)->down_since_ms == 6000 && meta_member(&m, 3)->down_reason == META_DOWN_FAULT);
+    CHECK(meta_member(&m, 4)->down_since_ms == 7000 && meta_member(&m, 4)->down_reason == META_DOWN_DRAIN);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    /* repeated DOWN at the same incarnation keeps earlier down_since_ms while allowing reason escalation */
+    meta_copy(&prev, &m);
+    meta_op_member_state(&e, 3, META_DOWN, 1, META_DOWN_FAILSTOP, 9000, 9000);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_member(&m, 3)->down_since_ms == 6000 && meta_member(&m, 3)->down_reason == META_DOWN_FAILSTOP);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    /* an earlier down_since_ms at the same incarnation is kept (min); a newer incarnation resets it */
+    meta_op_member_state(&e, 3, META_DOWN, 1, META_DOWN_FAILSTOP, 4500, 9000);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_member(&m, 3)->down_since_ms == 4500);
+    meta_op_member_state(&e, 3, META_DOWN, 2, META_DOWN_TIMEOUT, 9500, 9500);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_member(&m, 3)->down_since_ms == 9500 &&
+          meta_member(&m, 3)->down_reason == META_DOWN_TIMEOUT);
+    /* DESTROYED from DOWN or DRAINING is refused */
+    meta_op_member_state(&e, 2, META_DESTROYED, 1, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 4, META_DRAINING, 1, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 4, META_DESTROYED, 1, META_DOWN_NONE, 0, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE && res[1] == META_OK &&
+          res[2] == META_ERR_STATE);
+    CHECK(meta_member(&m, 4)->state == META_DRAINING && !meta_member(&m, 4)->down_since_ms &&
+          meta_member(&m, 4)->down_reason == META_DOWN_NONE);
+
+    /* 2. NODE_HOLD: bounded by META_HOLD_MAX_MS (86,400,000), refused on OUT/DESTROYED, until==0 releases */
+    meta_copy(&prev, &m);
+    uint64_t clk = 1000000000ull;
+    meta_op_node_hold(&e, 99, clk + 1000, clk);                     /* unknown member */
+    meta_op_node_hold(&e, 2, clk - 1, clk);                         /* until < op_clock */
+    meta_op_node_hold(&e, 2, 1000, 0);                              /* op_clock 0 */
+    meta_op_node_hold(&e, 2, clk + META_HOLD_MAX_MS + 1, clk);      /* past 24 h (MUT(56) holdunbounded) */
+    meta_op_node_hold(&e, 2, clk + META_HOLD_MAX_MS, clk);          /* exact 24 h: allowed */
+    meta_op_node_hold(&e, 4, clk + 60000, clk);                     /* hold on DRAINING: allowed */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_NOTFOUND && res[1] == META_ERR_INVALID &&
+          res[2] == META_ERR_INVALID && res[3] == META_ERR_INVALID && res[4] == META_OK && res[5] == META_OK);
+    CHECK(meta_member(&m, 2)->hold_until_ms == clk + META_HOLD_MAX_MS && meta_member(&m, 2)->hold_clock_ms == clk);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    /* hold survives DOWN -> UP; release (until == 0) clears it */
+    meta_op_member_state(&e, 2, META_UP, 2, META_DOWN_NONE, 0, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK &&
+          meta_member(&m, 2)->hold_until_ms == clk + META_HOLD_MAX_MS);
+    meta_op_node_hold(&e, 2, 0, clk + 500);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && !meta_member(&m, 2)->hold_until_ms &&
+          !meta_member(&m, 2)->hold_clock_ms);
+
+    /* 3. OUT reversible (new incarnation), OUT preserves addr & ident, DESTROYED frees them and is final */
+    {
+        struct meta_member mb;
+        member(&mb, 9);
+        memset(mb.ident, 0x99, 16);
+        meta_op_member_add(&e, &mb);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    }
+    meta_op_node_hold(&e, 9, clk + 10000, clk);
+    meta_op_member_state(&e, 9, META_OUT, 1, META_DOWN_NONE, 0, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+    CHECK(meta_member(&m, 9)->state == META_OUT && !meta_member(&m, 9)->hold_until_ms); /* OUT clears hold */
+    /* hold / DOWN / DRAINING / OUT refused while OUT; duplicate peer & ident refused while OUT */
+    meta_op_node_hold(&e, 9, clk + 1000, clk);
+    meta_op_node_hold(&e, 9, 0, clk);
+    meta_op_member_state(&e, 9, META_DOWN, 2, META_DOWN_TIMEOUT, 1000, 1000);
+    meta_op_member_state(&e, 9, META_DRAINING, 2, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 9, META_OUT, 2, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 9, META_UP, 1, META_DOWN_NONE, 0, 0); /* same incarnation: stale */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE && res[1] == META_ERR_STATE &&
+          res[2] == META_ERR_STATE && res[3] == META_ERR_STATE && res[4] == META_ERR_STATE &&
+          res[5] == META_ERR_STALE);
+    {
+        struct meta_member dup;
+        member(&dup, 10);
+        strcpy(dup.peer, meta_member(&m, 9)->peer);
+        meta_op_member_add(&e, &dup); /* peer reserved by OUT member 9 */
+        member(&dup, 10);
+        memset(dup.ident, 0x99, 16);
+        meta_op_member_add(&e, &dup); /* ident reserved by OUT member 9 */
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS && res[1] == META_ERR_EXISTS);
+    }
+    /* OUT -> UP with new incarnation succeeds (catches MUT(55) outfinal); MEMBER_ADDR paired before UP also works */
+    meta_copy(&prev, &m);
+    meta_op_member_addr(&e, 9, 2, "198.51.100.9:5555", "198.51.100.9:5556");
+    meta_op_member_state(&e, 9, META_UP, 2, META_DOWN_NONE, 0, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+    CHECK(meta_member(&m, 9)->state == META_UP && meta_member(&m, 9)->incarnation == 2 &&
+          !strcmp(meta_member(&m, 9)->peer, "198.51.100.9:5556"));
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    /* OUT -> DESTROYED is final (catches MUT(58) destroyedback) and frees peer & ident */
+    meta_op_member_state(&e, 9, META_OUT, 2, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 9, META_DESTROYED, 1, META_DOWN_NONE, 0, 0); /* stale inc */
+    meta_op_member_state(&e, 9, META_DESTROYED, 2, META_DOWN_NONE, 0, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_STALE && res[2] == META_OK);
+    CHECK(meta_member(&m, 9)->state == META_DESTROYED);
+    meta_op_member_state(&e, 9, META_UP, 3, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 9, META_OUT, 3, META_DOWN_NONE, 0, 0);
+    meta_op_node_hold(&e, 9, clk + 1000, clk);
+    meta_op_member_flags(&e, 9, 3, META_MF_ALL);
+    meta_op_member_addr(&e, 9, 3, "203.0.113.9:5555", "203.0.113.9:5556");
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE && res[1] == META_ERR_STATE &&
+          res[2] == META_ERR_STATE && res[3] == META_ERR_STATE && res[4] == META_ERR_STATE);
+    {
+        struct meta_member reuse;
+        member(&reuse, 10);
+        strcpy(reuse.peer, "198.51.100.9:5556");
+        memset(reuse.ident, 0x99, 16);
+        meta_op_member_add(&e, &reuse); /* freed by DESTROYED member 9 */
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_member(&m, 10) != NULL);
+    }
+
+    /* 4. Stripe position fill states, STRIPE_WHOLE, and meta_vol_margins */
+    meta_op_member_state(&e, 3, META_UP, 2, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 4, META_UP, 2, META_DOWN_NONE, 0, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+    uint32_t log3[3] = {1, 2, 3}, g6[6] = {1, 2, 3, 4, 5, 6};
+    ec_add(&e, 0, "ec0", 2, log3, 3, META_VOL_REPLICATED, 4, 2, g6, 6);
+    vol_add(&e, META_VOL_REPLICATED, 1, "rep1", 1, log3, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+    const struct meta_volume *v = meta_volume(&m, 0);
+    for (uint32_t p = 0; p < 6; p++)
+        CHECK(v->stripe_pos[p].state == META_STRIPE_WHOLE && v->stripe_pos[p].prev == 0 &&
+              v->stripe_pos[p].set_ver == 1);
+    int yg = 99, sd = 99;
+    meta_vol_margins(&m, meta_volume(&m, 1), NULL, &yg, &sd);
+    CHECK(yg == 2 && sd == 0); /* replicas: nisr(3) - min_isr(1) = 2, settled 0 */
+    meta_vol_margins(&m, v, NULL, &yg, &sd);
+    CHECK(yg == 1 && sd == 2); /* EC 4+2: nisr(3) - min_isr(2) = 1, 6 whole UP - 4 = 2 */
+
+    /* STRIPE_SET filling + refusals */
+    meta_op_stripe_set(&e, 0, 5, 7, 2, 6, 1); /* invalid state: format error */
+    CHECK(apply1(&m, &e, res, 8) == META_ERR_FORMAT);
+    meta_op_stripe_set(&e, 0, 5, 7, META_STRIPE_WHOLE, 6, 1);    /* prev on WHOLE */
+    meta_op_stripe_set(&e, 0, 5, 7, META_STRIPE_FILLING, 7, 1);  /* prev == node */
+    meta_op_stripe_set(&e, 0, 5, 7, META_STRIPE_FILLING, 99, 1); /* unknown prev */
+    meta_op_stripe_set(&e, 0, 5, 9, META_STRIPE_FILLING, 6, 1);  /* DESTROYED node */
+    meta_op_stripe_whole(&e, 0, 5, 1);                           /* already WHOLE */
+    meta_op_stripe_whole(&e, 1, 0, 0);                           /* replicas volume */
+    meta_op_stripe_whole(&e, 99, 0, 1);                          /* unknown volume */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
+          res[2] == META_ERR_INVALID && res[3] == META_ERR_INVALID && res[4] == META_ERR_INVALID &&
+          res[5] == META_ERR_INVALID && res[6] == META_ERR_NOTFOUND);
+
+    /* node 6 goes OUT, pos 5 reassigned to 7 as FILLING with prev 6 */
+    meta_op_member_state(&e, 6, META_OUT, 1, META_DOWN_NONE, 0, 0);
+    meta_op_stripe_set(&e, 0, 5, 7, META_STRIPE_FILLING, 6, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+    v = meta_volume(&m, 0);
+    CHECK(v->stripe[5] == 7 && v->stripe_version == 2 && v->stripe_pos[5].state == META_STRIPE_FILLING &&
+          v->stripe_pos[5].prev == 6 && v->stripe_pos[5].set_ver == 2);
+    /* filling counts as missing for objects below set_ver, even though node 7 is UP */
+    meta_vol_margins(&m, v, NULL, &yg, &sd);
+    CHECK(yg == 1 && sd == 1);
+    /* DRAINING still counts present; DOWN counts missing; liveness overlay marks UP node missing */
+    meta_op_member_state(&e, 4, META_DRAINING, 2, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 5, META_DOWN, 1, META_DOWN_TIMEOUT, 8000, 8000);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+    meta_vol_margins(&m, meta_volume(&m, 0), NULL, &yg, &sd);
+    CHECK(sd == 0); /* 1,2,3,4(draining) present; 5(DOWN) & 7(FILLING) missing -> 4 - 4 = 0 */
+    {
+        struct test_live_ctx lc = {.dead_mask = (1u << 1)}; /* node 1 UP in meta, unlive in overlay */
+        struct meta_liveness lv = {.live = test_live_fn, .ctx = &lc};
+        meta_vol_margins(&m, meta_volume(&m, 0), &lv, NULL, &sd);
+        CHECK(sd == -1);
+    }
+    meta_op_member_state(&e, 5, META_UP, 2, META_DOWN_NONE, 0, 0);
+    meta_op_member_state(&e, 4, META_UP, 2, META_DOWN_NONE, 0, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+
+    /* STRIPE_SET cannot bypass STRIPE_WHOLE (FILLING -> WHOLE refused); STRIPE_WHOLE checks exact stripe_version */
+    meta_op_stripe_set(&e, 0, 5, 7, META_STRIPE_WHOLE, 0, 2);
+    meta_op_stripe_whole(&e, 0, 5, 1); /* stale version (MUT(57) wholeanyversion) */
+    meta_op_stripe_whole(&e, 0, 5, 3); /* future version */
+    meta_op_stripe_whole(&e, 0, 6, 2); /* pos out of range */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_STALE &&
+          res[2] == META_ERR_STALE && res[3] == META_ERR_INVALID);
+    meta_copy(&prev, &m);
+    meta_op_stripe_whole(&e, 0, 5, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v = meta_volume(&m, 0);
+    CHECK(v->stripe_pos[5].state == META_STRIPE_WHOLE && v->stripe_version == 2 && v->stripe_whole_gen == 1 &&
+          v->stripe_whole_ver == 2 && v->stripe_pos[5].prev == 6 && v->stripe_pos[5].set_ver == 2);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    meta_vol_margins(&m, v, NULL, &yg, &sd);
+    CHECK(sd == 2); /* whole again -> full margin restored */
+    /* shared volume: young == 0, settled == 0 (no replicated young copies, matching margins.c young_na) */
+    {
+        struct meta_volume sv = *meta_volume(&m, 1);
+        sv.kind = META_VOL_SHARED;
+        yg = 99;
+        sd = 99;
+        meta_vol_margins(&m, &sv, NULL, &yg, &sd);
+        CHECK(yg == 0 && sd == 0);
+    }
+
+    /* 5. D23 settings defaults, bounds, and SNAP_VERSION 7 refusing version 6 by name */
+    {
+        struct meta_settings st;
+        meta_settings_default(&st);
+        CHECK(st.rebuild_after_s == 1800 && st.opening_hold_s == 3600 && st.failstop_out_s == 60 &&
+              st.out_guard_pct == 25 && st.out_guard_hold_s == 7200 && st.repl_retain_down_gb == 64 &&
+              st.young_high_pct == 90 && st.balance_mb_s == 0 && st.rebuild_concurrency == 4);
+        struct { int f; uint32_t v; int ok; } cases[] = {
+            {0, 0, 0},     {0, 1, 1},     {1, 0, 1},     {1, 86400, 1}, {1, 86401, 0}, {2, 0, 0},     {2, 1, 1},
+            {3, 0, 0},     {3, 1, 1},     {3, 100, 1},   {3, 101, 0},   {4, 0, 0},     {4, 1, 1},     {4, 86400, 1},
+            {4, 86401, 0}, {5, 0, 1},     {5, 128, 1},   {6, 9, 0},     {6, 10, 1},    {6, 99, 1},    {6, 100, 0},
+            {7, 0, 1},     {7, 500, 1},   {8, 0, 0},     {8, 1, 1},     {8, 64, 1},    {8, 65, 0},
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            meta_settings_default(&st);
+            uint32_t *ptrs[9] = {&st.rebuild_after_s,     &st.opening_hold_s, &st.failstop_out_s,
+                                 &st.out_guard_pct,       &st.out_guard_hold_s, &st.repl_retain_down_gb,
+                                 &st.young_high_pct,      &st.balance_mb_s,   &st.rebuild_concurrency};
+            *ptrs[cases[i].f] = cases[i].v;
+            meta_op_settings(&e, &st);
+            CHECK(apply1(&m, &e, res, 8) == META_OK && (res[0] == META_OK) == cases[i].ok);
+        }
+        /* set non-defaults, plus active DOWN & hold & FILLING, and verify snapshot v7 round-trip + v6 refusal */
+        meta_settings_default(&st);
+        st.rebuild_after_s = 30;
+        st.opening_hold_s = 120;
+        st.failstop_out_s = 5;
+        st.out_guard_pct = 30;
+        st.out_guard_hold_s = 900;
+        st.repl_retain_down_gb = 32;
+        st.young_high_pct = 85;
+        st.balance_mb_s = 100;
+        st.rebuild_concurrency = 8;
+        meta_op_settings(&e, &st);
+        meta_op_member_state(&e, 2, META_DOWN, 2, META_DOWN_FAILSTOP, 9000, 9100);
+        meta_op_node_hold(&e, 2, clk + 3600000, clk);
+        meta_op_stripe_set(&e, 0, 4, 8, META_STRIPE_FILLING, 5, 2);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK &&
+              res[3] == META_OK);
+        uint8_t *img;
+        size_t len;
+        meta_snapshot_encode(&m, &img, &len);
+        CHECK(meta_snapshot_version(img, len) == 7);
+        struct meta_state back;
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
+        CHECK(back.set.rebuild_after_s == 30 && back.set.opening_hold_s == 120 && back.set.failstop_out_s == 5 &&
+              back.set.out_guard_pct == 30 && back.set.out_guard_hold_s == 900 && back.set.repl_retain_down_gb == 32 &&
+              back.set.young_high_pct == 85 && back.set.balance_mb_s == 100 && back.set.rebuild_concurrency == 8);
+        CHECK(meta_member(&back, 2)->down_since_ms == 9000 && meta_member(&back, 2)->down_reason == META_DOWN_FAILSTOP &&
+              meta_member(&back, 2)->down_clock_ms == 9100 && meta_member(&back, 2)->hold_until_ms == clk + 3600000 &&
+              meta_member(&back, 2)->hold_clock_ms == clk && meta_member(&back, 9)->state == META_DESTROYED);
+        const struct meta_volume *bv = meta_volume(&back, 0);
+        CHECK(bv->stripe[4] == 8 && bv->stripe_pos[4].state == META_STRIPE_FILLING && bv->stripe_pos[4].prev == 5 &&
+              bv->stripe_pos[4].set_ver == 3 && bv->stripe_whole_gen == 1 && bv->stripe_whole_ver == 2);
+        /* snapshot version 6 refused and named */
+        uint32_t six = 6, crc;
+        memcpy(img + 4, &six, 4);
+        crc = iso_crc32c(0, img, len - 4);
+        memcpy(img + len - 4, &crc, 4);
+        CHECK(meta_snapshot_version(img, len) == 6 && meta_snapshot_decode(&back, img, len) == META_ERR_FORMAT);
+        meta_free(&back);
+        free(img);
+    }
+
+    /* 6. meta_check_step catches every new invariant violation directly */
+    {
+        struct meta_state bad;
+        /* hold > META_HOLD_MAX_MS */
+        meta_copy(&bad, &m);
+        ((struct meta_member *)meta_member(&bad, 2))->hold_until_ms = clk + META_HOLD_MAX_MS + 1;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+        /* DESTROYED left */
+        meta_copy(&bad, &m);
+        ((struct meta_member *)meta_member(&bad, 9))->state = META_UP;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+        /* OUT -> UP without new incarnation */
+        meta_copy(&bad, &m);
+        ((struct meta_member *)meta_member(&bad, 6))->state = META_UP;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+        /* down_since set on UP */
+        meta_copy(&bad, &m);
+        ((struct meta_member *)meta_member(&bad, 1))->down_since_ms = 1234;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+        /* down_since in future of op clock */
+        meta_copy(&bad, &m);
+        ((struct meta_member *)meta_member(&bad, 2))->down_since_ms = 9200;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+        /* stripe pos goes whole without STRIPE_WHOLE */
+        meta_copy(&bad, &m);
+        ((struct meta_volume *)meta_volume(&bad, 0))->stripe_pos[4].state = META_STRIPE_WHOLE;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        /* stripe pos goes whole at wrong version */
+        ((struct meta_volume *)meta_volume(&bad, 0))->stripe_whole_gen++;
+        ((struct meta_volume *)meta_volume(&bad, 0))->stripe_whole_ver = 1;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+    }
+
     meta_entry_free(&e);
     meta_free(&m);
 }
@@ -1461,7 +1833,7 @@ static void test_shared(void)
     g.att.incarnation = 0; /* a member's incarnation is 0 here: the power-off covers it */
     meta_op_volume_leader(&e, &g);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
-    meta_op_member_state(&e, 1, META_UP, 5);
+    meta_op_member_state(&e, 1, META_UP, 5, META_DOWN_NONE, 0, 0);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 0);
     if (v->leader != 1) {
@@ -1491,7 +1863,7 @@ static void test_shared(void)
     /* never to a member that is out */
     v = meta_volume(&m, 0);
     uint32_t gone = v->rep[0].node == v->leader ? v->rep[1].node : v->rep[0].node;
-    meta_op_member_state(&e, gone, META_OUT, 9);
+    meta_op_member_state(&e, gone, META_OUT, 9, META_DOWN_NONE, 0, 0);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 0);
     g = sgrant(v, gone, v->epoch + 2, META_GR_PLANNED);
@@ -2309,6 +2681,9 @@ struct msim {
     uint64_t applied_max, proposals, ops_ok, leader_changes, crashes, partitions, installs, cut_installs, reseeds;
     uint64_t changes; /* membership changes the leaders started */
     uint64_t resets;  /* REPLICA_RESET instances drawn */
+    uint64_t outs;    /* committed transitions into META_OUT */
+    uint64_t out_back_tries; /* valid OUT -> UP (new inc) proposals sent */
+    uint64_t out_backs; /* committed transitions META_OUT -> META_UP (catches outfinal) */
     uint64_t adopts;  /* installs cut short and finished from the kept image */
     uint64_t partial_resets;
     uint64_t rebases; /* logs started again on the snapshot at a boot (a reset cut short left them below it) */
@@ -2488,13 +2863,28 @@ static void check_one_op(struct msim *s, struct snode *nd, uint64_t index, uint3
                          nd->id, index, number);
         }
     }
-    if (kind == META_OP_STRIPE_SET && n >= 20) {
+    if (kind == META_OP_STRIPE_SET && n >= 25) {
+        const struct meta_volume *a = meta_volume(pre, number), *v = meta_volume(at, number);
+        uint32_t pos = rd32(b + 4), node = rd32(b + 8), prev = rd32(b + 13);
+        uint8_t st = b[12];
+        uint64_t sv = rd64(b + 17);
+        if (!a || !v || a->stripe_version != sv || v->stripe_version != a->stripe_version + 1 ||
+            pos >= v->nstripe || v->stripe[pos] != node || v->stripe_pos[pos].state != st ||
+            v->stripe_pos[pos].set_ver != v->stripe_version ||
+            (st == META_STRIPE_FILLING && v->stripe_pos[pos].prev != prev))
+            sim_fail(s, "node %u, index %" PRIu64 ": STRIPE_SET of volume %u named stripe version %" PRIu64
+                     " (the volume's: %" PRIu64 ") and was applied wrongly", nd->id, index, number, sv,
+                     a ? a->stripe_version : 0);
+    }
+    if (kind == META_OP_STRIPE_WHOLE && n >= 16) {
         const struct meta_volume *a = meta_volume(pre, number), *v = meta_volume(at, number);
         uint32_t pos = rd32(b + 4);
-        if (!a || !v || a->stripe_version != rd64(b + 12) || v->stripe_version != a->stripe_version + 1 ||
-            pos >= v->nstripe || v->stripe[pos] != rd32(b + 8))
-            sim_fail(s, "node %u, index %" PRIu64 ": STRIPE_SET of volume %u named stripe version %" PRIu64
-                     " (the volume's: %" PRIu64 ") and was applied wrongly", nd->id, index, number, rd64(b + 12),
+        uint64_t ver = rd64(b + 8);
+        if (!a || !v || a->stripe_version != ver || v->stripe_version != a->stripe_version || pos >= v->nstripe ||
+            a->stripe_pos[pos].state != META_STRIPE_FILLING || v->stripe_pos[pos].state != META_STRIPE_WHOLE ||
+            v->stripe_whole_gen != a->stripe_whole_gen + 1)
+            sim_fail(s, "node %u, index %" PRIu64 ": STRIPE_WHOLE of volume %u pos %u named version %" PRIu64
+                     " (the volume's: %" PRIu64 ") and was applied wrongly", nd->id, index, number, pos, ver,
                      a ? a->stripe_version : 0);
     }
     if (kind == META_OP_GC_SUSPEND && !(meta_volume(at, number) && meta_volume(at, number)->gc_suspended))
@@ -2502,8 +2892,9 @@ static void check_one_op(struct msim *s, struct snode *nd, uint64_t index, uint3
                  number);
     char why[256];
     if ((setop || kind == META_OP_VOLUME_LEADER || kind == META_OP_ISR_CHANGE || kind == META_OP_VOLUME_ADD ||
-         kind == META_OP_STRIPE_SET || kind == META_OP_GC_SUSPEND || kind == META_OP_GC_RESUME ||
-         kind == META_OP_RESTORE) &&
+         kind == META_OP_STRIPE_SET || kind == META_OP_STRIPE_WHOLE || kind == META_OP_GC_SUSPEND ||
+         kind == META_OP_GC_RESUME || kind == META_OP_RESTORE || kind == META_OP_MEMBER_STATE ||
+         kind == META_OP_NODE_HOLD) &&
         meta_check_step(pre, at, why, sizeof why))
         sim_fail(s, "node %u, index %" PRIu64 ", op %u (kind %u) on its own: %s", nd->id, index, k, kind, why);
 }
@@ -2574,13 +2965,30 @@ static void check_named(struct msim *s, struct snode *nd, const struct meta_stat
                              " and was applied", nd->id, e->index, rd32(b), rd32(b + 24 + i * 4), rd64(b + ro));
             }
         }
-        if (kind == META_OP_MEMBER_STATE && n >= 13 && ok) {
+        if (kind == META_OP_MEMBER_STATE && n >= 30 && ok) {
             const struct meta_member *mb = meta_member(&at, rd32(b));
+            uint8_t st = b[4];
             uint64_t inc = rd64(b + 5);
-            if (!mb || mb->state == META_OUT || inc < mb->incarnation)
-                sim_fail(s, "node %u, index %" PRIu64 ": MEMBER_STATE of member %u named incarnation %" PRIu64
-                         " (the member's: %" PRIu64 ", state %d) and was applied", nd->id, e->index, rd32(b), inc,
-                         mb ? mb->incarnation : 0, mb ? mb->state : -1);
+            int bad = !mb || mb->state == META_DESTROYED || inc < mb->incarnation ||
+                      (st == META_DESTROYED && mb->state != META_OUT) ||
+                      (mb->state == META_OUT && st != META_UP && st != META_DESTROYED) ||
+                      (mb->state == META_OUT && st == META_UP && inc <= mb->incarnation);
+            if (bad)
+                sim_fail(s, "node %u, index %" PRIu64 ": MEMBER_STATE of member %u (%d -> %u, inc %" PRIu64
+                         " vs %" PRIu64 ") was applied", nd->id, e->index, rd32(b), mb ? mb->state : -1, st, inc,
+                         mb ? mb->incarnation : 0);
+            if (mb && mb->state != META_OUT && st == META_OUT)
+                s->outs++;
+            if (mb && mb->state == META_OUT && st == META_UP)
+                s->out_backs++;
+        }
+        if (kind == META_OP_NODE_HOLD && n >= 20 && ok) {
+            const struct meta_member *mb = meta_member(&at, rd32(b));
+            uint64_t until_ms = rd64(b + 4), clk = rd64(b + 12);
+            if (!mb || mb->state >= META_OUT ||
+                (until_ms && (!clk || until_ms < clk || until_ms - clk > META_HOLD_MAX_MS)))
+                sim_fail(s, "node %u, index %" PRIu64 ": NODE_HOLD of member %u (until %" PRIu64 ", clock %" PRIu64
+                         ", state %d) was applied", nd->id, e->index, rd32(b), until_ms, clk, mb ? mb->state : -1);
         }
         if (ok) { /* the state the next op meets */
             uint8_t one[8 + 5 + 4096];
@@ -3014,6 +3422,14 @@ static void propose(struct msim *s, struct snode *nd)
                                v->isr_version - (rnd(s, 0, 9) == 0), isr, rid, ni, rnd(s, 0, 3) ? 0 : rnd(s, 1, 99));
         } else if (what == 4 && v) {
             uint32_t node = m->members[rnd(s, 0, m->nmembers - 1)].id;
+            if (rnd(s, 0, 7)) { /* usually pick a non-OUT member so replica moves exercise freely */
+                uint32_t live[16], nl = 0;
+                for (uint32_t j = 0; j < m->nmembers && nl < 16; j++)
+                    if (m->members[j].state < META_OUT)
+                        live[nl++] = m->members[j].id;
+                if (nl)
+                    node = live[rnd(s, 0, nl - 1)];
+            }
             uint64_t epoch = v->epoch - (stale && v->epoch > 1);
             unsigned how = (unsigned)rnd(s, 0, 7);
             int mover = -1; /* a pending move's learner */
@@ -3043,17 +3459,59 @@ static void propose(struct msim *s, struct snode *nd)
             meta_op_replica_open(&e, v->number, r->node, r->rid ^ (rnd(s, 0, 11) == 0), r->open_gen + rnd(s, 0, 2),
                                  rnd(s, 0, 1000));
         } else if (what == 6) {
-            uint32_t id = m->members[rnd(s, 0, m->nmembers - 1)].id;
-            uint64_t inc = meta_member(m, id)->incarnation + rnd(s, 0, 1);
-            if (rnd(s, 0, 3) == 0) { /* moved: to a fresh address, or onto another member's (refused) */
+            const struct meta_member *mb = &m->members[rnd(s, 0, m->nmembers - 1)];
+            uint32_t id = mb->id;
+            uint64_t inc = mb->incarnation + rnd(s, 0, 1);
+            uint64_t clk = 1000000ull + s->now / 1000000ull;
+            if (rnd(s, 0, 4) == 0) { /* moved: to a fresh address, or onto another member's (refused) */
                 char peer[32];
                 snprintf(peer, sizeof peer, "10.0.%u.%u:5556", (unsigned)rnd(s, 0, 1), (unsigned)rnd(s, 1, 9));
                 meta_op_member_addr(&e, id, inc, "10.9.9.9:5555", peer);
             }
-            if (rnd(s, 0, 2) == 0)
+            unsigned act = (unsigned)rnd(s, 0, 7);
+            if (mb->state == META_OUT) {
+                /* OUT: mostly return to UP with new inc (exercises OUT -> UP back path), sometimes DESTROYED */
+                uint32_t ndest = 0;
+                for (uint32_t j = 0; j < m->nmembers; j++)
+                    ndest += m->members[j].state == META_DESTROYED;
+                if (act <= 4) {
+                    uint64_t bump = rnd(s, 0, 5) ? 1 : 0;
+                    if (bump)
+                        s->out_back_tries++;
+                    meta_op_member_state(&e, id, META_UP, mb->incarnation + bump, META_DOWN_NONE, 0, 0);
+                } else if (act == 5 && m->nmembers >= 6 && ndest < 2)
+                    meta_op_member_state(&e, id, META_DESTROYED, mb->incarnation, META_DOWN_NONE, 0, 0);
+                else
+                    meta_op_node_hold(&e, id, clk + 60000, clk); /* refused on OUT */
+            } else if (mb->state == META_DESTROYED) {
+                /* DESTROYED: try leaving it (must be refused; catches destroyedback) */
+                meta_op_member_state(&e, id, META_UP, mb->incarnation + 1, META_DOWN_NONE, 0, 0);
+            } else if (act == 0) {
                 meta_op_member_flags(&e, id, inc, (uint8_t)rnd(s, 0, 3));
-            else
-                meta_op_member_state(&e, id, (int)rnd(s, 0, 2), inc);
+            } else if (act <= 2) {
+                /* NODE_HOLD: valid hold, release (0), or over-bound (catches holdunbounded) */
+                uint64_t until = rnd(s, 0, 4) == 0 ? 0
+                                 : rnd(s, 0, 2) == 0 ? clk + META_HOLD_MAX_MS + rnd(s, 1, 3600000)
+                                                     : clk + rnd(s, 1000, META_HOLD_MAX_MS);
+                meta_op_node_hold(&e, id, until, clk);
+            } else if (act == 3) {
+                /* propose OUT when enough live members remain for volume adds */
+                uint32_t alive = 0;
+                for (uint32_t j = 0; j < m->nmembers; j++)
+                    alive += m->members[j].state < META_OUT;
+                if (alive > 3 || s->outs == 0)
+                    meta_op_member_state(&e, id, META_OUT, inc, META_DOWN_NONE, 0, 0);
+                else
+                    meta_op_member_state(&e, id, META_DOWN, inc, (uint8_t)rnd(s, 1, META_DOWN_LAST),
+                                         clk - rnd(s, 0, 1000), clk);
+            } else if (act == 4) {
+                /* DOWN with random reason; occasionally a future since_ms (must be refused) */
+                uint64_t since_ms = rnd(s, 0, 9) ? clk - rnd(s, 0, 5000) : clk + 1000;
+                meta_op_member_state(&e, id, META_DOWN, inc, (uint8_t)rnd(s, 1, META_DOWN_LAST), since_ms, clk);
+            } else {
+                int st = rnd(s, 0, 1) ? META_UP : META_DRAINING;
+                meta_op_member_state(&e, id, st, inc, META_DOWN_NONE, 0, 0);
+            }
         } else if (what == 7 && m->nvolumes) {
             uint32_t first = (uint32_t)rnd(s, 0, META_SLOTS - 1);
             meta_op_slot_home(&e, first, (uint32_t)rnd(s, 1, first + 64 <= META_SLOTS ? 64 : META_SLOTS - first),
@@ -3116,14 +3574,25 @@ static void propose(struct msim *s, struct snode *nd)
             else
                 meta_op_restore(&e, m->restore_gen + rnd(s, 0, 1));
         } else if (what == 12 && v && v->redundancy == META_RED_EC) {
-            unsigned how = (unsigned)rnd(s, 0, 5);
-            if (how <= 2) { /* a position to any member, at the version this copy has (stale by apply, often) */
+            unsigned how = (unsigned)rnd(s, 0, 7);
+            if (how <= 2) { /* STRIPE_SET: mostly filling with prev, sometimes whole; sometimes stale version */
+                uint32_t pos = (uint32_t)rnd(s, 0, v->nstripe);
                 uint32_t node = m->members[rnd(s, 0, m->nmembers - 1)].id;
-                meta_op_stripe_set(&e, v->number, (uint32_t)rnd(s, 0, v->nstripe), node,
-                                   v->stripe_version - (rnd(s, 0, 7) == 0));
-            } else if (how == 3) { /* force-leader: a replica outside the ISR into it, orphan collection off */
+                uint8_t st = rnd(s, 0, 3) ? META_STRIPE_FILLING : META_STRIPE_WHOLE;
+                uint32_t prev = (st == META_STRIPE_FILLING && pos < v->nstripe && rnd(s, 0, 2)) ? v->stripe[pos] : 0;
+                meta_op_stripe_set(&e, v->number, pos, node, st, prev, v->stripe_version - (rnd(s, 0, 7) == 0));
+            } else if (how <= 4) { /* STRIPE_WHOLE: pick a filling pos when one exists; sometimes stale version */
+                uint32_t pos = (uint32_t)rnd(s, 0, v->nstripe - 1);
+                for (uint32_t j = 0; j < v->nstripe; j++)
+                    if (v->stripe_pos[j].state == META_STRIPE_FILLING) {
+                        pos = j;
+                        break;
+                    }
+                uint64_t ver = v->stripe_version - (rnd(s, 0, 3) == 0 && v->stripe_version > 1);
+                meta_op_stripe_whole(&e, v->number, pos, ver);
+            } else if (how == 5) { /* force-leader: a replica outside the ISR into it, orphan collection off */
                 meta_op_volume_force(&e, v, v->rep[rnd(s, 0, v->nrep - 1)].node);
-            } else if (how == 4) {
+            } else if (how == 6) {
                 meta_op_gc_resume(&e, v->number);
             } else {
                 meta_op_gc_suspend(&e, v->number);
@@ -3347,6 +3816,9 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
         }
     if (ok && s->applied_max < 100)
         snprintf(s->fail, sizeof s->fail, "only %" PRIu64 " entries applied", s->applied_max), ok = 0;
+    if (ok && s->out_back_tries >= 3 && s->out_backs == 0)
+        snprintf(s->fail, sizeof s->fail, "%" PRIu64 " OUT -> UP proposals tried (%" PRIu64 " OUT), none applied",
+                 s->out_back_tries, s->outs), ok = 0;
     for (unsigned i = 1; !ok && i <= s->n; i++) { /* every server's role, term and configuration, for the diagnosis */
         const struct snode *nd = &s->nd[i];
         size_t at = strlen(s->fail);
@@ -3442,6 +3914,7 @@ int main(int argc, char **argv)
         test_state_machine();
         test_replica_set();
         test_ec();
+        test_r9_meta();
         test_shared();
         test_users();
         test_users_limits();

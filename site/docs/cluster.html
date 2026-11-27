@@ -439,7 +439,7 @@ before.</p>
 <p>Options of <code>init</code>; each number is a whole number above 0 (<code>0</code> turns
 <code>--leader-balance-s</code> off). Settings for replication, leases, rebuilds and transfers are acted on; those for
 shared mode (<code>--mode shared</code>, <code>--failover</code>, <code>--lease-s</code>, <code>--read-barrier</code>),
-<code>--out-after-s</code> and <code>--volumes-per-server</code> are only stored.</p>
+<code>--rebuild-after-s</code> and <code>--volumes-per-server</code> are only stored.</p>
 <div class="table-wrap"><table>
 <thead><tr><th scope="col">Option</th><th scope="col">Default</th><th scope="col">What it does</th></tr></thead>
 <tbody>
@@ -448,7 +448,7 @@ shared mode (<code>--mode shared</code>, <code>--failover</code>, <code>--lease-
 <tr><td><code>--node-timeout-ms MS</code></td><td>3000</td><td>A server is marked down after this long without a heartbeat.</td></tr>
 <tr><td><code>--heartbeat-ms MS</code></td><td>500</td><td>How often servers report. Below <code>--node-timeout-ms</code>.</td></tr>
 <tr><td><code>--isr-lag-ms MS</code></td><td>1000</td><td>A copy this far behind leaves the in-sync set, and comes back once it has caught up. At least 500.</td></tr>
-<tr><td><code>--out-after-s S</code></td><td>1800</td><td>A server down this long is marked <code>out</code>. Stored; in the preview no server is ever marked <code>out</code>.</td></tr>
+<tr><td><code>--rebuild-after-s S</code></td><td>1800</td><td>A server down this long is marked <code>out</code>. Stored; in the preview no server is ever marked <code>out</code>.</td></tr>
 <tr><td><code>--voter-replace-s S</code></td><td>600</td><td>A voter down this long is replaced by another member.</td></tr>
 <tr><td><code>--voters N</code></td><td>5</td><td>The most voters the group has (an even number counts as one less).</td></tr>
 <tr><td><code>--volumes-per-server N</code></td><td>16</td><td>Volumes led per server.</td></tr>

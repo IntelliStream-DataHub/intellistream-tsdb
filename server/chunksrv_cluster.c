@@ -68,7 +68,7 @@ static void set_peers(struct chunksrv *cs, const struct cluster_copy *c, uint32_
     size_t nk = 0;
     for (uint32_t i = 0; i < c->nmembers; i++) {
         const struct cluster_copy_member *m = &c->members[i];
-        if (m->id == self || m->state == META_OUT)
+        if (m->id == self || m->state >= META_OUT)
             continue;
         if (keep)
             keep[nk++] = m->id;

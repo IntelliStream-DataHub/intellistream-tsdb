@@ -482,11 +482,13 @@ const char *cluster_strerror(int rc)
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out)
 {
     const uint32_t v[META_SETTINGS_WORDS + 1] = {
-        s->replication,   s->min_isr,          s->node_timeout_ms,    s->heartbeat_ms,   s->isr_lag_ms,
-        s->out_after_s,   s->voter_replace_s,  s->voters,             s->volumes_per_server, s->failover,
-        s->read_barrier,  s->lease_s,          s->lease_ms,           s->drift_ppm,      s->unanswered_ms,
-        s->commit_interval_ms, s->repl_retain_mb, s->repl_retain_s,   s->idle_seal_ms,   s->rebuild_mb_s,
-        s->rebuild_max,   s->transfer_wait_ms, s->leader_balance_s,   (uint32_t)mode};
+        s->replication,      s->min_isr,             s->node_timeout_ms,    s->heartbeat_ms,       s->isr_lag_ms,
+        s->rebuild_after_s,  s->voter_replace_s,     s->voters,             s->volumes_per_server, s->failover,
+        s->read_barrier,     s->lease_s,             s->lease_ms,           s->drift_ppm,          s->unanswered_ms,
+        s->commit_interval_ms, s->repl_retain_mb,    s->repl_retain_s,      s->idle_seal_ms,       s->rebuild_mb_s,
+        s->rebuild_max,      s->transfer_wait_ms,    s->leader_balance_s,   s->opening_hold_s,     s->failstop_out_s,
+        s->out_guard_pct,    s->out_guard_hold_s,    s->repl_retain_down_gb, s->young_high_pct,    s->balance_mb_s,
+        s->rebuild_concurrency, (uint32_t)mode};
     for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         for (int j = 0; j < 4; j++)
             out[i * 4 + j] = (uint8_t)(v[i] >> (8 * j));
@@ -499,13 +501,15 @@ static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
     for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         v[i] = get32(r);
     *s = (struct meta_settings){.replication = v[0], .min_isr = v[1], .node_timeout_ms = v[2], .heartbeat_ms = v[3],
-                                .isr_lag_ms = v[4], .out_after_s = v[5], .voter_replace_s = v[6], .voters = v[7],
+                                .isr_lag_ms = v[4], .rebuild_after_s = v[5], .voter_replace_s = v[6], .voters = v[7],
                                 .volumes_per_server = v[8], .failover = (uint8_t)v[9],
                                 .read_barrier = (uint8_t)v[10], .lease_s = v[11], .lease_ms = v[12],
                                 .drift_ppm = v[13], .unanswered_ms = v[14], .commit_interval_ms = v[15],
                                 .repl_retain_mb = v[16], .repl_retain_s = v[17], .idle_seal_ms = v[18],
                                 .rebuild_mb_s = v[19], .rebuild_max = v[20], .transfer_wait_ms = v[21],
-                                .leader_balance_s = v[22]};
+                                .leader_balance_s = v[22], .opening_hold_s = v[23], .failstop_out_s = v[24],
+                                .out_guard_pct = v[25], .out_guard_hold_s = v[26], .repl_retain_down_gb = v[27],
+                                .young_high_pct = v[28], .balance_mb_s = v[29], .rebuild_concurrency = v[30]};
     *mode = (int)v[META_SETTINGS_WORDS];
     return r->bad || v[9] > 255 || v[10] > 255 ? -1 : 0;
 }
@@ -4717,13 +4721,13 @@ static uint64_t member_applied(uint32_t id)
     return h ? h->applied : 0;
 }
 
-/* the members (not OUT) whose last reported applied index is below `index` */
+/* the members (neither OUT nor DESTROYED) whose last reported applied index is below `index` */
 static uint32_t user_laggards(uint64_t index, struct cluster_laggard *lag)
 {
     uint32_t nl = 0;
     for (uint32_t k = 0; k < C.sm.nmembers && nl < CLUSTER_LAGGARDS_MAX; k++) {
         const struct meta_member *m = &C.sm.members[k];
-        uint64_t a = m->state == META_OUT ? UINT64_MAX : member_applied(m->id);
+        uint64_t a = m->state >= META_OUT ? UINT64_MAX : member_applied(m->id);
         if (a < index)
             lag[nl++] = (struct cluster_laggard){m->id, a};
     }
@@ -5040,7 +5044,7 @@ static void on_probe(struct conn *c, struct rd *r)
 static const struct meta_member *member_by_ident(const uint8_t ident[16])
 {
     for (uint32_t i = 0; i < C.sm.nmembers; i++)
-        if (C.sm.members[i].state != META_OUT && !memcmp(C.sm.members[i].ident, ident, 16))
+        if (C.sm.members[i].state != META_DESTROYED && !memcmp(C.sm.members[i].ident, ident, 16))
             return &C.sm.members[i];
     return NULL;
 }
@@ -5812,8 +5816,18 @@ static void propose_member(uint32_t id, int state, uint64_t inc, struct heard *h
         snprintf(peer, sizeof peer, "%s", h->peer);
         meta_op_member_addr(&e, id, inc, addr, peer);
     }
-    if (state >= 0)
-        meta_op_member_state(&e, id, state, inc);
+    if (state >= 0) {
+        if (state == META_DOWN) {
+            struct timespec wt;
+            clock_gettime(CLOCK_REALTIME, &wt);
+            uint64_t wms = (uint64_t)wt.tv_sec * 1000ull + (uint64_t)wt.tv_nsec / 1000000ull;
+            if (!wms)
+                wms = 1;
+            meta_op_member_state(&e, id, state, inc, META_DOWN_TIMEOUT, wms, wms);
+        } else {
+            meta_op_member_state(&e, id, state, inc, META_DOWN_NONE, 0, 0);
+        }
+    }
     if (propose(&e, 0, 0, id) == ISO_OK) {
         if (h)
             say("proposes node %" PRIu32 " at %s, peer %s (incarnation %" PRIu64 ")", id, addr, peer, inc);
@@ -5851,7 +5865,7 @@ static void member_states(uint64_t now)
         return;
     for (uint32_t i = 0; i < C.sm.nmembers && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
         const struct meta_member *m = &C.sm.members[i];
-        if (m->state == META_OUT || m->state == META_DRAINING || pend_member(m->id))
+        if (m->state == META_DESTROYED || m->state == META_DRAINING || pend_member(m->id))
             continue;
         uint64_t last = heard_ns(m->id, now);
         struct heard *h = heard_get(m->id);
@@ -5867,6 +5881,12 @@ static void member_states(uint64_t now)
                                       (!h->moved_ns || since(now, h->moved_ns) >= to)
                                   ? h
                                   : NULL;
+        if (st == META_OUT) {
+            /* OUT is reversible (D2): a returning server with a new incarnation comes back UP */
+            if (fresh && inc > minc)
+                propose_member(id, META_UP, inc, moved, now);
+            continue;
+        }
         if (!settled && !(fresh && inc >= minc && (st == META_DOWN || inc > minc)))
             continue;
         if (st == META_UP && !fresh && (cl_mutant() == CLM_NOPROMOTEWAIT || now >= promote_safe_ns(id)))
