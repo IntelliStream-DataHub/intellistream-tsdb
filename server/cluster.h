@@ -322,6 +322,9 @@ struct cluster_vol_rec {
     uint32_t repl_retain_down_gb; /* R9 E29: per-server WAL retention budget for DOWN/held members, GB (meta.h) */
     uint32_t young_high_pct;      /* R9 E30: data dir fill % at which a member enters FULL (meta.h) */
     uint32_t rebuild_mb_s, rebuild_max, transfer_wait_ms, leader_balance_s; /* R4's settings (meta.h, D16) */
+    uint32_t scrub_days, scrub_mb_s, scrub_out_count; /* R12/R13 scrub settings (meta.h, D2) */
+    uint32_t young_warn_pct, young_move_pct, disk_stall_s; /* R13 fast-disk marks and probe stall (meta.h, D13) */
+    uint8_t log_on_hdd; /* R13 E50: 1 grants HDD-only members compute cap (placer still prefers fast members) */
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
  * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)
@@ -345,8 +348,12 @@ void cluster_set_volume_watch(cluster_vol_watch_fn fn, void *arg);
 struct cluster_copy_member {
     uint32_t id;
     uint8_t state;            /* enum meta_member_state */
+    uint8_t role;             /* enum meta_role (R13, E20, E49) */
+    uint8_t capability;       /* enum meta_cap bitmask (R13, E49) */
     char addr[META_ADDR_MAX]; /* the client address, host:port */
     char peer[META_ADDR_MAX]; /* the peer address */
+    uint32_t ndisks;
+    struct meta_disk disks[META_DISKS_MAX]; /* committed disks (R13, E52) */
 };
 struct cluster_copy_vol {
     uint32_t number;
@@ -378,6 +385,9 @@ struct cluster_copy {
     uint32_t self; /* this server's member id (0: none yet) */
     uint32_t nmembers, nvolumes;
     uint32_t rebuild_concurrency; /* R9 (D11, D23): objects in flight per server */
+    uint32_t scrub_days, scrub_mb_s, scrub_out_count; /* R12/R13 scrub settings (D2) */
+    uint32_t young_warn_pct, young_move_pct, young_high_pct, disk_stall_s; /* R13 fast-disk marks & stall (D13) */
+    uint8_t log_on_hdd; /* R13 E50: 1 grants HDD-only members compute cap (placer still prefers fast members) */
     const struct cluster_copy_member *members; /* ascending by id */
     const struct cluster_copy_vol *volumes;    /* ascending by number */
 };
@@ -390,6 +400,13 @@ unsigned long cluster_copy_builds(void);
  * intact, else -1. why: a line either way (counts, the longest swap). */
 int cluster_copy_stress(unsigned readers, unsigned long publishes, unsigned ms, char *why, size_t wn);
 const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy *c, uint32_t id); /* NULL: none */
+/* R13 (E49, E52): copy member `node`'s committed disks, declared role and computed capability from the published
+ * metadata copy (any thread, lock-free via cluster_copy_get). Returns the count copied into `out[0..cap)` (capped at
+ * `cap`), or -1 if no copy is published or `node` is unknown. `out` may be NULL when only metadata pointers are read.
+ * Note: a member with 0 registered disks reports capability == META_CAP_NONE; check `*total_out == 0` when treating
+ * unregistered (pre-r13-start) members as unrestricted. */
+int cluster_member_disks(uint32_t node, struct meta_disk *out, uint32_t cap, uint32_t *total_out, uint8_t *role_out,
+                         uint8_t *cap_out);
 const struct cluster_copy_vol *cluster_copy_vol(const struct cluster_copy *c, uint32_t number);    /* NULL: none */
 /* the volume named `name` (n bytes, no NUL needed), NULL: none (s2e routes series ops that name a volume by it) */
 const struct cluster_copy_vol *cluster_copy_vol_named(const struct cluster_copy *c, const char *name, size_t n);

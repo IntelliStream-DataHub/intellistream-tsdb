@@ -8,6 +8,19 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+- **Cluster metadata snapshot version 10 and R13 disks, roles, store states and R12/R13 settings (`r13-meta`).** Bumps
+  `META_SNAP_VERSION` from 9 to 10 (and entry magic from `"TME6"` to `"TME7"`; snapshot version 9 and `"TME6"` entries
+  are refused by name — pre-1.0 preview clusters are re-initialised, not upgraded). Adds per-member registered disks
+  (`META_DISKS_MAX = 64`: 16-byte globally unique `store_id`, class `nvme`/`ssd`/`hdd`, uses `log`/`chunk`, size, p50
+  sync latency, state `UP`/`DOWN`/`OUT`/`DESTROYED`), declared server `role` (`both`/`compute`/`storage`) and computed
+  `capability` updated at apply from UP disks and `log_on_hdd` (E20, E49, E52), ops `META_OP_STORE_ADD`,
+  `META_OP_STORE_CLASS`, `META_OP_STORE_STATE` (`OUT` only from `DOWN`; `DESTROYED` only from `OUT` and final;
+  `OUT -> DOWN` refused), and `META_OP_MEMBER_ROLE`,
+  7 new cluster settings words (`scrub_days` 14, `scrub_mb_s` 50, `scrub_out_count` 8, `log_on_hdd` 0, `young_warn_pct`
+  75, `young_move_pct` 80, `disk_stall_s` 10; `META_SETTINGS_WORDS = 38`) with `tsdb cluster init` flags and `status`
+  output, `cluster_member_disks()` and `cluster_vol_rec`/`cluster_copy` fields for drivers, and `meta_check_step`
+  invariants for log/stripe placement capability and `DESTROYED` store finality.
+
 - **Cluster metadata snapshot version 9 and R10 conversion metadata (`r10-meta`).** Bumps `META_SNAP_VERSION` from 8
   to 9 (and entry magic from `"TME5"` to `"TME6"`; snapshot version 8 and `"TME5"` entries are refused by name — pre-1.0
   preview clusters are re-initialised, not upgraded). Adds persisted redundancy conversion state (`META_OP_VOLUME_REDUNDANCY`,

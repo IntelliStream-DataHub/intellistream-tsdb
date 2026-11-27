@@ -826,6 +826,13 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.rebuild_max = 3;
         s.transfer_wait_ms = 2500;
         s.leader_balance_s = 60;
+        s.scrub_days = 7;
+        s.scrub_mb_s = 75;
+        s.scrub_out_count = 12;
+        s.log_on_hdd = 1;
+        s.young_warn_pct = 70;
+        s.young_move_pct = 78;
+        s.disk_stall_s = 15;
     }
     uint8_t req[4 * (META_SETTINGS_WORDS + 1)], *reply;
     size_t len;
@@ -5036,11 +5043,16 @@ static void scen_snapversion(void)
     struct view v;
     view(0, &v);
     const struct meta_settings *st = &v.m.set;
-    if (st->rebuild_mb_s != 300 || st->rebuild_max != 3 || st->transfer_wait_ms != 2500 || st->leader_balance_s != 60)
-        die("INIT's settings came back as rebuild_mb_s %u, rebuild_max %u, transfer_wait_ms %u, leader_balance_s %u "
-            "(sent 300, 3, 2500, 60)", st->rebuild_mb_s, st->rebuild_max, st->transfer_wait_ms, st->leader_balance_s);
+    if (st->rebuild_mb_s != 300 || st->rebuild_max != 3 || st->transfer_wait_ms != 2500 || st->leader_balance_s != 60 ||
+        st->scrub_days != 7 || st->scrub_mb_s != 75 || st->scrub_out_count != 12 || st->log_on_hdd != 1 ||
+        st->young_warn_pct != 70 || st->young_move_pct != 78 || st->disk_stall_s != 15)
+        die("INIT's settings came back wrong (rebuild_mb_s %u, rebuild_max %u, transfer_wait_ms %u, leader_balance_s %u, "
+            "scrub_days %u, scrub_mb_s %u, scrub_out_count %u, log_on_hdd %u, young_warn_pct %u, young_move_pct %u, "
+            "disk_stall_s %u)", st->rebuild_mb_s, st->rebuild_max, st->transfer_wait_ms, st->leader_balance_s,
+            st->scrub_days, st->scrub_mb_s, st->scrub_out_count, st->log_on_hdd, st->young_warn_pct, st->young_move_pct,
+            st->disk_stall_s);
     view_free(&v);
-    printf("  INIT's rebuild_mb_s, rebuild_max, transfer_wait_ms and leader_balance_s read back from STATUS\n");
+    printf("  INIT's R4 and R12/R13 settings read back from STATUS\n");
 
     /* R10 (D26, D28): verify HBS_LIVE_OBJS -> heard_sections -> cl_heard_live_objs -> STATUS round-trip
      * (uses TSDB_TEST_HOOKS live_objs_test=1) */

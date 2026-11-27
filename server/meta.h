@@ -80,6 +80,7 @@
 #define META_GROUP_MAX 64 /* a server group (the takeover cap) */
 #define META_DOMAIN_MAX 64
 #define META_REPLICAS_MAX 7 /* replication 4 plus learners during a move */
+#define META_DISKS_MAX 64   /* disks registered on one member (E52) */
 #define META_EC_K_MAX 16    /* an erasure-coded volume's data positions (E1) */
 #define META_EC_M_MAX 4     /* and its parity positions */
 #define META_STRIPE_MAX (META_EC_K_MAX + META_EC_M_MAX) /* positions of a stripe group */
@@ -147,6 +148,61 @@ const char *meta_down_reason_name(int r);
  * claims failed (CLAIM_FAILED's reasons: the state disk, the storage) reports claim_ok = 0 until it is well again. */
 enum meta_member_flags { META_MF_VOTER_OK = 1, META_MF_VOLUMES_OK = 2, META_MF_CLAIM_OK = 4, META_MF_ALL = 7 };
 
+/* Disk hardware class (R13, E47, E48, E52; values match src/disk.h's disk_class). */
+enum meta_disk_class {
+    META_DISK_NONE = 0,
+    META_DISK_NVME = 1,
+    META_DISK_SSD = 2,
+    META_DISK_HDD = 3,
+    META_DISK_CLASS_LAST = META_DISK_HDD,
+};
+const char *meta_disk_class_name(int c);
+static inline int meta_disk_class_fast(int c) { return c == META_DISK_NVME || c == META_DISK_SSD; }
+
+/* Uses assigned to a disk (R13, E48, E52). */
+enum meta_disk_uses {
+    META_DISK_USE_LOG = 1,
+    META_DISK_USE_CHUNK = 2,
+    META_DISK_USE_ALL = 3,
+};
+
+/* Device / store states (R13, E27, E52): UP -> DOWN -> OUT -> DESTROYED (OUT only from DOWN; DESTROYED is final). */
+enum meta_store_state {
+    META_STORE_UP = 0,
+    META_STORE_DOWN = 1,
+    META_STORE_OUT = 2,
+    META_STORE_DESTROYED = 3,
+    META_STORE_STATE_LAST = META_STORE_DESTROYED,
+};
+const char *meta_store_state_name(int s);
+
+/* Declared server role (R13, E20, E49): BOTH is 0 (default: whatever the UP disks allow). */
+enum meta_role {
+    META_ROLE_BOTH = 0,
+    META_ROLE_COMPUTE = 1,
+    META_ROLE_STORAGE = 2,
+    META_ROLE_LAST = META_ROLE_STORAGE,
+};
+const char *meta_role_name(int r);
+
+/* Computed capability bitmask updated at apply from UP disks and log_on_hdd (R13, E49). */
+enum meta_cap {
+    META_CAP_NONE = 0,
+    META_CAP_COMPUTE = 1,
+    META_CAP_STORAGE = 2,
+    META_CAP_BOTH = 3,
+};
+const char *meta_cap_name(uint8_t cap);
+
+struct meta_disk {
+    uint8_t store_id[16]; /* random 16-byte store id, unique across the cluster, never all-zero */
+    uint8_t disk_class;   /* enum meta_disk_class: META_DISK_NVME..META_DISK_HDD */
+    uint8_t uses;         /* bitmask of enum meta_disk_uses (non-zero) */
+    uint8_t state;        /* enum meta_store_state: UP, DOWN, OUT, DESTROYED */
+    uint64_t size_bytes;  /* disk capacity in bytes (> 0) */
+    uint64_t sync_us;     /* measured fdatasync p50 latency in microseconds */
+};
+
 struct meta_settings {
     uint32_t replication;        /* replicas per volume (3) */
     uint32_t min_isr;            /* default per volume (1, D1) */
@@ -183,8 +239,16 @@ struct meta_settings {
     uint32_t young_high_pct;      /* data dir fill % at which a member reports FULL (90, 10..99) */
     uint32_t balance_mb_s;        /* balancer move rate, MB/s (0: = rebuild_mb_s) */
     uint32_t rebuild_concurrency; /* EC objects filled in flight per server (4, 1..64) */
+    /* Scrub and device classes (R12/R13; D2, D13, E25, E50, E53, E57) */
+    uint32_t scrub_days;          /* scrub every chunk and young part every N days (14, 1..365) */
+    uint32_t scrub_mb_s;          /* scrub pace per disk, MB/s (50, >= 1) */
+    uint32_t scrub_out_count;     /* damaged chunks per store per UTC day before OUT (8, >= 1) */
+    uint8_t log_on_hdd;           /* 1: HDD-only members get compute cap (placer still prefers fast members); 0: off */
+    uint32_t young_warn_pct;      /* fast disk fill % warning alert (75, 1..98, <= young_move_pct) */
+    uint32_t young_move_pct;      /* fast disk fill % move-off / no-new-placement mark (80, 1..98, < young_high_pct) */
+    uint32_t disk_stall_s;        /* disk probe stall before DOWN, s (10, 1..3600) */
 };
-#define META_SETTINGS_WORDS 31 /* the words of the INIT body before the mode (cluster_settings_encode) */
+#define META_SETTINGS_WORDS 38 /* the words of the INIT body before the mode (cluster_settings_encode) */
 void meta_settings_default(struct meta_settings *s);
 
 struct meta_member {
@@ -205,6 +269,11 @@ struct meta_member {
     uint64_t hold_until_ms; /* proposer's wall clock (ms) until which automatic OUT is held; 0: no hold */
     uint64_t hold_clock_ms; /* op_clock_ms of the NODE_HOLD (checker witness); 0 when hold_until_ms == 0 */
     uint32_t replaced_by;   /* R9 (snapshot version 8; D22): node replace OLD NEW target (0: none) */
+    /* R13 (snapshot version 10; E20, E49, E52): declared role, computed capability and registered disks */
+    uint8_t role;       /* enum meta_role (default 0 = META_ROLE_BOTH: whatever UP disks allow) */
+    uint8_t capability; /* enum meta_cap bitmask, computed at apply from UP disks and log_on_hdd */
+    uint32_t ndisks;
+    struct meta_disk disks[META_DISKS_MAX];
 };
 
 struct meta_replica {
@@ -420,6 +489,9 @@ void meta_init(struct meta_state *m);
 void meta_free(struct meta_state *m);
 
 const struct meta_member *meta_member(const struct meta_state *m, uint32_t id);
+const struct meta_disk *meta_member_disk(const struct meta_member *mb, const uint8_t store_id[16]);
+uint8_t meta_member_effective_cap(const struct meta_member *mb);
+int meta_member_has_fast_disk(const struct meta_member *mb);
 const struct meta_volume *meta_volume(const struct meta_state *m, uint32_t number);
 const struct meta_domain *meta_domain(const struct meta_state *m, const char *name);
 const struct meta_replica *meta_replica(const struct meta_volume *v, uint32_t node);
@@ -480,7 +552,12 @@ enum meta_op_kind {
     META_OP_VOLUME_CONV_STEP,   /* conditional on conv.phase == from_phase: step to to_phase (RECORD sets target+min_isr) */
     META_OP_VOLUME_CONV_CANCEL, /* cancel conversion before DROP (GROW, RECORD or REENCODE) */
     META_OP_VOLUME_LIVE_OBJS,   /* if epoch == e and stripe_version == sv: leader's live object counts per stripe_version */
-    META_OP_LAST = META_OP_VOLUME_LIVE_OBJS,
+    /* R13 (snapshot version 10; E20, E49, E52): member disks, classes, store states and roles */
+    META_OP_STORE_ADD,          /* register a disk on `node` (refused if store_id is known on any member) */
+    META_OP_STORE_CLASS,        /* change a disk's class (nvme/ssd/hdd) on `node` and recompute capability */
+    META_OP_STORE_STATE,        /* change a disk's state (UP/DOWN/OUT/DESTROYED; OUT only from DOWN; DESTROYED final) */
+    META_OP_MEMBER_ROLE,        /* set member's declared role (both/compute/storage); refused if disks cannot satisfy */
+    META_OP_LAST = META_OP_MEMBER_ROLE,
 };
 
 /* Why a volume got a new leader (grant reasons of §5.5, in its order; 7 is the replicated mode's RESIGN). */
@@ -657,6 +734,11 @@ void meta_op_volume_conv_step(struct meta_entry *e, uint32_t number, uint8_t fro
 void meta_op_volume_conv_cancel(struct meta_entry *e, uint32_t number);
 void meta_op_volume_live_objs(struct meta_entry *e, uint32_t number, uint64_t epoch, uint64_t stripe_version,
                               uint8_t overflow, const struct meta_live_sv *sv, uint32_t nsv);
+/* R13 (E20, E49, E52): disk registration, class change, state transitions, and member role */
+void meta_op_store_add(struct meta_entry *e, uint32_t node, const struct meta_disk *disk);
+void meta_op_store_class(struct meta_entry *e, uint32_t node, const uint8_t store_id[16], uint8_t disk_class);
+void meta_op_store_state(struct meta_entry *e, uint32_t node, const uint8_t store_id[16], uint8_t state);
+void meta_op_member_role(struct meta_entry *e, uint32_t node, uint8_t role);
 /* force-leader's operations for replicated volume v (design-cluster.md 6.2, design-cluster-data.md §5.7): for an EC
  * volume GC_SUSPEND first, then the ISR_CHANGE of v's basis that adds `node` (with its instance) to the ISR. */
 void meta_op_volume_force(struct meta_entry *e, const struct meta_volume *v, uint32_t node);
@@ -675,8 +757,8 @@ void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const
 int meta_snapshot_encode(const struct meta_state *m, uint8_t **out, size_t *len);
 /* The snapshot format (meta.c has its history). Until 1.0 a change of the state's layout bumps it, and an image of
  * another version is refused (a preview cluster is initialised again, never upgraded). */
-#define META_SNAP_VERSION 9
-/* 1 when the entry is one of a build of metadata snapshot version 8 or older (its magic): meta_apply says
+#define META_SNAP_VERSION 10
+/* 1 when the entry is one of a build of metadata snapshot version 9 or older (its magic): meta_apply says
  * META_ERR_FORMAT for it, and the caller names both versions (the cluster is initialised again, never upgraded). */
 int meta_entry_older(const void *data, size_t len);
 /* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not META_SNAP_VERSION,

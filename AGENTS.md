@@ -265,8 +265,12 @@ cgroup, so `nice` does not keep your work out of its way.
   ops STRIPE_SET, GC_SUSPEND, GC_RESUME (`test_cluster ecadd`; an EC add is admin op VOLUME_ADD_EC, so an older server
   refuses it); `cluster_copy_caught_up_at(copy)` (D9: the copy has applied the leader's commit index heard last and that
   heartbeat's lease still holds, read on the caller's clock; `test_cluster copycaught`, mutants `copynodeadline
-  copynofloor` in `make copy-mutants`); snapshot version 9 and
-  entry magic "TME6": a state directory or log of another version is refused naming both, never upgraded);
+  copynofloor` in `make copy-mutants`); R13 (`r13-meta`): per-member registered disks (`META_DISKS_MAX = 64`:
+  `store_id`, `nvme`/`ssd`/`hdd`, `log`/`chunk`, size, sync_us, `UP`/`DOWN`/`OUT`/`DESTROYED`), declared `role`
+  (`both`/`compute`/`storage`) and computed `capability`, ops `STORE_ADD`/`STORE_CLASS`/`STORE_STATE`/`MEMBER_ROLE`,
+  R12/R13 settings (`META_SETTINGS_WORDS = 38`: `scrub_days`, `scrub_mb_s`, `scrub_out_count`, `log_on_hdd`,
+  `young_warn_pct`, `young_move_pct`, `disk_stall_s`), `cluster_member_disks()`; snapshot version 10 and
+  entry magic "TME7": a state directory or log of another version is refused naming both, never upgraded);
   R9 operator ops (`server/cnode.c`: Raft leader handlers for `node hold|out|drain|replace|destroyed` and
   `volume move --pos`, answered after commit, plus `cnode_duty` DRAINING->OUT, replace completion/abandon, and live
   OUT leader handoff; `test_cluster nodehold nodeout nodedrain nodereplace nodedestroyed posmove`; `make ops-mutants`

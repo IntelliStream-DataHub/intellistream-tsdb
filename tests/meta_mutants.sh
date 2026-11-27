@@ -26,7 +26,8 @@ shift
 # R9's failure handling, holds, DESTROYED, stripe fill states and replace: 55 outfinal, 56 holdunbounded,
 # 57 wholeanyversion, 58 destroyedback, 59 downsinceapply, 60 replacenosnap, 61 destroyedkeepreplace.
 # R10's conversion record and STRIPE_SET live-object refusal: 62 stripelive, 63 convskip, 64 retireclear, 65 livestale, 66 reencskip.
-muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66}
+# R13's disks, roles, store states and log_on_hdd: 67 storeaddtwice, 68 logonhdd, 69 rolewiden, 70 storedestroyedback.
+muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70}
 if [ -n "$part" ]; then
     k=${part%/*}
     n=${part#*/}
@@ -49,7 +50,9 @@ fi
 # snapshot round-trip in unit tests and ref_hash after Raft snapshots in sim).
 # R10's 62-66 caught in --sim-only by meta_check_step and check_one_op (STRIPE_SET drop live-object check, phase order,
 # retired_ver preservation, VOLUME_LIVE_OBJS epoch guard, and REENCODE -> DROP live-object check).
-SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 50 52 53 55 56 57 58 59 61 62 63 64 65 66 "
+# R13's 67-70 caught in --sim-only by meta_check_step and check_named (global store_id uniqueness, log placement
+# compute capability / log_on_hdd, role narrowing vs UP disks, and DESTROYED store finality).
+SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 50 52 53 55 56 57 58 59 61 62 63 64 65 66 67 68 69 70 "
 sim=
 for n in $muts; do
     case "$SIM_MUTANTS" in *" $n "*) sim="$sim $n" ;; esac

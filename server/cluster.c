@@ -488,13 +488,14 @@ const char *cluster_strerror(int rc)
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out)
 {
     const uint32_t v[META_SETTINGS_WORDS + 1] = {
-        s->replication,      s->min_isr,             s->node_timeout_ms,    s->heartbeat_ms,       s->isr_lag_ms,
-        s->rebuild_after_s,  s->voter_replace_s,     s->voters,             s->volumes_per_server, s->failover,
-        s->read_barrier,     s->lease_s,             s->lease_ms,           s->drift_ppm,          s->unanswered_ms,
-        s->commit_interval_ms, s->repl_retain_mb,    s->repl_retain_s,      s->idle_seal_ms,       s->rebuild_mb_s,
-        s->rebuild_max,      s->transfer_wait_ms,    s->leader_balance_s,   s->opening_hold_s,     s->failstop_out_s,
-        s->out_guard_pct,    s->out_guard_hold_s,    s->repl_retain_down_gb, s->young_high_pct,    s->balance_mb_s,
-        s->rebuild_concurrency, (uint32_t)mode};
+        s->replication,       s->min_isr,             s->node_timeout_ms,    s->heartbeat_ms,       s->isr_lag_ms,
+        s->rebuild_after_s,   s->voter_replace_s,     s->voters,             s->volumes_per_server, s->failover,
+        s->read_barrier,      s->lease_s,             s->lease_ms,           s->drift_ppm,          s->unanswered_ms,
+        s->commit_interval_ms, s->repl_retain_mb,     s->repl_retain_s,      s->idle_seal_ms,       s->rebuild_mb_s,
+        s->rebuild_max,       s->transfer_wait_ms,    s->leader_balance_s,   s->opening_hold_s,     s->failstop_out_s,
+        s->out_guard_pct,     s->out_guard_hold_s,    s->repl_retain_down_gb, s->young_high_pct,    s->balance_mb_s,
+        s->rebuild_concurrency, s->scrub_days,        s->scrub_mb_s,         s->scrub_out_count,    s->log_on_hdd,
+        s->young_warn_pct,    s->young_move_pct,      s->disk_stall_s,       (uint32_t)mode};
     for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         for (int j = 0; j < 4; j++)
             out[i * 4 + j] = (uint8_t)(v[i] >> (8 * j));
@@ -515,9 +516,12 @@ static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
                                 .rebuild_mb_s = v[19], .rebuild_max = v[20], .transfer_wait_ms = v[21],
                                 .leader_balance_s = v[22], .opening_hold_s = v[23], .failstop_out_s = v[24],
                                 .out_guard_pct = v[25], .out_guard_hold_s = v[26], .repl_retain_down_gb = v[27],
-                                .young_high_pct = v[28], .balance_mb_s = v[29], .rebuild_concurrency = v[30]};
+                                .young_high_pct = v[28], .balance_mb_s = v[29], .rebuild_concurrency = v[30],
+                                .scrub_days = v[31], .scrub_mb_s = v[32], .scrub_out_count = v[33],
+                                .log_on_hdd = (uint8_t)v[34], .young_warn_pct = v[35], .young_move_pct = v[36],
+                                .disk_stall_s = v[37]};
     *mode = (int)v[META_SETTINGS_WORDS];
-    return r->bad || v[9] > 255 || v[10] > 255 ? -1 : 0;
+    return r->bad || v[9] > 255 || v[10] > 255 || v[34] > 255 ? -1 : 0;
 }
 
 void cluster_status_free(struct cluster_status *st)
@@ -2493,12 +2497,24 @@ static void copy_publish(void)
         const struct meta_member *m = &C.sm.members[i];
         mem[i].id = m->id;
         mem[i].state = m->state;
+        mem[i].role = m->role;
+        mem[i].capability = m->capability;
         snprintf(mem[i].addr, sizeof mem[i].addr, "%s", m->addr);
         snprintf(mem[i].peer, sizeof mem[i].peer, "%s", m->peer);
+        mem[i].ndisks = m->ndisks < META_DISKS_MAX ? m->ndisks : META_DISKS_MAX;
+        if (mem[i].ndisks)
+            memcpy(mem[i].disks, m->disks, mem[i].ndisks * sizeof mem[i].disks[0]);
     }
     s->pub = (struct cluster_copy){.applied = C.sm.applied, .applied_term = C.sm.applied_term,
                                    .restore_gen = C.sm.restore_gen, .self = self, .nmembers = nm, .nvolumes = nv,
                                    .rebuild_concurrency = C.sm.set.rebuild_concurrency,
+                                   .scrub_days = C.sm.set.scrub_days, .scrub_mb_s = C.sm.set.scrub_mb_s,
+                                   .scrub_out_count = C.sm.set.scrub_out_count,
+                                   .young_warn_pct = C.sm.set.young_warn_pct,
+                                   .young_move_pct = C.sm.set.young_move_pct,
+                                   .young_high_pct = C.sm.set.young_high_pct,
+                                   .disk_stall_s = C.sm.set.disk_stall_s,
+                                   .log_on_hdd = C.sm.set.log_on_hdd,
                                    .members = mem, .volumes = vols};
     s->bytes = bytes;
     atomic_init(&s->refs, 1);
@@ -2517,6 +2533,31 @@ const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy 
         if (c->members[i].id == id)
             return &c->members[i];
     return NULL;
+}
+
+int cluster_member_disks(uint32_t node, struct meta_disk *out, uint32_t cap, uint32_t *total_out, uint8_t *role_out,
+                         uint8_t *cap_out)
+{
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return -1;
+    const struct cluster_copy_member *m = cluster_copy_member(c, node);
+    if (!m) {
+        cluster_copy_put(c);
+        return -1;
+    }
+    uint32_t total = m->ndisks < META_DISKS_MAX ? m->ndisks : META_DISKS_MAX;
+    uint32_t n = (out && cap) ? (total < cap ? total : cap) : 0;
+    if (n)
+        memcpy(out, m->disks, n * sizeof *out);
+    if (total_out)
+        *total_out = total;
+    if (role_out)
+        *role_out = m->role;
+    if (cap_out)
+        *cap_out = m->capability;
+    cluster_copy_put(c);
+    return (int)n;
 }
 
 const struct cluster_copy_vol *cluster_copy_vol(const struct cluster_copy *c, uint32_t number)
@@ -3432,7 +3473,7 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
     if (type == RAFT_ENTRY_NORMAL) {
         if (meta_apply(m, index, term, data, len, rcs, sizeof rcs / sizeof rcs[0]) != META_OK) {
             if (meta_entry_older(data, len)) /* a preview cluster is initialised again, never upgraded */
-                fail_stop("entry %" PRIu64 " (term %" PRIu64 ") was written by a build of metadata snapshot version 7 "
+                fail_stop("entry %" PRIu64 " (term %" PRIu64 ") was written by a build of metadata snapshot version 9 "
                           "or older and this build reads version %d: the cluster was made by another build; "
                           "initialise it again (docs/cluster-preview.md)", index, term, META_SNAP_VERSION);
             fail_stop("entry %" PRIu64 " (term %" PRIu64 ") does not decode: this build cannot apply it", index,
@@ -7331,6 +7372,13 @@ static void vol_watch_duty(void)
             r->rebuild_max = C.sm.set.rebuild_max;
             r->transfer_wait_ms = C.sm.set.transfer_wait_ms;
             r->leader_balance_s = C.sm.set.leader_balance_s;
+            r->scrub_days = C.sm.set.scrub_days;
+            r->scrub_mb_s = C.sm.set.scrub_mb_s;
+            r->scrub_out_count = C.sm.set.scrub_out_count;
+            r->young_warn_pct = C.sm.set.young_warn_pct;
+            r->young_move_pct = C.sm.set.young_move_pct;
+            r->disk_stall_s = C.sm.set.disk_stall_s;
+            r->log_on_hdd = C.sm.set.log_on_hdd;
             for (uint32_t j = 0; hold && j < nprev; j++) /* drop_fence_file: a volume this server led stays so here */
                 if (prev[j].number == r->number && prev[j].leader == C.id && r->epoch > prev[j].epoch) {
                     *r = prev[j];

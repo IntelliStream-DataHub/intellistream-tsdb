@@ -25,6 +25,8 @@ for args in "" help --help -h; do
         "tsdb cluster status PEER" "--secret-file" "--node-timeout-ms" "--voter-replace-s" "--mode replicated|shared" \
         "--failover lease|attested|bmc" "--read-barrier on|off" "--lease-s" "--replication" "--min-isr" \
         "--heartbeat-ms" "--isr-lag-ms" "--rebuild-after-s" "--voters" "--volumes-per-server" "docs/cluster-preview.md" \
+        "--scrub-days" "--scrub-mb-s" "--scrub-out-count" "--log-on-hdd" "--young-warn-pct" "--young-move-pct" \
+        "--disk-stall-s" \
         "marked out [1800] (stored, not acted on yet)" "the lease of a shared volume [10] (stored, not acted on yet)" \
         "reads only behind a fenced write [on] (stored, not acted on yet)" \
         "led per server at init [16] (stored, not acted on yet)"; do

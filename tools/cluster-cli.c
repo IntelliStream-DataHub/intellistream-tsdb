@@ -136,9 +136,16 @@ static const char cl_help[] =
     "    --out-guard-pct N       mass-OUT guard threshold, % of non-OUT members down [25] (1 to 100)\n"
     "    --out-guard-hold-s S    upper bound of the mass-OUT guard before OUT proceeds [7200] (1 to 86400)\n"
     "    --repl-retain-down-gb GB  per-server WAL retention budget for down or held members [64]\n"
-    "    --young-high-pct N      data dir fill % at which a member reports FULL [90] (10 to 99)\n"
+    "    --young-high-pct N      data dir fill % at which a member reports FULL [90] (10 to 99, > --young-move-pct)\n"
     "    --balance-mb-s MB       balancer move rate, MB/s [0: = rebuild-mb-s]\n"
     "    --rebuild-concurrency N EC objects filled in flight per server [4] (1 to 64)\n"
+    "    --scrub-days N          scrub every chunk and young part every N days [14] (1 to 365) (stored, not acted on yet)\n"
+    "    --scrub-mb-s MB         scrub pace per disk, MB/s [50] (stored, not acted on yet)\n"
+    "    --scrub-out-count N     damaged chunks per store per UTC day before OUT [8] (stored, not acted on yet)\n"
+    "    --log-on-hdd on|off     allow log replicas on HDD-only members [off] (stored, not acted on yet)\n"
+    "    --young-warn-pct N      fast disk fill % warning alert [75] (1 to 98, <= move < high) (stored, not acted on yet)\n"
+    "    --young-move-pct N      fast disk fill % move-off mark [80] (1 to 98, >= warn, < high) (stored, not acted on yet)\n"
+    "    --disk-stall-s S        disk probe stall before DOWN, s [10] (1 to 3600) (stored, not acted on yet)\n"
     "  The settings are fixed here and shown by status; they cannot be changed on a running cluster.\n"
     "  A setting marked (stored, not acted on yet) is kept and shown, and nothing uses it.\n";
 
@@ -308,6 +315,10 @@ static void print_status(const struct cluster_status *st)
                m.set.rebuild_after_s, m.set.opening_hold_s, m.set.failstop_out_s, m.set.out_guard_pct,
                m.set.out_guard_hold_s, m.set.repl_retain_down_gb, m.set.young_high_pct, m.set.balance_mb_s,
                m.set.rebuild_concurrency);
+        printf("scrub scrub_days %" PRIu32 " scrub_mb_s %" PRIu32 " scrub_out_count %" PRIu32
+               " log_on_hdd %s young_warn_pct %" PRIu32 " young_move_pct %" PRIu32 " disk_stall_s %" PRIu32 "\n",
+               m.set.scrub_days, m.set.scrub_mb_s, m.set.scrub_out_count, m.set.log_on_hdd ? "on" : "off",
+               m.set.young_warn_pct, m.set.young_move_pct, m.set.disk_stall_s);
     } else {
         printf("cluster %s (not initialised)\n", u);
     }
@@ -363,7 +374,23 @@ static void print_status(const struct cluster_status *st)
             printf(" hold_left %" PRIu64 "s", (mb->hold_until_ms - now_ms + UINT64_C(999)) / UINT64_C(1000));
         if (mb->replaced_by)
             printf(" replaced_by %" PRIu32, mb->replaced_by);
+        if (mb->role != META_ROLE_BOTH || mb->ndisks > 0)
+            printf(" role %s cap %s disks %" PRIu32, meta_role_name(mb->role), meta_cap_name(mb->capability),
+                   mb->ndisks);
         printf("\n");
+        for (uint32_t j = 0; j < mb->ndisks && j < META_DISKS_MAX; j++) {
+            const struct meta_disk *d = &mb->disks[j];
+            char sid[33];
+            for (int k = 0; k < 16; k++)
+                sprintf(sid + 2 * k, "%02x", d->store_id[k]);
+            const char *uses = (d->uses == META_DISK_USE_ALL)     ? "log,chunk"
+                               : (d->uses == META_DISK_USE_LOG)   ? "log"
+                               : (d->uses == META_DISK_USE_CHUNK) ? "chunk"
+                                                                  : "-";
+            printf("disk node %" PRIu32 " store %s class %s uses %s size %" PRIu64 " sync_us %" PRIu64 " state %s\n",
+                   mb->id, sid, meta_disk_class_name(d->disk_class), uses, d->size_bytes, d->sync_us,
+                   meta_store_state_name(d->state));
+        }
         for (uint32_t j = 0; h && j < h->nvols; j++) {
             const struct cluster_vol_status *v = &h->vols[j];
             printf("volume-report node %" PRIu32 " volume %" PRIu32 " role %s health %s epoch %" PRIu64
@@ -596,6 +623,12 @@ int cluster_cli(int argc, char **argv)
                 {"--out-guard-hold-s", &s.out_guard_hold_s},
                 {"--young-high-pct", &s.young_high_pct},
                 {"--rebuild-concurrency", &s.rebuild_concurrency},
+                {"--scrub-days", &s.scrub_days},
+                {"--scrub-mb-s", &s.scrub_mb_s},
+                {"--scrub-out-count", &s.scrub_out_count},
+                {"--young-warn-pct", &s.young_warn_pct},
+                {"--young-move-pct", &s.young_move_pct},
+                {"--disk-stall-s", &s.disk_stall_s},
                 {"--voter-replace-s", &s.voter_replace_s},
                 {"--voters", &s.voters},
                 {"--volumes-per-server", &s.volumes_per_server},
@@ -750,6 +783,16 @@ int cluster_cli(int argc, char **argv)
             i++;
             continue;
         }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--log-on-hdd")) {
+            if (!strcmp(argv[i + 1], "on") || !strcmp(argv[i + 1], "1"))
+                s.log_on_hdd = 1;
+            else if (!strcmp(argv[i + 1], "off") || !strcmp(argv[i + 1], "0"))
+                s.log_on_hdd = 0;
+            else
+                return cl_usage();
+            i++;
+            continue;
+        }
         size_t k = 0;
         for (; k < sizeof nums / sizeof nums[0]; k++)
             if (!strcmp(verb, "init") && !strcmp(argv[i], nums[k].flag) && i + 1 < argc)
@@ -759,6 +802,12 @@ int cluster_cli(int argc, char **argv)
         if (num(argv[i], argv[i + 1], nums[k].v) != 0)
             return 2;
         i++;
+    }
+    if (!strcmp(verb, "init") && (s.young_warn_pct > s.young_move_pct || s.young_move_pct >= s.young_high_pct)) {
+        fprintf(stderr,
+                "tsdb cluster: --young-warn-pct (%u) <= --young-move-pct (%u) < --young-high-pct (%u) required\n",
+                s.young_warn_pct, s.young_move_pct, s.young_high_pct);
+        return 2;
     }
     if (!secret_file) {
         fprintf(stderr, "tsdb cluster: --secret-file is required (the cluster's secret, as tsdbd's "

@@ -33,8 +33,9 @@
  * gc_suspended, gc_gen); 7: failure handling, holds, DESTROYED, stripe fill states and R9 settings (D2-D4, D9-D10,
  * D23); 8: member `replaced_by` for `node replace OLD NEW` failover resume (r9-ops, D22); 9: R10 redundancy conversion
  * record (`conv`, `conv_cancel_gen`), `retired_ver` on `stripe_pos`, and leader live-object counts per `stripe_version`
- * (E2, §6.4, D26, D28). A preview cluster is initialised again, not upgraded (the plan's D9): an image of another
- * version is refused, and its reader names both (meta_snapshot_version). */
+ * (E2, §6.4, D26, D28); 10: R13 member disks, declared role, computed capability, store ops, and R12/R13 scrub/disk
+ * settings (E20, E25, E49, E52, E53, E57). A preview cluster is initialised again, not upgraded (the plan's D9): an
+ * image of another version is refused, and its reader names both (meta_snapshot_version). */
 #define SNAP_VERSION META_SNAP_VERSION
 
 /* tests/test_meta.c --mutant N plants bug N (MUT(n)) in a build with -DMETA_MUTANTS; the simulator and the unit tests
@@ -46,12 +47,13 @@ int meta_mutant;
 #define MUT(n) 0
 #endif
 
-#define ENTRY_MAGIC 0x36454d54u    /* "TME6": entries of snapshot version 9 (R10 conversion ops and live-object reports) */
+#define ENTRY_MAGIC 0x37454d54u    /* "TME7": entries of snapshot version 10 (R13 disks, roles, store states, settings) */
 #define ENTRY_MAGIC_V1 0x31454d54u /* "TME1": entries of the builds of versions 1-4, refused by name */
 #define ENTRY_MAGIC_V2 0x32454d54u /* "TME2": entries of the builds of version 5, refused by name */
 #define ENTRY_MAGIC_V3 0x33454d54u /* "TME3": entries of the builds of version 6, refused by name */
 #define ENTRY_MAGIC_V4 0x34454d54u /* "TME4": entries of the builds of version 7, refused by name */
 #define ENTRY_MAGIC_V5 0x35454d54u /* "TME5": entries of the builds of version 8, refused by name */
+#define ENTRY_MAGIC_V6 0x36454d54u /* "TME6": entries of the builds of version 9, refused by name */
 #define SNAP_MAGIC 0x31534d54u     /* "TMS1" */
 
 uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c */
@@ -97,6 +99,30 @@ const char *meta_conv_phase_name(int phase)
     return phase >= 0 && phase <= META_CONV_LAST ? n[phase] : "?";
 }
 
+const char *meta_disk_class_name(int c)
+{
+    static const char *n[] = {"none", "nvme", "ssd", "hdd"};
+    return c >= 0 && c <= META_DISK_CLASS_LAST ? n[c] : "?";
+}
+
+const char *meta_store_state_name(int s)
+{
+    static const char *n[] = {"up", "down", "out", "destroyed"};
+    return s >= 0 && s <= META_STORE_STATE_LAST ? n[s] : "?";
+}
+
+const char *meta_role_name(int r)
+{
+    static const char *n[] = {"both", "compute", "storage"};
+    return r >= 0 && r <= META_ROLE_LAST ? n[r] : "?";
+}
+
+const char *meta_cap_name(uint8_t cap)
+{
+    static const char *n[] = {"none", "compute", "storage", "both"};
+    return cap <= META_CAP_BOTH ? n[cap] : "?";
+}
+
 void meta_settings_default(struct meta_settings *s)
 {
     s->replication = 3;
@@ -130,6 +156,13 @@ void meta_settings_default(struct meta_settings *s)
     s->young_high_pct = 90;
     s->balance_mb_s = 0;
     s->rebuild_concurrency = 4;
+    s->scrub_days = 14;
+    s->scrub_mb_s = 50;
+    s->scrub_out_count = 8;
+    s->log_on_hdd = 0;
+    s->young_warn_pct = 75;
+    s->young_move_pct = 80;
+    s->disk_stall_s = 10;
 }
 
 uint32_t meta_voter_target(const struct meta_settings *s, uint32_t servers)
@@ -489,6 +522,143 @@ const struct meta_member *meta_member(const struct meta_state *m, uint32_t id)
     return i >= 0 ? &m->members[i] : NULL;
 }
 
+static int store_id_zero(const uint8_t id[16])
+{
+    static const uint8_t zero[16];
+    return memcmp(id, zero, 16) == 0;
+}
+
+static int member_disk_at(const struct meta_member *mb, const uint8_t store_id[16])
+{
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++)
+        if (memcmp(mb->disks[i].store_id, store_id, 16) == 0)
+            return (int)i;
+    return -1;
+}
+
+const struct meta_disk *meta_member_disk(const struct meta_member *mb, const uint8_t store_id[16])
+{
+    if (!mb || !store_id)
+        return NULL;
+    int i = member_disk_at(mb, store_id);
+    return i >= 0 ? &mb->disks[i] : NULL;
+}
+
+int meta_member_has_fast_disk(const struct meta_member *mb)
+{
+    if (!mb)
+        return 0;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++)
+        if (mb->disks[i].state == META_STORE_UP && meta_disk_class_fast(mb->disks[i].disk_class))
+            return 1;
+    return 0;
+}
+
+uint8_t meta_member_effective_cap(const struct meta_member *mb)
+{
+    if (!mb)
+        return META_CAP_NONE;
+    uint8_t mask = mb->role == META_ROLE_COMPUTE ? META_CAP_COMPUTE
+                 : mb->role == META_ROLE_STORAGE ? META_CAP_STORAGE
+                                                 : META_CAP_BOTH;
+    return (uint8_t)(mb->capability & mask);
+}
+
+/* Compute member capability from UP disks and cluster log_on_hdd (E49):
+ *   compute-capable = UP fast disk (nvme/ssd), or UP hdd when log_on_hdd == 1 and no fast disk;
+ *   storage-capable = UP disk with META_DISK_USE_CHUNK. */
+static uint8_t member_compute_cap(const struct meta_member *mb, uint8_t log_on_hdd)
+{
+    int has_fast = 0, has_hdd = 0, has_chunk = 0;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if (d->state != META_STORE_UP)
+            continue;
+        if (meta_disk_class_fast(d->disk_class))
+            has_fast = 1;
+        else if (d->disk_class == META_DISK_HDD)
+            has_hdd = 1;
+        if (d->uses & META_DISK_USE_CHUNK)
+            has_chunk = 1;
+    }
+    uint8_t cap = META_CAP_NONE;
+    if (has_fast || (log_on_hdd && has_hdd))
+        cap |= META_CAP_COMPUTE;
+    if (has_chunk)
+        cap |= META_CAP_STORAGE;
+    return cap;
+}
+
+static int store_id_known(const struct meta_state *m, const uint8_t store_id[16])
+{
+    for (uint32_t i = 0; i < m->nmembers; i++)
+        if (member_disk_at(&m->members[i], store_id) >= 0)
+            return 1;
+    return 0;
+}
+
+/* 1 if member `mb` is eligible for a log replica (E49, E50):
+ *   - declared role must allow compute (BOTH or COMPUTE);
+ *   - when disks are registered (ndisks > 0), effective capability must include META_CAP_COMPUTE.
+ * Members with 0 registered disks (pre-r13-start) pass the disk check for backwards compatibility. */
+static int member_log_capable(const struct meta_member *mb)
+{
+    if (!mb || mb->role == META_ROLE_STORAGE)
+        return 0;
+    if (mb->ndisks == 0)
+        return 1;
+    return (meta_member_effective_cap(mb) & META_CAP_COMPUTE) != 0;
+}
+
+static int member_log_ok(const struct meta_member *mb)
+{
+    if (!mb || mb->role == META_ROLE_STORAGE)
+        return 0;
+    if (mb->ndisks == 0)
+        return 1;
+    if (MUT(68)) { /* logonhdd: ignores log_on_hdd (allows HDD-only member even when log_on_hdd == 0) */
+        for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++)
+            if (mb->disks[i].state == META_STORE_UP)
+                return 1;
+        return 0;
+    }
+    return (meta_member_effective_cap(mb) & META_CAP_COMPUTE) != 0;
+}
+
+/* 1 if member `mb` is eligible for an EC stripe position (E49, E51):
+ *   - declared role must allow storage (BOTH or STORAGE);
+ *   - when disks are registered (ndisks > 0), effective capability must include META_CAP_STORAGE. */
+static int member_storage_capable(const struct meta_member *mb)
+{
+    if (!mb || mb->role == META_ROLE_COMPUTE)
+        return 0;
+    if (mb->ndisks == 0)
+        return 1;
+    return (meta_member_effective_cap(mb) & META_CAP_STORAGE) != 0;
+}
+
+static int disk_fields_valid(const struct meta_disk *d)
+{
+    return !store_id_zero(d->store_id) && d->disk_class >= META_DISK_NVME && d->disk_class <= META_DISK_CLASS_LAST &&
+           d->uses != 0 && !(d->uses & ~META_DISK_USE_ALL) && d->state <= META_STORE_STATE_LAST && d->size_bytes > 0;
+}
+
+static int stores_unique(const struct meta_state *m)
+{
+    for (uint32_t i = 0; i < m->nmembers; i++) {
+        const struct meta_member *mi = &m->members[i];
+        for (uint32_t di = 0; di < mi->ndisks && di < META_DISKS_MAX; di++) {
+            for (uint32_t dj = di + 1; dj < mi->ndisks && dj < META_DISKS_MAX; dj++)
+                if (memcmp(mi->disks[di].store_id, mi->disks[dj].store_id, 16) == 0)
+                    return 0;
+            for (uint32_t j = i + 1; j < m->nmembers; j++)
+                if (member_disk_at(&m->members[j], mi->disks[di].store_id) >= 0)
+                    return 0;
+        }
+    }
+    return 1;
+}
+
 const struct meta_volume *meta_volume(const struct meta_state *m, uint32_t number)
 {
     int32_t i = volume_at(m, number);
@@ -719,6 +889,13 @@ static void put_settings(struct wr *w, const struct meta_settings *s)
     put32(w, s->young_high_pct);
     put32(w, s->balance_mb_s);
     put32(w, s->rebuild_concurrency);
+    put32(w, s->scrub_days);
+    put32(w, s->scrub_mb_s);
+    put32(w, s->scrub_out_count);
+    put8(w, s->log_on_hdd);
+    put32(w, s->young_warn_pct);
+    put32(w, s->young_move_pct);
+    put32(w, s->disk_stall_s);
 }
 
 static void get_settings(struct rd *r, struct meta_settings *s)
@@ -760,6 +937,13 @@ static void get_settings(struct rd *r, struct meta_settings *s)
     s->young_high_pct = get32(r);
     s->balance_mb_s = get32(r);
     s->rebuild_concurrency = get32(r);
+    s->scrub_days = get32(r);
+    s->scrub_mb_s = get32(r);
+    s->scrub_out_count = get32(r);
+    s->log_on_hdd = get8(r);
+    s->young_warn_pct = get32(r);
+    s->young_move_pct = get32(r);
+    s->disk_stall_s = get32(r);
 }
 
 static int settings_valid(const struct meta_settings *s)
@@ -772,7 +956,32 @@ static int settings_valid(const struct meta_settings *s)
            s->transfer_wait_ms >= 100 && s->transfer_wait_ms <= 60000 && s->leader_balance_s <= 86400 &&
            s->opening_hold_s <= 86400 && s->failstop_out_s >= 1 && s->out_guard_pct >= 1 && s->out_guard_pct <= 100 &&
            s->out_guard_hold_s >= 1 && s->out_guard_hold_s <= 86400 && s->young_high_pct >= 10 &&
-           s->young_high_pct <= 99 && s->rebuild_concurrency >= 1 && s->rebuild_concurrency <= 64;
+           s->young_high_pct <= 99 && s->rebuild_concurrency >= 1 && s->rebuild_concurrency <= 64 &&
+           s->scrub_days >= 1 && s->scrub_days <= 365 && s->scrub_mb_s >= 1 && s->scrub_out_count >= 1 &&
+           s->log_on_hdd <= 1 && s->young_warn_pct >= 1 && s->young_move_pct >= 1 &&
+           s->young_warn_pct <= s->young_move_pct && s->young_move_pct < s->young_high_pct &&
+           s->disk_stall_s >= 1 && s->disk_stall_s <= 3600;
+}
+
+static void put_disk(struct wr *w, const struct meta_disk *d)
+{
+    put(w, d->store_id, 16);
+    put8(w, d->disk_class);
+    put8(w, d->uses);
+    put8(w, d->state);
+    put64(w, d->size_bytes);
+    put64(w, d->sync_us);
+}
+
+static void get_disk(struct rd *r, struct meta_disk *d)
+{
+    memset(d, 0, sizeof *d);
+    get(r, d->store_id, 16);
+    d->disk_class = get8(r);
+    d->uses = get8(r);
+    d->state = get8(r);
+    d->size_bytes = get64(r);
+    d->sync_us = get64(r);
 }
 
 static void put_member(struct wr *w, const struct meta_member *mb)
@@ -793,6 +1002,12 @@ static void put_member(struct wr *w, const struct meta_member *mb)
     put64(w, mb->hold_until_ms);
     put64(w, mb->hold_clock_ms);
     put32(w, MUT(60) ? 0u : mb->replaced_by); /* replacenosnap */
+    put8(w, mb->role);
+    put8(w, mb->capability);
+    uint32_t nd = mb->ndisks <= META_DISKS_MAX ? mb->ndisks : META_DISKS_MAX;
+    put32(w, nd);
+    for (uint32_t i = 0; i < nd; i++)
+        put_disk(w, &mb->disks[i]);
 }
 
 static void get_member(struct rd *r, struct meta_member *mb)
@@ -814,8 +1029,20 @@ static void get_member(struct rd *r, struct meta_member *mb)
     mb->hold_until_ms = get64(r);
     mb->hold_clock_ms = get64(r);
     mb->replaced_by = get32(r);
-    if (mb->state > META_DESTROYED || (mb->flags & ~META_MF_ALL) || mb->down_reason > META_DOWN_LAST)
+    mb->role = get8(r);
+    mb->capability = get8(r);
+    uint32_t nd = get32(r);
+    if (mb->state > META_DESTROYED || (mb->flags & ~META_MF_ALL) || mb->down_reason > META_DOWN_LAST ||
+        mb->role > META_ROLE_LAST || (mb->capability & ~META_CAP_BOTH) || nd > META_DISKS_MAX) {
         r->bad = 1;
+        return;
+    }
+    mb->ndisks = nd;
+    for (uint32_t i = 0; i < nd && !r->bad; i++) {
+        get_disk(r, &mb->disks[i]);
+        if (!disk_fields_valid(&mb->disks[i]))
+            r->bad = 1;
+    }
 }
 
 static void put_ids(struct wr *w, const uint32_t *ids, uint32_t n)
@@ -1356,6 +1583,44 @@ void meta_op_volume_live_objs(struct meta_entry *e, uint32_t number, uint64_t ep
     op_end(e, st);
 }
 
+void meta_op_store_add(struct meta_entry *e, uint32_t node, const struct meta_disk *disk)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_STORE_ADD);
+    put32(&w, node);
+    put_disk(&w, disk);
+    op_end(e, st);
+}
+
+void meta_op_store_class(struct meta_entry *e, uint32_t node, const uint8_t store_id[16], uint8_t disk_class)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_STORE_CLASS);
+    put32(&w, node);
+    put(&w, store_id, 16);
+    put8(&w, disk_class);
+    op_end(e, st);
+}
+
+void meta_op_store_state(struct meta_entry *e, uint32_t node, const uint8_t store_id[16], uint8_t state)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_STORE_STATE);
+    put32(&w, node);
+    put(&w, store_id, 16);
+    put8(&w, state);
+    op_end(e, st);
+}
+
+void meta_op_member_role(struct meta_entry *e, uint32_t node, uint8_t role)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_MEMBER_ROLE);
+    put32(&w, node);
+    put8(&w, role);
+    op_end(e, st);
+}
+
 void meta_op_volume_force(struct meta_entry *e, const struct meta_volume *v, uint32_t node)
 {
     /* the leader's log may lack markers the old ISR committed: no orphan may be judged by it until the operator says
@@ -1429,11 +1694,24 @@ static int ident_taken(const struct meta_state *m, const uint8_t ident[16])
 
 static int insert_member(struct meta_state *m, const struct meta_member *mb)
 {
-    if (mb->id == 0 || mb->id == META_NONE || !mb->peer[0])
+    if (mb->id == 0 || mb->id == META_NONE || !mb->peer[0] || mb->role > META_ROLE_LAST || mb->ndisks > META_DISKS_MAX)
         return META_ERR_INVALID;
     int32_t at = member_at(m, mb->id);
     if (at >= 0 || mb->id < m->next_member || addr_taken(m, mb->peer) || ident_taken(m, mb->ident))
         return META_ERR_EXISTS; /* ids are never reused, nor a live or out server's peer address/ident under two ids */
+    for (uint32_t i = 0; i < mb->ndisks; i++) {
+        if (!disk_fields_valid(&mb->disks[i]) || mb->disks[i].state != META_STORE_UP)
+            return META_ERR_INVALID;
+        if (store_id_known(m, mb->disks[i].store_id))
+            return META_ERR_EXISTS;
+        for (uint32_t j = 0; j < i; j++)
+            if (memcmp(mb->disks[j].store_id, mb->disks[i].store_id, 16) == 0)
+                return META_ERR_EXISTS;
+    }
+    uint8_t cap = member_compute_cap(mb, m->set.log_on_hdd);
+    if (mb->ndisks > 0 && ((mb->role == META_ROLE_COMPUTE && !(cap & META_CAP_COMPUTE)) ||
+                           (mb->role == META_ROLE_STORAGE && !(cap & META_CAP_STORAGE))))
+        return META_ERR_INVALID;
     uint32_t pos = (uint32_t)(-1 - at);
     m->members = grow(m->members, &m->members_cap, m->nmembers + 1, sizeof *m->members);
     memmove(&m->members[pos + 1], &m->members[pos], (m->nmembers - pos) * sizeof *m->members);
@@ -1445,6 +1723,7 @@ static int insert_member(struct meta_state *m, const struct meta_member *mb)
     m->members[pos].hold_until_ms = 0;
     m->members[pos].hold_clock_ms = 0;
     m->members[pos].replaced_by = 0;
+    m->members[pos].capability = cap;
     m->nmembers++;
     m->next_member = mb->id + 1;
     return META_OK;
@@ -1714,6 +1993,8 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         m->mode = mode;
         m->level = level;
         m->initialised = 1;
+        for (uint32_t i = 0; i < m->nmembers; i++)
+            m->members[i].capability = member_compute_cap(&m->members[i], m->set.log_on_hdd);
         return META_OK;
     }
     case META_OP_MEMBER_ADD: {
@@ -1888,6 +2169,8 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         if (!settings_valid(&s))
             return META_ERR_INVALID;
         m->set = s;
+        for (uint32_t i = 0; i < m->nmembers; i++)
+            m->members[i].capability = member_compute_cap(&m->members[i], m->set.log_on_hdd);
         return META_OK;
     }
     case META_OP_VOLUME_ADD: {
@@ -1926,7 +2209,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                 return META_ERR_INVALID;
             for (uint32_t i = 0; i < ns; i++) {
                 const struct meta_member *sm = meta_member(m, stripe[i]);
-                if (!sm || sm->state >= META_OUT || has_id(stripe, i, stripe[i]))
+                if (!sm || sm->state >= META_OUT || !member_storage_capable(sm) || has_id(stripe, i, stripe[i]))
                     return META_ERR_INVALID;
             }
             if (MUT(53)) { /* stripeatapply: the group from this copy's own members, not the proposer's pick */
@@ -1963,7 +2246,8 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                 return META_ERR_EXISTS;
         for (uint32_t i = 0; i < n; i++) {
             const struct meta_member *mb = meta_member(m, nodes[i]);
-            if (!mb || mb->state >= META_OUT || !(mb->flags & META_MF_VOLUMES_OK) || has_id(nodes, i, nodes[i]))
+            if (!mb || mb->state >= META_OUT || !(mb->flags & META_MF_VOLUMES_OK) ||
+                (vk == META_VOL_REPLICATED && !member_log_ok(mb)) || has_id(nodes, i, nodes[i]))
                 return META_ERR_INVALID;
         }
         int32_t at = volume_at(m, number);
@@ -2122,7 +2406,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                 v->rep[replica_at(v, ids[i])].learner = 0;
         } else if (kind == META_OP_REPLICA_ADD) {
             const struct meta_member *mb = meta_member(m, node);
-            if (!mb || mb->state >= META_OUT || !(mb->flags & META_MF_VOLUMES_OK))
+            if (!mb || mb->state >= META_OUT || !(mb->flags & META_MF_VOLUMES_OK) || (!shared && !member_log_ok(mb)))
                 return META_ERR_INVALID;
             if (replica_at(v, node) >= 0)
                 return META_ERR_EXISTS;
@@ -2502,7 +2786,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             return META_OK;
         }
         const struct meta_member *mb = meta_member(m, node);
-        if (!mb || mb->state >= META_OUT)
+        if (!mb || mb->state >= META_OUT || ((pos >= v->nstripe || node != v->stripe[pos]) && !member_storage_capable(mb)))
             return META_ERR_INVALID;
         for (uint32_t i = 0; i < v->nstripe; i++)
             if (i != pos && v->stripe[i] == node)
@@ -2655,7 +2939,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                             return META_ERR_INVALID; /* existing positions never renumbered (E9) */
                     for (uint32_t i = v->nstripe; i < need; i++) {
                         const struct meta_member *sm = meta_member(m, stripe[i]);
-                        if (!sm || sm->state >= META_OUT || has_id(stripe, i, stripe[i]))
+                        if (!sm || sm->state >= META_OUT || !member_storage_capable(sm) || has_id(stripe, i, stripe[i]))
                             return META_ERR_INVALID;
                     }
                 } else if (ns != 0) {
@@ -2962,6 +3246,101 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         snprintf(mb->peer, sizeof mb->peer, "%s", peer);
         return META_OK;
     }
+    case META_OP_STORE_ADD: {
+        uint32_t node = get32(r);
+        struct meta_disk d;
+        get_disk(r, &d);
+        if (r->bad || d.state > META_STORE_STATE_LAST || (d.uses & ~META_DISK_USE_ALL))
+            return META_ERR_FORMAT;
+        if (!disk_fields_valid(&d) || d.state != META_STORE_UP)
+            return META_ERR_INVALID;
+        int32_t at = member_at(m, node);
+        if (at < 0)
+            return META_ERR_NOTFOUND;
+        struct meta_member *mb = &m->members[at];
+        if (mb->state >= META_OUT)
+            return META_ERR_STATE;
+        if (!MUT(67) && store_id_known(m, d.store_id)) /* storeaddtwice: a disk moved between members is not new */
+            return META_ERR_EXISTS;
+        if (mb->ndisks >= META_DISKS_MAX)
+            return META_ERR_RANGE;
+        mb->disks[mb->ndisks++] = d;
+        mb->capability = member_compute_cap(mb, m->set.log_on_hdd);
+        return META_OK;
+    }
+    case META_OP_STORE_CLASS: {
+        uint32_t node = get32(r);
+        uint8_t store_id[16];
+        get(r, store_id, 16);
+        uint8_t cls = get8(r);
+        if (r->bad)
+            return META_ERR_FORMAT;
+        if (cls < META_DISK_NVME || cls > META_DISK_CLASS_LAST)
+            return META_ERR_INVALID;
+        int32_t at = member_at(m, node);
+        if (at < 0)
+            return META_ERR_NOTFOUND;
+        struct meta_member *mb = &m->members[at];
+        if (mb->state == META_DESTROYED)
+            return META_ERR_STATE;
+        int di = member_disk_at(mb, store_id);
+        if (di < 0)
+            return META_ERR_NOTFOUND;
+        if (mb->disks[di].state == META_STORE_DESTROYED)
+            return META_ERR_STATE;
+        mb->disks[di].disk_class = cls;
+        mb->capability = member_compute_cap(mb, m->set.log_on_hdd);
+        return META_OK;
+    }
+    case META_OP_STORE_STATE: {
+        uint32_t node = get32(r);
+        uint8_t store_id[16];
+        get(r, store_id, 16);
+        uint8_t st = get8(r);
+        if (r->bad || st > META_STORE_STATE_LAST)
+            return META_ERR_FORMAT;
+        int32_t at = member_at(m, node);
+        if (at < 0)
+            return META_ERR_NOTFOUND;
+        struct meta_member *mb = &m->members[at];
+        if (mb->state == META_DESTROYED)
+            return META_ERR_STATE;
+        int di = member_disk_at(mb, store_id);
+        if (di < 0)
+            return META_ERR_NOTFOUND;
+        struct meta_disk *d = &mb->disks[di];
+        if (d->state == META_STORE_DESTROYED && !(MUT(70) && st == META_STORE_UP)) /* storedestroyedback */
+            return META_ERR_STATE; /* DESTROYED is final */
+        if (st == META_STORE_OUT && d->state != META_STORE_DOWN)
+            return META_ERR_STATE; /* OUT only from DOWN */
+        if (st == META_STORE_DESTROYED && d->state != META_STORE_OUT)
+            return META_ERR_STATE; /* DESTROYED only from OUT (matches MEMBER_STATE) */
+        if (d->state == META_STORE_OUT && st != META_STORE_UP && st != META_STORE_DESTROYED)
+            return META_ERR_STATE; /* OUT may only return to UP or become DESTROYED (no OUT -> DOWN) */
+        d->state = st;
+        mb->capability = member_compute_cap(mb, m->set.log_on_hdd);
+        return META_OK;
+    }
+    case META_OP_MEMBER_ROLE: {
+        uint32_t node = get32(r);
+        uint8_t role = get8(r);
+        if (r->bad || role > META_ROLE_LAST)
+            return META_ERR_FORMAT;
+        int32_t at = member_at(m, node);
+        if (at < 0)
+            return META_ERR_NOTFOUND;
+        struct meta_member *mb = &m->members[at];
+        if (mb->state >= META_OUT)
+            return META_ERR_STATE;
+        if (mb->ndisks > 0 && !MUT(69)) { /* rolewiden: role wider than UP disks' capability */
+            if (role == META_ROLE_COMPUTE && !(mb->capability & META_CAP_COMPUTE))
+                return META_ERR_INVALID;
+            if (role == META_ROLE_STORAGE && !(mb->capability & META_CAP_STORAGE))
+                return META_ERR_INVALID;
+        }
+        mb->role = role;
+        return META_OK;
+    }
     }
     return META_ERR_FORMAT; /* an operation this build does not know (head comment of meta.h) */
 }
@@ -2991,7 +3370,7 @@ int meta_entry_older(const void *data, size_t len)
     struct rd r = {data, len, 0, 0};
     uint32_t magic = get32(&r);
     return (magic == ENTRY_MAGIC_V1 || magic == ENTRY_MAGIC_V2 || magic == ENTRY_MAGIC_V3 ||
-            magic == ENTRY_MAGIC_V4 || magic == ENTRY_MAGIC_V5) &&
+            magic == ENTRY_MAGIC_V4 || magic == ENTRY_MAGIC_V5 || magic == ENTRY_MAGIC_V6) &&
            !r.bad;
 }
 
@@ -3398,7 +3777,11 @@ static int decode_body(struct rd *r, struct meta_state *m)
         if (mb->replaced_by &&
             (mb->replaced_by == mb->id || mb->state == META_DESTROYED || !meta_member(m, mb->replaced_by)))
             r->bad = 1;
+        if (mb->capability != member_compute_cap(mb, m->set.log_on_hdd))
+            r->bad = 1;
     }
+    if (!r->bad && !stores_unique(m))
+        r->bad = 1;
     m->next_volume = get32(r);
     n = get32(r);
     if (r->bad || n > (r->len - r->off) / 16)
@@ -4104,6 +4487,29 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
                          b->rep[j].node, (unsigned long long)b->rep[j].rid);
             if (b->kind == META_VOL_REPLICATED && !b->rep[j].rid)
                 FAIL("volume %u: replica %u has no instance", b->number, b->rep[j].node);
+            /* R13 (E49, E50, D15): a newly placed log replica must land on a compute-capable member (or one with 0
+             * registered disks) whose declared role allows compute; checked across prev/next for multi-op entries. */
+            if (b->kind == META_VOL_REPLICATED && (!a || !meta_replica(a, b->rep[j].node))) {
+                const struct meta_member *mp = meta_member(prev, b->rep[j].node);
+                const struct meta_member *mn = meta_member(next, b->rep[j].node);
+                if (!mn || (!member_log_capable(mp) && !member_log_capable(mn)))
+                    FAIL("volume %u: log replica placed on node %u without compute capability (role %s, cap %s, log_on_hdd %u)",
+                         b->number, b->rep[j].node, mn ? meta_role_name(mn->role) : "?",
+                         mn ? meta_cap_name(mn->capability) : "?", next->set.log_on_hdd);
+            }
+        }
+        /* R13 (E49, E51): newly placed EC stripe positions must land on storage-capable members (when disks exist). */
+        if (b->redundancy == META_RED_EC) {
+            for (uint32_t j = 0; j < b->nstripe && j < META_STRIPE_MAX; j++) {
+                if (!a || j >= a->nstripe || a->stripe[j] != b->stripe[j]) {
+                    const struct meta_member *mp = meta_member(prev, b->stripe[j]);
+                    const struct meta_member *mn = meta_member(next, b->stripe[j]);
+                    if (!mn || (!member_storage_capable(mp) && !member_storage_capable(mn)))
+                        FAIL("volume %u: stripe position %u placed on node %u without storage capability (role %s, cap %s)",
+                             b->number, j, b->stripe[j], mn ? meta_role_name(mn->role) : "?",
+                             mn ? meta_cap_name(mn->capability) : "?");
+                }
+            }
         }
         /* at most one move, of a current member that is not itself moving in (D10) */
         uint32_t moves = 0;
@@ -4142,11 +4548,44 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
             FAIL("member %u: left OUT to %s without a new incarnation (%llu -> %llu)", a->id,
                  meta_member_state_name(b->state), (unsigned long long)a->incarnation,
                  (unsigned long long)b->incarnation);
+        if (b->ndisks < a->ndisks)
+            FAIL("member %u: disk count went down (%u -> %u)", a->id, a->ndisks, b->ndisks);
+        for (uint32_t j = 0; j < a->ndisks && j < META_DISKS_MAX; j++) {
+            if (memcmp(a->disks[j].store_id, b->disks[j].store_id, 16) != 0)
+                FAIL("member %u: disk %u changed store_id", a->id, j);
+            if (a->disks[j].state == META_STORE_DESTROYED && b->disks[j].state != META_STORE_DESTROYED)
+                FAIL("member %u: disk %u left DESTROYED to %s", a->id, j, meta_store_state_name(b->disks[j].state));
+        }
+        if (a->role != b->role && b->ndisks > 0) {
+            if (b->role == META_ROLE_COMPUTE && !(a->ndisks == 0 || (a->capability & META_CAP_COMPUTE)) &&
+                !(b->capability & META_CAP_COMPUTE))
+                FAIL("member %u: role set to compute without compute capability", a->id);
+            if (b->role == META_ROLE_STORAGE && !(a->ndisks == 0 || (a->capability & META_CAP_STORAGE)) &&
+                !(b->capability & META_CAP_STORAGE))
+                FAIL("member %u: role set to storage without storage capability", a->id);
+        }
     }
     for (uint32_t i = 0; i < next->nmembers; i++) {
         const struct meta_member *b = &next->members[i];
         if (b->state > META_DESTROYED)
             FAIL("member %u: unknown state %u", b->id, b->state);
+        if (b->role > META_ROLE_LAST)
+            FAIL("member %u: unknown role %u", b->id, b->role);
+        if (b->ndisks > META_DISKS_MAX)
+            FAIL("member %u: ndisks %u exceeds META_DISKS_MAX", b->id, b->ndisks);
+        for (uint32_t j = 0; j < b->ndisks; j++)
+            if (!disk_fields_valid(&b->disks[j]))
+                FAIL("member %u: disk %u has invalid fields", b->id, j);
+        uint8_t want_cap = member_compute_cap(b, next->set.log_on_hdd);
+        if (b->capability != want_cap)
+            FAIL("member %u: capability %s does not match UP disks (%s)", b->id, meta_cap_name(b->capability),
+                 meta_cap_name(want_cap));
+        if (!meta_member(prev, b->id) && b->ndisks > 0) {
+            if ((b->role == META_ROLE_COMPUTE && !(b->capability & META_CAP_COMPUTE)) ||
+                (b->role == META_ROLE_STORAGE && !(b->capability & META_CAP_STORAGE)))
+                FAIL("member %u: added with role %s unsupported by disks (%s)", b->id, meta_role_name(b->role),
+                     meta_cap_name(b->capability));
+        }
         if (b->state == META_DOWN) {
             if (!b->down_since_ms || b->down_reason < META_DOWN_TIMEOUT || b->down_reason > META_DOWN_LAST)
                 FAIL("member %u: DOWN without down_since or reason (%llu, %u)", b->id,
@@ -4177,6 +4616,8 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
                 FAIL("member %u: replaced_by unknown member %u", b->id, b->replaced_by);
         }
     }
+    if (!stores_unique(next))
+        FAIL("two disks share a store_id");
     if (next->next_member < prev->next_member || next->next_volume < prev->next_volume)
         FAIL("an id counter went back");
     /* a slot changes home only from a freeze committed in an earlier entry, under the epoch its old home had then */
