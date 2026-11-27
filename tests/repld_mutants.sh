@@ -141,6 +141,7 @@ table=(
     "downnocap|downbudget|downbudget: past repl_retain_down_gb budget, leader still keeps [0-9]+ WAL segments"
     "keepafterout|holdkeep|holdkeep: after META_OUT, leader still keeps [0-9]+ WAL segments"
     "fullafteradmit|full|full: refused row .* appeared"
+    "youngleavebelow|youngscrub|left ISR below min_isr"
 )
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}
 export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)

@@ -87,26 +87,31 @@ static void t_ack(void)
     struct rw_msg m;
     CHECK(dec(b, n, &m) == 0 && m.m.durable == 90 && m.m.written == 95 && m.volume == 4 && !m.m.resync && !m.m.full,
           "the ACK decodes");
-    /* RW_ACK_FULL (flag bit 1) alone and combined with RW_F_RESYNC (flag bit 0), plus invalid higher bits */
+    /* RW_ACK_FULL (bit 1) and RW_ACK_DAMAGED (bit 2) alone and combined with RW_F_RESYNC (bit 0), plus invalid bits */
     for (int res = 0; res <= 1; res++) {
         for (int full = 0; full <= 1; full++) {
-            struct repl_msg af = am;
-            af.resync = res;
-            af.full = full;
-            uint8_t fb[RW_HEAD + RW_CHECK];
-            size_t fn = rw_encode_msg(fb, sizeof fb, 4, &af, NULL, 0, 0, NULL, 0);
-            CHECK(fn == RW_HEAD + RW_CHECK, "ACK(resync=%d,full=%d) encodes to %zu", res, full, fn);
-            uint16_t wf = 0;
-            memcpy(&wf, fb + 2, 2);
-            CHECK(wf == (uint16_t)((res ? RW_F_RESYNC : 0u) | (full ? RW_ACK_FULL : 0u)),
-                  "ACK(resync=%d,full=%d) wire flags 0x%x", res, full, (unsigned)wf);
-            CHECK(dec(fb, fn, &m) == 0 && m.m.resync == res && m.m.full == full && m.m.durable == 90,
-                  "ACK(resync=%d,full=%d) round-trips", res, full);
-            if (full)
-                CHECK(flips_refused(fb, fn, 0, fn, "ACK(full)") == 0, "a flipped FULL ACK decoded");
+            for (int dmg = 0; dmg <= 1; dmg++) {
+                struct repl_msg af = am;
+                af.resync = res;
+                af.full = full;
+                af.damaged = dmg;
+                uint8_t fb[RW_HEAD + RW_CHECK];
+                size_t fn = rw_encode_msg(fb, sizeof fb, 4, &af, NULL, 0, 0, NULL, 0);
+                CHECK(fn == RW_HEAD + RW_CHECK, "ACK(resync=%d,full=%d,dmg=%d) encodes to %zu", res, full, dmg, fn);
+                uint16_t wf = 0;
+                memcpy(&wf, fb + 2, 2);
+                CHECK(wf == (uint16_t)((res ? RW_F_RESYNC : 0u) | (full ? RW_ACK_FULL : 0u) |
+                                       (dmg ? RW_ACK_DAMAGED : 0u)),
+                      "ACK(resync=%d,full=%d,dmg=%d) wire flags 0x%x", res, full, dmg, (unsigned)wf);
+                CHECK(dec(fb, fn, &m) == 0 && m.m.resync == res && m.m.full == full && m.m.damaged == dmg &&
+                          m.m.durable == 90,
+                      "ACK(resync=%d,full=%d,dmg=%d) round-trips", res, full, dmg);
+                if (full || dmg)
+                    CHECK(flips_refused(fb, fn, 0, fn, "ACK(flags)") == 0, "a flipped flagged ACK decoded");
+            }
         }
     }
-    const uint16_t bad_flags[] = {0x0004u, 0x0008u, 0x0007u, 0x8000u};
+    const uint16_t bad_flags[] = {0x0008u, 0x0010u, 0x000fu, 0x8000u};
     for (size_t k = 0; k < sizeof bad_flags / sizeof *bad_flags; k++) {
         uint8_t bf[RW_HEAD + RW_CHECK];
         memcpy(bf, b, n);
@@ -115,12 +120,16 @@ static void t_ack(void)
         memcpy(bf + RW_HEAD, &ck, 8);
         CHECK(dec(bf, n, &m) == -1, "sealed ACK with unknown flags 0x%04x decoded", (unsigned)bad_flags[k]);
     }
-    /* RW_ACK_FULL is valid on REPL_M_ACK only: encoder and decoder both refuse it on non-ACK messages */
+    /* RW_ACK_FULL and RW_ACK_DAMAGED are valid on REPL_M_ACK only: encoder and decoder refuse them on non-ACK */
     struct repl_msg bad_ap = {.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 4, .leader = 0, .prev_pos = 10,
                               .prev_epoch = 3, .commit = 9, .full = 1, .meta.leader = -1};
     CHECK(rw_encode_msg(b, sizeof b, 4, &bad_ap, NULL, 0, 0, NULL, 0) == 0,
           "non-ACK with RW_ACK_FULL encoded");
     bad_ap.full = 0;
+    bad_ap.damaged = 1;
+    CHECK(rw_encode_msg(b, sizeof b, 4, &bad_ap, NULL, 0, 0, NULL, 0) == 0,
+          "non-ACK with RW_ACK_DAMAGED encoded");
+    bad_ap.damaged = 0;
     size_t an = rw_encode_msg(b, sizeof b, 4, &bad_ap, NULL, 0, 0, NULL, 0);
     CHECK(an == RW_HEAD + RW_CHECK, "empty APPEND encodes");
     uint16_t full_flag = RW_ACK_FULL;
@@ -128,6 +137,11 @@ static void t_ack(void)
     uint64_t ack_ck = rw_check(RW_K_MSG, b, RW_HEAD);
     memcpy(b + RW_HEAD, &ack_ck, 8);
     CHECK(dec(b, an, &m) == -1, "sealed APPEND with RW_ACK_FULL decoded");
+    uint16_t dmg_flag = RW_ACK_DAMAGED;
+    memcpy(b + 2, &dmg_flag, 2);
+    ack_ck = rw_check(RW_K_MSG, b, RW_HEAD);
+    memcpy(b + RW_HEAD, &ack_ck, 8);
+    CHECK(dec(b, an, &m) == -1, "sealed APPEND with RW_ACK_DAMAGED decoded");
     /* re-encode am into b for the remaining ACK checks below */
     n = rw_encode_msg(b, sizeof b, 4, &am, NULL, 0, 0, NULL, 0);
     /* F3: durable raised inside (durable, written]: every bound holds, only the check can tell; *out stays zeroed */

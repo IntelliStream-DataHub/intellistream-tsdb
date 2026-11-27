@@ -2980,7 +2980,7 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                 v->rid = get64(&s);
                 v->open_gen = get64(&s);
                 v->open_nonce = get64(&s);
-                if (v->health == CL_HEALTH_OK)
+                if (v->health != CL_HEALTH_LOCAL_FAULT && v->health != CL_HEALTH_DOMAIN_FAULT)
                     continue;
                 /* the timer of a (volume, domain) fault runs from the first report of it and breaks on a report
                  * without it (M6); the leader reads it as `local_fault_s` */

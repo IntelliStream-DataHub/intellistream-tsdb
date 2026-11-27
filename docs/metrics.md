@@ -106,7 +106,7 @@ Gauges for volumes this server does **not** hold (not listed in the volume's rep
 | `tsdb_cluster_volume_min_isr{volume}` | gauge | per held volume: configured `min_isr` |
 | `tsdb_cluster_volume_young_margin{volume}` | gauge | per held volume: young-tier fault-tolerance margin (`isr_size - 1`; omitted for shared volumes); page on `<= 0` |
 | `tsdb_cluster_volume_settled_margin{volume}` | gauge | per held EC volume: settled-tier fault-tolerance margin (`present stripe positions - k`; omitted for non-EC volumes); page on `<= 0` |
-| `tsdb_cluster_volume_health{volume}` | gauge | per held volume: local health: `0` ok, `1` local_fault (fail-stopped or diverged), `2` domain_fault |
+| `tsdb_cluster_volume_health{volume}` | gauge | per held volume: local health: `0` ok, `1` local_fault (fail-stopped or diverged), `2` domain_fault, `3` damaged (young-part or `.ec` file damage found by scrub) |
 | `tsdb_cluster_volume_diverged{volume}` | gauge | per held volume: 1 while the volume is DIVERGED, else 0; page on 1 |
 | `tsdb_cluster_volume_lag_positions{volume}` | gauge | per held volume: replication lag in log positions (leader: written minus commit; replica: max(commit, written) minus applied) |
 | `tsdb_cluster_volume_lag_ms{volume}` | gauge | per held volume: replication lag duration in milliseconds (leader: commit stall or unacked peer age while `lag_positions > 0`; replica: active missing-file fetch wait while `lag_positions > 0`; 0 when caught up) |
@@ -116,6 +116,11 @@ Gauges for volumes this server does **not** hold (not listed in the volume's rep
 | `tsdb_cluster_transfers_total{event}` | counter | planned leadership transfer events since process start (`started`, `done`, `timed_out`, `cancelled`, `fallback`, `balance`, `drain_timed_out`, `blind`, `ready`, `cuts`) |
 | `tsdb_cluster_moves_total{event}` | counter | replica move lifecycle events since process start on the Raft leader (`started`, `done`, `cancelled`) |
 | `tsdb_cluster_settles_total{result}` | counter | EC part settle outcomes since process start (`done`, `failed`, `abandoned`) |
+| `tsdb_young_scrub_bytes_total{volume}` | counter | per held volume: total bytes verified by young-part and `.ec` scrub since process start (R12) |
+| `tsdb_young_scrub_parts_total{volume}` | counter | per held volume: total young and `.ec` parts verified by scrub since process start (R12) |
+| `tsdb_young_scrub_damaged_total{volume}` | counter | per held volume: total damaged young or `.ec` parts detected by scrub since process start (R12) |
+| `tsdb_young_scrub_age_seconds{volume}` | gauge | per held volume: seconds since the start of the last completed young-part scrub pass, or the first pass start (R12) |
+| `tsdb_young_scrub_min_isr_held{volume}` | gauge | per held volume: 1 while a damaged replica stays in the ISR because leaving would drop below `min_isr`, else 0 (R12) |
 
 Note on overlapping families: `tsdb_volume_{young_margin,settled_margin,settled_state}` report every volume in this server's metadata copy (including volumes held elsewhere), and `tsdb_volume_diverged{volume,path}` covers local engine volumes (standalone and cluster); the `tsdb_cluster_volume_*` families above report only cluster volumes **held** by this server and carry the fixed names used by P4's cluster alerts. Per-volume rebuild progress metrics are added by R14's progress track (`r14-progress`); messages a replica dropped for another set version remain a rate-limited log line only (not a counter).
 

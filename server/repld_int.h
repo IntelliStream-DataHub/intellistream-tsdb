@@ -74,6 +74,7 @@ struct rpeer {
     int heard;
     int was_down;      /* R9 E29: saw this peer META_DOWN; cleared on META_OUT/META_DESTROYED or META_UP + in ISR */
     int full;          /* R9 E30: last ACK from this peer carried RW_ACK_FULL */
+    int damaged;       /* R12 D7: last ACK from this peer carried RW_ACK_DAMAGED (asks to leave ISR) */
     uint64_t full_probe_ms; /* last empty heartbeat probe sent while non-ISR peer's catch-up is paused for FULL */
     uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
     uint64_t acked_ms; /* when its last ACK came (the stalesent fault takes a peer heard from since the file) */
@@ -132,6 +133,8 @@ struct rvol {
     int isr_full;        /* isr_full_locked of `rec` + peer[].full, counted in G.nfull_isr (full_sync_locked) */
     int full_said;       /* writer logged FULL backpressure active (cleared once FULL clears) */
     int full_pause_said; /* non-ISR replica logged catch-up pause for FULL (cleared once resumed) */
+    int dmg_leave_said;  /* R12 D7: damaged follower logged its ISR-leave request */
+    int dmg_minisr_said; /* R12 D7: damaged follower logged staying in ISR at min_isr */
     _Atomic uint64_t full_refusals; /* R9 E30: writes refused with TSDB_WHY_FULL on this volume */
     int sync_said;       /* noclock's line, once */
     uint64_t sync_late;  /* synclate: a report op_synced held back for the next tick (0: none) */
@@ -264,7 +267,8 @@ enum {
                           * checknocmp and checkshort are replwire.c's (rw_mutant) */
     RM_DOWNNOCAP,        /* r9-retain: ignores the repl_retain_down_gb server budget (downbudget) */
     RM_KEEPAFTEROUT,     /* r9-retain: keeps extending retention even after a member is META_OUT (holdkeep) */
-    RM_FULLAFTERADMIT    /* r9-full: refuses FULL after WAL append/commit instead of before (full) */
+    RM_FULLAFTERADMIT,   /* r9-full: refuses FULL after WAL append/commit instead of before (full) */
+    RM_YOUNGLB           /* r12-young: damaged follower leaves ISR even when (nisr - 1) < min_isr (youngscrub) */
 };
 
 enum { FI_REC = 1, FI_EPOCH, FI_DESC }; /* TSDB_REPLD_TEST=flipin[=epoch|desc] (repld.c flip_received) */

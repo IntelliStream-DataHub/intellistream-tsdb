@@ -43,10 +43,12 @@
 #include "../src/repl.h"
 
 /* RW_VERSION 3 (pre-1.0 E40: same 0.11.0 cycle as rd-drvcheck and PL_CL_VERSION 10; mixed builds predating r9-full
- * are not supported). Flag bit 1 (RW_ACK_FULL) is valid on REPL_M_ACK only; unknown higher bits are refused. */
+ * are not supported). Flag bits 1 (RW_ACK_FULL) and 2 (RW_ACK_DAMAGED) are valid on REPL_M_ACK only; unknown higher
+ * bits are refused. */
 #define RW_VERSION 3
-#define RW_F_RESYNC 1u /* ACK: the leader should send from written + 1 */
-#define RW_ACK_FULL 2u /* ACK: the sender's server is FULL (R9 E30, D17) */
+#define RW_F_RESYNC 1u    /* ACK: the leader should send from written + 1 */
+#define RW_ACK_FULL 2u    /* ACK: the sender's server is FULL (R9 E30, D17) */
+#define RW_ACK_DAMAGED 4u /* ACK: the sender's replica has young damage and asks to leave ISR (R12 D7) */
 enum { RW_T_MSG = 1, RW_T_FETCH = 2 };
 #define RW_HEAD 212         /* the fixed part of an RW_T_MSG, up to and with nrec */
 #define RW_CHECK 8          /* the driver check */

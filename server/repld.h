@@ -64,6 +64,8 @@ unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max);
 unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t after_ms);
 /* Stops every driver thread and the links (before the handle is closed). */
 void repld_stop(void);
+/* Wakes volume v's replication driver thread (e.g. when scrubd marks young damage). Any thread; no-op if absent. */
+void repld_wake_vol(uint32_t v);
 /* Closes one volume's driver and engine (a replica the record no longer names, or one reset: server/cvolset_mgr.c): its
  * thread stopped and joined, a writer deposed, the engine closed, the driver unlisted and freed once the last holder of
  * a vol_find reference (a link thread, the cluster thread, a worker, the snapshot worker) gives it back. 0 (also when

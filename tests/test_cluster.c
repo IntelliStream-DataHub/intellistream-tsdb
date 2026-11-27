@@ -23941,6 +23941,492 @@ static void scen_fullnonisr(void)
            R, expected_rows);
 }
 
+/* Helpers for scen_youngscrub: find first .part file in <dir>/v<vol> and flip one byte inside its granule payload. */
+static int find_first_part(const char *vdir, char *out_name, size_t cap)
+{
+    DIR *d = opendir(vdir);
+    if (!d)
+        return 0;
+    struct dirent *de;
+    int found = 0;
+    while ((de = readdir(d)) != NULL) {
+        size_t len = strlen(de->d_name);
+        if (de->d_name[0] == 'p' && len > 5 && strcmp(de->d_name + len - 5, ".part") == 0) {
+            snprintf(out_name, cap, "%s", de->d_name);
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static void flip_part_payload_byte(const char *vdir, const char *pname)
+{
+    char path[PATH_MAX + 256];
+    snprintf(path, sizeof path, "%s/%s", vdir, pname);
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        die("youngscrub: open %s: %s", path, strerror(errno));
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 160)
+        die("youngscrub: part %s too small (%lld)", path, (long long)st.st_size);
+    /* Offset 64 lies right after the 48-byte part_header, strictly inside granule 0's payload. */
+    off_t off = 64;
+    uint8_t b = 0;
+    if (pread(fd, &b, 1, off) != 1)
+        die("youngscrub: pread %s: %s", path, strerror(errno));
+    b ^= 0x5au;
+    if (pwrite(fd, &b, 1, off) != 1)
+        die("youngscrub: pwrite %s: %s", path, strerror(errno));
+    close(fd);
+}
+
+static int vol_health_in_status(int leader_srv, uint32_t node_id, uint32_t vol)
+{
+    struct view vw = {0};
+    view(leader_srv, &vw);
+    int res = -1;
+    for (uint32_t k = 0; k < vw.st.nheard; k++) {
+        if (vw.st.heard[k].id != node_id)
+            continue;
+        for (uint32_t j = 0; j < vw.st.heard[k].nvols; j++) {
+            if (vw.st.heard[k].vols[j].v.volume == vol) {
+                res = (int)vw.st.heard[k].vols[j].v.health;
+                break;
+            }
+        }
+    }
+    view_free(&vw);
+    return res;
+}
+
+static int node_in_isr(int srv, const char *vname, uint32_t node_id, uint32_t *nisr_out)
+{
+    struct meta_volume v = {0};
+    if (!vol_rec(srv, vname, &v))
+        return -1;
+    if (nisr_out)
+        *nisr_out = v.nisr;
+    for (uint32_t i = 0; i < v.nisr; i++)
+        if (v.isr[i] == node_id)
+            return 1;
+    return 0;
+}
+
+/* youngscrub (R12, r12-young; D4, D7, D10):
+ * Part A (3 replicas, min_isr = 2):
+ *   - Flip a granule payload byte on follower R1 -> scrubd detects damage, reports CL_HEALTH_DAMAGED in HBS_VOLUMES,
+ *     /metrics (tsdb_cluster_volume_health=3, tsdb_young_scrub_*), and TOPOLOGY (DEGRADED/SUSPECT).
+ *   - R1 asks to leave the ISR through the core; ISR drops 3 -> 2; writes continue on leader L.
+ *   - v1/SCRUB persists damaged state; restarting R1 re-scrubs the damaged part first and stays DAMAGED & out of ISR.
+ *   - Flip a granule payload byte on leader L -> leader reports CL_HEALTH_DAMAGED and keeps leading cleanly.
+ * Part B (3 replicas, min_isr = 3):
+ *   - Flip a granule payload byte on follower R1 -> reports CL_HEALTH_DAMAGED, stays in ISR (nisr == 3), logs clearly,
+ *     and exports tsdb_young_scrub_min_isr_held{volume="1"} == 1 (catches mutant youngleavebelow!). */
+static void scen_youngscrub(void)
+{
+    scenario("youngscrub");
+
+    /* ---- Part A: 3 replicas, min_isr = 2 ---- */
+    int mports[3] = {0};
+    init_min_isr = 2;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+        if (mports[i] <= 0)
+            die("youngscrub: server %d reported no metrics port", i);
+    }
+    init_cluster(0, 600);
+    init_min_isr = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+
+    uint32_t vnum = 0;
+    int rc;
+    if ((rc = vol_add(0, "ys", 3, &vnum)) != 0 || vnum != 1)
+        die("youngscrub: vol_add ys: %s num=%" PRIu32, cluster_strerror(rc), vnum);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ys", i, 1, 0);
+    struct meta_volume v = {0};
+    if (!vol_rec(0, "ys", &v) || v.min_isr != 2)
+        die("youngscrub: no record of ys or min_isr=%" PRIu32 " != 2", v.min_isr);
+    int L = server_of(v.leader);
+    int R1 = (L + 1) % 3;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, "ys.s0", "ys", 30000);
+    await_isr(L, "ys", 3, 15000, "ys 3/3 ISR");
+
+    /* Large insert (> 65536 rows) produces a committed .part file immediately on all 3 replicas. */
+    const size_t nbatch = 70000;
+    int64_t *ts = malloc(nbatch * sizeof *ts);
+    float *vals = malloc(nbatch * sizeof *vals);
+    if (!ts || !vals)
+        die("youngscrub: malloc");
+    for (size_t k = 0; k < nbatch; k++) {
+        ts[k] = 100000 + (int64_t)k * 10;
+        vals[k] = (float)(k % 100) * 0.5f;
+    }
+    if ((rc = tsdbc_insert_series(c, id, ts, vals, nbatch)) != 0)
+        die("youngscrub: large insert: %s", ers(rc));
+
+    /* Wait for R1 to hold a .part file and complete at least one clean scrub pass. */
+    char sdir[PATH_MAX + 80], vdir[PATH_MAX + 128], pname[128] = "";
+    server_dir(R1, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    uint64_t t0 = now_ms();
+    while (!find_first_part(vdir, pname, sizeof pname)) {
+        if (now_ms() - t0 > 15000)
+            die("youngscrub: follower %d never received a .part file in %s", R1, vdir);
+        usleep(50000);
+    }
+
+    char mbuf[65536];
+    int scrubbed_clean = 0;
+    for (t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        metrics_get(mports[R1], mbuf, sizeof mbuf);
+        int64_t parts = 0, dmg = -1, hlth = -1;
+        if (metrics_find_i64(mbuf, "\ntsdb_young_scrub_parts_total{volume=\"1\"} ", &parts) && parts >= 1 &&
+            metrics_find_i64(mbuf, "\ntsdb_young_scrub_damaged_total{volume=\"1\"} ", &dmg) && dmg == 0 &&
+            metrics_find_i64(mbuf, "\ntsdb_cluster_volume_health{volume=\"1\"} ", &hlth) && hlth == CL_HEALTH_OK) {
+            scrubbed_clean = 1;
+            break;
+        }
+    }
+    if (!scrubbed_clean)
+        die("youngscrub: follower %d never finished a clean scrub pass", R1);
+
+    /* Flip a granule payload byte on follower R1. */
+    flip_part_payload_byte(vdir, pname);
+
+    /* 1. R1 reports CL_HEALTH_DAMAGED in HBS_VOLUMES (via Raft leader STATUS) and leaves the ISR (3 -> 2). */
+    int saw_hb_dmg = 0, left_isr = 0;
+    for (t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        if (vol_health_in_status(0, ids[R1], 1) == CL_HEALTH_DAMAGED)
+            saw_hb_dmg = 1;
+        uint32_t nisr = 0;
+        int in = node_in_isr(L, "ys", ids[R1], &nisr);
+        if (in == 0 && nisr == 2)
+            left_isr = 1;
+        if (saw_hb_dmg && left_isr)
+            break;
+    }
+    if (!saw_hb_dmg)
+        die("youngscrub: follower %d did not report CL_HEALTH_DAMAGED in HBS_VOLUMES", R1);
+    if (!left_isr)
+        die("youngscrub: damaged follower %d did not leave ISR (min_isr=2)", R1);
+
+    /* 2. Check TOPOLOGY on R1 reports DEGRADED/SUSPECT for R1's entry, and /metrics reports all young scrub families. */
+    tsdbc *cr1 = client(R1);
+    tsdbc_topo *topo = NULL;
+    if (tsdbc_topology(cr1, &topo) != 0 || !topo)
+        die("youngscrub: TOPOLOGY on R1 failed");
+    int saw_topo_deg = 0;
+    for (size_t i = 0; i < topo->nvols; i++) {
+        if (topo->vols[i].vol == 1 && topo->vols[i].owner == ids[R1]) {
+            if (topo->vols[i].health == TSDB_HEALTH_DEGRADED && topo->vols[i].reason == TSDB_WHY_SUSPECT)
+                saw_topo_deg = 1;
+        }
+    }
+    tsdbc_topology_free(topo);
+    tsdbc_close(cr1);
+    if (!saw_topo_deg)
+        die("youngscrub: TOPOLOGY on R1 did not report DEGRADED/SUSPECT for damaged replica");
+
+    metrics_get(mports[R1], mbuf, sizeof mbuf);
+    int64_t m_hlth = -1, m_bytes = 0, m_parts = 0, m_dmg = 0, m_held = -1;
+    if (!metrics_find_i64(mbuf, "\ntsdb_cluster_volume_health{volume=\"1\"} ", &m_hlth) || m_hlth != CL_HEALTH_DAMAGED ||
+        !metrics_find_i64(mbuf, "\ntsdb_young_scrub_bytes_total{volume=\"1\"} ", &m_bytes) || m_bytes <= 0 ||
+        !metrics_find_i64(mbuf, "\ntsdb_young_scrub_parts_total{volume=\"1\"} ", &m_parts) || m_parts < 1 ||
+        !metrics_find_i64(mbuf, "\ntsdb_young_scrub_damaged_total{volume=\"1\"} ", &m_dmg) || m_dmg < 1 ||
+        !strstr(mbuf, "\ntsdb_young_scrub_age_seconds{volume=\"1\"} ") ||
+        !metrics_find_i64(mbuf, "\ntsdb_young_scrub_min_isr_held{volume=\"1\"} ", &m_held) || m_held != 0)
+        die("youngscrub: R1 metrics mismatch (health=%" PRId64 " bytes=%" PRId64 " parts=%" PRId64 " dmg=%" PRId64
+            " held=%" PRId64 ")",
+            m_hlth, m_bytes, m_parts, m_dmg, m_held);
+
+    /* 3. Writes continue succeeding on leader L while R1 is out of ISR. */
+    for (int k = 0; k < 20; k++) {
+        int64_t wts = 2000000 + k * 100;
+        float wv = 9.0f;
+        if ((rc = tsdbc_insert_series(c, id, &wts, &wv, 1)) != 0)
+            die("youngscrub: write %d after damaged follower left ISR failed: %s", k, ers(rc));
+    }
+
+    /* 4. Restart R1: v1/SCRUB must trigger priority re-scrub of damaged part -> still DAMAGED & out of ISR. */
+    char spath[PATH_MAX + 160];
+    snprintf(spath, sizeof spath, "%s/SCRUB", vdir);
+    if (access(spath, F_OK) != 0)
+        die("youngscrub: expected advisory progress file %s", spath);
+    stop(R1, SIGTERM);
+    start(R1);
+    mports[R1] = th_mport;
+    await_open_gen(0, "ys", R1, 2, 0);
+    int re_dmg = 0;
+    for (t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        metrics_get(mports[R1], mbuf, sizeof mbuf);
+        int64_t r_dmg = 0, r_hlth = -1;
+        if (metrics_find_i64(mbuf, "\ntsdb_young_scrub_damaged_total{volume=\"1\"} ", &r_dmg) && r_dmg >= 1 &&
+            metrics_find_i64(mbuf, "\ntsdb_cluster_volume_health{volume=\"1\"} ", &r_hlth) &&
+            r_hlth == CL_HEALTH_DAMAGED && vol_health_in_status(0, ids[R1], 1) == CL_HEALTH_DAMAGED) {
+            re_dmg = 1;
+            break;
+        }
+    }
+    if (!re_dmg)
+        die("youngscrub: restarted follower %d did not re-scrub and re-detect CL_HEALTH_DAMAGED", R1);
+    usleep(500000);
+    uint32_t nisr_after = 0;
+    if (node_in_isr(L, "ys", ids[R1], &nisr_after) != 0 || nisr_after != 2)
+        die("youngscrub: restarted damaged follower %d rejoined ISR (nisr=%" PRIu32 ")", R1, nisr_after);
+
+    /* 4b. Vanished damaged priority part across restart (e.g. merged away before scrubd ran):
+     * Write a valid v1/SCRUB naming a non-existent damaged_part on clean follower R2 and restart R2.
+     * scrubd MUST keep R2 CL_HEALTH_DAMAGED (never silently clear damage when the priority part vanished). */
+    int R2a = (L + 2) % 3;
+    char r2dir[PATH_MAX + 80], r2scrub[PATH_MAX + 160];
+    server_dir(R2a, r2dir, sizeof r2dir);
+    snprintf(r2scrub, sizeof r2scrub, "%s/v1/SCRUB", r2dir);
+    stop(R2a, SIGTERM);
+    {
+        const char *body = "tsdb-scrub 1\n"
+                           "pass_start_s 1000\n"
+                           "last_pass_s 1000\n"
+                           "first_pass_s 1000\n"
+                           "cursor 0 0 0 0 0 0\n"
+                           "damaged 1\n"
+                           "damaged_part p0_999_999_0.part\n";
+        int sfd = open(r2scrub, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (sfd < 0 || write(sfd, body, strlen(body)) != (ssize_t)strlen(body))
+            die("youngscrub: write body to %s", r2scrub);
+        uint64_t bsz = 0, bh = 0;
+        if (snap_xxh64_fd(sfd, &bsz, &bh) != 0)
+            die("youngscrub: snap_xxh64_fd %s", r2scrub);
+        char tail[64];
+        int tl = snprintf(tail, sizeof tail, "end %016" PRIx64 "\n", bh);
+        if (lseek(sfd, 0, SEEK_END) < 0 || write(sfd, tail, (size_t)tl) != tl)
+            die("youngscrub: write end to %s", r2scrub);
+        close(sfd);
+    }
+    start(R2a);
+    mports[R2a] = th_mport;
+    await_open_gen(0, "ys", R2a, 2, 0);
+    await_log(R2a, "vanished before restart re-scrub; keeping volume DAMAGED", 15000,
+              "R2 kept volume DAMAGED when priority part vanished");
+    int r2_kept_dmg = 0;
+    for (t0 = now_ms(); now_ms() - t0 < 10000; usleep(50000)) {
+        metrics_get(mports[R2a], mbuf, sizeof mbuf);
+        int64_t h2 = -1;
+        if (metrics_find_i64(mbuf, "\ntsdb_cluster_volume_health{volume=\"1\"} ", &h2) && h2 == CL_HEALTH_DAMAGED) {
+            r2_kept_dmg = 1;
+            break;
+        }
+    }
+    if (!r2_kept_dmg)
+        die("youngscrub: R2 cleared CL_HEALTH_DAMAGED after priority part vanished");
+
+    /* 5. Flip a granule byte on leader L: leader reports CL_HEALTH_DAMAGED and keeps leading cleanly. */
+    char ldir[PATH_MAX + 80], lvdir[PATH_MAX + 128], lpname[128] = "";
+    server_dir(L, ldir, sizeof ldir);
+    snprintf(lvdir, sizeof lvdir, "%s/v1", ldir);
+    if (!find_first_part(lvdir, lpname, sizeof lpname))
+        die("youngscrub: leader %d has no .part file", L);
+    flip_part_payload_byte(lvdir, lpname);
+    int lead_dmg = 0;
+    for (t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        if (vol_health_in_status(0, ids[L], 1) == CL_HEALTH_DAMAGED) {
+            lead_dmg = 1;
+            break;
+        }
+    }
+    if (!lead_dmg)
+        die("youngscrub: damaged leader %d did not report CL_HEALTH_DAMAGED", L);
+    for (int k = 0; k < 10; k++) {
+        int64_t wts = 3000000 + k * 100;
+        float wv = 11.0f;
+        if ((rc = tsdbc_insert_series(c, id, &wts, &wv, 1)) != 0)
+            die("youngscrub: damaged leader %d stopped taking writes: %s", L, ers(rc));
+    }
+
+    tsdbc_close(c);
+    stop_all();
+
+    /* ---- Part B: 3 replicas, min_isr = 3 (damaged follower MUST stay in ISR, log & export min_isr_held=1) ---- */
+    scenario("youngscrub-minisr3");
+    init_min_isr = 3;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    init_min_isr = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    want = 3;
+    await_view(0, p_voters, &want, "three voters (min_isr=3)");
+
+    vnum = 0;
+    if ((rc = vol_add(0, "ys3", 3, &vnum)) != 0 || vnum != 1)
+        die("youngscrub(min_isr=3): vol_add ys3: %s num=%" PRIu32, cluster_strerror(rc), vnum);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ys3", i, 1, 0);
+    if (!vol_rec(0, "ys3", &v) || v.min_isr != 3)
+        die("youngscrub(min_isr=3): bad record min_isr=%" PRIu32, v.min_isr);
+    L = server_of(v.leader);
+    R1 = (L + 1) % 3;
+    c = client(L);
+    id = rep_series(c, "ys3.s0", "ys3", 30000);
+    await_isr(L, "ys3", 3, 15000, "ys3 3/3 ISR");
+
+    if ((rc = tsdbc_insert_series(c, id, ts, vals, nbatch)) != 0)
+        die("youngscrub(min_isr=3): large insert: %s", ers(rc));
+    free(ts);
+    free(vals);
+
+    server_dir(R1, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    pname[0] = '\0';
+    for (t0 = now_ms(); !find_first_part(vdir, pname, sizeof pname); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("youngscrub(min_isr=3): follower %d never received .part", R1);
+    flip_part_payload_byte(vdir, pname);
+
+    /* Wait for R1 to report CL_HEALTH_DAMAGED, log min_isr hold, and set tsdb_young_scrub_min_isr_held=1.
+     * Check ISR on every poll so a mutant that leaves below min_isr fails immediately with its oracle line. */
+    int saw_held = 0;
+    for (t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        uint32_t nisr_chk = 0;
+        int in_chk = node_in_isr(L, "ys3", ids[R1], &nisr_chk);
+        if (in_chk == 0 || (in_chk == 1 && nisr_chk < 3))
+            die("youngscrub(min_isr=3): damaged follower %d left ISR below min_isr=3 (nisr=%" PRIu32 ")", R1, nisr_chk);
+        metrics_get(mports[R1], mbuf, sizeof mbuf);
+        int64_t hlth = -1, held = 0;
+        if (metrics_find_i64(mbuf, "\ntsdb_cluster_volume_health{volume=\"1\"} ", &hlth) &&
+            hlth == CL_HEALTH_DAMAGED &&
+            metrics_find_i64(mbuf, "\ntsdb_young_scrub_min_isr_held{volume=\"1\"} ", &held) && held == 1) {
+            saw_held = 1;
+            break;
+        }
+    }
+    if (!saw_held)
+        die("youngscrub(min_isr=3): follower %d did not report CL_HEALTH_DAMAGED + tsdb_young_scrub_min_isr_held=1",
+            R1);
+    await_log(R1, "damaged replica stays in ISR", 10000, "follower R1 logged min_isr hold");
+
+    /* Wait 1.5 s and assert R1 STAYS in ISR (catches youngleavebelow!). */
+    usleep(1500000);
+    uint32_t nisr3 = 0;
+    if (node_in_isr(L, "ys3", ids[R1], &nisr3) != 1 || nisr3 != 3)
+        die("youngscrub(min_isr=3): damaged follower %d left ISR below min_isr=3 (nisr=%" PRIu32 ")", R1, nisr3);
+
+    int64_t wts = 5000000;
+    float wv = 42.0f;
+    if ((rc = tsdbc_insert_series(c, id, &wts, &wv, 1)) != 0)
+        die("youngscrub(min_isr=3): write failed while held in ISR: %s", ers(rc));
+
+    tsdbc_close(c);
+    stop_all();
+
+    /* ---- Part C: 3 replicas, min_isr = 1, TWO damaged followers must both leave ISR and stay out without flapping ---- */
+    scenario("youngscrub-two-damaged");
+    init_min_isr = 1;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    init_min_isr = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    want = 3;
+    await_view(0, p_voters, &want, "three voters (min_isr=1)");
+
+    vnum = 0;
+    if ((rc = vol_add(0, "ys1", 3, &vnum)) != 0 || vnum != 1)
+        die("youngscrub(two-damaged): vol_add ys1: %s num=%" PRIu32, cluster_strerror(rc), vnum);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ys1", i, 1, 0);
+    if (!vol_rec(0, "ys1", &v) || v.min_isr != 1)
+        die("youngscrub(two-damaged): bad record min_isr=%" PRIu32, v.min_isr);
+    L = server_of(v.leader);
+    R1 = (L + 1) % 3;
+    int R2 = (L + 2) % 3;
+    c = client(L);
+    id = rep_series(c, "ys1.s0", "ys1", 30000);
+    await_isr(L, "ys1", 3, 15000, "ys1 3/3 ISR");
+
+    ts = malloc(nbatch * sizeof *ts);
+    vals = malloc(nbatch * sizeof *vals);
+    if (!ts || !vals)
+        die("youngscrub(two-damaged): malloc");
+    for (size_t k = 0; k < nbatch; k++) {
+        ts[k] = 100000 + (int64_t)k * 10;
+        vals[k] = (float)(k % 100) * 0.5f;
+    }
+    if ((rc = tsdbc_insert_series(c, id, ts, vals, nbatch)) != 0)
+        die("youngscrub(two-damaged): large insert: %s", ers(rc));
+    free(ts);
+    free(vals);
+
+    char vdir2[PATH_MAX + 128], pname2[128] = "";
+    server_dir(R1, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    server_dir(R2, ldir, sizeof ldir);
+    snprintf(vdir2, sizeof vdir2, "%s/v1", ldir);
+    pname[0] = '\0';
+    for (t0 = now_ms(); !find_first_part(vdir, pname, sizeof pname) || !find_first_part(vdir2, pname2, sizeof pname2);
+         usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("youngscrub(two-damaged): followers %d/%d never received .part", R1, R2);
+
+    flip_part_payload_byte(vdir, pname);
+    flip_part_payload_byte(vdir2, pname2);
+
+    int both_left = 0;
+    for (t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        uint32_t n1 = 0, n2 = 0;
+        if (node_in_isr(L, "ys1", ids[R1], &n1) == 0 && node_in_isr(L, "ys1", ids[R2], &n2) == 0 && n1 == 1) {
+            both_left = 1;
+            break;
+        }
+    }
+    if (!both_left)
+        die("youngscrub(two-damaged): both damaged followers did not leave ISR (min_isr=1)");
+
+    struct meta_volume v_before = {0};
+    if (!vol_rec(L, "ys1", &v_before))
+        die("youngscrub(two-damaged): vol_rec before stability window failed");
+    /* Send writes and wait 1.5 s: neither damaged follower may rejoin and isr_version must stay stable (no flapping). */
+    for (int k = 0; k < 10; k++) {
+        int64_t t2 = 6000000 + k * 100;
+        float v2 = 3.0f;
+        if ((rc = tsdbc_insert_series(c, id, &t2, &v2, 1)) != 0)
+            die("youngscrub(two-damaged): write %d failed: %s", k, ers(rc));
+    }
+    usleep(1500000);
+    struct meta_volume v_after = {0};
+    if (!vol_rec(L, "ys1", &v_after) || v_after.nisr != 1 || v_after.isr_version != v_before.isr_version)
+        die("youngscrub(two-damaged): ISR flapped (nisr=%" PRIu32 " isrv %" PRIu64 " -> %" PRIu64 ")", v_after.nisr,
+            v_before.isr_version, v_after.isr_version);
+
+    tsdbc_close(c);
+    stop_all();
+    for (int i = 0; i < 3; i++) {
+        penv[i] = NULL;
+        xargs[i] = NULL;
+    }
+    printf("  youngscrub: min_isr=2 damaged follower left ISR + restart re-scrubbed first + damaged leader kept leading; "
+           "min_isr=3 stayed in ISR with metric & log; two damaged followers (min_isr=1) both left ISR stably\n");
+}
+
 
 struct saved_chunk {
     char name[128];
@@ -25416,7 +25902,8 @@ int main(int argc, char **argv)
                {"outmove", scen_outmove}, {"ecout", scen_ecout}, {"metrics", scen_metrics},
                {"full", scen_full}, {"fullnonisr", scen_fullnonisr}, {"ecrebuild", scen_ecrebuild},
                {"nodehold", scen_nodehold}, {"nodeout", scen_nodeout}, {"nodedrain", scen_nodedrain},
-               {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove}};
+               {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
+               {"youngscrub", scen_youngscrub}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

@@ -27,6 +27,7 @@
 #include "ecpart.h"
 #include "ecswap.h"
 #include "ppos.h"
+#include "scrub.h"
 
 #include <dirent.h>
 #include <stddef.h>
@@ -365,6 +366,196 @@ int granule_decode(codec_ctx *c, const part *p, const granule *g, const uint8_t 
         rc = TSDB_ERR_CORRUPT;
     if (rc == 0 && v)
         rc = block_decode_vals(c, type, blk + g->ts_len, g->val_len, g->count, v);
+    return rc;
+}
+
+static int scrub_pread_exact(int fd, void *buf, size_t len, uint64_t off)
+{
+    uint8_t *p = buf;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t r = pread(fd, p + done, len - done, (off_t)(off + done));
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return TSDB_ERR_IO;
+        }
+        if (r == 0)
+            return TSDB_ERR_CORRUPT;
+        done += (size_t)r;
+    }
+    return 0;
+}
+
+/* Verifies a .part file via pread (never reading p->map, so EIO returns TSDB_ERR_IO instead of SIGBUS).
+ * Checks header, footer, header+index+tombstones+footer hash, tombstones, packed granule index, and every
+ * granule's xxh64 checksum in [g_start, p->ng). */
+int part_scrub_pread(const part *p, uint32_t g_start, uint64_t bytes_budget, uint32_t *g_next, uint64_t *bytes_out)
+{
+    *g_next = p->ng;
+    *bytes_out = 0;
+
+    bool use_mmap = false;
+#ifdef TSDB_TEST_HOOKS
+    if (scrub_test_mutant == SCRUB_MUT_MMAP)
+        use_mmap = true;
+#endif
+
+    int fd = -1;
+    size_t size = p->map_len;
+    if (!use_mmap) {
+        fd = openat(p->dirfd, p->name, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            if (errno == ENOENT)
+                return TSDB_ERR_NOTFOUND;
+            if (errno == EMFILE || errno == ENFILE || errno == ENOMEM)
+                return TSDB_ERR_NOMEM; /* transient resource pressure: retry, never mark part damaged */
+            return TSDB_ERR_IO;
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            close(fd);
+            return TSDB_ERR_IO;
+        }
+        if (st.st_size < 0 || (size_t)st.st_size != size) {
+            close(fd);
+            return TSDB_ERR_CORRUPT;
+        }
+    }
+
+    int rc = TSDB_ERR_CORRUPT;
+    uint8_t *ib = NULL;
+    uint8_t *gbuf = NULL;
+    size_t gbuf_cap = 0;
+    uint64_t win_off = 0;
+    size_t win_len = 0;
+
+    if (size < p->hdr_len + sizeof(part_footer) || (p->hdr_len != PART_HDR_V8 && p->hdr_len != sizeof(part_header)))
+        goto out;
+
+    part_header h;
+    part_footer f;
+    memset(&h, 0, sizeof h);
+    if (use_mmap) {
+        memcpy(&h, p->map, p->hdr_len);
+        memcpy(&f, p->map + size - sizeof f, sizeof f);
+    } else {
+        if ((rc = scrub_pread_exact(fd, &h, p->hdr_len, 0)) != 0 ||
+            (rc = scrub_pread_exact(fd, &f, sizeof f, size - sizeof f)) != 0)
+            goto out;
+        rc = TSDB_ERR_CORRUPT;
+    }
+
+    if (memcmp(h.magic, PART_MAGIC, 8) != 0 || memcmp(f.magic, PART_END_MAGIC, 8) != 0)
+        goto out;
+    bool v8 = p->hdr_len == PART_HDR_V8;
+    if ((v8 && h.version != PREV_FORMAT_VERSION) || (!v8 && h.version != FORMAT_VERSION) || f.version != h.version ||
+        h.granule_rows == 0 || h.granule_rows > MAX_GRANULE_ROWS || h.granule_rows != p->grows)
+        goto out;
+    if (!v8 && (h.fno_lo > h.fno_hi || (h.fno_lo == 0) != (h.fno_hi == 0) || h.fno_hi >= FNO_BOUND_MAX))
+        goto out;
+    if (f.index_off % 8 != 0 || f.index_len % 8 != 0 || f.index_off < p->hdr_len ||
+        f.index_off > (uint64_t)size - sizeof f || f.index_len > (uint64_t)size - sizeof f - f.index_off ||
+        f.index_off != p->index_off || f.index_len != p->index_len || f.ngranules != p->ng ||
+        f.index_hash != p->index_hash || f.min_ts > f.max_ts || f.min_ts != p->min_ts || f.max_ts != p->max_ts ||
+        f.rows != p->rows)
+        goto out;
+
+    size_t ilen = (size_t)f.index_len;
+    size_t tlen = (size_t)((uint64_t)size - sizeof f - f.index_off - f.index_len);
+    ib = malloc(ilen + tlen + 8);
+    if (!ib) {
+        rc = TSDB_ERR_NOMEM;
+        goto out;
+    }
+    if (use_mmap) {
+        memcpy(ib, p->map + f.index_off, ilen + tlen);
+    } else {
+        if ((rc = scrub_pread_exact(fd, ib, ilen + tlen, f.index_off)) != 0)
+            goto out;
+        rc = TSDB_ERR_CORRUPT;
+    }
+    memset(ib + ilen + tlen, 0, 8);
+
+    const tomb *tombs = NULL;
+    uint32_t nt = 0;
+    gix ix;
+    if (part_hash(&h, p->hdr_len, ib, ilen, ib + ilen, tlen, &f) != f.index_hash ||
+        !trailer_parse(ib + ilen, tlen, &tombs, &nt) || gix_parse(ib, ilen, f.ngranules, &ix) != 0)
+        goto out;
+
+    /* Count every metadata byte actually read so pacing tracks real I/O, and ensure the granule slice is at least
+     * as large as the index+tombstones so multi-step passes over huge parts stay O(part_size), never O(part_size^2). */
+    uint64_t meta_bytes = (uint64_t)p->hdr_len + sizeof f + ilen + tlen;
+    *bytes_out += meta_bytes;
+    uint64_t eff_budget = bytes_budget;
+    if (eff_budget > 0 && eff_budget < ilen + tlen)
+        eff_budget = ilen + tlen;
+
+    uint32_t limit = f.ngranules;
+#ifdef TSDB_TEST_HOOKS
+    if (scrub_test_mutant == SCRUB_MUT_SKIPGRANULE && limit > 0)
+        limit--;
+#endif
+
+    uint64_t step_bytes = 0;
+    for (uint32_t i = g_start; i < limit; i++) {
+        uint32_t cnt = (uint32_t)gix_get(&ix, i, GF_COUNT);
+        uint64_t goff = gix_get(&ix, i, GF_OFF);
+        uint32_t ts_len = (uint32_t)gix_get(&ix, i, GF_TSLEN);
+        uint32_t val_len = (uint32_t)gix_get(&ix, i, GF_VALLEN);
+        uint32_t crc = (uint32_t)gix_get(&ix, i, GF_CRC);
+        uint64_t glen = (uint64_t)ts_len + val_len;
+        if (cnt == 0 || cnt > h.granule_rows || glen == 0 || goff < p->hdr_len || goff > f.index_off ||
+            glen > f.index_off - goff)
+            goto out;
+
+        const uint8_t *gptr;
+        if (use_mmap) {
+            gptr = p->map + goff;
+        } else {
+            if (goff < win_off || goff + glen > win_off + win_len) {
+                size_t want = glen > (256u << 10) ? (size_t)glen : (256u << 10);
+                uint64_t avail = f.index_off - goff;
+                if (want > avail)
+                    want = (size_t)avail;
+                if (want > gbuf_cap) {
+                    uint8_t *nb = realloc(gbuf, want);
+                    if (!nb) {
+                        rc = TSDB_ERR_NOMEM;
+                        goto out;
+                    }
+                    gbuf = nb;
+                    gbuf_cap = want;
+                }
+                if ((rc = scrub_pread_exact(fd, gbuf, want, goff)) != 0)
+                    goto out;
+                rc = TSDB_ERR_CORRUPT;
+                win_off = goff;
+                win_len = want;
+            }
+            gptr = gbuf + (goff - win_off);
+        }
+
+        if ((uint32_t)xxh64(gptr, (size_t)glen, 0) != crc)
+            goto out;
+
+        step_bytes += glen;
+        *bytes_out += glen;
+        if (eff_budget > 0 && step_bytes >= eff_budget && i + 1 < limit) {
+            *g_next = i + 1;
+            rc = 0;
+            goto out;
+        }
+    }
+
+    *g_next = f.ngranules;
+    rc = 0;
+out:
+    free(gbuf);
+    free(ib);
+    if (fd >= 0)
+        close(fd);
     return rc;
 }
 

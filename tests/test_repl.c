@@ -1155,6 +1155,107 @@ static void leave(void)
     repl_free(r);
 }
 
+/* R12 (D7): repl_set_nojoin keeps multiple damaged learners out of the ISR without flapping, cancels an active join
+ * hold for a masked peer, remaps across repl_reconfig, and clears on step_down/lead. */
+static void nojoin(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c); /* ISR {0, 2}, node 1 a caught-up learner */
+    CHECK(r, "nojoin: no leader");
+
+    /* 1. Masked caught-up learner (node 1) is never asked into the ISR. */
+    CHECK(repl_set_nojoin(r, 1u << 1) == REPL_OK, "nojoin set node 1");
+    for (int t = 0; t < 40; t++) {
+        struct repl_msg k1 = ack_msg(1, 0, repl_written(r), 22, 1, 0);
+        struct repl_msg k2 = ack_msg(2, 0, repl_written(r), 33, 1, 0);
+        repl_recv(r, &k1);
+        drain(r, &d, NULL);
+        repl_recv(r, &k2);
+        drain(r, &d, NULL);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        const struct repl_action *q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+        CHECK(!q, "nojoin: masked learner 1 asked into ISR (%#x)", q ? q->msg.meta.isr : 0u);
+    }
+
+    /* 2. Active join hold for learner 1 ends when node 1 is masked. */
+    CHECK(repl_set_nojoin(r, 0) == REPL_OK, "nojoin clear");
+    uint64_t pos = 0;
+    CHECK(repl_write(r, 1, &pos) == REPL_OK, "nojoin write");
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    struct repl_msg k2 = ack_msg(2, 0, repl_written(r), 33, 1, 0);
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    repl_tick(r);
+    drain(r, &d, NULL);
+    CHECK(repl_set_nojoin(r, 1u << 1) == REPL_OK, "nojoin re-mask node 1");
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) == repl_written(r), "nojoin: commit stalled behind masked learner");
+
+    /* 3. Remap across repl_reconfig: insert a new member at index 1 so old masked learner 1 moves to index 3! */
+    const int old_of[4] = {0, -1, 2, 1};
+    CHECK(repl_reconfig(r, 4, 0, old_of) == REPL_OK, "nojoin reconfig");
+    repl_set_version(r, 2);
+    struct repl_msg rm = meta_msg(0, 2, 0, 0x5, 0); /* ISR {0, 2} */
+    rm.meta.isr_version = 10;
+    rm.meta.rid[0] = 11;
+    rm.meta.rid[2] = 33;
+    rm.set_version = 2;
+    repl_recv(r, &rm);
+    drain(r, &d, NULL);
+    const struct repl_action *q = NULL;
+    for (int t = 0; t < 40 && !q; t++) {
+        struct repl_msg km = ack_msg(3, 0, repl_written(r), 22, 1, 2);
+        struct repl_msg k2m = ack_msg(2, 0, repl_written(r), 33, 1, 2);
+        repl_recv(r, &km);
+        drain(r, &d, NULL);
+        repl_recv(r, &k2m);
+        drain(r, &d, NULL);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+        CHECK(!q, "nojoin: remapped masked peer 3 asked into ISR (%#x)", q ? q->msg.meta.isr : 0u);
+    }
+
+    /* 4. Cleared on step_down (follow) and lead (new epoch): once leading again, peer 3 joins normally. */
+    struct repl_msg fm = meta_msg(0, 3, 2, 0x5, 0);
+    fm.meta.isr_version = 1;
+    fm.set_version = 2;
+    repl_recv(r, &fm); /* step_down -> follow node 2 */
+    drain(r, &d, NULL);
+    CHECK(repl_set_nojoin(r, 1u << 3) == REPL_E_NOTLEADER, "nojoin refused on follower");
+    struct repl_msg lm = meta_msg(0, 4, 0, 0x5, 0);
+    lm.meta.isr_version = 1;
+    lm.meta.rid[0] = 11;
+    lm.meta.rid[2] = 33;
+    lm.set_version = 2;
+    repl_recv(r, &lm); /* lead epoch 4: nojoin cleared */
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    q = NULL;
+    for (int t = 0; t < 40 && !q; t++) {
+        struct repl_msg km = ack_msg(3, 0, repl_written(r), 22, 1, 2);
+        km.epoch = 4;
+        struct repl_msg k2m = ack_msg(2, 0, repl_written(r), 33, 1, 2);
+        k2m.epoch = 4;
+        repl_recv(r, &km);
+        drain(r, &d, NULL);
+        repl_recv(r, &k2m);
+        drain(r, &d, NULL);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    }
+    CHECK(q && (q->msg.meta.isr & (1u << 3)) && repl_isr_why(r) == REPL_WHY_JOIN,
+          "nojoin: peer 3 did not join after lead cleared nojoin");
+    repl_free(r);
+}
+
 static void target(void)
 {
     struct repl_vmeta m0 = {.epoch = 6, .isr_version = 9, .leader = 0, .isr = 0x7, .rid = {11, 22, 33}};
@@ -1921,6 +2022,7 @@ int main(int argc, char **argv)
     join_remap();
     busy_drop();
     leave();
+    nojoin();
     target();
     replay();
     snapshot();

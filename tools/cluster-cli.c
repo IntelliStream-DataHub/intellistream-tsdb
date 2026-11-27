@@ -369,7 +369,11 @@ static void print_status(const struct cluster_status *st)
             printf("volume-report node %" PRIu32 " volume %" PRIu32 " role %s health %s epoch %" PRIu64
                    " domain %s local_fault_s %" PRIu64 " fenced_age_ms %" PRIu64 "\n",
                    mb->id, v->v.volume, v->v.role == CL_ROLE_OWNER ? "owner" : v->v.role == CL_ROLE_RELEASING ? "releasing" : v->v.role == CL_ROLE_PROMOTING ? "promoting" : "none",
-                   v->v.health == CL_HEALTH_OK ? "ok" : v->v.health == CL_HEALTH_LOCAL_FAULT ? "local-fault" : "domain-fault",
+                   v->v.health == CL_HEALTH_OK             ? "ok"
+                   : v->v.health == CL_HEALTH_LOCAL_FAULT  ? "local-fault"
+                   : v->v.health == CL_HEALTH_DOMAIN_FAULT ? "domain-fault"
+                   : v->v.health == CL_HEALTH_DAMAGED      ? "damaged"
+                                                           : "unknown",
                    v->v.epoch, v->v.domain[0] ? v->v.domain : "-", v->local_fault_s, v->v.fenced_age_ms);
         }
         for (uint32_t j = 0; h && j < h->ndoms; j++)

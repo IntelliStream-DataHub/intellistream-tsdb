@@ -122,6 +122,7 @@ struct repl_msg {
                                      replay (the leader bounds it by what it sends it, and by its own log start) */
     int resync;                   /* ACK: the leader should send from written + 1 */
     int full;                     /* ACK: sender's server is FULL (R9 E30, D17; carried for replwire/repld) */
+    int damaged;                  /* ACK: sender's replica has young damage and asks to leave ISR (R12 D7) */
     struct repl_vmeta meta;       /* META, ISR_REQ */
 };
 
@@ -278,6 +279,10 @@ uint64_t repl_dropped_meta(const struct repl *r);
  * REPL_E_NOTLEADER, or REPL_E_INVALID (idx is this leader or no member). */
 int repl_leave(struct repl *r, int idx, uint32_t min_isr);
 int repl_leaving(const struct repl *r);            /* the leaving member's index, or -1 */
+/* Leader: bitmask of peer indexes that must not be asked back into the ISR (e.g., damaged followers in R12 D7).
+ * Unlike repl_leave (one slot), supports multiple excluded peers without flapping. Cleared on step_down/lead and
+ * remapped across repl_reconfig. */
+int repl_set_nojoin(struct repl *r, uint32_t mask);
 /* Why the core asked for its current (or last) ISR change: */
 enum { REPL_WHY_NONE = 0, REPL_WHY_DROP, REPL_WHY_JOIN, REPL_WHY_LEAVE };
 int repl_isr_why(const struct repl *r);

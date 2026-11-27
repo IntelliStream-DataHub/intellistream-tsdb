@@ -132,6 +132,7 @@ _Static_assert(METRICS_RDMA_FB_MAX == PL_RDMA_FB_MAX, "metrics RDMA fallback tab
 #include "fwdreq.h"
 #include "cvol.h"
 #include "repld.h"
+#include "scrubd.h"
 #include "../src/cvol.h"
 #include "crashpt.h"
 #include "margins.h"
@@ -3209,6 +3210,10 @@ static void topology_cluster(req *r)
             if (tv.role == TSDB_ROLE_OWNER && here) {
                 uint32_t retry;
                 vol_health(v->number, &tv.health, &tv.reason, &tv.since_ms, &(uint64_t){0}, &retry, &tv.domain);
+                if (tv.health == TSDB_HEALTH_AVAILABLE && scrubd_vol_damaged(v->number)) {
+                    tv.health = TSDB_HEALTH_DEGRADED;
+                    tv.reason = TSDB_WHY_SUSPECT;
+                }
             } else if (tv.role == TSDB_ROLE_OWNER) {
                 bool up = lm && lm->state == META_UP;
                 tv.health = up ? TSDB_HEALTH_AVAILABLE : TSDB_HEALTH_UNAVAILABLE;
@@ -3217,6 +3222,10 @@ static void topology_cluster(req *r)
                 bool up = m && m->state == META_UP;
                 tv.health = up ? TSDB_HEALTH_AVAILABLE : TSDB_HEALTH_UNAVAILABLE;
                 tv.reason = up ? TSDB_WHY_NONE : TSDB_WHY_UNREACHABLE;
+                if (up && cp->self && v->rep[k].node == cp->self && scrubd_vol_damaged(v->number)) {
+                    tv.health = TSDB_HEALTH_DEGRADED;
+                    tv.reason = TSDB_WHY_SUSPECT;
+                }
             }
             const char *path = paths && cp->self && v->rep[k].node == cp->self && v->number < tsdb_volume_count(db)
                                    ? tsdb_volume_path(db, v->number)
@@ -4468,6 +4477,8 @@ static void crep_held_vol(void *ctx, struct creport_sink *sink)
                 tsdb_domain_info di;
                 if (d >= 0 && dom.health && tsdb_health_info(dom.health, d, &di) == 0 && di.state == TSDB_DOM_DOWN)
                     h = CL_HEALTH_DOMAIN_FAULT;
+                else if (scrubd_vol_damaged(v->number))
+                    h = CL_HEALTH_DAMAGED;
             }
             creport_sink_put_u64(sink, &vlbl, 1, h);
             break;
@@ -4630,7 +4641,7 @@ static void register_cluster_metrics(void)
                              "Settled-tier fault-tolerance margin (present stripe positions minus k) of an EC volume this server holds.",
                              crep_held_vol, (void *)(intptr_t)CREP_V_SETTLED_MARGIN);
     creport_metric_collector("tsdb_cluster_volume_health", CREPORT_GAUGE,
-                             "Local health of a volume this server holds: 0 ok, 1 local_fault, 2 domain_fault.",
+                             "Local health of a volume this server holds: 0 ok, 1 local_fault, 2 domain_fault, 3 damaged.",
                              crep_held_vol, (void *)(intptr_t)CREP_V_HEALTH);
     creport_metric_collector("tsdb_cluster_volume_diverged", CREPORT_GAUGE,
                              "1 while a volume this server holds is DIVERGED, else 0.", crep_held_vol,
@@ -7965,12 +7976,17 @@ int main(int argc, char **argv)
                                  .peer_advertise = padv, .rack = rack, .power_feed = power_feed, .bmc = bmc,
                                  .read_barrier_off = rb_off, .secret = secret, .secret_len = secret_len,
                                  .loop_gated = 1};
-        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_start() != 0 ||
-            fwd_cluster_start(fwd_on_event, NULL) != 0)
+        if (scrubd_start(db, dir) != 0)
             return 1;
+        if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_start() != 0 ||
+            fwd_cluster_start(fwd_on_event, NULL) != 0) {
+            scrubd_stop();
+            return 1;
+        }
         char cerr[512];
         if (chunksrv_cluster_start(chunk_dirs, nchunk, chunk_rate, cerr, sizeof cerr) != 0) {
             fprintf(stderr, "tsdbd: %s\n", cerr); /* D11: a store of another owner, or one another process holds */
+            scrubd_stop();
             return 1;
         }
         if (!witness && sfill_cluster_start(db) != 0) {
@@ -8010,6 +8026,7 @@ int main(int argc, char **argv)
         metrics_stop(); /* before tsdb_close: it reads the database */
     eng_set_wal_sync_observer(NULL);
     if (cluster_on) {
+        scrubd_stop();
         cluster_stop();
         sfill_cluster_stop(); /* stops fill workers while chunk server & db are still open */
         creport_reset();

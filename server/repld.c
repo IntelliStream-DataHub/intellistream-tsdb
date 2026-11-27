@@ -130,6 +130,7 @@
 #include "rset.h"
 #include "rsnap.h"
 #include "rtransfer.h"
+#include "scrubd.h"
 
 struct repld_g G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
@@ -265,6 +266,95 @@ static int isr_full_locked(const struct rvol *rv)
 static int vol_full_locked(const struct rvol *rv)
 {
     return cluster_self_full() || isr_full_locked(rv);
+}
+
+/* R12 (D7): checks whether this damaged follower should ask to leave the ISR via RW_ACK_DAMAGED.
+ * Only asks to leave when (nisr - 1) >= min_isr (or when already out of ISR so the leader does not re-add it).
+ * If stuck at min_isr, logs clearly once and marks tsdb_young_scrub_min_isr_held=1. A damaged leader keeps leading. */
+static int damaged_want_leave_locked(struct rvol *rv)
+{
+    if (rv->mode != M_REPLICA || rv->failed || !scrubd_vol_damaged(rv->number)) {
+        scrubd_set_min_isr_held(rv->number, 0);
+        rv->dmg_leave_said = 0;
+        rv->dmg_minisr_said = 0;
+        return 0;
+    }
+    if (!self_in_isr_locked(rv)) {
+        scrubd_set_min_isr_held(rv->number, 0);
+        return 1; /* already out of ISR: keep advertising damaged so leader does not re-add us */
+    }
+    uint32_t min_isr = rv->rec.min_isr ? rv->rec.min_isr : 1;
+    int can_leave = rv->rec.nisr > 1 && rv->rec.nisr - 1 >= min_isr;
+#ifdef TSDB_TEST_HOOKS
+    if (G.mutant == RM_YOUNGLB)
+        can_leave = 1;
+#endif
+    if (can_leave) {
+        scrubd_set_min_isr_held(rv->number, 0);
+        rv->dmg_minisr_said = 0;
+        if (!rv->dmg_leave_said) {
+            say("volume %" PRIu32 ": damaged replica asks to leave ISR (nisr %" PRIu32 ", min_isr %" PRIu32 ")",
+                rv->number, rv->rec.nisr, min_isr);
+            rv->dmg_leave_said = 1;
+        }
+        return 1;
+    }
+    scrubd_set_min_isr_held(rv->number, 1);
+    if (!rv->dmg_minisr_said) {
+        say("volume %" PRIu32 ": damaged replica stays in ISR (leaving would drop below min_isr: nisr %" PRIu32
+            ", min_isr %" PRIu32 ")", rv->number, rv->rec.nisr, min_isr);
+        rv->dmg_minisr_said = 1;
+    }
+    return 0;
+}
+
+/* R12 (D7): on the volume leader, keeps every damaged follower out of ISR joins via repl_set_nojoin() and shrinks
+ * one in-ISR damaged follower at a time through repl_leave() (respecting min_isr, unless planted mutant
+ * youngleavebelow is active). Never interferes with an active replica move's repl_leave slot. */
+static void damaged_leader_sync_locked(struct rvol *rv)
+{
+    if (rv->mode != M_WRITER || rv->failed || !rv->core || !repl_is_leader(rv->core))
+        return;
+    uint32_t dmg_mask = 0;
+    int pick_in = -1;
+    for (int k = 0; k < (int)rv->rec.nrep && k < REPL_MAX_NODES; k++) {
+        if (k == rv->self || !rv->peer[k].damaged)
+            continue;
+        dmg_mask |= 1u << k;
+        if (pick_in < 0 && peer_in_isr_locked(rv, k))
+            pick_in = k;
+    }
+    repl_set_nojoin(rv->core, dmg_mask);
+
+    int move_active = 0;
+    for (uint32_t k = 0; k < rv->rec.nrep && k < META_REPLICAS_MAX; k++)
+        if (rv->rec.rep[k].replaces)
+            move_active = 1;
+    if (move_active)
+        return;
+
+    int lv = repl_leaving(rv->core);
+    if (lv >= 0 && (uint32_t)lv < rv->rec.nrep && (!rv->peer[lv].damaged || !peer_in_isr_locked(rv, lv))) {
+        if (!rv->peer[lv].damaged)
+            say("volume %" PRIu32 ": follower %d (node %" PRIu32 ") no longer reports damaged; clearing leave",
+                rv->number, lv, rv->rec.rep[lv].node);
+        repl_leave(rv->core, -1, 0);
+        lv = -1;
+    }
+    if (lv >= 0 || pick_in < 0)
+        return;
+
+    uint32_t min_isr = rv->rec.min_isr ? rv->rec.min_isr : 1;
+    uint32_t leave_min = min_isr;
+#ifdef TSDB_TEST_HOOKS
+    if (G.mutant == RM_YOUNGLB)
+        leave_min = 1;
+#endif
+    if (repl_leave(rv->core, pick_in, leave_min) == REPL_OK) {
+        say("volume %" PRIu32 ": damaged follower %d (node %" PRIu32
+            ") asks to leave ISR through core (leave_min %" PRIu32 ")",
+            rv->number, pick_in, rv->rec.rep[pick_in].node, leave_min);
+    }
 }
 
 static void full_sync_locked(struct rvol *rv)
@@ -2305,6 +2395,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
                 if (G.slow_ack && rv->mode == M_REPLICA)
                     slow_ack(rv, &a->msg);
                 a->msg.full = cluster_self_full();
+                a->msg.damaged = damaged_want_leave_locked(rv);
             }
             send_msg(rv, &a->msg);
         }
@@ -2725,6 +2816,7 @@ static void handle(struct rvol *rv, struct item *it)
         p->heard = 1;
         p->acked_ms = now_ms();
         p->full = rv->cur.m.full != 0;
+        p->damaged = rv->cur.m.damaged != 0;
         if (!p->full)
             p->full_probe_ms = 0;
         if (rv->cur.m.written != p->wrote || !p->wrote_ms) {
@@ -2733,6 +2825,7 @@ static void handle(struct rvol *rv, struct item *it)
         }
         ahead_mark(p, now_ms());
         full_sync_locked(rv);
+        damaged_leader_sync_locked(rv);
     } else if (rv->mode == M_REPLICA && rv->cur.m.type == REPL_M_APPEND && rv->cur.m.nrec > 0 &&
                !self_in_isr_locked(rv) && cluster_self_full()) {
         if (!rv->full_pause_said) {
@@ -2939,6 +3032,7 @@ static void demote(struct rvol *rv)
     for (int i = 0; i < REPL_MAX_NODES; i++) {
         struct rpeer *p = &rv->peer[i];
         p->sent = p->want = p->sent_ms = p->acked = p->acked_ms = p->gen = p->wrote = p->wrote_ms = p->ahead_ms = 0;
+        p->damaged = 0;
     }
     rv->nidx = 0;
     rv->idx_end = 0;
@@ -3157,8 +3251,12 @@ static void *vol_main(void *arg)
                 rv->ret_check_ms = now;
                 retain_refresh(rv);
             }
-            if (rv->mode == M_WRITER)
+            if (rv->mode == M_WRITER) {
                 full_sync_locked(rv);
+                damaged_leader_sync_locked(rv);
+            } else if (rv->mode == M_REPLICA) {
+                (void)damaged_want_leave_locked(rv);
+            }
             if (rv->full_pause_said && (rv->mode != M_REPLICA || self_in_isr_locked(rv) || !cluster_self_full())) {
                 say("volume %" PRIu32 ": FULL cleared; resuming catch-up", rv->number);
                 rv->full_pause_said = 0;
@@ -3397,6 +3495,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "downnocap")      ? RM_DOWNNOCAP
                : !strcmp(mu, "keepafterout")   ? RM_KEEPAFTEROUT
                : !strcmp(mu, "fullafteradmit") ? RM_FULLAFTERADMIT
+               : !strcmp(mu, "youngleavebelow") ? RM_YOUNGLB
                                                : RM_NONE;
     rw_mutant = !mu                         ? RW_MUT_NONE
                 : !strcmp(mu, "checknocmp") ? RW_MUT_NOCMP
@@ -3991,6 +4090,15 @@ void repld_close_failed(void)
     for (uint32_t i = 0; i < n; i++)
         if (repld_failed(G.vols[i]->number) && !G.vols[i]->started)
             cvol_close(G.vols[i]->number);
+}
+
+void repld_wake_vol(uint32_t v)
+{
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return;
+    post(rv, IN_WAKE, 0, NULL, 0);
+    vol_put(rv);
 }
 
 void repld_stop(void)

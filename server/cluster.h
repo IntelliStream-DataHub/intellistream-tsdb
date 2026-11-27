@@ -110,7 +110,12 @@ enum cluster_mode { CLUSTER_MODE_NONE = 0, CLUSTER_MODE_CORE = 1, CLUSTER_MODE_W
 /* PROMOTING: named the record's leader, its driver not the writer yet (the EPOCH marker's commit, the reopen); the
  * report's epoch is then the epoch it promotes to */
 enum cluster_vol_role { CL_ROLE_NONE = 0, CL_ROLE_OWNER = 1, CL_ROLE_RELEASING = 2, CL_ROLE_PROMOTING = 3 };
-enum cluster_vol_health { CL_HEALTH_OK = 0, CL_HEALTH_LOCAL_FAULT = 1, CL_HEALTH_DOMAIN_FAULT = 2 };
+enum cluster_vol_health {
+    CL_HEALTH_OK = 0,
+    CL_HEALTH_LOCAL_FAULT = 1,
+    CL_HEALTH_DOMAIN_FAULT = 2,
+    CL_HEALTH_DAMAGED = 3, /* R12 (D7): young part or .ec file damage found by scrub */
+};
 /* R9 (D6): why a volume is reported CL_HEALTH_LOCAL_FAULT in HBS_VOLUMES. */
 enum cluster_fault_reason {
     CL_FAULT_NONE = 0,         /* healthy, or older sender without reason byte */

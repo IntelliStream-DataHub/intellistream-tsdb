@@ -69,6 +69,7 @@ struct repl {
     int leave;          /* leader: the member a move takes out of the ISR (repl_leave; -1: none), while the ISR
                            without it has leave_min members */
     uint32_t leave_min;
+    uint32_t nojoin;    /* leader: peers excluded from joining the ISR (repl_set_nojoin; e.g. damaged followers) */
     int isr_why;        /* REPL_WHY_* of the ISR request in flight (or the last one) */
     int ghost_on;       /* MUT(45) only: the lowest match of removed members, still counted */
     uint64_t ghost;
@@ -389,6 +390,7 @@ static void step_down(struct repl *r)
     r->isr_busy = 0;
     r->leave = -1;
     r->leave_min = 0;
+    r->nojoin = 0;
 }
 
 /* Follow `leader` in `epoch`: first find where our logs part (QUERY / ANSWER), then take appends. */
@@ -712,7 +714,7 @@ static void isr_check(struct repl *r)
     int half = lagged && r->cfg.join_hold_ticks && !MUT(42);
     uint64_t near = half ? wend_at(r, r->now - r->cfg.isr_lag_ticks / 2) : 0;
     for (int i = 0; i < r->cfg.nnodes; i++) {
-        if (i == r->cfg.self || (isr & (1u << i)) || (i == r->leave && !MUT(48)))
+        if (i == r->cfg.self || (isr & (1u << i)) || (i == r->leave && !MUT(48)) || (r->nojoin & (1u << i)))
             continue;
         const struct peer *p = &r->peer[i];
         /* Its log must also reach the start of this epoch (Kafka's leaderEpochStartOffset): a new leader's commit
@@ -758,6 +760,7 @@ static void lead(struct repl *r, const struct repl_vmeta *v)
     r->join_retry = 0;
     r->leave = -1;
     r->leave_min = 0;
+    r->nojoin = 0;
     r->meta_hold = 0;
     r->ghost_on = 0;
     r->npend = r->hpend = 0;
@@ -1166,7 +1169,7 @@ uint32_t repl_next_tick(const struct repl *r)
                 return 1;
             uint64_t start = r->nhist ? r->hist[r->nhist - 1].start : 0;
             for (int i = 0; i < r->cfg.nnodes; i++) {
-                if (i == r->cfg.self || (isr & (1u << i)) || (i == r->leave && !MUT(48)))
+                if (i == r->cfg.self || (isr & (1u << i)) || (i == r->leave && !MUT(48)) || (r->nojoin & (1u << i)))
                     continue;
                 const struct peer *p = &r->peer[i];
                 if (!p->rid)
@@ -1403,6 +1406,7 @@ int repl_reconfig(struct repl *r, int nnodes, int self, const int *old_of)
         if (r->leave < 0)
             r->leave_min = 0;
     }
+    r->nojoin = remap_mask(r->nojoin, new_of, on);
     if (r->leader >= 0 && r->leader < on) {
         r->leader = new_of[r->leader];
         if (r->leader < 0 && !r->leading) {
@@ -1444,6 +1448,19 @@ int repl_leave(struct repl *r, int idx, uint32_t min_isr)
     r->leave = idx;
     r->leave_min = min_isr;
     if (r->join == idx)
+        join_end(r, 0);
+    return REPL_OK;
+}
+
+int repl_set_nojoin(struct repl *r, uint32_t mask)
+{
+    if (r->failed)
+        return REPL_E_FAILED;
+    if (!r->leading)
+        return REPL_E_NOTLEADER;
+    mask &= ~(1u << r->cfg.self);
+    r->nojoin = mask;
+    if (r->join >= 0 && (mask & (1u << r->join)))
         join_end(r, 0);
     return REPL_OK;
 }

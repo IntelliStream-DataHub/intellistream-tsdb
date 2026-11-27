@@ -82,6 +82,7 @@
 #include "cvol.h"
 #include "cvolfs.h"
 #include "repld.h"
+#include "scrubd.h"
 #include "chunkpeer.h"
 #include "cvolset.h"
 #include "../client/tsdb_crypto.h"
@@ -446,6 +447,9 @@ static void on_report(void *arg, struct cluster_report *out)
             if (out->vols[i].fault_reason == CL_FAULT_NONE)
                 out->vols[i].fault_reason = CL_FAULT_FAILSTOP;
         }
+        /* R12 (D7): young-part or .ec damage found by scrubd: report CL_HEALTH_DAMAGED (does not fail-stop). */
+        if (out->vols[i].health == CL_HEALTH_OK && scrubd_vol_damaged(out->vols[i].volume))
+            out->vols[i].health = CL_HEALTH_DAMAGED;
         uint64_t pe = 0;
         int l = repld_leading(out->vols[i].volume, &pe); /* the driver's writer only while its core leads: a deposed */
         if (l >= 0)                                       /* one is no OWNER (the Raft leader's lease check) */
