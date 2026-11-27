@@ -23,6 +23,8 @@
 #include "creport.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/chunk.h"
+#include "../src/chunk_priv.h"
+#include "../src/chunkmove.h"
 #include "../src/compat.h"
 #include "../src/internal.h"
 
@@ -64,6 +66,15 @@ struct disk_entry {
     int probe_down;       /* 1 while health domain is DOWN or RECOVERING */
     int probe_recovering; /* 1 while health domain is RECOVERING */
     int io_down;          /* 1 after chunk store EIO/ENOSPC or probe DOWN (sticky until restart/replace) */
+    /* R13 r13-lmove: local chunk drain state. */
+    int draining;                /* 1 while this chunk store is being drained locally (no new puts) */
+    int drain_no_space;          /* 1 while drain stopped because no target store has room */
+    int drain_no_space_logged;   /* rate-limit log message while stuck with no room */
+    int drain_started_logged;    /* log once when chunks are actually seen to drain on this store */
+    uint64_t drain_bytes_left;   /* remaining chunk bytes on this draining store (HBS_PROGRESS) */
+    uint64_t drain_chunks_moved; /* chunks moved off this store since start */
+    uint64_t drain_bytes_moved;  /* bytes moved off this store since start */
+    uint64_t drain_done_logged;  /* drain_chunks_moved value when completion was last logged */
 };
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -92,6 +103,14 @@ static struct {
     void *probe_ctx;
     int probe_down_override; /* 1 if TSDBD_TEST_HEALTH explicitly set down= */
     int probe_down_ms;       /* current down_ms configured on probe_h */
+    /* R13 r13-lmove: background local chunk drain driver. */
+    int drain_started;
+    int drain_thr_running;
+    int drain_stop;
+    int drain_kick;
+    int drain_no_space_any;
+    pthread_t drain_thr;
+    pthread_cond_t drain_cv;
 #ifdef TSDB_TEST_HOOKS
     int mutant;
 #endif
@@ -581,12 +600,13 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
     struct hbs_disk_row rows[DISKS_MAX];
     uint32_t nrows = 0, mismatches = 0;
     uint8_t role = META_ROLE_BOTH;
-    int allow_shared = 0, started = 0;
+    int allow_shared = 0, drain_no_space = 0, started = 0;
 
     pthread_mutex_lock(&g_mu);
     started = G.started;
     role = G.role;
     allow_shared = G.allow_shared;
+    drain_no_space = G.drain_no_space_any;
     mismatches = G.class_mismatches;
     for (int i = 0; started && i < G.ndisks && nrows < DISKS_MAX; i++) {
         const struct disk_entry *d = &G.disks[i];
@@ -606,7 +626,7 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
 
     if (!started)
         return 0;
-    if (nrows == 0 && role == META_ROLE_BOTH && !allow_shared && mismatches == 0)
+    if (nrows == 0 && role == META_ROLE_BOTH && !allow_shared && !drain_no_space && mismatches == 0)
         return 0;
 #ifdef TSDB_TEST_HOOKS
     apply_disk_usage_file(rows, nrows);
@@ -616,7 +636,7 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         return -1;
     buf[0] = HBS_DISKS_VER;
     buf[1] = role;
-    buf[2] = allow_shared ? 1u : 0u;
+    buf[2] = (uint8_t)((allow_shared ? 1u : 0u) | (drain_no_space ? 2u : 0u));
     buf[3] = (uint8_t)nrows;
     put_le32(buf + 4, mismatches);
     for (uint32_t i = 0; i < nrows; i++) {
@@ -646,7 +666,7 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
     uint8_t role = data[1];
     uint8_t flags = data[2];
     uint32_t n = data[3];
-    if (role > META_ROLE_LAST || (flags & ~1u) || n > DISKS_MAX)
+    if (role > META_ROLE_LAST || (flags & ~3u) || n > DISKS_MAX)
         return -1;
     if (len != HBS_DISKS_HDR + (size_t)n * esz)
         return -1;
@@ -655,6 +675,7 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
         return -1;
     v->role = role;
     v->allow_shared_device = (uint8_t)(flags & 1u);
+    v->drain_no_space = (uint8_t)((flags >> 1) & 1u);
     v->class_mismatches = get_le32(data + 4);
     v->ndisks = n;
     for (uint32_t i = 0; i < n; i++) {
@@ -716,6 +737,11 @@ static size_t disks_sec_format(uint32_t member_id, const void *val, char *buf, s
     if (v->class_mismatches > 0 && off + 1 < cap) {
         int n = snprintf(buf + off, cap - off, "disks node=%" PRIu32 " warn=class_mismatch count=%" PRIu32 "\n",
                          member_id, v->class_mismatches);
+        if (n > 0)
+            off += (size_t)n < cap - off ? (size_t)n : cap - off - 1;
+    }
+    if (v->drain_no_space && off + 1 < cap) {
+        int n = snprintf(buf + off, cap - off, "disks node=%" PRIu32 " warn=drain_no_space\n", member_id);
         if (n > 0)
             off += (size_t)n < cap - off ? (size_t)n : cap - off - 1;
     }
@@ -1167,6 +1193,7 @@ static void compute_uses_locked(void)
     for (int i = 0; i < G.ndisks; i++) {
         struct disk_entry *d = &G.disks[i];
         d->has_chunks = 0;
+        d->draining = 0;
         d->chunks_path[0] = '\0';
         /* Disk uses follow hardware layout (E48/E50): HDD holds chunks; fast disks hold log replicas, and also
          * chunks on a server without capacity disks. Preserve recorded metadata/DISKS uses for missing (!present)
@@ -1190,6 +1217,21 @@ static void compute_uses_locked(void)
             d->has_chunks = 1;
         if (d->has_chunks && d->present)
             snprintf(d->chunks_path, sizeof d->chunks_path, "%s/chunks", d->path);
+        /* R13 r13-lmove (E50): when capacity disks are added to an all-flash server, any fast disk that already holds
+         * a `<disk>/chunks/` store is still opened so reads stay whole and start-time dedupe sees both stores, while
+         * marked draining (no new puts; background drain moves its chunks locally onto capacity disks). */
+        if (!d->has_chunks && d->present && has_cap && G.role != META_ROLE_COMPUTE &&
+            d->state != META_STORE_DESTROYED && d->state != META_STORE_OUT && d->path[0] != '\0') {
+            char cpath[PATH_MAX];
+            if (snprintf(cpath, sizeof cpath, "%s/chunks", d->path) < (int)sizeof cpath) {
+                uint8_t cid[16];
+                if (chunk_store_meta_read(cpath, cid, NULL) == 0) {
+                    d->has_chunks = 1;
+                    d->draining = 1;
+                    snprintf(d->chunks_path, sizeof d->chunks_path, "%s", cpath);
+                }
+            }
+        }
     }
 }
 
@@ -1564,7 +1606,7 @@ int disks_bind_late(const uint8_t cluster_uuid[16], uint32_t node_id, char *err,
     return 0;
 }
 
-void disks_chunk_paths(const char **paths, int cap, int *n_out)
+void disks_chunk_layout(const char **paths, int *prefs, bool *draining, int cap, int *n_out)
 {
     int idx[DISKS_MAX];
     int rank[DISKS_MAX];
@@ -1602,6 +1644,14 @@ void disks_chunk_paths(const char **paths, int cap, int *n_out)
     for (int a = 0; a < n && out < cap; a++) {
         struct disk_entry *d = &G.disks[idx[a]];
         d->chunk_slot = out;
+        if (prefs) {
+            prefs[out] = d->draining                             ? 0
+                         : d->effective_class == DISK_CLASS_HDD  ? 30
+                         : d->effective_class == DISK_CLASS_SSD  ? 20
+                                                                 : 10;
+        }
+        if (draining)
+            draining[out] = d->draining != 0;
         /* Known-missing configured chunk disk keeps a NULL DOWN_MISSING slot so hash%n placement stays stable and
          * reads answer UNAVAILABLE instead of NOTFOUND. */
         if (d->present && d->chunks_path[0])
@@ -1612,6 +1662,11 @@ void disks_chunk_paths(const char **paths, int cap, int *n_out)
     pthread_mutex_unlock(&g_mu);
     if (n_out)
         *n_out = out;
+}
+
+void disks_chunk_paths(const char **paths, int cap, int *n_out)
+{
+    disks_chunk_layout(paths, NULL, NULL, cap, n_out);
 }
 
 int disks_list(struct disk_info *out, int cap)
@@ -2096,8 +2151,733 @@ void disk_probe_stop(void)
     tsdb_health_close(h);
 }
 
+/* ---------------------------------------------------------------- local chunk drain driver (R13, r13-lmove; E50, §15.3) */
+
+struct drain_item {
+    uint32_t vol;
+    uint8_t oid[16];
+    uint16_t pos;
+    uint64_t size;
+};
+
+struct drain_list {
+    struct drain_item *v;
+    size_t n, cap;
+    uint32_t cur_vol;
+    uint64_t total_bytes;
+    int err;
+};
+
+static int drain_list_cb(void *ctx, const chunk_listed *c)
+{
+    struct drain_list *dl = ctx;
+    if (dl->n == dl->cap) {
+        size_t nc = dl->cap ? dl->cap * 2 : 64;
+        struct drain_item *nv = realloc(dl->v, nc * sizeof *nv);
+        if (!nv) {
+            dl->err = TSDB_ERR_NOMEM;
+            return 1;
+        }
+        dl->v = nv;
+        dl->cap = nc;
+    }
+    struct drain_item *it = &dl->v[dl->n++];
+    it->vol = dl->cur_vol;
+    memcpy(it->oid, c->oid, 16);
+    it->pos = c->pos;
+    it->size = c->size;
+    dl->total_bytes += c->size;
+    return 0;
+}
+
+static int drain_is_stopping(void *ctx)
+{
+    (void)ctx;
+    pthread_mutex_lock(&g_mu);
+    int st = G.drain_stop;
+    pthread_mutex_unlock(&g_mu);
+    return st;
+}
+
+static void drain_recompute_no_space_locked(void)
+{
+    int any = 0;
+    for (int i = 0; i < G.ndisks; i++) {
+        if (G.disks[i].draining && G.disks[i].drain_no_space) {
+            any = 1;
+            break;
+        }
+    }
+    G.drain_no_space_any = any;
+}
+
+/* Picks the eligible UP non-draining target chunk store with the most free room below its fill mark (E27/E50/§15.3).
+ * Never drains onto a fast disk while any UP non-draining capacity (HDD) store exists on this server. */
+static int drain_pick_target(chunk_backend *be, int src_slot, uint64_t need_bytes)
+{
+    struct {
+        int slot;
+        int cls;
+    } cands[DISKS_MAX];
+    int nc = 0;
+    int have_hdd = 0;
+
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks && nc < DISKS_MAX; i++) {
+        const struct disk_entry *d = &G.disks[i];
+        if (!d->present || !d->has_chunks || d->draining || d->chunk_slot < 0 || d->chunk_slot == src_slot)
+            continue;
+        if (d->state != META_STORE_UP || d->io_down || d->probe_down)
+            continue;
+        cands[nc].slot = d->chunk_slot;
+        cands[nc].cls = d->effective_class;
+        if (d->effective_class == DISK_CLASS_HDD)
+            have_hdd = 1;
+        nc++;
+    }
+    pthread_mutex_unlock(&g_mu);
+
+    int best = -1;
+    uint64_t best_free = 0;
+    for (int i = 0; i < nc; i++) {
+        if (have_hdd && cands[i].cls != DISK_CLASS_HDD)
+            continue;
+        int slot = cands[i].slot;
+        if (chunk_be_store_state(be, slot) != CHUNK_STORE_UP)
+            continue;
+        chunk_store *st = chunk_be_store_ref(be, slot);
+        if (!st || chunk_store_failed(st)) {
+            chunk_store_unref(st);
+            continue;
+        }
+        chunk_store_fs_refresh(st);
+        uint64_t used = 0, avail = 0, total = 0;
+        int frc = chunk_store_fs_bytes_cached(st, &used, &avail, &total);
+        chunk_store_unref(st);
+        if (frc != 0 || total == 0 || avail <= need_bytes)
+            continue;
+        uint64_t proj_used = used <= UINT64_MAX - need_bytes ? used + need_bytes : UINT64_MAX;
+        uint64_t proj_pct = (uint64_t)(((__uint128_t)proj_used * 100u) / total);
+        if (proj_pct >= CHUNK_STORE_PUT_MAX_PCT)
+            continue;
+        if (best < 0 || avail > best_free) {
+            best = slot;
+            best_free = avail;
+        }
+    }
+    return best;
+}
+
+static uint64_t drain_current_rate_bps(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    const char *ov = getenv("TSDB_DRAIN_RATE_BPS");
+    if (ov && *ov) {
+        unsigned long long v = strtoull(ov, NULL, 10);
+        if (v > 0)
+            return (uint64_t)v;
+    }
+#endif
+    uint32_t mb_s = 0;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (c) {
+        mb_s = c->balance_mb_s > 0 ? c->balance_mb_s : c->rebuild_mb_s;
+        cluster_copy_put(c);
+    }
+    return mb_s > 0 ? ((uint64_t)mb_s << 20) : ((uint64_t)CHUNKMOVE_DEFAULT_MB_S << 20);
+}
+
+static void disks_store_extra_cb(void *arg, uint32_t store, uint64_t *scrub_age_s, uint64_t *drain_bytes_left)
+{
+    (void)arg;
+    (void)scrub_age_s;
+    if (!drain_bytes_left)
+        return;
+    *drain_bytes_left = 0;
+    if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++) {
+        if (G.disks[i].chunk_slot == (int)store) {
+            *drain_bytes_left = G.disks[i].drain_bytes_left;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void disks_collect_drain_bytes(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    struct {
+        uint8_t store_id[16];
+        int cls;
+        uint64_t left;
+    } snap[DISKS_MAX];
+    int n = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.started) {
+        for (int i = 0; i < G.ndisks && n < DISKS_MAX; i++) {
+            const struct disk_entry *d = &G.disks[i];
+            if (!d->draining && d->drain_bytes_left == 0)
+                continue;
+            memcpy(snap[n].store_id, d->meta.store_id, 16);
+            snap[n].cls = d->effective_class;
+            snap[n].left = d->drain_bytes_left;
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < n; i++) {
+        char hex[33];
+        chunk_oid_hex(snap[i].store_id, hex);
+        struct creport_label lbl[2] = {{"store", hex}, {"class", meta_disk_class_name(snap[i].cls)}};
+        creport_sink_put_u64(sink, lbl, 2, snap[i].left);
+    }
+}
+
+static void disks_collect_drain_moved(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    struct {
+        uint8_t store_id[16];
+        int cls;
+        uint64_t moved;
+    } snap[DISKS_MAX];
+    int n = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.started) {
+        for (int i = 0; i < G.ndisks && n < DISKS_MAX; i++) {
+            const struct disk_entry *d = &G.disks[i];
+            if (!d->draining && d->drain_chunks_moved == 0)
+                continue;
+            memcpy(snap[n].store_id, d->meta.store_id, 16);
+            snap[n].cls = d->effective_class;
+            snap[n].moved = d->drain_chunks_moved;
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < n; i++) {
+        char hex[33];
+        chunk_oid_hex(snap[i].store_id, hex);
+        struct creport_label lbl[2] = {{"store", hex}, {"class", meta_disk_class_name(snap[i].cls)}};
+        creport_sink_put_u64(sink, lbl, 2, snap[i].moved);
+    }
+}
+
+static void disks_collect_drain_no_space(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    pthread_mutex_lock(&g_mu);
+    int ns = G.drain_no_space_any;
+    int started = G.started;
+    pthread_mutex_unlock(&g_mu);
+    if (started)
+        creport_sink_put_u64(sink, NULL, 0, ns ? 1u : 0u);
+}
+
+/* Rate-limit per-chunk / per-volume drain error logs (owned exclusively by the single drain thread). */
+enum { DRAIN_ERR_LOG_SLOTS = 64 };
+struct drain_err_ent {
+    int used;
+    int slot;
+    uint32_t vol;
+    uint8_t oid[16];
+    uint16_t pos;
+    int rc;
+    uint64_t last_ns;
+};
+
+static uint64_t drain_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static bool drain_should_log_err(struct drain_err_ent tab[DRAIN_ERR_LOG_SLOTS], size_t *next_evict, int slot,
+                                 uint32_t vol, const uint8_t oid[16], uint16_t pos, int rc)
+{
+    uint64_t now = drain_now_ns();
+    const uint64_t cooldown_ns = 300ULL * 1000000000ULL;
+    for (size_t i = 0; i < DRAIN_ERR_LOG_SLOTS; i++) {
+        if (!tab[i].used)
+            continue;
+        if (tab[i].slot == slot && tab[i].vol == vol && tab[i].pos == pos && tab[i].rc == rc &&
+            memcmp(tab[i].oid, oid, 16) == 0) {
+            if (now - tab[i].last_ns < cooldown_ns)
+                return false;
+            tab[i].last_ns = now;
+            return true;
+        }
+    }
+    size_t idx = *next_evict % DRAIN_ERR_LOG_SLOTS;
+    for (size_t i = 0; i < DRAIN_ERR_LOG_SLOTS; i++) {
+        if (!tab[i].used) {
+            idx = i;
+            break;
+        }
+    }
+    *next_evict = (idx + 1u) % DRAIN_ERR_LOG_SLOTS;
+    tab[idx].used = 1;
+    tab[idx].slot = slot;
+    tab[idx].vol = vol;
+    memcpy(tab[idx].oid, oid, 16);
+    tab[idx].pos = pos;
+    tab[idx].rc = rc;
+    tab[idx].last_ns = now;
+    return true;
+}
+
+static bool vol_in_list(const uint32_t *vols, size_t n, uint32_t vol)
+{
+    for (size_t i = 0; i < n; i++)
+        if (vols[i] == vol)
+            return true;
+    return false;
+}
+
+static void *disks_drain_main(void *arg)
+{
+    (void)arg;
+    chunk_move_pacer pacer;
+    chunk_move_pacer_init(&pacer, drain_current_rate_bps());
+    struct drain_err_ent err_log[DRAIN_ERR_LOG_SLOTS];
+    memset(err_log, 0, sizeof err_log);
+    size_t err_evict = 0;
+    int64_t backoff_ms = 250;
+
+    for (;;) {
+        if (drain_is_stopping(NULL))
+            break;
+
+        struct chunksrv *cs = chunksrv_cluster_hold();
+        if (!cs) {
+            pthread_mutex_lock(&g_mu);
+            if (!G.drain_stop) {
+                struct timespec ts;
+                tsdb_cond_deadline_ns(&ts, 100 * 1000000LL);
+                pthread_cond_timedwait(&G.drain_cv, &g_mu, &ts);
+            }
+            int stop = G.drain_stop;
+            pthread_mutex_unlock(&g_mu);
+            if (stop)
+                break;
+            continue;
+        }
+        chunk_backend *be = chunksrv_backend(cs);
+        if (!be) {
+            chunksrv_cluster_release();
+            pthread_mutex_lock(&g_mu);
+            if (!G.drain_stop) {
+                struct timespec ts;
+                tsdb_cond_deadline_ns(&ts, 500 * 1000000LL);
+                pthread_cond_timedwait(&G.drain_cv, &g_mu, &ts);
+            }
+            int stop = G.drain_stop;
+            pthread_mutex_unlock(&g_mu);
+            if (stop)
+                break;
+            continue;
+        }
+
+        /* Snapshot draining disk slots under g_mu. */
+        struct {
+            int disk_idx;
+            int slot;
+            char path[PATH_MAX];
+        } todo[DISKS_MAX];
+        int ntodo = 0;
+        pthread_mutex_lock(&g_mu);
+        for (int i = 0; i < G.ndisks && ntodo < DISKS_MAX; i++) {
+            const struct disk_entry *d = &G.disks[i];
+            if (d->draining && d->present && d->has_chunks && d->chunk_slot >= 0 && d->state == META_STORE_UP &&
+                !d->io_down && !d->probe_down) {
+                todo[ntodo].disk_idx = i;
+                todo[ntodo].slot = d->chunk_slot;
+                snprintf(todo[ntodo].path, sizeof todo[ntodo].path, "%s", d->path);
+                ntodo++;
+            }
+        }
+        pthread_mutex_unlock(&g_mu);
+
+        bool moved_any = false;
+
+        for (int t = 0; t < ntodo && !drain_is_stopping(NULL); t++) {
+            int di = todo[t].disk_idx;
+            int src_slot = todo[t].slot;
+            if (chunk_be_store_state(be, src_slot) != CHUNK_STORE_UP)
+                continue;
+            chunk_store *st_src = chunk_be_store_ref(be, src_slot);
+            if (!st_src || chunk_store_failed(st_src)) {
+                chunk_store_unref(st_src);
+                continue;
+            }
+            uint32_t *vols = NULL;
+            uint64_t *eps = NULL;
+            size_t nv = 0;
+            struct drain_list dl = {0};
+            int list_rc = chunk_store_volumes(st_src, &vols, &eps, &nv);
+            if (list_rc == 0) {
+                for (size_t vi = 0; vi < nv && dl.err == 0; vi++) {
+                    dl.cur_vol = vols[vi];
+                    int lrc = chunk_store_list(st_src, vols[vi], false, drain_list_cb, &dl);
+                    if (lrc != 0) {
+                        list_rc = lrc;
+                        break;
+                    }
+                }
+            }
+            if (list_rc == 0 && dl.err != 0)
+                list_rc = dl.err;
+            free(vols);
+            free(eps);
+            chunk_store_unref(st_src);
+
+            /* Never treat a listing/OOM error as an empty store or "drain complete": keep previous metrics. */
+            if (list_rc != 0) {
+                static const uint8_t zero_oid[16] = {0};
+                if (drain_should_log_err(err_log, &err_evict, src_slot, 0, zero_oid, 0, list_rc)) {
+                    fprintf(stderr,
+                            "tsdbd: disks: local drain of store %d (%s): listing failed (%d); will retry\n",
+                            src_slot, todo[t].path, list_rc);
+                }
+                free(dl.v);
+                continue;
+            }
+
+            bool beat = false;
+            bool log_start = false;
+            bool log_done = false;
+            uint64_t done_chunks = 0, done_bytes = 0;
+            pthread_mutex_lock(&g_mu);
+            struct disk_entry *de = &G.disks[di];
+            uint64_t prev_left = de->drain_bytes_left;
+            int prev_ns = G.drain_no_space_any;
+            de->drain_bytes_left = dl.total_bytes;
+            if (dl.n == 0) {
+                de->drain_no_space = 0;
+                de->drain_no_space_logged = 0;
+                drain_recompute_no_space_locked();
+                if (prev_left > 0 || prev_ns != G.drain_no_space_any)
+                    beat = true;
+                if (de->drain_chunks_moved > 0 && de->drain_done_logged != de->drain_chunks_moved) {
+                    de->drain_done_logged = de->drain_chunks_moved;
+                    done_chunks = de->drain_chunks_moved;
+                    done_bytes = de->drain_bytes_moved;
+                    log_done = true;
+                }
+            } else {
+                if (!de->drain_started_logged) {
+                    de->drain_started_logged = 1;
+                    log_start = true;
+                }
+                if (prev_left == 0)
+                    beat = true;
+            }
+            pthread_mutex_unlock(&g_mu);
+            if (log_start) {
+                fprintf(stderr,
+                        "tsdbd: disks: local drain of store %d (%s) started (%zu chunks, %" PRIu64 " bytes)\n",
+                        src_slot, todo[t].path, dl.n, dl.total_bytes);
+            }
+            if (log_done) {
+                fprintf(stderr,
+                        "tsdbd: disks: local drain of store %d (%s) complete (%" PRIu64 " chunks, %" PRIu64
+                        " bytes moved)\n",
+                        src_slot, todo[t].path, done_chunks, done_bytes);
+            }
+            if (beat)
+                cluster_beat_soon();
+            if (dl.n == 0) {
+                free(dl.v);
+                continue;
+            }
+
+            uint32_t unsure_vols[64];
+            size_t n_unsure = 0;
+            uint64_t left = dl.total_bytes;
+            for (size_t k = 0; k < dl.n && !drain_is_stopping(NULL); k++) {
+                pthread_mutex_lock(&g_mu);
+                int still_draining = G.disks[di].draining;
+                pthread_mutex_unlock(&g_mu);
+                if (!still_draining)
+                    break;
+                if (vol_in_list(unsure_vols, n_unsure, dl.v[k].vol))
+                    continue;
+
+                chunk_move_pacer_set_rate(&pacer, drain_current_rate_bps());
+                int dst_slot = drain_pick_target(be, src_slot, dl.v[k].size);
+                if (dst_slot < 0) {
+                    bool do_log = false, do_beat = false;
+                    pthread_mutex_lock(&g_mu);
+                    int prev_ns = G.drain_no_space_any;
+                    G.disks[di].drain_no_space = 1;
+                    G.disks[di].drain_bytes_left = left;
+                    drain_recompute_no_space_locked();
+                    if (!G.disks[di].drain_no_space_logged) {
+                        G.disks[di].drain_no_space_logged = 1;
+                        do_log = true;
+                    }
+                    if (prev_ns != G.drain_no_space_any)
+                        do_beat = true;
+                    pthread_mutex_unlock(&g_mu);
+                    if (do_log) {
+                        fprintf(stderr,
+                                "tsdbd: disks: local drain of store %d (%s) stopped: no target chunk store has room "
+                                "(%" PRIu64 " bytes remaining)\n",
+                                src_slot, todo[t].path, left);
+                    }
+                    if (do_beat)
+                        cluster_beat_soon();
+                    break;
+                }
+
+                chunk_ident id = {.volume = dl.v[k].vol, .pos = dl.v[k].pos};
+                memcpy(id.oid, dl.v[k].oid, 16);
+                uint64_t moved_b = 0;
+                chunk_move_opts mo = {
+                    .pacer = &pacer,
+                    .cancel = drain_is_stopping,
+                    .bytes_moved = &moved_b,
+                };
+
+                chunksrv_scrub_pause_all(cs, 1);
+                int mrc = chunk_move(be, &id, src_slot, dst_slot, &mo);
+                chunksrv_scrub_pause_all(cs, -1);
+
+                if (mrc == 0) {
+                    moved_any = true;
+                    left = left > dl.v[k].size ? left - dl.v[k].size : 0;
+                    bool do_beat = false;
+                    pthread_mutex_lock(&g_mu);
+                    int prev_ns = G.drain_no_space_any;
+                    G.disks[di].drain_no_space = 0;
+                    G.disks[di].drain_no_space_logged = 0;
+                    G.disks[di].drain_bytes_left = left;
+                    G.disks[di].drain_chunks_moved++;
+                    G.disks[di].drain_bytes_moved += moved_b;
+                    drain_recompute_no_space_locked();
+                    if (prev_ns != G.drain_no_space_any)
+                        do_beat = true;
+                    pthread_mutex_unlock(&g_mu);
+                    if (do_beat)
+                        cluster_beat_soon();
+                } else if (mrc == TSDB_ERR_NOTFOUND) {
+                    left = left > dl.v[k].size ? left - dl.v[k].size : 0;
+                    pthread_mutex_lock(&g_mu);
+                    G.disks[di].drain_bytes_left = left;
+                    pthread_mutex_unlock(&g_mu);
+                } else if (mrc == CHUNK_ERR_FULL) {
+                    bool do_log = false, do_beat = false;
+                    pthread_mutex_lock(&g_mu);
+                    int prev_ns = G.drain_no_space_any;
+                    G.disks[di].drain_no_space = 1;
+                    G.disks[di].drain_bytes_left = left;
+                    drain_recompute_no_space_locked();
+                    if (!G.disks[di].drain_no_space_logged) {
+                        G.disks[di].drain_no_space_logged = 1;
+                        do_log = true;
+                    }
+                    if (prev_ns != G.drain_no_space_any)
+                        do_beat = true;
+                    pthread_mutex_unlock(&g_mu);
+                    if (do_log) {
+                        fprintf(stderr,
+                                "tsdbd: disks: local drain of store %d (%s) stopped: target store %d full "
+                                "(%" PRIu64 " bytes remaining)\n",
+                                src_slot, todo[t].path, dst_slot, left);
+                    }
+                    if (do_beat)
+                        cluster_beat_soon();
+                    break;
+                } else if (mrc == CHUNK_ERR_EPOCH_UNSURE) {
+                    /* Skip this unsure volume for the rest of the pass so all other sure volumes finish draining. */
+                    if (n_unsure < 64 && !vol_in_list(unsure_vols, n_unsure, dl.v[k].vol))
+                        unsure_vols[n_unsure++] = dl.v[k].vol;
+                    static const uint8_t zero_oid[16] = {0};
+                    if (drain_should_log_err(err_log, &err_evict, src_slot, dl.v[k].vol, zero_oid, 0, mrc)) {
+                        fprintf(stderr,
+                                "tsdbd: disks: local drain of store %d: skipping volume %" PRIu32
+                                " while EPOCH is unsure (other volumes continue)\n",
+                                src_slot, dl.v[k].vol);
+                    }
+                } else if (mrc == TSDB_ERR_STOPPED) {
+                    break;
+                } else {
+                    if (drain_should_log_err(err_log, &err_evict, src_slot, dl.v[k].vol, dl.v[k].oid, dl.v[k].pos,
+                                             mrc)) {
+                        char hex[33];
+                        chunk_oid_hex(dl.v[k].oid, hex);
+                        fprintf(stderr,
+                                "tsdbd: disks: local drain of store %d: vol %" PRIu32 " oid %s pos %u failed (%d); "
+                                "leaving source intact\n",
+                                src_slot, dl.v[k].vol, hex, (unsigned)dl.v[k].pos, mrc);
+                    }
+                }
+            }
+            free(dl.v);
+        }
+
+        chunksrv_cluster_release();
+
+        /* If we moved chunks in this pass, reset backoff and re-scan right away to confirm 0 remaining. */
+        if (moved_any && !drain_is_stopping(NULL)) {
+            backoff_ms = 250;
+            continue;
+        }
+
+        pthread_mutex_lock(&g_mu);
+        if (!G.drain_stop && !G.drain_kick) {
+            struct timespec ts;
+            tsdb_cond_deadline_ns(&ts, backoff_ms * 1000000LL);
+            pthread_cond_timedwait(&G.drain_cv, &g_mu, &ts);
+        }
+        int kicked = G.drain_kick;
+        G.drain_kick = 0;
+        int stop = G.drain_stop;
+        pthread_mutex_unlock(&g_mu);
+        if (stop)
+            break;
+        if (kicked) {
+            backoff_ms = 250;
+        } else {
+            backoff_ms *= 2;
+            if (backoff_ms > 10000)
+                backoff_ms = 10000;
+        }
+    }
+    return NULL;
+}
+
+int disks_mark_draining(const uint8_t store_id[16], int draining)
+{
+    if (!store_id)
+        return -1;
+    int slot = -1;
+    int spawn = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++) {
+        if (memcmp(G.disks[i].meta.store_id, store_id, 16) != 0)
+            continue;
+        if (!G.disks[i].has_chunks || G.disks[i].chunk_slot < 0) {
+            pthread_mutex_unlock(&g_mu);
+            return -1;
+        }
+        slot = G.disks[i].chunk_slot;
+        G.disks[i].draining = draining ? 1 : 0;
+        if (!draining) {
+            G.disks[i].drain_no_space = 0;
+            G.disks[i].drain_no_space_logged = 0;
+            G.disks[i].drain_bytes_left = 0;
+            drain_recompute_no_space_locked();
+        }
+        if (draining && G.drain_started && !G.drain_stop && !G.drain_thr_running)
+            spawn = 1;
+        if (G.drain_started) {
+            G.drain_kick = 1;
+            pthread_cond_broadcast(&G.drain_cv);
+        }
+        break;
+    }
+    if (spawn) {
+        if (pthread_create(&G.drain_thr, NULL, disks_drain_main, NULL) == 0)
+            G.drain_thr_running = 1;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (slot < 0)
+        return -1;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (cs) {
+        chunk_backend *be = chunksrv_backend(cs);
+        if (be)
+            chunk_be_set_draining(be, slot, draining != 0);
+        chunksrv_cluster_release();
+    }
+    cluster_beat_soon();
+    return 0;
+}
+
+int disks_drain_start(void)
+{
+    pthread_mutex_lock(&g_mu);
+    if (!G.started || G.drain_started) {
+        pthread_mutex_unlock(&g_mu);
+        return 0;
+    }
+    tsdb_cond_init_mono(&G.drain_cv);
+    G.drain_stop = 0;
+    G.drain_no_space_any = 0;
+    G.drain_started = 1;
+    int any_draining = 0;
+    for (int i = 0; i < G.ndisks; i++) {
+        if (G.disks[i].draining && G.disks[i].present && G.disks[i].has_chunks) {
+            any_draining = 1;
+            break;
+        }
+    }
+    if (any_draining) {
+        if (pthread_create(&G.drain_thr, NULL, disks_drain_main, NULL) != 0) {
+            G.drain_started = 0;
+            pthread_cond_destroy(&G.drain_cv);
+            pthread_mutex_unlock(&g_mu);
+            return -1;
+        }
+        G.drain_thr_running = 1;
+    }
+    pthread_mutex_unlock(&g_mu);
+
+    creport_progress_set_store_extra(disks_store_extra_cb, NULL);
+    (void)creport_metric_collector("tsdb_disk_drain_bytes_left", CREPORT_GAUGE,
+                                   "Remaining chunk bytes to drain locally off this disk.",
+                                   disks_collect_drain_bytes, NULL);
+    (void)creport_metric_collector("tsdb_disk_drain_chunks_moved_total", CREPORT_COUNTER,
+                                   "Total chunks moved locally off this draining disk since process start.",
+                                   disks_collect_drain_moved, NULL);
+    (void)creport_metric_collector("tsdb_disk_drain_no_space", CREPORT_GAUGE,
+                                   "1 while any local chunk store drain stopped because no target store has room.",
+                                   disks_collect_drain_no_space, NULL);
+    return 0;
+}
+
+void disks_drain_stop(void)
+{
+    pthread_mutex_lock(&g_mu);
+    if (!G.drain_started) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    G.drain_stop = 1;
+    pthread_cond_broadcast(&G.drain_cv);
+    int running = G.drain_thr_running;
+    pthread_t thr = G.drain_thr;
+    G.drain_thr_running = 0;
+    G.drain_started = 0;
+    pthread_mutex_unlock(&g_mu);
+
+    if (running)
+        pthread_join(thr, NULL);
+
+    pthread_mutex_lock(&g_mu);
+    pthread_cond_destroy(&G.drain_cv);
+    pthread_mutex_unlock(&g_mu);
+
+    creport_progress_set_store_extra(NULL, NULL);
+    creport_metric_collector_del("tsdb_disk_drain_bytes_left");
+    creport_metric_collector_del("tsdb_disk_drain_chunks_moved_total");
+    creport_metric_collector_del("tsdb_disk_drain_no_space");
+}
+
 void disks_stop(void)
 {
+    disks_drain_stop();
     disk_probe_stop();
     atomic_store_explicit(&g_disks_started, 0, memory_order_release);
     pthread_mutex_lock(&g_mu);

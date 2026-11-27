@@ -164,7 +164,7 @@ $(B)/ec_%.o: src/ec/%.c $(EC_HDR) src/internal.h | $(B)
 # Objects, chunk files and stores (src/chunk*.c, docs/design-cluster-data.md R6): not part of the codec copy, but chunk.c and
 # chunkread.c include its rs.h, which wants the one-line headers of src/ec/compat.
 $(B)/chunk.o $(B)/chunkread.o: override CFLAGS += -Isrc/ec/compat
-$(B)/chunk.o $(B)/chunkstore.o $(B)/chunkread.o $(B)/chunkheal.o $(B)/chunkscrub.o: src/chunk.h src/chunk_priv.h src/chunkscrub.h $(EC_HDR)
+$(B)/chunk.o $(B)/chunkstore.o $(B)/chunkread.o $(B)/chunkheal.o $(B)/chunkscrub.o $(B)/chunkmove.o: src/chunk.h src/chunk_priv.h src/chunkscrub.h src/chunkmove.h $(EC_HDR)
 $(B)/fuzz-ec: override CFLAGS += -Isrc/ec/compat
 LIB  := $(B)/libtsdb.a
 # defined here, before any rule names it: a rule's prerequisites are expanded when it is read, so a later definition left
@@ -412,7 +412,7 @@ BT_TARGETS := test-groups-1 test-groups-2 test-groups-3 test-groups-4
 UNITS_GROUPS := test-units-c test-units-d test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-h3 test-units-h4 test-units-h5 test-units-i
 UNITS_B_GROUPS := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-units-b6 test-units-b7 test-units-b8 test-units-b9
 # the binaries of `make test`, once: the groups below build the same set, so that a binary added here is built for every group
-TEST_BINS := $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_disks $(B)/test_tiers $(B)/test_scrub $(B)/test_chunkscrub $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_replwire $(B)/test_margins $(B)/test_pout $(B)/test_pace $(B)/test_place $(B)/test_plrdma
+TEST_BINS := $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_disks $(B)/test_tiers $(B)/test_scrub $(B)/test_chunkscrub $(B)/test_chunkmove $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_replwire $(B)/test_margins $(B)/test_pout $(B)/test_pace $(B)/test_place $(B)/test_plrdma
 $(UNITS_GROUPS) test-groups $(BT_TARGETS): $(TEST_BINS)
 test: $(TEST_BINS)
 	./$(B)/test_tsdb $(SCRATCH)
@@ -548,6 +548,8 @@ test-units-g:
 	$(MUT) --name test_scrub --list "youngskipgranule youngmmap" -- $(if $(filter Darwin,$(UNAME_S)),,env OUTAGEFS_LIB=$(B)/liboutagefs.so )./$(B)/test_scrub --mutant @M@ @D@ # each planted bug must fail it
 	$(if $(filter Darwin,$(UNAME_S)),,OUTAGEFS_LIB=$(B)/liboutagefs.so )./$(B)/test_chunkscrub $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_chunkscrub --list "scrubskipcell scrubeioclean scrubrestart" -- $(if $(filter Darwin,$(UNAME_S)),,env OUTAGEFS_LIB=$(B)/liboutagefs.so )./$(B)/test_chunkscrub --mutant @M@ @D@) # each planted bug must fail it
+	./$(B)/test_chunkmove $(SCRATCH)
+	$(MUT) --name test_chunkmove --list "moveunlinkfirst movekeepwrong" -- ./$(B)/test_chunkmove --mutant @M@ @D@ # each planted bug must fail it
 test-units-h1:
 	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs" -- ./$(B)/test_replica --mutant @M@ @D@
 test-units-h2:
@@ -673,7 +675,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs 
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
     nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio \
-    ecbackduring ecbackafterwhole logbackduring
+    ecbackduring ecbackafterwhole logbackduring hddadd
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
 	CRASHFS_SO=$(B)/libcrashfs.so OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1081,7 +1083,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants lmove-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1151,9 +1153,9 @@ $(B)/chunksrv.o: server/chunksrv.c server/chunksrv.h server/peerlink.h src/chunk
 # links it with chunksrv.o)
 $(B)/chunkpeer.o: server/chunkpeer.c server/chunkpeer.h server/chunksrv.h src/coldops.h src/chunk.h src/eccold.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
-$(B)/chunksrv_cluster.o: server/chunksrv_cluster.c server/chunksrv.h server/creport.h server/disks.h server/peerlink.h server/cluster.h server/meta.h src/chunk.h src/chunkscrub.h client/tsdb_crypto.h src/chunk_priv.h src/internal.h | $(B)
+$(B)/chunksrv_cluster.o: server/chunksrv_cluster.c server/chunksrv.h server/creport.h server/disks.h server/peerlink.h server/cluster.h server/meta.h src/chunk.h src/chunkscrub.h src/chunkmove.h client/tsdb_crypto.h src/chunk_priv.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
-$(B)/disks.o: server/disks.c server/disks.h server/chunksrv.h server/cluster.h server/creport.h server/meta.h client/tsdb_crypto.h src/disk.h src/chunk.h src/compat.h src/internal.h | $(B)
+$(B)/disks.o: server/disks.c server/disks.h server/chunksrv.h server/cluster.h server/creport.h server/meta.h client/tsdb_crypto.h src/disk.h src/chunk.h src/chunk_priv.h src/chunkmove.h src/compat.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
@@ -1664,6 +1666,13 @@ $(B)/test_chunkscrub: tests/test_chunkscrub.c tests/outagefs_ctl.h tests/watchdo
 chunkscrub-mutants: $(B)/test_chunkscrub $(CRASHFS_SO)
 	@$(if $(EC_OBJ),true,echo "chunkscrub-mutants: this build has no erasure codec (NO_EC=1): test_chunkscrub skips, nothing to plant"; false)
 	$(MUT) --name test_chunkscrub --list "scrubskipcell scrubeioclean scrubrestart" -- $(if $(filter Darwin,$(UNAME_S)),,env OUTAGEFS_LIB=$(B)/liboutagefs.so )./$(B)/test_chunkscrub --mutant @M@ @D@
+
+# R13 (r13-lmove): local chunk moves, start-time dedupe, concurrent delete/repair serialization, crashfs, and mutants
+$(B)/test_chunkmove: tests/test_chunkmove.c src/internal.h src/chunk.h src/chunk_priv.h src/chunkmove.h $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+lmove-mutants: $(B)/test_chunkmove $(CRASHFS_SO)
+	$(MUT) --name test_chunkmove --list "moveunlinkfirst movekeepwrong" -- ./$(B)/test_chunkmove --mutant @M@ @D@
 
 # R12 (r12-repair): volume-leader chunk repair unit tests and planted mutants (server/chunkrepair.c, test_cluster scrubrepair)
 $(B)/test_chunkrepair: tests/test_chunkrepair.c server/chunkrepair.h server/chunksrv.h server/chunkpeer.h src/chunk.h src/chunk_priv.h $(B)/chunkrepair.o $(B)/chunkpeer.o $(B)/chunksrv.o $(B)/peerlink.o $(B)/plrdma.o $(B)/tsdb_crypto.o $(LIB) | $(B)

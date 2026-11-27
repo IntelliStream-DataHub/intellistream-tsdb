@@ -157,6 +157,10 @@ struct chunksrv;
  * store that is missing, damaged or failing is DOWN, logged and not fatal; another owner holding one (BUSY) or a path
  * named twice fails the open. NULL with a line in err. */
 struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_t errlen);
+/* Like chunksrv_open, with optional per-store dedupe preference ranks `prefs[0..n)` and initial `draining[0..n)`
+ * flags (R13 r13-lmove: draining stores stay readable/deletable while new puts skip them). */
+struct chunksrv *chunksrv_open_ex(const char *const *paths, const int *prefs, const bool *draining, int n, char *err,
+                                  size_t errlen);
 void chunksrv_close(struct chunksrv *cs); /* after chunksrv_unlisten */
 /* D11: every store that is open must name this cluster and node in its META; one that names another one, or none,
  * is refused with a line naming both (a disk moved between members or clusters): -1. */
@@ -324,6 +328,8 @@ extern struct chunksrv_ec_cfg g_ec_cfg;
  * DOWN), checks their owner when this server's node is known (-1 with the line in err: tsdbd refuses to start) and
  * starts the thread that puts the server on the cluster's peer port once it is a member. After cluster_start. */
 int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char *err, size_t errlen);
+int chunksrv_cluster_start_ex(const char *const *paths, const int *prefs, const bool *draining, int n, uint64_t rate,
+                              char *err, size_t errlen);
 void chunksrv_cluster_stop(void);         /* after cluster_stop: no socket is handed to the links any more */
 void chunksrv_cluster_free(void);         /* once tsdbd's workers are joined */
 struct chunksrv *chunksrv_cluster(void);  /* NULL until it serves */

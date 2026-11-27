@@ -24,6 +24,7 @@
 #define TSDBD_DISKS_H
 
 #include <limits.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -65,6 +66,7 @@ struct hbs_disk_row {
 struct hbs_disks {
     uint8_t role;                /* enum meta_role: declared --role */
     uint8_t allow_shared_device; /* 1 while --allow-shared-device is set */
+    uint8_t drain_no_space;      /* 1 while any draining store stopped because no target store has room */
     uint32_t class_mismatches;   /* local /sys detection disagreements */
     uint32_t ndisks;
     struct hbs_disk_row disks[];
@@ -90,6 +92,15 @@ int disks_start(char *err, size_t errlen);
 int disks_bind_late(const uint8_t cluster_uuid[16], uint32_t node_id, char *err, size_t errlen);
 /* Fill `paths[0..cap)` with the `<disk>/chunks` directories this server serves and store count in `*n_out`. */
 void disks_chunk_paths(const char **paths, int cap, int *n_out);
+/* Like disks_chunk_paths, also filling optional per-slot dedupe preference ranks `prefs[0..cap)` (capacity > fast >
+ * draining) and initial `draining[0..cap)` flags (R13 r13-lmove; E50). */
+void disks_chunk_layout(const char **paths, int *prefs, bool *draining, int cap, int *n_out);
+/* Mark a local disk's chunk store as draining (or clear it) at runtime (prepared for r13-dev's `disk out`/`disk class`)
+ * and wake the local drain driver. Returns 0 on success, -1 if store_id is unknown or has no chunk store. */
+int disks_mark_draining(const uint8_t store_id[16], int draining);
+/* Start/stop the local chunk drain driver (R13 r13-lmove; after chunksrv_cluster_start, before chunksrv_cluster_stop). */
+int disks_drain_start(void);
+void disks_drain_stop(void);
 
 /* Read-only snapshot of one configured disk (for multi-disk cvolfs/scrubd; R13 r13-cvolfs). */
 struct disk_info {

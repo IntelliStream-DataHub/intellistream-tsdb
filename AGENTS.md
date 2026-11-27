@@ -621,6 +621,23 @@ cgroup, so `nice` does not keep your work out of its way.
   `chunknofence chunkselfraise putokearly nocellcheck storeforeign nometacheck sumsonly noreqcheck noopmatch norespcheck`),
   `test_peerlink chunk`, fuzz-replframe mode 9. Open: a store that hangs (not fails) in
   fdatasync holds the backend's fence mutex and stalls every request (R13's health domains).
+- `src/chunkmove.[ch]` (R13 `r13-lmove`; E50, §15.3, D18): local chunk moves between two stores of one backend
+  (`chunk_move(be, id, from, to, opts)`): raises the volume's fence on `to` first (refuses `CHUNK_ERR_EPOCH_UNSURE`),
+  copies cells paced to `balance_mb_s` (falling back to `rebuild_mb_s`, then 50 MiB/s) into `tmp_*` on `to`, writes
+  tail and fsyncs `tmp_*` outside the per-`(volume, oid)` stripe lock (`oid_mu`), then under `oid_mu` verifies source
+  `(st_dev, st_ino)` unchanged (aborting on concurrent `MK_GC` delete, retrying on `r12-repair` replace-put), commits
+  rename + dir fsync (`defer_loc`), verifies every cell on `to` against its sums (unlinking corrupt target on failure),
+  updates the local off-primary index (`loc_tab`), and unlinks the source + fsyncs its directory. Start-time dedupe in
+  `src/chunkstore.c` (`be_open_dedupe`, enabled when `chunk_be_opts.store_pref` is set) verifies duplicate copies at
+  open, keeps the whole copy on the preferred store (capacity over fast / drain target), drops damaged copies, and
+  leaves all-damaged copies intact. Background local drain driver in `server/disks.c` (`disks_drain_start`/`stop`,
+  `disks_mark_draining`) drains E50 fast-disk chunk stores when capacity disks are present (and prepares runtime drain
+  for `r13-dev`), skips draining stores for new puts in `server/chunksrv.c` and `server/sfill.c`, reports
+  `drain_bytes_left` via `r14-progress`'s `HBS_PROGRESS` callback, emits `warn=drain_no_space` in `HBS_DISKS` and
+  `tsdb_disk_drain_*` / `tsdb_chunk_peerlink_bytes_total` / `tsdb_chunk_srv_bytes_total` metrics (`docs/metrics.md`),
+  and skips unsure-EPOCH volumes with exponential backoff instead of stalling other volumes. Test knobs:
+  `TSDB_LMOVE_MUTANT` (`moveunlinkfirst`, `movekeepwrong`) and `TSDB_DRAIN_RATE_BPS` (`TSDB_TEST_HOOKS`).
+  `tests/test_chunkmove.c`, `make lmove-mutants`, `test_cluster hddadd`.
 - `server/disks.[ch]` (R13 `r13-start`; E47-E49, E58, D11-D13): `--disk PATH[:CLASS]` (repeatable, `storage.disks`),
   `--role compute|storage|both` (`cluster.role`), `--allow-shared-device` (`cluster.allow.shared.device`, warns on health
   and `tsdb_disk_shared_device`), replacing `--chunk-dir` and `tsdb chunk-store init`. In cluster mode `--dir` is a disk

@@ -31318,6 +31318,430 @@ static void scen_diskeio(void)
 #endif
 }
 
+static int count_live_parts_in(const char *disk_dir, uint32_t vol, char *buf, size_t cap)
+{
+    char p[PATH_MAX + 64];
+    snprintf(p, sizeof p, "%s/v%" PRIu32, disk_dir, vol);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return -1;
+    int n = 0;
+    size_t at = 0;
+    buf[0] = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] != 'p' || l < 6 || strcmp(e->d_name + l - 5, ".part") != 0)
+            continue;
+        n++;
+        if (at + l + 2 < cap)
+            at += (size_t)snprintf(buf + at, cap - at, " %s", e->d_name);
+    }
+    closedir(dd);
+    return n;
+}
+
+/* R13 (r13-lmove; E50, §15.3, D18): all-flash cluster (node 0 has only an NVMe store) settles EC chunks onto NVMe;
+ * restarting node 0 with an HDD added drains its chunks locally from NVMe to HDD while peer-link chunk bulk/put
+ * counters remain unchanged, reads remain bit-exact throughout, and new settles land on HDD. Also verifies that when
+ * no target has room (TSDB_TEST_STORE_FILL_PCT=99 on node 1), drain stops cleanly with HBS_DISKS warn=drain_no_space,
+ * tsdb_disk_drain_no_space=1, and HBS_PROGRESS drain_bytes_left > 0, then finishes cleanly once room is restored. */
+static void scen_hddadd(void)
+{
+    scenario("hddadd");
+#ifndef TSDB_EC
+    printf("  skipped: no erasure codec in this build\n");
+    return;
+#else
+    char d0_nv[PATH_MAX], d0_hd[PATH_MAX], d1_nv[PATH_MAX], d1_hd[PATH_MAX], d2_nv[PATH_MAX];
+    snprintf(d0_nv, sizeof d0_nv, "%s/ha_n0_nvme", base);
+    snprintf(d0_hd, sizeof d0_hd, "%s/ha_n0_hdd", base);
+    snprintf(d1_nv, sizeof d1_nv, "%s/ha_n1_nvme", base);
+    snprintf(d1_hd, sizeof d1_hd, "%s/ha_n1_hdd", base);
+    snprintf(d2_nv, sizeof d2_nv, "%s/ha_n2_nvme", base);
+    disk_make(d0_nv, "nvme");
+    disk_make(d0_hd, "hdd");
+    disk_make(d1_nv, "nvme");
+    disk_make(d1_hd, "hdd");
+    disk_make(d2_nv, "nvme");
+
+    disk_meta dm0_nv, dm1_nv;
+    if (disk_load(d0_nv, &dm0_nv) != 0 || disk_load(d1_nv, &dm1_nv) != 0)
+        die("hddadd: disk_load failed");
+
+    static char xa0[PATH_MAX * 2 + 256], xa1[PATH_MAX * 2 + 256], xa2[PATH_MAX + 256];
+    for (int i = 0; i < 3; i++) {
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+    }
+    snprintf(xa0, sizeof xa0,
+             "--disk %s:nvme --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             d0_nv);
+    snprintf(xa1, sizeof xa1,
+             "--disk %s:nvme --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             d1_nv);
+    snprintf(xa2, sizeof xa2,
+             "--disk %s:nvme --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             d2_nv);
+    xargs[0] = xa0;
+    xargs[1] = xa1;
+    xargs[2] = xa2;
+
+    start(0);
+    int mport0 = th_mport;
+    start(1);
+    int mport1 = th_mport;
+    start(2);
+    int mport2 = th_mport;
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "hddadd: three voters");
+
+    struct disks_want w0 = {ids[0], 1, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w1 = {ids[1], 1, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w2 = {ids[2], 1, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w0, "hddadd: node 0 nvme");
+    await_view(0, p_member_disks, &w1, "hddadd: node 1 nvme");
+    await_view(0, p_member_disks, &w2, "hddadd: node 2 nvme");
+
+    uint32_t ec_num = 0, tw_num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "ha21", 0, 2, 1, &ec_num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("hddadd: vol_add_ec 2+1: %s (%s)", cluster_strerror(rc), text);
+    if ((rc = vol_add(0, "hatwin", 3, &tw_num)) != 0)
+        die("hddadd: vol_add twin: %s", cluster_strerror(rc));
+
+    struct meta_volume mv, mt;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "ha21", &mv) || !mv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("hddadd: no leader for ha21");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "hatwin", &mt) || !mt.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("hddadd: no leader for hatwin");
+    int L = server_of(mv.leader);
+    int Lt = server_of(mt.leader);
+    await_isr(L, "ha21", (int)mv.nrep, 30000, "hddadd: ha21 ISR full");
+
+    tsdbc *ce = client(L);
+    tsdbc *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ha.s%d", s);
+        ide[s] = ecb_series(ce, nm, "ha21");
+        idt[s] = ecb_series(ct, nm, "hatwin");
+    }
+
+    const int64_t day0 = 1704067200000LL;
+    const int64_t part_step = 30LL * 86400000LL;
+    const int pre_days = 4;
+    for (int d = 0; d < pre_days; d++) {
+        int64_t day = day0 + (int64_t)d * part_step;
+        for (int b = 0; b < 2; b++) {
+            for (int s = 0; s < ECB_SERIES; s++) {
+                int64_t ts[ECB_ROWS];
+                float val[ECB_ROWS];
+                ecb_rows_of(s, b, day, ts, val);
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ce, ide[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("hddadd: insert ha21: %s", ers(rc));
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("hddadd: insert twin: %s", ers(rc));
+            }
+            usleep(400000);
+        }
+    }
+    for (uint64_t t0 = now_ms();
+         count_chunk_files_in(d0_nv, ec_num) < pre_days || count_chunk_files_in(d1_nv, ec_num) < pre_days ||
+         count_chunk_files_in(d2_nv, ec_num) < pre_days;
+         usleep(200000)) {
+        if (now_ms() - t0 > 90000)
+            die("hddadd: partitions did not settle onto all-flash nvme stores (n0=%d n1=%d n2=%d)",
+                count_chunk_files_in(d0_nv, ec_num), count_chunk_files_in(d1_nv, ec_num),
+                count_chunk_files_in(d2_nv, ec_num));
+    }
+    /* Wait until no unsettled .part remains on leader so no background settle fires during drain counter check. */
+    const char *ldr_disk = L == 0 ? d0_nv : (L == 1 ? d1_nv : d2_nv);
+    char livebuf[1024];
+    for (uint64_t t0 = now_ms(); count_live_parts_in(ldr_disk, ec_num, livebuf, sizeof livebuf) != 0; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("hddadd: unsettled .part left on leader before restart: %s", livebuf);
+
+    int pre_n0 = count_chunk_files_in(d0_nv, ec_num);
+    int pre_n1 = count_chunk_files_in(d1_nv, ec_num);
+    if (pre_n0 < pre_days || count_chunk_files_in(d0_hd, ec_num) != 0)
+        die("hddadd: unexpected pre-restart counts n0_nv=%d n0_hd=%d", pre_n0, count_chunk_files_in(d0_hd, ec_num));
+
+    /* Capture twin hashes and peer-link counters on nodes 1 & 2 before restarting node 0 with an HDD. */
+    struct ecb_sum twin_pre[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        if ((rc = ecb_read(ct, idt[s], &twin_pre[s])) != 0)
+            die("hddadd: twin read s=%d: %s", s, ers(rc));
+        struct ecb_sum a;
+        if ((rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != twin_pre[s].n || a.h != twin_pre[s].h)
+            die("hddadd: pre-drain ha21 read s=%d mismatch (rc=%d)", s, rc);
+    }
+
+    char mbuf[65536];
+    int64_t p1_bulk_pre = -1, p2_bulk_pre = -1, p1_put_pre = -1, p2_put_pre = -1;
+    metrics_get(mport1, mbuf, sizeof mbuf);
+    if (!metrics_find_i64(mbuf, "\ntsdb_chunk_peerlink_bytes_total{dir=\"bulk\"} ", &p1_bulk_pre) ||
+        !metrics_find_i64(mbuf, "\ntsdb_chunk_srv_bytes_total{op=\"put\"} ", &p1_put_pre))
+        die("hddadd: missing peerlink/srv metrics on node 1");
+    metrics_get(mport2, mbuf, sizeof mbuf);
+    if (!metrics_find_i64(mbuf, "\ntsdb_chunk_peerlink_bytes_total{dir=\"bulk\"} ", &p2_bulk_pre) ||
+        !metrics_find_i64(mbuf, "\ntsdb_chunk_srv_bytes_total{op=\"put\"} ", &p2_put_pre))
+        die("hddadd: missing peerlink/srv metrics on node 2");
+    printf("  all-flash settled: n0_nvme=%d n1_nvme=%d chunks; restarting node 0 with HDD added\n", pre_n0, pre_n1);
+
+    tsdbc_close(ce);
+    tsdbc_close(ct);
+
+    /* Part A: Restart node 0 with --disk n0_nvme:nvme --disk n0_hdd:hdd. Throttle drain to 1 MiB/s (~4-5 s for 4 chunks)
+     * so we can read concurrently while draining and verify zero peerlink bulk/put bytes. */
+    snprintf(xa0, sizeof xa0,
+             "--disk %s:nvme --disk %s:hdd --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             d0_nv, d0_hd);
+    penv[0] = "TSDB_DRAIN_RATE_BPS=1048576";
+    restart_xargs(0, xa0);
+    mport0 = th_mport;
+
+    struct disks_want w0_post = {ids[0], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(1, p_member_disks, &w0_post, "hddadd: node 0 registered new HDD");
+
+    /* Re-acquire leaders (leadership may have shifted when node 0 restarted) and read continuously while draining! */
+    for (uint64_t t0 = now_ms(); !vol_rec(1, "ha21", &mv) || !mv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("hddadd: no leader for ha21 after restart");
+    for (uint64_t t0 = now_ms(); !vol_rec(1, "hatwin", &mt) || !mt.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("hddadd: no leader for hatwin after restart");
+    L = server_of(mv.leader);
+    Lt = server_of(mt.leader);
+    ce = client(L);
+    ct = client(Lt);
+
+    int reads_during_drain = 0;
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int s = reads_during_drain % ECB_SERIES;
+        struct ecb_sum a;
+        rc = ecb_read(ce, ide[s], &a);
+        if (rc == 0) {
+            if (a.n != twin_pre[s].n || a.h != twin_pre[s].h)
+                die("hddadd: read during drain s=%d mismatch (got %" PRIu64 "/0x%" PRIx64 ", want %" PRIu64
+                    "/0x%" PRIx64 ")",
+                    s, a.n, a.h, twin_pre[s].n, twin_pre[s].h);
+            reads_during_drain++;
+        } else if (rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) {
+            die("hddadd: read during drain s=%d failed: %s", s, ers(rc));
+        }
+        int nv_left = count_chunk_files_in(d0_nv, ec_num);
+        int hd_have = count_chunk_files_in(d0_hd, ec_num);
+        if (nv_left == 0 && hd_have == pre_n0)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("hddadd: node 0 did not finish draining to HDD in 60 s (nvme=%d hdd=%d want=%d)", nv_left, hd_have,
+                pre_n0);
+    }
+
+    /* Verify drain metrics and UNCHANGED peer-link bulk/put byte counters across all 3 nodes! */
+    char hex0[33], key_moved[128], key_left[128];
+    chunk_oid_hex(dm0_nv.store_id, hex0);
+    snprintf(key_moved, sizeof key_moved, "\ntsdb_disk_drain_chunks_moved_total{store=\"%s\",class=\"nvme\"} ", hex0);
+    snprintf(key_left, sizeof key_left, "\ntsdb_disk_drain_bytes_left{store=\"%s\",class=\"nvme\"} ", hex0);
+
+    int64_t moved0 = -1, left0 = -1, nospace0 = -1, p0_bulk = -1, p0_put = -1;
+    int64_t p1_bulk_post = -1, p2_bulk_post = -1, p1_put_post = -1, p2_put_post = -1;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 5000; usleep(100000)) {
+        metrics_get(mport0, mbuf, sizeof mbuf);
+        if (metrics_find_i64(mbuf, key_moved, &moved0) && metrics_find_i64(mbuf, key_left, &left0) && left0 == 0 &&
+            metrics_find_i64(mbuf, "\ntsdb_disk_drain_no_space ", &nospace0) &&
+            metrics_find_i64(mbuf, "\ntsdb_chunk_peerlink_bytes_total{dir=\"bulk\"} ", &p0_bulk) &&
+            metrics_find_i64(mbuf, "\ntsdb_chunk_srv_bytes_total{op=\"put\"} ", &p0_put))
+            break;
+    }
+    if (moved0 < pre_n0 || left0 != 0 || nospace0 != 0)
+        die("hddadd: node 0 drain metrics unexpected (moved=%" PRId64 " left=%" PRId64 " nospace=%" PRId64 ")", moved0,
+            left0, nospace0);
+    if (p0_bulk != 0 || p0_put != 0)
+        die("hddadd: node 0 moved chunks over network! (peerlink bulk=%" PRId64 " srv put=%" PRId64 ")", p0_bulk,
+            p0_put);
+    metrics_get(mport1, mbuf, sizeof mbuf);
+    (void)metrics_find_i64(mbuf, "\ntsdb_chunk_peerlink_bytes_total{dir=\"bulk\"} ", &p1_bulk_post);
+    (void)metrics_find_i64(mbuf, "\ntsdb_chunk_srv_bytes_total{op=\"put\"} ", &p1_put_post);
+    metrics_get(mport2, mbuf, sizeof mbuf);
+    (void)metrics_find_i64(mbuf, "\ntsdb_chunk_peerlink_bytes_total{dir=\"bulk\"} ", &p2_bulk_post);
+    (void)metrics_find_i64(mbuf, "\ntsdb_chunk_srv_bytes_total{op=\"put\"} ", &p2_put_post);
+    if (p1_bulk_post != p1_bulk_pre || p2_bulk_post != p2_bulk_pre || p1_put_post != p1_put_pre ||
+        p2_put_post != p2_put_pre)
+        die("hddadd: peer-link chunk bytes changed during local drain! (n1 bulk %" PRId64 "->%" PRId64 ", n2 bulk %" PRId64
+            "->%" PRId64 ")",
+            p1_bulk_pre, p1_bulk_post, p2_bulk_pre, p2_bulk_post);
+
+    /* Every series reads bit-exact after drain. */
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a;
+        if ((rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != twin_pre[s].n || a.h != twin_pre[s].h)
+            die("hddadd: post-drain read s=%d mismatch (rc=%d)", s, rc);
+    }
+
+    /* New settle must land on node 0's HDD, leaving NVMe at 0 chunks. */
+    int64_t extra_day = day0 + (int64_t)pre_days * part_step;
+    for (int b = 0; b < 2; b++) {
+        for (int s = 0; s < ECB_SERIES; s++) {
+            int64_t ts[ECB_ROWS];
+            float val[ECB_ROWS];
+            ecb_rows_of(s, b, extra_day, ts, val);
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ce, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("hddadd: post-drain insert ha21: %s", ers(rc));
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("hddadd: post-drain insert twin: %s", ers(rc));
+        }
+        usleep(400000);
+    }
+    for (uint64_t t0 = now_ms(); count_chunk_files_in(d0_hd, ec_num) < pre_n0 + 1; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("hddadd: post-drain settle did not land on n0_hdd (have=%d want=%d, nvme=%d)",
+                count_chunk_files_in(d0_hd, ec_num), pre_n0 + 1, count_chunk_files_in(d0_nv, ec_num));
+    if (count_chunk_files_in(d0_nv, ec_num) != 0)
+        die("hddadd: new settle landed on draining n0_nvme (%d chunks)!", count_chunk_files_in(d0_nv, ec_num));
+    printf("  node 0 drained %d chunks locally to HDD (%d live reads, 0 peerlink bulk/put bytes); new settle landed on "
+           "HDD\n",
+           pre_n0, reads_during_drain);
+
+    /* Part B: Restart node 1 with HDD added AND TSDB_TEST_STORE_FILL_PCT=99 -> no target has room -> drain stops
+     * cleanly with warn=drain_no_space in HBS_DISKS STATUS, tsdb_disk_drain_no_space=1, and HBS_PROGRESS
+     * drain_bytes_left > 0; chunks remain intact on n1_nvme; then clear fill cap (and also plant an unsure-EPOCH
+     * volume 99 beside sure volume ec_num to verify unsure volumes never stall sure volumes) and confirm drain
+     * finishes cleanly. */
+    penv[0] = NULL;
+    tsdbc_close(ce);
+    tsdbc_close(ct);
+    int pre_n1_all = count_chunk_files_in(d1_nv, ec_num);
+    snprintf(xa1, sizeof xa1,
+             "--disk %s:nvme --disk %s:hdd --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             d1_nv, d1_hd);
+    penv[1] = "TSDB_TEST_STORE_FILL_PCT=99";
+    restart_xargs(1, xa1);
+    mport1 = th_mport;
+
+    int saw_nospace_metric = 0, saw_nospace_health = 0, saw_prog_left = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 20000; usleep(150000)) {
+        int64_t ns1 = -1;
+        metrics_get(mport1, mbuf, sizeof mbuf);
+        if (metrics_find_i64(mbuf, "\ntsdb_disk_drain_no_space ", &ns1) && ns1 == 1)
+            saw_nospace_metric = 1;
+        struct view v;
+        view(0, &v);
+        int ldr = leader_index(&v);
+        if (ldr >= 0 && ldr != 0) {
+            view_free(&v);
+            view(ldr, &v);
+        }
+        for (uint32_t k = 0; k < v.st.nheard; k++) {
+            if (v.st.heard[k].id != ids[1])
+                continue;
+            if (v.st.heard[k].sections && strstr(v.st.heard[k].sections, "warn=drain_no_space"))
+                saw_nospace_health = 1;
+            for (uint32_t j = 0; j < v.st.heard[k].nprogress_stores; j++) {
+                if (v.st.heard[k].progress_stores[j].drain_bytes_left > 0)
+                    saw_prog_left = 1;
+            }
+        }
+        view_free(&v);
+        if (saw_nospace_metric && saw_nospace_health && saw_prog_left)
+            break;
+    }
+    if (!saw_nospace_metric || !saw_nospace_health || !saw_prog_left)
+        die("hddadd: no-room drain check failed (metric=%d health=%d prog=%d)", saw_nospace_metric, saw_nospace_health,
+            saw_prog_left);
+    if (count_chunk_files_in(d1_nv, ec_num) != pre_n1_all || count_chunk_files_in(d1_hd, ec_num) != 0)
+        die("hddadd: full-target drain moved or lost chunks (n1_nv=%d want=%d, n1_hd=%d)",
+            count_chunk_files_in(d1_nv, ec_num), pre_n1_all, count_chunk_files_in(d1_hd, ec_num));
+
+    /* Stop node 1, plant a synthetic volume 99 on n1_nvme/chunks with one torn EPOCH slot (unsure) alongside sure
+     * volume ec_num, clear fill override, and restart node 1 -> drain must skip unsure vol 99 and still drain all
+     * pre_n1_all chunks of ec_num cleanly to n1_hdd, clearing warn=drain_no_space! */
+    stop(1, SIGTERM);
+    {
+        char cdir1[PATH_MAX + 32], ep99[PATH_MAX + 64];
+        snprintf(cdir1, sizeof cdir1, "%s/chunks", d1_nv);
+        chunk_store *st = NULL;
+        if (chunk_store_open(cdir1, NULL, &st) != 0)
+            die("hddadd: open n1_nvme chunk store for unsure-vol test failed");
+        chunk_geom g99;
+        if (chunk_geom_make(&g99, 2, 1, 4096, 8192) != 0)
+            die("hddadd: geom for unsure vol 99 failed");
+        chunk_ident id99 = {.volume = 99, .pos = 0};
+        for (int b = 0; b < 16; b++)
+            id99.oid[b] = (uint8_t)(0x99u ^ (unsigned)b);
+        uint8_t *buf99 = calloc(1, (size_t)chunk_pos_len(&g99, 0));
+        if (!buf99 || chunk_store_put(st, &id99, &g99, 1, buf99, NULL) != 0 || chunk_store_raise(st, 99, 2) != 0)
+            die("hddadd: seed unsure vol 99 chunk failed");
+        free(buf99);
+        chunk_store_close(st);
+        snprintf(ep99, sizeof ep99, "%s/s99/EPOCH", cdir1);
+        int fd = open(ep99, O_RDWR);
+        uint8_t byte = 0;
+        if (fd < 0 || pread(fd, &byte, 1, 0) != 1 || (byte ^= 0xffu, pwrite(fd, &byte, 1, 0) != 1) || close(fd) != 0)
+            die("hddadd: corrupt slot 0 of %s failed", ep99);
+    }
+    penv[1] = NULL;
+    start(1);
+    mport1 = th_mport;
+    for (uint64_t t0 = now_ms();
+         count_chunk_files_in(d1_nv, ec_num) != 0 || count_chunk_files_in(d1_hd, ec_num) != pre_n1_all;
+         usleep(150000)) {
+        if (now_ms() - t0 > 45000)
+            die("hddadd: node 1 did not finish draining sure vol %" PRIu32
+                " beside unsure vol 99 (nv=%d hd=%d want=%d)",
+                ec_num, count_chunk_files_in(d1_nv, ec_num), count_chunk_files_in(d1_hd, ec_num), pre_n1_all);
+    }
+    if (count_chunk_files_in(d1_nv, 99) != 1 || count_chunk_files_in(d1_hd, 99) != 0)
+        die("hddadd: unsure vol 99 should remain untouched on n1_nvme (nv=%d hd=%d)", count_chunk_files_in(d1_nv, 99),
+            count_chunk_files_in(d1_hd, 99));
+    for (uint64_t t0 = now_ms(); !log_has(1, "skipping volume 99 while EPOCH is unsure"); usleep(100000))
+        if (now_ms() - t0 > 10000)
+            die("hddadd: expected unsure-volume skip log on node 1");
+    int64_t ns1_after = -1;
+    metrics_get(mport1, mbuf, sizeof mbuf);
+    if (!metrics_find_i64(mbuf, "\ntsdb_disk_drain_no_space ", &ns1_after) || ns1_after != 0)
+        die("hddadd: expected tsdb_disk_drain_no_space == 0 after recovery (got %" PRId64 ")", ns1_after);
+
+    /* Final full read verification against twin across all partitions (pre + post). */
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "ha21", &mv) || !mv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("hddadd: no leader for ha21 at end");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "hatwin", &mt) || !mt.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("hddadd: no leader for hatwin at end");
+    ce = client(server_of(mv.leader));
+    ct = client(server_of(mt.leader));
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(ct, idt[s], &b)) != 0 || (rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != b.n || a.h != b.h)
+            die("hddadd: final read s=%d mismatch (rc=%d)", s, rc);
+    }
+    tsdbc_close(ce);
+    tsdbc_close(ct);
+    printf("  no-room stop (warn=drain_no_space + HBS_PROGRESS drain_bytes_left) and recovery drain: ok\n");
+    stop_all();
+#endif
+}
+
 #ifdef TSDB_EC
 /* Helpers for scen_scrubrepair (R12, r12-repair; E11, E14, E25, E26, §5.9). */
 static void sr_flip_byte(const char *path, off_t off)
@@ -33019,7 +33443,8 @@ int main(int argc, char **argv)
                {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub},
                {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass},
                {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio},
-               {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring}};
+               {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring},
+               {"hddadd", scen_hddadd}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

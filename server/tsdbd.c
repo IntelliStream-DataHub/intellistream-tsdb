@@ -8476,10 +8476,23 @@ int main(int argc, char **argv)
         }
         cvol_disks_ready();
         const char *chunk_paths[CHUNKSRV_DIRS_MAX];
+        int chunk_prefs[CHUNKSRV_DIRS_MAX];
+        bool chunk_draining[CHUNKSRV_DIRS_MAX];
         int nchunk = 0;
-        disks_chunk_paths(chunk_paths, CHUNKSRV_DIRS_MAX, &nchunk);
-        if (chunksrv_cluster_start(chunk_paths, nchunk, chunk_rate, cerr, sizeof cerr) != 0) {
+        disks_chunk_layout(chunk_paths, chunk_prefs, chunk_draining, CHUNKSRV_DIRS_MAX, &nchunk);
+        if (chunksrv_cluster_start_ex(chunk_paths, chunk_prefs, chunk_draining, nchunk, chunk_rate, cerr,
+                                      sizeof cerr) != 0) {
             fprintf(stderr, "tsdbd: %s\n", cerr);
+            disks_stop();
+            scrubd_stop();
+            cluster_stop();
+            fwd_cluster_stop();
+            cvol_stop();
+            return 1;
+        }
+        if (disks_drain_start() != 0) {
+            fprintf(stderr, "tsdbd: cannot start the local chunk drain driver\n");
+            chunksrv_cluster_stop();
             disks_stop();
             scrubd_stop();
             cluster_stop();
@@ -8489,6 +8502,7 @@ int main(int argc, char **argv)
         }
         if (dom_disk_init(cerr, sizeof cerr) != 0) {
             fprintf(stderr, "tsdbd: %s\n", cerr);
+            disks_drain_stop();
             chunksrv_cluster_stop();
             disks_stop();
             scrubd_stop();
@@ -8500,6 +8514,7 @@ int main(int argc, char **argv)
         if (!witness && sfill_cluster_start(db, state_dir) != 0) {
             fprintf(stderr, "tsdbd: cannot start the stripe fill worker\n");
             dom_disk_shutdown();
+            disks_drain_stop();
             chunksrv_cluster_stop();
             disks_stop();
             scrubd_stop();
@@ -8545,6 +8560,7 @@ int main(int argc, char **argv)
         dom_disk_shutdown(); /* stop per-disk probes & recovery threads before cluster/cvol/chunksrv close */
         cluster_stop();
         sfill_cluster_stop(); /* stops fill workers while chunk server & db are still open */
+        disks_drain_stop();   /* stops local chunk drain driver while chunk server is still open */
         creport_reset();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         chunksrv_cluster_stop(); /* likewise for the chunk links; freed below */

@@ -662,7 +662,8 @@ static inline size_t pend_bucket(uint64_t rid)
 #define CS_PUT_QUEUE_BYTES (16u << 20)
 int chunksrv_test_put_delay_ms; /* test hook: the first cell of every put waits this long (a slow disk) */
 
-struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_t errlen)
+struct chunksrv *chunksrv_open_ex(const char *const *paths, const int *prefs, const bool *draining, int n, char *err,
+                                  size_t errlen)
 {
     struct chunksrv *cs = calloc(1, sizeof *cs);
     if (!cs) {
@@ -691,7 +692,7 @@ struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_
         for (int i = 0; cs->paths && i < n; i++)
             cs->paths[i] = paths[i] ? strdup(paths[i]) : NULL;
         cs->n = n;
-        chunk_be_opts o = {.min_up = 0};
+        chunk_be_opts o = {.min_up = 0, .store_pref = prefs};
         int rc = chunk_be_open2(&cs->be, paths, n, NULL, &o);
         if (rc != 0) {
             snprintf(err, errlen, "the chunk stores cannot be opened: %s",
@@ -701,8 +702,18 @@ struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_
             chunksrv_close(cs);
             return NULL;
         }
+        if (draining) {
+            for (int i = 0; i < n; i++)
+                if (draining[i])
+                    chunk_be_set_draining(cs->be, i, true);
+        }
     }
     return cs;
+}
+
+struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_t errlen)
+{
+    return chunksrv_open_ex(paths, NULL, NULL, n, err, errlen);
 }
 
 void chunksrv_close(struct chunksrv *cs)
@@ -1743,6 +1754,8 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
             rc = TSDB_ERR_UNAVAILABLE;
             for (int off = 0; off < cs->n; off++) {
                 int cand = (primary + off) % cs->n;
+                if (chunk_be_store_draining(cs->be, cand))
+                    continue; /* R13 r13-lmove (E50): draining stores accept no new puts */
                 int st_state = chunk_be_store_state(cs->be, cand);
                 if (st_state != CHUNK_STORE_UP && st_state != CHUNK_STORE_REPLACING)
                     continue;
@@ -2032,7 +2045,9 @@ static int req_store_idx(struct chunksrv *cs, const struct cs_req *r)
     case CS_OP_SUMS:
     case CS_OP_DEL:
     case CS_OP_DEL_REL: {
-        int s = chunk_be_place_n(r->oid, r->pos, cs->nspools);
+        int s = chunk_be_loc_get(cs->be, r->volume, r->oid, r->pos);
+        if (s < 0 || s >= cs->nspools)
+            s = chunk_be_place_n(r->oid, r->pos, cs->nspools);
         /* Only route to store s's dedicated pool while store s is UP: once DOWN (e.g. hung disk), route to the shared
          * pool so fallback copies on other UP stores and DEL/DEL_REL never stall behind stuck workers. */
         if (s >= 0 && s < cs->nspools && chunk_be_store_state(cs->be, s) == CHUNK_STORE_UP)

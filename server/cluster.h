@@ -389,6 +389,8 @@ struct cluster_copy {
     uint64_t applied, applied_term, restore_gen;
     uint32_t self; /* this server's member id (0: none yet) */
     uint32_t nmembers, nvolumes;
+    uint32_t rebuild_mb_s;        /* R9/R13: rebuild rate, MB/s (default 200) */
+    uint32_t balance_mb_s;        /* R9/R13: balancer & local chunk move rate, MB/s (0: = rebuild_mb_s, meta.h:240) */
     uint32_t rebuild_concurrency; /* R9 (D11, D23): objects in flight per server */
     uint32_t scrub_days, scrub_mb_s, scrub_out_count; /* R12/R13 scrub settings (D2) */
     uint32_t young_warn_pct, young_move_pct, young_high_pct, disk_stall_s; /* R13 fast-disk marks & stall (D13) */

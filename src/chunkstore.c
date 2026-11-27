@@ -31,6 +31,7 @@
 #include "internal.h"
 #include "chunk.h"
 #include "chunk_priv.h"
+#include "chunkmove.h"
 #include "chunkscrub.h"
 
 #include <dirent.h>
@@ -1110,7 +1111,15 @@ struct chunk_wr {
     uint64_t *sums;
     int err;          /* a failed cell poisons the writer: commit refuses */
     bool replace_only;/* R12 (D9): refuse open and commit unless target chunk file already exists */
+    bool synced;      /* R13 r13-lmove: tail already written and tmp fd already fsynced via chunk_wr_sync() */
+    bool defer_loc;   /* R13 r13-lmove: caller (chunk_move) publishes loc_tab only after read-back verification */
 };
+
+void chunk_wr_set_defer_loc(chunk_wr *w)
+{
+    if (w)
+        w->defer_loc = true;
+}
 
 static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t epoch, uint64_t fence,
                    bool heal, bool replace_only, chunk_wr **out)
@@ -1249,9 +1258,12 @@ void chunk_wr_abort(chunk_wr *w)
     free(w);
 }
 
-int chunk_wr_commit(chunk_wr *w)
+int chunk_wr_sync(chunk_wr *w)
 {
-    chunk_store *st = w->st;
+    if (!w)
+        return TSDB_ERR_INVALID;
+    if (w->synced)
+        return 0;
     int rc = w->err;
     if (rc == 0 && w->next != w->ncells)
         rc = TSDB_ERR_INVALID; /* cells missing */
@@ -1270,10 +1282,27 @@ int chunk_wr_commit(chunk_wr *w)
     }
     if (rc == 0 && sync_fd(w->fd) != 0)
         rc = TSDB_ERR_IO; /* nothing named yet: just this call fails, and the file is dropped */
+    if (rc == 0)
+        w->synced = true;
+    else
+        w->err = rc;
+    return rc;
+}
+
+int chunk_wr_commit(chunk_wr *w)
+{
+    chunk_store *st = w->st;
+    int rc = w->synced ? w->err : chunk_wr_sync(w);
     if (rc) {
         chunk_wr_abort(w);
         return rc;
     }
+    /* R13 r13-lmove: serialize replace-put commits (r12-repair) against concurrent chunk_move and MK_GC deletes on
+     * the same (volume, oid) so a repair never races a move or resurrects a deleted chunk. */
+    chunk_backend *be = st->owner_be;
+    bool take_oid = w->replace_only && be != NULL;
+    if (take_oid)
+        chunk_be_oid_lock(be, w->id.volume, w->id.oid);
     pthread_mutex_lock(&st->mu);
     vol_state *v;
     if (atomic_load(&st->failed))
@@ -1287,6 +1316,8 @@ int chunk_wr_commit(chunk_wr *w)
         rc = TSDB_ERR_IO;
     pthread_mutex_unlock(&st->mu);
     if (rc) {
+        if (take_oid)
+            chunk_be_oid_unlock(be, w->id.volume, w->id.oid);
         chunk_wr_abort(w);
         return rc;
     }
@@ -1296,6 +1327,15 @@ int chunk_wr_commit(chunk_wr *w)
         store_fail(st, "directory fsync after a chunk was named", errno);
         rc = TSDB_ERR_IO;
     }
+    if (rc == 0 && be && !w->defer_loc) {
+        int primary = chunk_be_place(be, w->id.oid, w->id.pos);
+        if (st->owner_idx != primary)
+            chunk_be_loc_set(be, w->id.volume, w->id.oid, w->id.pos, st->owner_idx);
+        else if (atomic_load_explicit(&be->loc_cnt, memory_order_acquire) > 0)
+            chunk_be_loc_del(be, w->id.volume, w->id.oid, w->id.pos);
+    }
+    if (take_oid)
+        chunk_be_oid_unlock(be, w->id.volume, w->id.oid);
     chunk_store_unref(st);
     free(w->sums);
     free(w);
@@ -1501,6 +1541,44 @@ void chunk_rd_close(chunk_rd *r)
 
 const chunk_hdr *chunk_rd_hdr(const chunk_rd *r) { return &r->h; }
 const uint64_t *chunk_rd_sums(const chunk_rd *r) { return r->sums; }
+
+int chunk_rd_stat(const chunk_rd *r, dev_t *dev_out, ino_t *ino_out)
+{
+    if (!r || r->fd < 0)
+        return TSDB_ERR_INVALID;
+    struct stat sb;
+    if (fstat(r->fd, &sb) != 0)
+        return TSDB_ERR_IO;
+    if (dev_out)
+        *dev_out = sb.st_dev;
+    if (ino_out)
+        *ino_out = sb.st_ino;
+    return 0;
+}
+
+int chunk_store_stat_chunk(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos, dev_t *dev_out,
+                           ino_t *ino_out)
+{
+    if (!st || pos >= CHUNK_POS_MAX)
+        return TSDB_ERR_INVALID;
+    pthread_mutex_lock(&st->mu);
+    vol_state *v;
+    int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, volume, false, &v);
+    int vfd = rc == 0 ? v->dirfd : -1;
+    pthread_mutex_unlock(&st->mu);
+    if (rc != 0)
+        return rc;
+    char name[80];
+    chunk_name(name, sizeof name, oid, pos);
+    struct stat sb;
+    if (fstatat(vfd, name, &sb, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    if (dev_out)
+        *dev_out = sb.st_dev;
+    if (ino_out)
+        *ino_out = sb.st_ino;
+    return 0;
+}
 
 int chunk_rd_read_ex(chunk_rd *r, uint64_t off, void *buf, size_t len, bool *real_io)
 {
@@ -1960,6 +2038,391 @@ void chunk_be_note_ioerr(chunk_backend *be, int store)
     }
 }
 
+/* ---------------------------------------------------------------- per-oid lock, draining, local index & open dedupe */
+
+static size_t be_oid_stripe(uint32_t volume, const uint8_t oid[16])
+{
+    uint64_t h = xxh64(oid, 16, (uint64_t)volume);
+    return (size_t)(h & (CHUNK_OID_STRIPES - 1u));
+}
+
+void chunk_be_oid_lock(chunk_backend *be, uint32_t volume, const uint8_t oid[16])
+{
+    if (be && oid)
+        pthread_mutex_lock(&be->oid_mu[be_oid_stripe(volume, oid)]);
+}
+
+void chunk_be_oid_unlock(chunk_backend *be, uint32_t volume, const uint8_t oid[16])
+{
+    if (be && oid)
+        pthread_mutex_unlock(&be->oid_mu[be_oid_stripe(volume, oid)]);
+}
+
+void chunk_be_set_draining(chunk_backend *be, int i, bool draining)
+{
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n || !be->st_draining)
+        return;
+    atomic_store_explicit(&be->st_draining[i], draining, memory_order_release);
+}
+
+bool chunk_be_store_draining(const chunk_backend *be, int i)
+{
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n || !be->st_draining)
+        return false;
+    return atomic_load_explicit(&be->st_draining[i], memory_order_acquire);
+}
+
+static uint64_t loc_hash(uint32_t vol, const uint8_t oid[16], unsigned pos)
+{
+    uint64_t h = xxh64(oid, 16, ((uint64_t)vol << 16) | (uint64_t)pos);
+    return h ? h : 1;
+}
+
+static bool loc_eq(const chunk_loc_ent *e, uint32_t vol, const uint8_t oid[16], unsigned pos)
+{
+    return e->vol == vol && e->pos == (uint16_t)pos && memcmp(e->oid, oid, 16) == 0;
+}
+
+static int loc_rehash_locked(chunk_backend *be, size_t ncap)
+{
+    chunk_loc_ent *ntab = calloc(ncap, sizeof *ntab);
+    if (!ntab)
+        return TSDB_ERR_NOMEM;
+    size_t mask = ncap - 1u;
+    size_t cnt = 0;
+    for (size_t i = 0; i < be->loc_cap; i++) {
+        if (be->loc_tab[i].state != 1)
+            continue;
+        size_t s = (size_t)loc_hash(be->loc_tab[i].vol, be->loc_tab[i].oid, be->loc_tab[i].pos) & mask;
+        while (ntab[s].state == 1)
+            s = (s + 1u) & mask;
+        ntab[s] = be->loc_tab[i];
+        cnt++;
+    }
+    free(be->loc_tab);
+    be->loc_tab = ntab;
+    be->loc_cap = ncap;
+    be->loc_n = cnt;
+    be->loc_used = cnt;
+    return 0;
+}
+
+int chunk_be_loc_get(const chunk_backend *be, uint32_t volume, const uint8_t oid[16], unsigned pos)
+{
+    if (!be || !oid || pos >= CHUNK_POS_MAX)
+        return -1;
+    if (atomic_load_explicit(&be->loc_cnt, memory_order_acquire) == 0)
+        return -1;
+    chunk_backend *mbe = (chunk_backend *)be;
+    int store = -1;
+    pthread_mutex_lock(&mbe->loc_mu);
+    if (mbe->loc_cap > 0 && mbe->loc_n > 0) {
+        size_t mask = mbe->loc_cap - 1u;
+        size_t s = (size_t)loc_hash(volume, oid, pos) & mask;
+        for (size_t p = 0; p < mbe->loc_cap; p++) {
+            const chunk_loc_ent *e = &mbe->loc_tab[s];
+            if (e->state == 0)
+                break;
+            if (e->state == 1 && loc_eq(e, volume, oid, pos)) {
+                store = e->store;
+                break;
+            }
+            s = (s + 1u) & mask;
+        }
+    }
+    pthread_mutex_unlock(&mbe->loc_mu);
+    return store;
+}
+
+void chunk_be_loc_set(chunk_backend *be, uint32_t volume, const uint8_t oid[16], unsigned pos, int store)
+{
+    if (!be || !oid || pos >= CHUNK_POS_MAX || store < 0)
+        return;
+    pthread_mutex_lock(&be->loc_mu);
+    if (be->loc_cap == 0 || (be->loc_used + 1u) * 10u >= be->loc_cap * 7u) {
+        size_t ncap = be->loc_cap ? be->loc_cap : 64u;
+        if (be->loc_cap > 0 && (be->loc_n + 1u) * 10u >= be->loc_cap * 6u)
+            ncap *= 2u;
+        if (loc_rehash_locked(be, ncap) != 0) {
+            pthread_mutex_unlock(&be->loc_mu);
+            return;
+        }
+    }
+    size_t mask = be->loc_cap - 1u;
+    size_t s = (size_t)loc_hash(volume, oid, pos) & mask;
+    size_t first_tomb = SIZE_MAX;
+    for (size_t p = 0; p < be->loc_cap; p++) {
+        chunk_loc_ent *e = &be->loc_tab[s];
+        if (e->state == 0) {
+            size_t ins = first_tomb != SIZE_MAX ? first_tomb : s;
+            if (be->loc_tab[ins].state == 0)
+                be->loc_used++;
+            be->loc_tab[ins].vol = volume;
+            be->loc_tab[ins].pos = (uint16_t)pos;
+            be->loc_tab[ins].state = 1;
+            be->loc_tab[ins].store = store;
+            memcpy(be->loc_tab[ins].oid, oid, 16);
+            be->loc_n++;
+            atomic_store_explicit(&be->loc_cnt, be->loc_n, memory_order_release);
+            break;
+        }
+        if (e->state == 1 && loc_eq(e, volume, oid, pos)) {
+            e->store = store;
+            break;
+        }
+        if (e->state == 2 && first_tomb == SIZE_MAX)
+            first_tomb = s;
+        s = (s + 1u) & mask;
+    }
+    pthread_mutex_unlock(&be->loc_mu);
+}
+
+void chunk_be_loc_del(chunk_backend *be, uint32_t volume, const uint8_t oid[16], unsigned pos)
+{
+    if (!be || !oid || pos >= CHUNK_POS_MAX)
+        return;
+    if (atomic_load_explicit(&be->loc_cnt, memory_order_acquire) == 0)
+        return;
+    pthread_mutex_lock(&be->loc_mu);
+    if (be->loc_cap > 0 && be->loc_n > 0) {
+        size_t mask = be->loc_cap - 1u;
+        size_t s = (size_t)loc_hash(volume, oid, pos) & mask;
+        for (size_t p = 0; p < be->loc_cap; p++) {
+            chunk_loc_ent *e = &be->loc_tab[s];
+            if (e->state == 0)
+                break;
+            if (e->state == 1 && loc_eq(e, volume, oid, pos)) {
+                e->state = 2;
+                be->loc_n--;
+                atomic_store_explicit(&be->loc_cnt, be->loc_n, memory_order_release);
+                break;
+            }
+            s = (s + 1u) & mask;
+        }
+    }
+    pthread_mutex_unlock(&be->loc_mu);
+}
+
+/* Unlinks a duplicate or damaged chunk file during start-time dedupe without touching EPOCH (safe even on an unsure
+ * volume). Fail-stops the store if directory fsync fails. */
+static int store_unlink_dedupe(chunk_store *st, uint32_t vol, const uint8_t oid[16], unsigned pos)
+{
+    char name[80];
+    chunk_name(name, sizeof name, oid, pos);
+    pthread_mutex_lock(&st->mu);
+    vol_state *v;
+    int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, vol, false, &v);
+    int vfd = -1;
+    if (rc == 0) {
+        if (unlinkat(v->dirfd, name, 0) != 0)
+            rc = errno == ENOENT ? 0 : TSDB_ERR_IO;
+        else
+            vfd = v->dirfd;
+    }
+    pthread_mutex_unlock(&st->mu);
+    if (rc == 0 && vfd >= 0 && tsdb_fsync(vfd) != 0) {
+        store_fail(st, "directory fsync after start-time dedupe unlink", errno);
+        rc = TSDB_ERR_IO;
+    }
+    return rc;
+}
+
+typedef struct dedupe_ent {
+    uint8_t oid[16];
+    uint16_t pos;
+    int store;
+} dedupe_ent;
+
+typedef struct dedupe_vec {
+    dedupe_ent *v;
+    size_t n, cap;
+    int store;
+    int err;
+} dedupe_vec;
+
+static int dedupe_add(void *vctx, const chunk_listed *c)
+{
+    dedupe_vec *dv = vctx;
+    if (dv->n == dv->cap) {
+        size_t nc = dv->cap ? 2 * dv->cap : 128;
+        dedupe_ent *nv = realloc(dv->v, nc * sizeof *nv);
+        if (!nv) {
+            dv->err = TSDB_ERR_NOMEM;
+            return 1;
+        }
+        dv->v = nv;
+        dv->cap = nc;
+    }
+    memcpy(dv->v[dv->n].oid, c->oid, 16);
+    dv->v[dv->n].pos = c->pos;
+    dv->v[dv->n].store = dv->store;
+    dv->n++;
+    return 0;
+}
+
+static int dedupe_cmp(const void *a, const void *b)
+{
+    const dedupe_ent *x = a, *y = b;
+    int c = memcmp(x->oid, y->oid, 16);
+    if (c != 0)
+        return c;
+    if (x->pos != y->pos)
+        return (x->pos > y->pos) - (x->pos < y->pos);
+    return (x->store > y->store) - (x->store < y->store);
+}
+
+static bool dedupe_store_better(const chunk_backend *be, int cand, int best, const uint8_t oid[16], unsigned pos)
+{
+    int pc = be->store_pref ? be->store_pref[cand] : 0;
+    int pb = be->store_pref ? be->store_pref[best] : 0;
+#ifdef TSDB_TEST_HOOKS
+    bool invert = chunkmove_mutant == CHUNKMOVE_MUT_KEEPWRONG;
+#else
+    bool invert = false;
+#endif
+    if (pc != pb)
+        return invert ? (pc < pb) : (pc > pb);
+    int placed = chunk_be_place(be, oid, pos);
+    bool c_pl = (cand == placed);
+    bool b_pl = (best == placed);
+    if (c_pl != b_pl)
+        return invert ? !c_pl : c_pl;
+    return invert ? (cand < best) : (cand > best);
+}
+
+enum { DEDUPE_ABSENT = 0, DEDUPE_WHOLE = 1, DEDUPE_DAMAGED = 2, DEDUPE_IOERR = 3 };
+
+/* R13 r13-lmove (E50, §15.3): scan open stores at backend open (only when store_pref is supplied, so single-server
+ * tiers on NFS pay zero startup scan), and whenever the same (volume, oid, pos) exists in two or more stores verify
+ * every copy against its encode-time cell sums, keep the whole copy on the preferred store (capacity over fast / drain
+ * target over draining), drop damaged copies and non-preferred duplicates (unlink + dir fsync). Single-copy chunks are
+ * NOT inserted into loc_tab (keeping normal backends at 0 bytes / 0 lock contention); only off-primary winners are. */
+static void be_open_dedupe(chunk_backend *be)
+{
+    if (!be || be->read_only || !be->has_store_pref)
+        return;
+    int bn = atomic_load_explicit(&be->n, memory_order_relaxed);
+    int up = 0;
+    for (int i = 0; i < bn; i++)
+        if (atomic_load(&be->st[i]))
+            up++;
+    if (up < 2 || be->nf == 0)
+        return;
+
+    for (size_t vi = 0; vi < be->nf; vi++) {
+        uint32_t vol = be->f[vi].vol;
+        dedupe_vec dv = {0};
+        bool list_err = false;
+        for (int i = 0; i < bn; i++) {
+            chunk_store *st = atomic_load(&be->st[i]);
+            if (!st)
+                continue;
+            dv.store = i;
+            int rc = store_list(st, vol, false, true, dedupe_add, &dv);
+            if (rc != 0 || dv.err != 0) {
+                list_err = true;
+                break;
+            }
+        }
+        if (list_err || dv.n == 0) {
+            free(dv.v);
+            continue;
+        }
+        if (dv.n > 1)
+            qsort(dv.v, dv.n, sizeof *dv.v, dedupe_cmp);
+
+        for (size_t a = 0; a < dv.n;) {
+            size_t b = a + 1;
+            while (b < dv.n && dv.v[b].pos == dv.v[a].pos && memcmp(dv.v[b].oid, dv.v[a].oid, 16) == 0)
+                b++;
+            if (b - a == 1) {
+                a = b;
+                continue;
+            }
+
+            /* Duplicate chunk across >= 2 stores: verify every copy's header, footer, sums table, and all cells. */
+            size_t m = b - a;
+            int *cls = calloc(m, sizeof *cls);
+            uint8_t (*vuuids)[16] = calloc(m, sizeof *vuuids);
+            if (!cls || !vuuids) {
+                free(cls);
+                free(vuuids);
+                a = b;
+                continue;
+            }
+            int winner = -1;
+            for (size_t k = 0; k < m; k++) {
+                int sidx = dv.v[a + k].store;
+                chunk_store *st = atomic_load(&be->st[sidx]);
+                if (!st) {
+                    cls[k] = DEDUPE_ABSENT;
+                    continue;
+                }
+                chunk_rd *rd = NULL;
+                int orc = chunk_rd_open_any(st, vol, dv.v[a].oid, dv.v[a].pos, &rd);
+                if (orc == 0) {
+                    uint64_t nbad = 0;
+                    int src = chunk_rd_scrub(rd, &nbad);
+                    memcpy(vuuids[k], chunk_rd_hdr(rd)->vuuid, 16);
+                    chunk_rd_close(rd);
+                    if (src == 0 && nbad == 0)
+                        cls[k] = DEDUPE_WHOLE;
+                    else if (src == 0)
+                        cls[k] = DEDUPE_DAMAGED;
+                    else
+                        cls[k] = DEDUPE_IOERR;
+                } else if (orc == TSDB_ERR_CORRUPT) {
+                    cls[k] = DEDUPE_DAMAGED;
+                } else if (orc == TSDB_ERR_NOTFOUND) {
+                    cls[k] = DEDUPE_ABSENT;
+                } else {
+                    cls[k] = DEDUPE_IOERR;
+                }
+                if (cls[k] == DEDUPE_WHOLE) {
+                    if (winner < 0 || dedupe_store_better(be, sidx, dv.v[a + (size_t)winner].store, dv.v[a].oid,
+                                                          dv.v[a].pos))
+                        winner = (int)k;
+                }
+            }
+
+            char hex[33];
+            chunk_oid_hex(dv.v[a].oid, hex);
+            if (winner >= 0) {
+                int wstore = dv.v[a + (size_t)winner].store;
+                for (size_t k = 0; k < m; k++) {
+                    if ((int)k == winner)
+                        continue;
+                    if (cls[k] != DEDUPE_DAMAGED &&
+                        !(cls[k] == DEDUPE_WHOLE && memcmp(vuuids[k], vuuids[winner], 16) == 0))
+                        continue; /* never drop an unreadable (IOERR) or foreign-vuuid copy */
+                    int kstore = dv.v[a + k].store;
+                    chunk_store *st = atomic_load(&be->st[kstore]);
+                    if (!st)
+                        continue;
+                    if (store_unlink_dedupe(st, vol, dv.v[a].oid, dv.v[a].pos) == 0) {
+                        fprintf(stderr, "tsdb: chunk dedupe: vol %" PRIu32 " oid %s pos %u: kept store %d, unlinked %s "
+                                        "copy on store %d\n",
+                                vol, hex, (unsigned)dv.v[a].pos, wstore,
+                                cls[k] == DEDUPE_DAMAGED ? "damaged" : "duplicate", kstore);
+                    }
+                }
+                if (wstore != chunk_be_place(be, dv.v[a].oid, dv.v[a].pos))
+                    chunk_be_loc_set(be, vol, dv.v[a].oid, dv.v[a].pos, wstore);
+            } else {
+                fprintf(stderr, "tsdb: chunk dedupe: vol %" PRIu32 " oid %s pos %u: %zu copies found, none whole "
+                                "(leaving intact)\n",
+                        vol, hex, (unsigned)dv.v[a].pos, m);
+            }
+            free(cls);
+            free(vuuids);
+            a = b;
+        }
+        free(dv.v);
+    }
+}
+
 /* The state a failed open puts a store in, or -1 when the open itself must fail. */
 static int down_state(int rc)
 {
@@ -1996,12 +2459,26 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
     be->state = calloc((size_t)cap, sizeof *be->state);
     be->st_failed = calloc((size_t)cap, sizeof *be->st_failed);
     be->st_lost = calloc((size_t)cap, sizeof *be->st_lost);
+    be->st_draining = calloc((size_t)cap, sizeof *be->st_draining);
+    be->store_pref = calloc((size_t)cap, sizeof *be->store_pref);
     be->pending_close = calloc((size_t)cap, sizeof *be->pending_close);
     be->path = calloc((size_t)cap, sizeof *be->path);
+    for (size_t i = 0; i < CHUNK_OID_STRIPES; i++)
+        pthread_mutex_init(&be->oid_mu[i], NULL);
     pthread_mutex_init(&be->mu, NULL);
     pthread_mutex_init(&be->st_mu, NULL);
+    pthread_mutex_init(&be->loc_mu, NULL);
+    atomic_init(&be->loc_cnt, 0);
     pthread_cond_init(&be->ioerr_cv, NULL);
-    int rc = be->st && be->state && be->st_failed && be->st_lost && be->pending_close && be->path ? 0 : TSDB_ERR_NOMEM;
+    int rc = be->st && be->state && be->st_failed && be->st_lost && be->st_draining && be->store_pref &&
+                     be->pending_close && be->path
+                 ? 0
+                 : TSDB_ERR_NOMEM;
+    if (rc == 0 && o && o->store_pref) {
+        be->has_store_pref = true;
+        for (int i = 0; i < n; i++)
+            be->store_pref[i] = o->store_pref[i];
+    }
     bool ro = o && o->read_only;
     bool strict = !o || o->strict;
     be->read_only = ro;
@@ -2102,6 +2579,7 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
         chunk_be_close(be);
         return rc;
     }
+    be_open_dedupe(be);
     *out = be;
     return 0;
 }
@@ -2127,15 +2605,21 @@ void chunk_be_close(chunk_backend *be)
     for (int i = 0; i < be->nretired; i++)
         chunk_store_unref(be->retired[i]);
     pthread_cond_destroy(&be->ioerr_cv);
+    pthread_mutex_destroy(&be->loc_mu);
     pthread_mutex_destroy(&be->st_mu);
     pthread_mutex_destroy(&be->mu);
+    for (size_t i = 0; i < CHUNK_OID_STRIPES; i++)
+        pthread_mutex_destroy(&be->oid_mu[i]);
     free(be->st);
     free(be->state);
     free(be->st_failed);
     free(be->st_lost);
+    free(be->st_draining);
+    free(be->store_pref);
     free(be->pending_close);
     free(be->path);
     free(be->retired);
+    free(be->loc_tab);
     free(be->f);
     free(be);
 }
@@ -2416,10 +2900,26 @@ int chunk_be_wr_open_replace(chunk_backend *be, const chunk_ident *id, const chu
     if (rc)
         return rc;
     int bn = chunk_be_nstores(be);
+    int hint = chunk_be_loc_get(be, id->volume, id->oid, id->pos);
     int primary = bn > 0 ? chunk_be_place(be, id->oid, id->pos) : -1;
     chunk_store *st = NULL;
     bool saw_down = false, saw_ioerr = false;
-    if (primary >= 0 && primary < bn) {
+    if (hint >= 0 && hint < bn) {
+        chunk_store *cand = chunk_be_store_ref(be, hint);
+        if (!cand) {
+            saw_down = true;
+        } else {
+            int h = store_has_chunk_file(cand, id);
+            if (h == 1)
+                st = cand;
+            else {
+                if (h < 0)
+                    saw_ioerr = true;
+                chunk_store_unref(cand);
+            }
+        }
+    }
+    if (!st && primary >= 0 && primary < bn && primary != hint) {
         chunk_store *cand = chunk_be_store_ref(be, primary);
         if (!cand) {
             saw_down = true;
@@ -2435,7 +2935,7 @@ int chunk_be_wr_open_replace(chunk_backend *be, const chunk_ident *id, const chu
         }
     }
     for (int i = 0; !st && i < bn; i++) {
-        if (i == primary)
+        if (i == primary || i == hint)
             continue;
         chunk_store *cand = chunk_be_store_ref(be, i);
         if (!cand) {
@@ -2488,8 +2988,30 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
     bool saw_down = false;
     bool saw_nomem = false;
     int bn = chunk_be_nstores(be);
+    int hint = chunk_be_loc_get(be, id->volume, id->oid, id->pos);
     int primary = bn > 0 ? (int)((xxh64(id->oid, 16, 0) + id->pos) % (uint64_t)bn) : -1;
-    if (primary >= 0 && primary < bn) {
+    if (hint >= 0 && hint < bn) {
+        chunk_store *st = chunk_be_store_ref(be, hint);
+        if (!st) {
+            saw_down = true;
+        } else {
+            bool real_io = false;
+            int rc = chunk_rd_open_ex(st, id, out, &real_io);
+            chunk_store_unref(st);
+            if (rc == 0) {
+                if (store_out)
+                    *store_out = hint;
+                return 0;
+            }
+            if (rc == TSDB_ERR_IO && real_io)
+                chunk_be_note_ioerr(be, hint);
+            if (rc == TSDB_ERR_NOMEM)
+                saw_nomem = true;
+            else if (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && worst != TSDB_ERR_IO))
+                worst = rc;
+        }
+    }
+    if (primary >= 0 && primary < bn && primary != hint) {
         chunk_store *st = chunk_be_store_ref(be, primary);
         if (!st) {
             saw_down = true;
@@ -2498,6 +3020,8 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
             int rc = chunk_rd_open_ex(st, id, out, &real_io);
             chunk_store_unref(st);
             if (rc == 0) {
+                if (hint >= 0)
+                    chunk_be_loc_del(be, id->volume, id->oid, id->pos);
                 if (store_out)
                     *store_out = primary;
                 return 0;
@@ -2511,7 +3035,7 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
         }
     }
     for (int i = 0; i < bn; i++) {
-        if (i == primary)
+        if (i == primary || i == hint)
             continue;
         chunk_store *st = chunk_be_store_ref(be, i);
         if (!st) {
@@ -2522,6 +3046,7 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
         int rc = chunk_rd_open_ex(st, id, out, &real_io);
         chunk_store_unref(st);
         if (rc == 0) {
+            chunk_be_loc_set(be, id->volume, id->oid, id->pos, i);
             if (store_out)
                 *store_out = i;
             return 0;
@@ -2551,9 +3076,14 @@ int chunk_be_del(chunk_backend *be, const chunk_ident *id, uint64_t epoch)
 {
     if (be->read_only)
         return TSDB_ERR_READONLY;
+    /* R13 r13-lmove: serialize against concurrent chunk_move and r12-repair replace-puts on the same (volume, oid)
+     * so a delete racing a move never leaves a resurrected copy on the target store. */
+    chunk_be_oid_lock(be, id->volume, id->oid);
     int rc = chunk_be_prepare(be, id->volume, epoch);
-    if (rc)
+    if (rc) {
+        chunk_be_oid_unlock(be, id->volume, id->oid);
         return rc;
+    }
     bool found = false;
     int bn = chunk_be_nstores(be);
     for (int i = 0; i < bn; i++) {
@@ -2564,9 +3094,13 @@ int chunk_be_del(chunk_backend *be, const chunk_ident *id, uint64_t epoch)
         chunk_store_unref(st);
         if (rc == 0)
             found = true;
-        else if (rc != TSDB_ERR_NOTFOUND)
+        else if (rc != TSDB_ERR_NOTFOUND) {
+            chunk_be_oid_unlock(be, id->volume, id->oid);
             return rc;
+        }
     }
+    chunk_be_loc_del(be, id->volume, id->oid, id->pos);
+    chunk_be_oid_unlock(be, id->volume, id->oid);
     return found ? 0 : TSDB_ERR_NOTFOUND;
 }
 

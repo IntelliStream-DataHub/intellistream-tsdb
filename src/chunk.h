@@ -252,6 +252,8 @@ typedef struct chunk_be_opts {
     int min_up;
     bool read_only; /* R15 D13: open every store with CHUNK_OPEN_RDONLY (no flock, no EPOCH, no tmp cleanup, no write/del) */
     bool strict;    /* require every named (non-NULL) store path to open UP, as chunk_be_open does */
+    const int *store_pref; /* R13 r13-lmove (E50, §15.3): optional per-store preference rank [0..n); higher rank wins on
+                            * start-time dedupe (capacity > fast, drain target > draining). NULL: all equal. */
 } chunk_be_opts;
 /* The stores at paths[0..n); ids (n x 16 bytes) or NULL as chunk_store_open's expect_id. The fence of a volume is the
  * maximum over the stores that are UP at open: a DOWN store may have seen a higher epoch, so the caller gives the

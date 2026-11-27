@@ -2550,6 +2550,8 @@ static void copy_publish(void)
     }
     s->pub = (struct cluster_copy){.applied = C.sm.applied, .applied_term = C.sm.applied_term,
                                    .restore_gen = C.sm.restore_gen, .self = self, .nmembers = nm, .nvolumes = nv,
+                                   .rebuild_mb_s = C.sm.set.rebuild_mb_s,
+                                   .balance_mb_s = C.sm.set.balance_mb_s,
                                    .rebuild_concurrency = C.sm.set.rebuild_concurrency,
                                    .scrub_days = C.sm.set.scrub_days, .scrub_mb_s = C.sm.set.scrub_mb_s,
                                    .scrub_out_count = C.sm.set.scrub_out_count,

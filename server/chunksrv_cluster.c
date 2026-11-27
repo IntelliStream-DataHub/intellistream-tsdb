@@ -32,6 +32,7 @@
 #include "peerlink.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/chunk_priv.h"
+#include "../src/chunkmove.h"
 #include "../src/chunkscrub.h"
 #include "../src/internal.h"
 
@@ -303,6 +304,41 @@ static void cscrub_collect_metric(void *ctx, struct creport_sink *sink)
             break;
         }
     }
+    chunksrv_cluster_release();
+}
+
+static void cc_collect_peerlink_bytes(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return;
+    struct peerlink *pl = chunksrv_peerlink(cs);
+    if (pl) {
+        struct pl_stats ps;
+        peerlink_stats(pl, &ps);
+        struct creport_label l_out = {"dir", "out"};
+        struct creport_label l_in = {"dir", "in"};
+        struct creport_label l_bulk = {"dir", "bulk"};
+        creport_sink_put_u64(sink, &l_out, 1, ps.bytes_out);
+        creport_sink_put_u64(sink, &l_in, 1, ps.bytes_in);
+        creport_sink_put_u64(sink, &l_bulk, 1, ps.bulk_bytes);
+    }
+    chunksrv_cluster_release();
+}
+
+static void cc_collect_srv_bytes(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return;
+    struct chunksrv_stats st;
+    chunksrv_get_stats(cs, &st);
+    struct creport_label l_put = {"op", "put"};
+    struct creport_label l_read = {"op", "read"};
+    creport_sink_put_u64(sink, &l_put, 1, st.put_bytes);
+    creport_sink_put_u64(sink, &l_read, 1, st.read_bytes);
     chunksrv_cluster_release();
 }
 
@@ -591,11 +627,24 @@ static void *cc_main(void *arg)
     return NULL;
 }
 
-int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char *err, size_t errlen)
+int chunksrv_cluster_start_ex(const char *const *paths, const int *prefs, const bool *draining, int n, uint64_t rate,
+                              char *err, size_t errlen)
 {
     if (G.started)
         return 0;
-    G.cs = chunksrv_open(paths, n, err, errlen);
+#ifdef TSDB_TEST_HOOKS
+    const char *lmu = getenv("TSDB_LMOVE_MUTANT");
+    if (lmu && *lmu) {
+        int m = chunkmove_mutant_parse(lmu);
+        if (m < 0) {
+            snprintf(err, errlen, "TSDB_LMOVE_MUTANT=%s is not a planted bug", lmu);
+            return -1;
+        }
+        chunkmove_mutant = m;
+        fprintf(stderr, "tsdbd: chunk move MUTANT %s (tests only)\n", lmu);
+    }
+#endif
+    G.cs = chunksrv_open_ex(paths, prefs, draining, n, err, errlen);
     if (!G.cs)
         return -1;
     chunksrv_set_store_fault(G.cs, cc_on_store_fault, NULL);
@@ -661,6 +710,12 @@ int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char 
     (void)creport_metric_collector("tsdb_chunk_scrub_age_seconds", CREPORT_GAUGE,
                                    "Seconds since the start of the last completed whole chunk scrub pass (or first pass).",
                                    cscrub_collect_metric, (void *)(intptr_t)CSM_AGE);
+    (void)creport_metric_collector("tsdb_chunk_peerlink_bytes_total", CREPORT_COUNTER,
+                                   "Bytes sent/received/bulk on this server's chunk peerlink.",
+                                   cc_collect_peerlink_bytes, NULL);
+    (void)creport_metric_collector("tsdb_chunk_srv_bytes_total", CREPORT_COUNTER,
+                                   "Chunk bytes served over network puts and reads by this server.",
+                                   cc_collect_srv_bytes, NULL);
     atomic_store(&G.stop, 0);
     if (pthread_create(&G.thr, NULL, cc_main, NULL) != 0) {
         snprintf(err, errlen, "cannot start the chunk server's thread");
@@ -669,12 +724,19 @@ int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char 
         creport_metric_collector_del("tsdb_chunk_scrub_chunks_total");
         creport_metric_collector_del("tsdb_chunk_scrub_damaged_total");
         creport_metric_collector_del("tsdb_chunk_scrub_age_seconds");
+        creport_metric_collector_del("tsdb_chunk_peerlink_bytes_total");
+        creport_metric_collector_del("tsdb_chunk_srv_bytes_total");
         chunksrv_close(G.cs);
         G.cs = NULL;
         return -1;
     }
     G.started = 1;
     return 0;
+}
+
+int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char *err, size_t errlen)
+{
+    return chunksrv_cluster_start_ex(paths, NULL, NULL, n, rate, err, errlen);
 }
 
 void chunksrv_cluster_stop(void)
@@ -691,6 +753,8 @@ void chunksrv_cluster_stop(void)
     creport_metric_collector_del("tsdb_chunk_scrub_chunks_total");
     creport_metric_collector_del("tsdb_chunk_scrub_damaged_total");
     creport_metric_collector_del("tsdb_chunk_scrub_age_seconds");
+    creport_metric_collector_del("tsdb_chunk_peerlink_bytes_total");
+    creport_metric_collector_del("tsdb_chunk_srv_bytes_total");
     if (atomic_load(&G.pub)) {
         /* the cluster thread is stopped (tsdbd stops it first): nothing hands a socket over any more */
         cluster_set_peerlink_kind(PL_KIND_CHUNK, NULL);

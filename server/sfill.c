@@ -15,6 +15,7 @@
  * Lock order: sf->mu is a leaf lock (never held across network I/O, disk I/O, pacing waits, or user callbacks).
  */
 #include "sfill.h"
+#include "../src/chunk_priv.h"
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -328,7 +329,16 @@ static int open_local_writer(chunk_backend *be, const chunk_ident *id, const str
     int rc = chunk_be_prepare(be, id->volume, fe);
     if (rc != 0)
         return rc;
-    int idx = chunk_be_place(be, id->oid, id->pos);
+    int n = chunk_be_nstores(be);
+    int base = chunk_be_place(be, id->oid, id->pos);
+    int idx = base;
+    for (int k = 0; k < n; k++) {
+        int cand = (base + k) % n;
+        if (chunk_be_store_state(be, cand) == CHUNK_STORE_UP && !chunk_be_store_draining(be, cand)) {
+            idx = cand;
+            break;
+        }
+    }
     chunk_store *st = chunk_be_open_store(be, idx);
     if (!st)
         return TSDB_ERR_UNAVAILABLE;

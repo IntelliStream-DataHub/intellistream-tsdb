@@ -7,6 +7,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sys/types.h>
 
 uint64_t chunk_le64(const uint8_t *p);
 void chunk_put_le64(uint8_t *p, uint64_t v);
@@ -47,6 +48,18 @@ int chunk_store_test_flip(chunk_store *st, const chunk_ident *id); /* test hook:
 typedef struct chunk_rpool chunk_rpool;
 void chunk_rpool_destroy(chunk_rpool *p);
 
+/* Local (volume, oid, pos) -> store index entry in chunk_backend (R13 r13-lmove, §15.3). */
+typedef struct chunk_loc_ent {
+    uint32_t vol;
+    uint16_t pos;
+    uint8_t state; /* 0 = empty, 1 = occupied, 2 = tombstone */
+    uint8_t pad;
+    int store;
+    uint8_t oid[16];
+} chunk_loc_ent;
+
+#define CHUNK_OID_STRIPES 64u
+
 /* A backend's stores (chunkstore.c) as the heal code (chunkheal.c) needs them. */
 struct chunk_backend {
     atomic_int n;
@@ -56,15 +69,24 @@ struct chunk_backend {
     atomic_int *state;           /* CHUNK_STORE_* (an open store that failed in service reads as DOWN_IOERR) */
     atomic_bool *st_failed;      /* mirrors chunk_store_failed(st[i]) for lock-free chunk_be_store_state() */
     atomic_bool *st_lost;        /* R15 E15: true iff slot i was declared permanently LOST in TIERS */
+    atomic_bool *st_draining;    /* R13 r13-lmove: true while store i is draining (no new puts; reads/dels continue) */
+    int *store_pref;             /* R13 r13-lmove: per-store dedupe preference rank (higher wins) */
+    bool has_store_pref;         /* R13 r13-lmove: true when caller passed store_pref (enables open-time dedupe) */
     chunk_store **pending_close; /* stores detached by chunk_be_set_down: unreffed on attach worker or close, never on
                                   * health/monitor/reader threads where close() on a hung NFS mount could block */
     char **path;                 /* what each index was opened or attached at (for messages; guarded by st_mu) */
     chunk_store **retired;       /* stores replaced after they failed in service: kept until close, never freed
                                   * under a thread that may still hold a writer on one */
     int nretired;
+    pthread_mutex_t oid_mu[CHUNK_OID_STRIPES]; /* R13 r13-lmove: outermost per-(volume, oid) lock serializing
+                                                * chunk_move, chunk_be_del (MK_GC), and replace-put commits */
     pthread_mutex_t mu;          /* the in-memory fence, and serializes install() */
-    pthread_mutex_t st_mu;       /* pure leaf lock (never held across I/O; lock order: mu > st_mu): guards st[],
+    pthread_mutex_t st_mu;       /* pure leaf lock (never held across I/O; lock order: oid_mu > mu > st_mu): guards st[],
                                   * state[] transitions, path[], refcount acquisition, and on_ioerr */
+    pthread_mutex_t loc_mu;      /* pure leaf lock: guards local chunk location hash table (moved / off-primary only) */
+    chunk_loc_ent *loc_tab;
+    size_t loc_cap, loc_n, loc_used;
+    atomic_size_t loc_cnt;       /* mirrors loc_n for lock-free empty fast path in chunk_be_loc_get */
     struct fence {
         uint32_t vol;
         uint64_t epoch;
@@ -161,5 +183,21 @@ const uint64_t *chunk_obj_pos_sums(const chunk_obj *o, unsigned pos);
 int chunk_obj_pos_status(const chunk_obj *o, unsigned pos);
 uint64_t chunk_obj_epoch(const chunk_obj *o);
 int chunk_obj_place_n(const chunk_obj *o);
+
+/* R13 r13-lmove: per-(volume, oid) serialization, local location index, draining flags, and chunk_move helpers. */
+void chunk_be_oid_lock(chunk_backend *be, uint32_t volume, const uint8_t oid[16]);
+void chunk_be_oid_unlock(chunk_backend *be, uint32_t volume, const uint8_t oid[16]);
+int chunk_be_loc_get(const chunk_backend *be, uint32_t volume, const uint8_t oid[16], unsigned pos);
+void chunk_be_loc_set(chunk_backend *be, uint32_t volume, const uint8_t oid[16], unsigned pos, int store);
+void chunk_be_loc_del(chunk_backend *be, uint32_t volume, const uint8_t oid[16], unsigned pos);
+void chunk_be_set_draining(chunk_backend *be, int i, bool draining);
+bool chunk_be_store_draining(const chunk_backend *be, int i);
+int chunk_rd_stat(const chunk_rd *r, dev_t *dev_out, ino_t *ino_out);
+int chunk_store_stat_chunk(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos, dev_t *dev_out,
+                           ino_t *ino_out);
+/* Writes sums + footer and fsyncs the tmp file without renaming yet (for chunk_move Phase 1 before oid_mu). */
+int chunk_wr_sync(chunk_wr *w);
+/* Defers local-index publication in chunk_wr_commit so chunk_move updates it only after verifying the target. */
+void chunk_wr_set_defer_loc(chunk_wr *w);
 
 #endif
