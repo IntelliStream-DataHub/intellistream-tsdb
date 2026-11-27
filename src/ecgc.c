@@ -501,10 +501,17 @@ static bool delete_object(tier *t, const gc_item *it)
     return ok;
 }
 
+static bool gc_can_delete(tier *t, coldvol *cv)
+{
+    if (cv->ops->writable(cv->ctx))
+        return true;
+    return cv->ops == &coldops_dir && tier_gc_deletable(t);
+}
+
 static bool delete_object_cv(tier *t, coldvol *cv, const gc_item *it)
 {
     uint64_t epoch = coldvol_epoch(cv);
-    if (epoch == 0 || !cv->ops->writable(cv->ctx))
+    if (epoch == 0 || !gc_can_delete(t, cv))
         return false;
     for (int f = atomic_load(&ecgc_test_del_fail); f > 0; f = atomic_load(&ecgc_test_del_fail))
         if (atomic_compare_exchange_weak(&ecgc_test_del_fail, &f, f - 1))
@@ -517,7 +524,7 @@ static bool delete_object_cv(tier *t, coldvol *cv, const gc_item *it)
         if (ecgc_test_after_del)
             ecgc_test_after_del(t, pos);
     }
-    return ecgc_mutant == GC_MUT_NOAFTER || cv->ops->writable(cv->ctx);
+    return ecgc_mutant == GC_MUT_NOAFTER || gc_can_delete(t, cv);
 }
 
 static int sweep_list(tier *t, uint32_t volume, const uint8_t vuuid[16], uint8_t (*named)[16], size_t nnamed);

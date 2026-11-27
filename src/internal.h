@@ -2813,6 +2813,7 @@ typedef struct lt_sec {
     bool noteoom;       /* a note did not fit: the write section folds every list */
     void **dfree; /* the fold lists, freed by lt_end after the lock is released: at 10^6 series one is 40 MB, and its */
     size_t ndfree; /* munmap (2 ms) stalled every lookup */
+    bool no_lgen;  /* tests (salvagelatest mutant): skip lgen++ in lt_end */
 } lt_sec;
 void lt_begin(eng *db, lt_sec *sec);
 /* lt_begin for a flush's parts: a long fold list is stored in a window without the lock (3.2) */
@@ -2822,6 +2823,7 @@ void lt_end(eng *db, lt_sec *sec);
 /* in a write section of lt_begin: */
 void lt_retention_lowered(eng *db, lt_sec *sec, uint32_t series, int64_t oldc);
 void lt_merge_marks(eng *db, lt_sec *sec, part **src, size_t k);
+void lt_salvage_marks(eng *db, lt_sec *sec, part **src, size_t k);
 void lt_drop_floor(eng *db, int64_t ts);
 /* the part writer's side: add the rows of one granule of `series` (strictly increasing ts, slots of type) */
 int lf_granule(struct lfold **lf, size_t *n, size_t *cap, uint32_t series, int type, const int64_t *ts,

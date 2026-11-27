@@ -95,6 +95,8 @@ typedef struct metrics_tier {
     int nstores;
     metrics_tier_store stores[METRICS_TIER_STORES_MAX];
     uint64_t settles_waiting;
+    uint64_t salvaged_parts;
+    uint64_t salvaged_rows;
     uint32_t nvols;
     uint8_t *vol_full; /* malloc'ed by cfg.tier callback (length nvols), freed by metrics.c */
 } metrics_tier;

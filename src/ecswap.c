@@ -1181,6 +1181,328 @@ int ec_swap_unsettle(eng *db, part **in, part **out, size_t n)
     return ec_swap_unsettle_at(db, in, out, n, 0);
 }
 
+/* ------------------------------------------------------------ R15 tier salvage */
+
+static bool salvage_args_valid(part **in, size_t n)
+{
+    if (!in || n == 0 || n > (1u << 16))
+        return false;
+    int64_t key = 0;
+    for (size_t i = 0; i < n; i++) {
+        part *e = in[i];
+        struct ecpart *ep = e ? atomic_load(&e->ec) : NULL;
+        if (!e || !ep || ep->test_mark || !ec_file_name(e->name))
+            return false;
+        if (i == 0)
+            key = e->partition;
+        else if (e->partition != key)
+            return false;
+        for (size_t j = 0; j < i; j++)
+            if (in[j] == e || strcmp(in[j]->name, e->name) == 0)
+                return false;
+    }
+    return true;
+}
+
+static int intent_write_salvage(eng *db, const char *intent, part **in, size_t n)
+{
+    size_t cap = 64, len = 0;
+    for (size_t i = 0; i < n; i++)
+        cap += 20 + 2 * strlen(in[i]->name);
+    char *buf = malloc(cap);
+    if (!buf)
+        return TSDB_ERR_NOMEM;
+    sn_add(&len, cap, snprintf(buf + len, cap - len, INTENT_V5_HEAD "%zu\n", n));
+    for (size_t i = 0; i < n; i++)
+        sn_add(&len, cap, snprintf(buf + len, cap - len, "X %s retired_%s\n", in[i]->name, in[i]->name));
+    sn_add(&len, cap, snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0)));
+    int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int rc = fd < 0 || write_full(fd, buf, len) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+    if (fd >= 0 && close(fd) != 0 && rc == 0)
+        rc = TSDB_ERR_IO;
+    free(buf);
+    if (rc) {
+        if (fd >= 0) {
+            unlinkat(db->dirfd, intent, 0);
+            if (!eng_check(db))
+                (void)eng_sync_dir(db, "fsync of the directory after unlinking a failed salvage intent");
+        }
+    }
+    return rc;
+}
+
+static bool salvage_shadows_lower_locked(const eng *db, part **in, size_t n)
+{
+    int64_t key = in[0]->partition;
+    for (size_t qi = 0; qi < db->nparts; qi++) {
+        const part *q = db->parts[qi];
+        if (q->partition != key || q->dropped)
+            continue;
+        bool in_set = false;
+        for (size_t i = 0; i < n; i++) {
+            if (in[i] == q) {
+                in_set = true;
+                break;
+            }
+        }
+        if (in_set)
+            continue;
+        for (size_t i = 0; i < n; i++) {
+            const part *p = in[i];
+            if (q->min_block >= p->max_block)
+                continue; /* q is higher-block (newer) than p: retiring p cannot resurrect q */
+            /* 1. Check whether any tombstone in p shadows rows in lower-block q. */
+            for (uint32_t ti = 0; ti < p->nt; ti++) {
+                uint32_t qa, qb;
+                gix_run(&q->ix, p->t[ti].series, &qa, &qb);
+                if (qa >= qb)
+                    continue;
+                if (qb > q->ng)
+                    qb = q->ng;
+                for (uint32_t g = qa; g < qb; g++) {
+                    int64_t qlo, qhi;
+                    gx_ts(q, g, &qlo, &qhi);
+                    if (qlo < p->t[ti].end && qhi >= p->t[ti].start) {
+                        fprintf(stderr,
+                                "tsdb: %s: tier salvage of %s refused: its tombstone shadows surviving lower-block "
+                                "part %s (retiring it would resurrect deleted rows)\n",
+                                db->dir, p->name, q->name);
+                        return true;
+                    }
+                }
+            }
+            /* 2. Check whether any granule in p overlaps a granule of the same series in lower-block q. */
+            const gix *pix = &p->ix;
+            for (uint32_t r = 0; r < pix->nruns; r++) {
+                uint32_t s = pix->rser[r];
+                uint32_t qa, qb;
+                gix_run(&q->ix, s, &qa, &qb);
+                if (qa >= qb)
+                    continue;
+                if (qb > q->ng)
+                    qb = q->ng;
+                uint32_t pa = gix_rstart(pix, r);
+                uint32_t pb = r + 1 < pix->nruns ? gix_rstart(pix, r + 1) : p->ng;
+                if (pb > p->ng)
+                    pb = p->ng;
+                uint32_t gpi = pa, gqi = qa;
+                while (gpi < pb && gqi < qb) {
+                    int64_t plo, phi, qlo, qhi;
+                    gx_ts(p, gpi, &plo, &phi);
+                    gx_ts(q, gqi, &qlo, &qhi);
+                    if (phi < qlo)
+                        gpi++;
+                    else if (qhi < plo)
+                        gqi++;
+                    else {
+                        fprintf(stderr,
+                                "tsdb: %s: tier salvage of %s refused: its rows overlap surviving lower-block "
+                                "part %s (retiring it would resurrect overwritten values)\n",
+                                db->dir, p->name, q->name);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool swap_renames_salvage(eng *db, part **in, size_t n)
+{
+    char retired[sizeof in[0]->name + 16];
+    for (size_t i = 0; i < n; i++) {
+        if (i > 0)
+            settle_crash(SC_BETWEEN_RENAMES);
+        retired_of(in[i]->name, retired, sizeof retired);
+        if (renameat(db->dirfd, in[i]->name, db->dirfd, retired) != 0) {
+            eng_fail(db, "rename of a salvaged .ec part to retired_", errno);
+            return false;
+        }
+    }
+    return true;
+}
+
+int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
+{
+    sm_init();
+    if (n == 0)
+        return 0;
+    if (db->opt.read_only || db->opt.follow)
+        return TSDB_ERR_READONLY;
+    if (!salvage_args_valid(in, n))
+        return TSDB_ERR_INVALID;
+
+    char intent[64];
+    snprintf(intent, sizeof intent, "txn_%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
+
+    pthread_mutex_lock(&db->publish_lock);
+    if (eng_check(db)) {
+        pthread_mutex_unlock(&db->publish_lock);
+        return TSDB_ERR_IO;
+    }
+    if (ec_swap_hook)
+        ec_swap_hook(db);
+
+    /* Serialize against concurrent drops (tsdb_drop_before and TTL drops) through post-rename dir fsync. */
+    db_pub_begin(db, in, n);
+
+    pthread_mutex_lock(&db->lock);
+    bool pre_ok = eng_check(db) == 0;
+    for (size_t i = 0; i < n && pre_ok; i++) {
+        size_t j = 0;
+        while (j < db->nparts && db->parts[j] != in[i])
+            j++;
+        pre_ok = j < db->nparts && !in[i]->dropped && !in[i]->merging && !in[i]->reencoding;
+    }
+    bool pre_shadow = pre_ok && salvage_shadows_lower_locked(db, in, n);
+    if (!pre_ok || pre_shadow) {
+        int rc = pre_shadow ? TSDB_ERR_INVALID : eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
+        db_pub_end_locked(db);
+        pthread_mutex_unlock(&db->lock);
+        pthread_mutex_unlock(&db->publish_lock);
+        return rc;
+    }
+    pthread_mutex_unlock(&db->lock);
+
+    /* WAL-replay guard: never retire a part whose WAL segment is not durably unlinked (retiring it would drop
+     * the WAL replay barrier and let a crash replay its WAL segment). */
+    uint64_t max_wal_seq = 0;
+    for (size_t i = 0; i < n; i++)
+        if (in[i]->wal_seq > max_wal_seq)
+            max_wal_seq = in[i]->wal_seq;
+    if (max_wal_seq > atomic_load(&db->wal_removed_synced)) {
+        if (max_wal_seq <= atomic_load(&db->wal_removed)) {
+            if (eng_sync_dir(db, "fsync of the directory to advance wal_removed_synced before salvage") != 0) {
+                db_pub_end(db);
+                pthread_mutex_unlock(&db->publish_lock);
+                return TSDB_ERR_IO;
+            }
+        }
+        if (max_wal_seq > atomic_load(&db->wal_removed_synced)) {
+            fprintf(stderr,
+                    "tsdb: %s: tier salvage deferred: lost part wal_seq %" PRIu64 " > wal_removed_synced %" PRIu64 "\n",
+                    db->dir, max_wal_seq, atomic_load(&db->wal_removed_synced));
+            db_pub_end(db);
+            pthread_mutex_unlock(&db->publish_lock);
+            return TSDB_ERR_LOCKED;
+        }
+    }
+
+    const char *hit = NULL;
+    int rbusy = retired_ec_busy(db, in, n, &hit);
+    if (rbusy != 0) {
+        if (rbusy > 0)
+            fprintf(stderr, "tsdb: %s: salvage of %s refused while retired_%s is still awaiting GC\n", db->dir, hit,
+                    hit);
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        return rbusy < 0 ? TSDB_ERR_IO : TSDB_ERR_LOCKED;
+    }
+
+    int rc = intent_write_salvage(db, intent, in, n);
+    if (rc == 0 && eng_sync_dir(db, "fsync of the directory after writing a salvage's intent") != 0)
+        rc = TSDB_ERR_IO;
+    if (rc != 0) {
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        return rc;
+    }
+    settle_crash(SC_AFTER_INTENT);
+
+    lt_sec lsec;
+    lt_begin(db, &lsec);
+#ifdef TSDB_TEST_HOOKS
+    if (no_lgen_mut)
+        lsec.no_lgen = true;
+#else
+    (void)no_lgen_mut;
+#endif
+    pthread_mutex_lock(&db->lock);
+    bool ok = eng_check(db) == 0;
+    for (size_t i = 0; i < n && ok; i++) {
+        size_t j = 0;
+        while (j < db->nparts && db->parts[j] != in[i])
+            j++;
+        ok = j < db->nparts && !in[i]->dropped && !in[i]->merging && !in[i]->reencoding;
+    }
+    bool shadow_err = ok && salvage_shadows_lower_locked(db, in, n);
+    if (shadow_err)
+        ok = false;
+    bool renamed = ok && swap_renames_salvage(db, in, n);
+    if (renamed) {
+        lt_salvage_marks(db, &lsec, in, n);
+        for (size_t i = 0; i < n; i++) {
+            char settled[sizeof in[0]->name + 16];
+            settled_of_ec(in[i]->name, settled, sizeof settled);
+            if (settled[0])
+                eckeep_unsettle_locked(db, settled);
+            in[i]->dropped = true;
+            cls_dropped_note(db, in[i]);
+            ecgc_retire_locked(db, in[i]);
+            if (db->opt.obsolete_part_lifetime_s <= 0) {
+                in[i]->retired = true;
+                atomic_store(&in[i]->obsolete, true);
+            } else {
+                char retired[sizeof in[0]->name + 16];
+                retired_of(in[i]->name, retired, sizeof retired);
+                (void)graveyard_add(db, retired, GY_EC,
+                                    eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000);
+            }
+            db_parts_remove_locked(db, in[i]); /* pushes stats_ev_remove and drops list's reference */
+        }
+        pthread_cond_signal(&db->merge_cv);
+    }
+    pthread_mutex_unlock(&db->lock);
+    lt_end(db, &lsec);
+
+    if (!ok) {
+        rc = shadow_err ? TSDB_ERR_INVALID : eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
+        if (eng_check(db) == 0 && (unlinkat(db->dirfd, intent, 0) == 0 || errno == ENOENT))
+            (void)eng_sync_dir(db, "fsync of the directory after removing a refused salvage's intent");
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        return rc;
+    }
+    if (!renamed) {
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        return TSDB_ERR_IO;
+    }
+    if ((rc = eng_sync_dir(db, "fsync of the directory after retiring salvaged .ec parts")) != 0) {
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        return rc;
+    }
+    settle_crash(SC_BEFORE_UNLINK);
+    if (unlinkat(db->dirfd, intent, 0) != 0)
+        fprintf(stderr, "tsdb: unlink of salvage intent %s after retire: %s (the next open rolls it forward)\n",
+                intent, strerror(errno));
+    /* Remove any corrupt settled_<P>.part left beside a retired .ec part so it does not become an orphan. */
+    bool unlinked_settled = false;
+    for (size_t i = 0; i < n; i++) {
+        char settled[sizeof in[0]->name + 16];
+        settled_of_ec(in[i]->name, settled, sizeof settled);
+        if (settled[0] && unlinkat(db->dirfd, settled, 0) == 0)
+            unlinked_settled = true;
+    }
+    if (unlinked_settled)
+        (void)eng_sync_dir(db, "fsync of the directory after removing a corrupt settled_ copy");
+    db_pub_end(db);
+    pthread_mutex_unlock(&db->publish_lock);
+    eckeep_unsettle_cleanup_jobs(db);
+
+    for (size_t i = 0; i < n; i++) {
+        struct ecpart *ep = atomic_load(&in[i]->ec);
+        if (ep && !ep->test_mark && db->tier)
+            eccache_forget(db->tier, db->tier_vol, ep->rec.oid);
+    }
+    if (db->tier)
+        ecgc_kick_tier(db->tier);
+    (void)ec_swap_publish(db);
+    return 0;
+}
+
 /* ------------------------------------------------------------ recovery */
 
 typedef struct {
@@ -1462,20 +1784,22 @@ int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
     return rc;
 }
 
-/* ------------------------------------------------------------ intent v5: cold apply & reverse unsettle */
+/* ------------------------------------------------------------ intent v5: cold apply, reverse unsettle, salvage */
+
+enum { V5_COLD = 0, V5_UNSETTLE = 1, V5_SALVAGE = 2 };
 
 typedef struct {
-    char kind; /* N (.ec), Y (late part), R (own part retired); or unsettle: L (local .part), U (.ec retired) */
+    char kind; /* N/Y/R (cold apply); L/U (unsettle); X (salvage) */
     char from[128], to[160];
 } v5_line;
 
-/* Parses an unsealed v5 intent: 1; 0 when a line breaks the rules (only the names a cold apply or reverse unsettle
- * writes, one key, never mixed); TSDB_ERR_NOMEM. */
-static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, bool *is_unsettle)
+/* Parses an unsealed v5 intent: 1; 0 when a line breaks the rules (only the names a cold apply, reverse unsettle,
+ * or tier salvage writes, one key, never mixed); TSDB_ERR_NOMEM. */
+static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, int *kind_out)
 {
     *out = NULL;
     *nout = 0;
-    *is_unsettle = false;
+    *kind_out = V5_COLD;
     char *line = buf, *next = strchr(line, '\n'), extra;
     size_t n;
     if (!next)
@@ -1487,7 +1811,7 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, bool *
     if (!s)
         return TSDB_ERR_NOMEM;
     bool rank_mut = ecunsettle_mut() == ECUNSETTLE_MUT_RANK;
-    bool unsettle = false;
+    int v5k = V5_COLD;
     size_t got = 0;
     for (line = next + 1; got < n; line = next + 1) {
         next = strchr(line, '\n');
@@ -1496,12 +1820,16 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, bool *
         v5_line *x = &s[got];
         bool good = sscanf(line, "%c %127s %159s%c", &x->kind, x->from, x->to, &extra) == 3;
         int64_t k = 0;
-        if (good && got == 0 && (x->kind == 'L' || x->kind == 'U')) {
-            unsettle = true;
-            if ((n & 1u) != 0)
-                good = false;
+        if (good && got == 0) {
+            if (x->kind == 'L' || x->kind == 'U') {
+                v5k = V5_UNSETTLE;
+                if ((n & 1u) != 0)
+                    good = false;
+            } else if (x->kind == 'X') {
+                v5k = V5_SALVAGE;
+            }
         }
-        if (good && unsettle) {
+        if (good && v5k == V5_UNSETTLE) {
             size_t half = n / 2;
             if (got < half) {
                 bool is_tmp = part_tmp_name(x->from);
@@ -1527,6 +1855,13 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, bool *
                     if (strcmp(s[j].from, x->from) == 0)
                         good = false;
             }
+        } else if (good && v5k == V5_SALVAGE) {
+            char want[sizeof x->to];
+            retired_of(x->from, want, sizeof want);
+            good = x->kind == 'X' && ec_file_name(x->from) && strcmp(want, x->to) == 0 && name_key(x->from, &k);
+            for (size_t j = 0; good && j < got; j++)
+                if (strcmp(s[j].from, x->from) == 0)
+                    good = false;
         } else if (good && x->kind == 'N')
             good = ec_tmp_name(x->from) && ec_file_name(x->to) && name_key(x->to, &k);
         else if (good && x->kind == 'Y')
@@ -1543,7 +1878,7 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, bool *
                 good = false;
             }
         } else
-            good = false; /* X (R15 salvage) is not written here */
+            good = false;
         if (good && got == 0)
             *key = k;
         if (!good || k != *key) {
@@ -1560,8 +1895,63 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, bool *
     }
     *out = s;
     *nout = n;
-    *is_unsettle = unsettle;
+    *kind_out = v5k;
     return 1;
+}
+
+/* Recovery of a v5 salvage intent (X lines) at open. A sealed intent always rolls forward: every listed pX.ec still
+ * on disk is renamed to retired_pX.ec; parts already renamed (or already GC'd) are left alone and never resurrected.
+ * Both pX.ec and retired_pX.ec present simultaneously is damage (TSDB_ERR_CORRUPT). Directory is synced before
+ * returning so the intent is unlinked only after all renames are durable. */
+static int salvage_recover(eng *db, const char *name, const v5_line *s, size_t n)
+{
+    unsigned char (*on)[2] = calloc(n, sizeof *on); /* 0: from (pX.ec), 1: to (retired_pX.ec) */
+    if (!on)
+        return TSDB_ERR_NOMEM;
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        int r0 = name_at(db, name, s[i].from);
+        int r1 = r0 < 0 ? r0 : name_at(db, name, s[i].to);
+        if (r0 < 0 || r1 < 0) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        if (r0 == 1 && r1 == 1) {
+            fprintf(stderr, "tsdb: salvage intent %s: both %s and %s exist on disk: damage, the open fails\n", name,
+                    s[i].from, s[i].to);
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        on[i][0] = (unsigned char)r0;
+        on[i][1] = (unsigned char)r1;
+    }
+    size_t renamed_now = 0, already = 0, gone = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        if (on[i][0]) {
+            if (renameat(db->dirfd, s[i].from, db->dirfd, s[i].to) != 0) {
+                fprintf(stderr, "tsdb: rolling salvage intent %s forward: rename of %s: %s\n", name, s[i].from,
+                        strerror(errno));
+                rc = TSDB_ERR_IO;
+            } else {
+                renamed_now++;
+            }
+        } else if (on[i][1]) {
+            already++;
+        } else {
+            gone++;
+        }
+    }
+    free(on);
+    if (rc == 0) {
+        fprintf(stderr,
+                "tsdb: salvage intent %s rolled forward: %zu retired now, %zu already retired, %zu deleted\n", name,
+                renamed_now, already, gone);
+        if (db->opt.fsync && tsdb_fsync(db->dirfd) != 0) {
+            fprintf(stderr, "tsdb: salvage intent %s: fsync of the directory: %s\n", name, strerror(errno));
+            rc = TSDB_ERR_IO;
+        }
+    }
+    return rc;
 }
 
 /* Recovery of a v5 reverse (unsettle) intent at open (before load_parts removes temporaries).
@@ -1697,16 +2087,21 @@ int ecapply_recover(eng *db, const char *name, char *buf, size_t len)
     v5_line *s = NULL;
     size_t n = 0;
     int64_t key = 0;
-    bool is_unsettle = false;
-    int rc = v5_parse(buf, &s, &n, &key, &is_unsettle);
+    int v5k = V5_COLD;
+    int rc = v5_parse(buf, &s, &n, &key, &v5k);
     if (rc <= 0) {
         if (rc == 0)
             fprintf(stderr, "tsdb: intent %s: its checksum holds but a line breaks the rules of a v5 intent's "
                             "names: damage, the open fails\n", name);
         return rc < 0 ? rc : TSDB_ERR_CORRUPT;
     }
-    if (is_unsettle) {
+    if (v5k == V5_UNSETTLE) {
         rc = unsettle_recover(db, name, s, n);
+        free(s);
+        return rc;
+    }
+    if (v5k == V5_SALVAGE) {
+        rc = salvage_recover(db, name, s, n);
         free(s);
         return rc;
     }

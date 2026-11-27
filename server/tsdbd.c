@@ -127,6 +127,7 @@
 #include "chunkpeer.h"
 #include "../src/tiers.h"
 #include "../src/tier.h"
+#include "../src/tiersalv.h"
 #include "../src/settle.h"
 #include "../src/chunk.h"
 #include "fwd.h"
@@ -942,6 +943,10 @@ static bool tsdbd_tier_metrics(metrics_tier *out)
         }
     }
     out->settles_waiting = ecsettle_tier_waiting_now(t);
+    tiersalv_counters sc;
+    tiersalv_get_counters(t, &sc);
+    out->salvaged_parts = sc.parts;
+    out->salvaged_rows = sc.rows_lost;
     uint32_t nv = db ? (uint32_t)tsdb_volume_count(db) : 0;
     if (nv > 0) {
         out->vol_full = calloc(nv, 1);

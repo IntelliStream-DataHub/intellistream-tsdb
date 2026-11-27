@@ -153,7 +153,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/tierfill.h src/tierctl.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/ecunsettle.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
+R7_HDR := src/ecpart.h src/tier.h src/tierfill.h src/tierctl.h src/tiersalv.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/ecunsettle.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -457,7 +457,7 @@ META_GROUPS := test-meta-1 test-meta-2 test-cluster-1 test-cluster-2 test-cluste
 TEST_GROUPS ?= $(UNITS_GROUPS) test-units-b $(UNITS_B_GROUPS) $(META_GROUPS) test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-groups $(BT_TARGETS) test-units-b $(UNITS_GROUPS) $(UNITS_B_GROUPS) test-meta $(META_GROUPS) test-meta-mutants-1 test-meta-mutants-2 test-net
-TEST_B_BINS_1 := $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunkpeer $(B)/test_chunkrepair $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_ecunsettle $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_tierctl $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
+TEST_B_BINS_1 := $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunkpeer $(B)/test_chunkrepair $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_ecunsettle $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_tierctl $(B)/test_tiersalv $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
 TEST_B_BINS_2 := $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 $(UNITS_B_GROUPS) test-groups $(BT_TARGETS): $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
 $(UNITS_B_GROUPS) test-groups $(BT_TARGETS): $(TEST_B_BINS_1) $(TEST_B_BINS_2)
@@ -625,6 +625,8 @@ test-units-b6:
 	$(if $(EC_OBJ),$(MUT) --name test_tier --list "tierperengine tierunsure tierstrict tierfresh tierfence selfepoch dbidskip lostopen downnoread attachnoheal fullnoflag storeput96 followflock followdel" -- ./$(B)/test_tier --mutant @M@ @D@,$(MUT) --name test_tier --list "tiernoec" -- ./$(B)/test_tier --mutant @M@ @D@) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
 	./$(B)/test_tierctl $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_tierctl --list "lostnoreplace rebuildfast" -- ./$(B)/test_tierctl --mutant @M@ @D@) # r15-lost planted bugs must fail it
+	./$(B)/test_tiersalv $(SCRATCH)
+	$(if $(EC_OBJ),$(MUT) --name test_tiersalv --list "salvagedown salvagelatest" -- ./$(B)/test_tiersalv --quick --mutant @M@ @D@) # r15-salvage planted bugs must fail it
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
 	$(if $(EC_OBJ),$(MUT) --name test_chunk_heal --list "heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always" -- ./$(B)/test_chunk_heal --quick --mutant @M@ @D@) # each planted bug must fail it
 test-units-b7:
@@ -1083,7 +1085,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants lmove-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants lmove-mutants tiers-mutants tierctl-mutants tiersalv-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1347,6 +1349,10 @@ tiers-mutants: $(B)/test_tiers $(CRASHFS_SO)
 # Tier worker, TIERS re-read, paced rebuild and tier lost --replace mutants (src/tierctl.c, tests/test_tierctl.c)
 tierctl-mutants: $(B)/test_tierctl $(B)/tsdb $(CRASHFS_SO)
 	$(if $(EC_OBJ),$(MUT) --name test_tierctl --list "lostnoreplace rebuildfast" -- ./$(B)/test_tierctl --mutant @M@ @D@)
+
+# Tier salvage past m LOST stores mutants (src/tiersalv.c, src/ecswap.c, src/ltab.c, tests/test_tiersalv.c)
+tiersalv-mutants: $(B)/test_tiersalv $(CRASHFS_SO)
+	$(if $(EC_OBJ),$(MUT) --name test_tiersalv --list "salvagedown salvagelatest" -- ./$(B)/test_tiersalv --quick --mutant @M@ @D@)
 
 # R15 settle policy mutants (src/ecpolicy.c, src/settle.c, tests/test_settle.c)
 settle-policy-mutants: $(B)/test_settle
@@ -1767,6 +1773,10 @@ $(B)/test_tier: tests/test_tier.c tests/outagefs_ctl.h src/internal.h src/ecgc.h
 
 # r15-lost: tier worker, TIERS re-read, paced replacement rebuild, kill/crashfs resume, E15 LOST vs DOWN; mutants must fail
 $(B)/test_tierctl: tests/test_tierctl.c src/internal.h src/ecgc.h src/eccache.h src/tier.h src/tierctl.h src/tiers.h src/chunk.h src/chunk_priv.h $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# r15-salvage: tier salvage past m LOST stores, intent v5 X lines & crashfs recovery, ltab/warmer/stats; mutants must fail
+$(B)/test_tiersalv: tests/test_tiersalv.c src/internal.h src/ecgc.h src/eccache.h src/ecpart.h src/ecswap.h src/tier.h src/tierctl.h src/tiersalv.h src/tiers.h src/chunk.h src/chunk_priv.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # the chunk server through a fake link and two real peerlinks: puts, reads, fences, unsure stores, store binding, power

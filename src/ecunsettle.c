@@ -284,6 +284,22 @@ static int try_settled_source(eng *db, const part *ec, const char *settled_name,
     return 0;
 }
 
+int ecunsettle_try_settled(eng *db, const part *ec, part **out)
+{
+    if (!out)
+        return TSDB_ERR_INVALID;
+    *out = NULL;
+    if (!db || !ec)
+        return TSDB_ERR_INVALID;
+    size_t elen = strlen(ec->name);
+    if (elen <= 3 || strcmp(ec->name + elen - 3, ".ec") != 0 || elen - 3 + 6 >= sizeof ec->name)
+        return TSDB_ERR_INVALID;
+    char fin_name[128], settled_name[160];
+    snprintf(fin_name, sizeof fin_name, "%.*s.part", (int)(elen - 3), ec->name);
+    snprintf(settled_name, sizeof settled_name, "settled_%s", fin_name);
+    return try_settled_source(db, ec, settled_name, fin_name, false, out);
+}
+
 /* Source 2 (decode path): decode ec's object through the tier seam into tmp_<pid>_<cnt>.part, verify sums,
  * byte digest (object_xxh64), fsync, open, and verify the decoded .part footer and granules. */
 static int decode_ec_source(eng *db, const part *ec, const char *fin_name, bool rank_mut, part **out)
@@ -466,6 +482,17 @@ static int prepare_unsettle_parts(eng *db, part **in, size_t n, bool rank_mut, b
     if (n_decode_out)
         *n_decode_out = n_decode;
     return rc;
+}
+
+#else /* !TSDB_EC */
+
+int ecunsettle_try_settled(eng *db, const part *ec, part **out)
+{
+    (void)db;
+    (void)ec;
+    if (out)
+        *out = NULL;
+    return TSDB_ERR_NOTFOUND;
 }
 
 #endif /* TSDB_EC */

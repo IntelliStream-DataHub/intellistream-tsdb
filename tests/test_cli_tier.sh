@@ -50,6 +50,7 @@ if [ "$probe_rc" -ne 0 ] && grep -q "not built with the erasure codec" "$dir/pro
     for args in \
         "add $fs1/s0:hdd --allow-shared-device" \
         "set --after 7d" \
+        "salvage" \
         "status"
     do
         # shellcheck disable=SC2086
@@ -59,7 +60,7 @@ if [ "$probe_rc" -ne 0 ] && grep -q "not built with the erasure codec" "$dir/pro
         cli_refusal_ok "$rc" "$dir/noec.err" "not built with the erasure codec" ||
             fail "NO_EC: tier $args: status $rc, stderr '$(head -c 200 "$dir/noec.err")'"
     done
-    for args in "lost s0 --shrink" "salvage"; do
+    for args in "lost s0 --shrink"; do
         # shellcheck disable=SC2086
         t tier $args >/dev/null 2>"$dir/noec.err"
         rc=$?
@@ -248,11 +249,9 @@ assert d["volumes"][0]["margin"] == "underneath"
 assert d["stores"][0]["single_copy"] is True
 ' || fail "sc_db status --json fields mismatch: $sc_json"
 
-# 7. Unbuilt verbs (lost --shrink, salvage) exit 2 with "not built", and validate arguments.
+# 7. Unbuilt verbs (lost --shrink) exit 2 with "not built", and salvage/lost validate arguments.
 for args in \
-    "lost s0 --shrink" \
-    "salvage" \
-    "salvage --partition 100 --force"
+    "lost s0 --shrink"
 do
     # shellcheck disable=SC2086
     t tier $args >/dev/null 2>"$dir/err"
@@ -260,6 +259,11 @@ do
     [ "$rc" -eq 2 ] || fail "tier $args exited $rc (expected 2)"
     grep -q "not built" "$dir/err" || fail "tier $args stderr missing 'not built': $(cat "$dir/err")"
 done
+# tier salvage with all stores UP (no lost objects) succeeds as a clean no-op.
+out_salv=$(t tier salvage) || fail "tier salvage no-op failed"
+echo "$out_salv" | grep -q "retired 0 part(s)" || fail "tier salvage no-op output unexpected: $out_salv"
+out_salv_p=$(t tier salvage --partition 100 --force) || fail "tier salvage --partition --force no-op failed"
+echo "$out_salv_p" | grep -q "retired 0 part(s)" || fail "tier salvage --partition output unexpected: $out_salv_p"
 for args in \
     "lost s0" \
     "lost s0 --replace $fs2/repl --shrink" \
@@ -331,13 +335,14 @@ assert d["stores"][0]["path"].endswith("/s0_new")
 assert d["rebuild"]["active"] is False and d["rebuild"]["state"] == "idle"
 ' || fail "live lost status --json mismatch: $jrep"
 
-    # Unbuilt verbs beside live tsdbd still exit 2 with "not built".
+    # Unbuilt lost --shrink beside live tsdbd still exits 2 with "not built"; tier salvage refuses while locked.
     t tier lost s0 --shrink >/dev/null 2>"$dir/err"
     rc=$?
     [ "$rc" -eq 2 ] && grep -q "not built" "$dir/err" || fail "live tier lost: rc=$rc err=$(cat "$dir/err")"
     t tier salvage >/dev/null 2>"$dir/err"
     rc=$?
-    [ "$rc" -eq 2 ] && grep -q "not built" "$dir/err" || fail "live tier salvage: rc=$rc err=$(cat "$dir/err")"
+    [ "$rc" -ne 0 ] || fail "live tier salvage was accepted while tsdbd held locks"
+    grep -qE "locked|busy|running writer" "$dir/err" || fail "live tier salvage stderr unexpected: $(cat "$dir/err")"
 
     kill -0 "$srv_pid" 2>/dev/null || fail "tsdbd died while tier commands ran"
 else
@@ -389,6 +394,14 @@ assert d["stores"][4]["state"] == "down_damaged"
 assert d["stores"][5]["state"] == "down_other_id"
 assert d["stores"][6]["state"] == "down_missing"
 ' || fail "unavailable store status mismatch: $jdown"
+
+# 9b. tier salvage refuses while a store is DOWN (not LOST) without --force, and succeeds with --force.
+t tier salvage >/dev/null 2>"$dir/err"
+rc=$?
+[ "$rc" -ne 0 ] || fail "tier salvage accepted with DOWN (not LOST) stores without --force"
+grep -q "not LOST" "$dir/err" || fail "tier salvage DOWN refusal missing 'not LOST': $(cat "$dir/err")"
+out_sf=$(t tier salvage --force) || fail "tier salvage --force with DOWN stores failed"
+echo "$out_sf" | grep -q "retired 0 part(s)" || fail "tier salvage --force output unexpected: $out_sf"
 
 mv "$fs2/s6.gone" "$fs2/s6" || fail "restore s6"
 mv "$dir/s5.META.bak" "$fs2/s5/META" || fail "restore s5 META"

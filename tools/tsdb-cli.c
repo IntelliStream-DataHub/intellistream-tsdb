@@ -13,6 +13,7 @@
 #include "../src/ecdiverge.h"
 #include "../src/ecunsettle.h"
 #include "../src/tierctl.h"
+#include "../src/tiersalv.h"
 #include "../src/tiers.h"
 #include "tsdb_calendar.h"
 
@@ -2407,7 +2408,6 @@ static int cmd_tier_lost(const char *dir, int argc, char **argv)
 
 static int cmd_tier_salvage(const char *dir, int argc, char **argv)
 {
-    (void)dir;
     bool have_part = false, force = false;
     int64_t part = 0;
     for (int i = 0; i < argc; i++) {
@@ -2428,14 +2428,29 @@ static int cmd_tier_salvage(const char *dir, int argc, char **argv)
             return tier_usage();
         }
     }
+#ifndef TSDB_EC
+    (void)dir;
     (void)part;
     (void)force;
-#ifndef TSDB_EC
     fprintf(stderr, "tsdb: tier salvage: not built with the erasure codec (TSDB_EC)\n");
+    return 1;
 #else
-    fprintf(stderr, "tsdb: tier salvage: not built\n");
+    tiersalv_report rep;
+    int rc = tiersalv_cli(dir, part, !have_part, force, &rep);
+    if (rc != 0) {
+        fprintf(stderr, "tsdb: tier salvage: %s\n", tsdb_strerror(rc));
+        return 1;
+    }
+    if (rep.restored > 0)
+        printf("tier salvage: restored %" PRIu64 " part(s) from intact settled_ copies (0 rows lost)\n", rep.restored);
+    printf("tier salvage: retired %" PRIu64 " part(s) across %" PRIu64 " partition(s), %" PRIu64 " rows lost\n",
+           rep.parts, rep.partitions, rep.rows_lost);
+    if (rep.parts > 0 || rep.restored > 0)
+        printf("tier salvage: next step before starting tsdbd: replace each LOST store with "
+               "`tsdb %s tier lost <store> --replace <path>`\n",
+               dir);
+    return 0;
 #endif
-    return 2;
 }
 
 static int cmd_tier_status(const char *dir, int argc, char **argv)

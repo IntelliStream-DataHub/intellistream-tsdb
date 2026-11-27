@@ -97,6 +97,10 @@ typedef struct tier {
     uint8_t db_id[16];
     tiers_view tview;
     bool ov_grace;
+    /* R15 (r15-salvage): cumulative salvage counters exposed on /metrics */
+    atomic_uint_fast64_t salvaged_partitions;
+    atomic_uint_fast64_t salvaged_parts;
+    atomic_uint_fast64_t salvaged_rows;
 } tier;
 
 /* Default geometry by store count (R15 D4, D5): all_single_copy -> 1+0; else 2 -> 1+1, 3..5 -> (n-1)+1, 6+ -> 4+2.
@@ -106,6 +110,13 @@ bool tier_default_geom(int nstores, bool all_single_copy, int *k_out, int *m_out
 /* tsdb_open's: *out NULL when no tier is configured, else a tier holding the caller's reference. A configuration the
  * build cannot serve (no TSDB_EC) is refused with a line. dir: the database, for messages. */
 int tier_open(const char *dir, const tsdb_options *opt, tier **out);
+/* R15 (r15-salvage): opens a TIERS-configured tier allowing fewer than min_up active stores (e.g. > m stores
+ * permanently LOST) for offline salvage and post-crash recovery. Still enforces db_id and store flocks (BUSY),
+ * marks LOST stores as lost and DOWN stores as DOWN_*, and keeps settles halted. */
+int tier_open_salvage(const char *dir, const tsdb_options *opt, tier **out);
+/* R15 (r15-salvage): true when every non-LOST store in t->be is UP (and not failed / fence_halted), so ecgc may
+ * delete surviving chunks on UP stores while skipping permanently LOST stores as clean no-ops. */
+bool tier_gc_deletable(tier *t);
 tier *tier_get(tier *t);  /* another reference; NULL stays NULL */
 tier *tier_try_get(tier *t); /* another reference iff refs > 0, else NULL */
 void tier_put(tier *t);   /* the last one closes the tier (its settle thread, cache, backend) */
@@ -170,6 +181,7 @@ struct chunk_heal_opts;
 void tier_health_set_wake(tier *t, void (*fn)(void *), void *ctx);
 bool tier_health_take_reopen(tier *t);
 bool tier_health_has_pending(tier *t);
+bool tier_health_busy(tier *t);
 bool tier_health_run_one(tier *t, const struct chunk_heal_opts *ho_tpl, int64_t *wait_ms_out);
 bool tier_health_any_settling(tier *t);
 int tier_health_live_oids(tier *t, uint8_t (**oids_out)[16], size_t *n_out, bool *complete_out);

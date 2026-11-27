@@ -916,6 +916,32 @@ bool tier_health_has_pending(tier *t)
     return pending;
 }
 
+bool tier_health_busy(tier *t)
+{
+    if (!t)
+        return false;
+    struct tier_health *th = atomic_load_explicit(&t->health, memory_order_acquire);
+    if (!th)
+        return false;
+    bool busy = false;
+    pthread_mutex_lock(&th->mu);
+    if (!th->closing) {
+        if (th->need_reopen) {
+            busy = true;
+        } else {
+            for (int i = 0; i < th->nstores; i++) {
+                th_store *st = th->stores[i];
+                if (st && st->active && (st->attaching || st->attach_queued)) {
+                    busy = true;
+                    break;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&th->mu);
+    return busy;
+}
+
 bool tier_health_run_one(tier *t, const chunk_heal_opts *ho_tpl, int64_t *wait_ms_out)
 {
     if (wait_ms_out)
@@ -1541,6 +1567,11 @@ bool tier_health_take_reopen(tier *t)
     return false;
 }
 bool tier_health_has_pending(tier *t)
+{
+    (void)t;
+    return false;
+}
+bool tier_health_busy(tier *t)
 {
     (void)t;
     return false;

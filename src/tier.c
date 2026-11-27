@@ -523,7 +523,7 @@ static int tier_be_open(tier *t, const char *dir)
  *   store_id and db_id so a follower on shared storage refuses a missing or foreign-db store naming it.
  * - LOST stores are passed as NULL (CHUNK_STORE_DOWN_MISSING), REPLACED_BY stores by their replacement path & id.
  * - Fewer than min_up active stores fails the open (TSDB_ERR_UNAVAILABLE). */
-static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up, bool read_only)
+static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up, bool read_only, bool salvage_mode)
 {
     int n = (int)t->tview.nstores;
     if (n <= 0 || n > TIERS_STORES_MAX)
@@ -553,13 +553,16 @@ static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up, bool re
             active++;
         }
     }
-    if (active < min_up) {
+    if (!salvage_mode && active < min_up) {
         fprintf(stderr, "tsdb: %s: %d of %d tier stores in %s are active, %d are needed: the open fails\n", dir,
                 active, n, TIERS_FILE, min_up);
         return TSDB_ERR_UNAVAILABLE;
     }
     int rc;
-    if (read_only) {
+    if (salvage_mode) {
+        chunk_be_opts bo = {.min_up = 0, .read_only = false, .strict = false};
+        rc = chunk_be_open2(&t->be, paths, n, ids, &bo);
+    } else if (read_only) {
         chunk_be_opts bo = {.min_up = min_up, .read_only = true, .strict = true};
         rc = chunk_be_open2(&t->be, paths, n, ids, &bo);
     } else {
@@ -773,7 +776,7 @@ void tier_set_cluster(tier_cluster_fn fn, void *arg, uint64_t cache_mb)
     cluster_cache_mb = cache_mb;
 }
 
-int tier_open(const char *dir, const tsdb_options *opt, tier **out)
+static int tier_open_impl(const char *dir, const tsdb_options *opt, bool salvage_mode, tier **out)
 {
     *out = NULL;
     tiers_view tv;
@@ -922,13 +925,19 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
 #ifdef TSDB_TEST_HOOKS
         t->ov_grace = !ro && ov.has_grace;
 #endif
-        int open_rc = tier_be_open_from_tiers(t, dir, min_up, ro);
+        int open_rc = tier_be_open_from_tiers(t, dir, min_up, ro, salvage_mode);
         if (open_rc != 0 || (open_rc = eccache_tier_open(t)) != 0) {
             tier_put(t);
             return open_rc;
         }
         eccache_set_backend(t, t->be);
-        if (!ro) {
+        if (salvage_mode) {
+            atomic_store(&t->halted, true);
+            if ((open_rc = ecgc_tier_open(t)) != 0) {
+                tier_put(t);
+                return open_rc;
+            }
+        } else if (!ro) {
             if ((open_rc = ecgc_tier_open(t)) != 0 || (open_rc = ecsettle_tier_open(t)) != 0 ||
                 (open_rc = tier_health_open(t)) != 0 || (open_rc = tierctl_open(t)) != 0) {
                 tier_put(t);
@@ -941,6 +950,8 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
 #endif
     }
     tiers_view_free(&tv);
+    if (salvage_mode)
+        return 0;
 
     tier_cfg c = {0};
 #ifdef TSDB_TEST_HOOKS
@@ -1019,6 +1030,16 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     *out = t;
     return 0;
 #endif
+}
+
+int tier_open(const char *dir, const tsdb_options *opt, tier **out)
+{
+    return tier_open_impl(dir, opt, false, out);
+}
+
+int tier_open_salvage(const char *dir, const tsdb_options *opt, tier **out)
+{
+    return tier_open_impl(dir, opt, true, out);
 }
 
 tier *tier_get(tier *t)
@@ -1758,6 +1779,34 @@ bool tier_writable(tier *t)
         return false;
     }
     return true;
+}
+
+bool tier_gc_deletable(tier *t)
+{
+#ifdef TSDB_EC
+    if (!t || !t->be || t->read_only || atomic_load(&t->fence_halted))
+        return false;
+    /* Respect health attach/reopen/sweep windows and non-LOST halts: only bypass t->halted when at least one
+     * store is permanently LOST (which keeps t->halted set to pause settles) and every non-LOST store is UP. */
+    if (tier_health_busy(t))
+        return false;
+    int bn = chunk_be_nstores(t->be);
+    bool any_lost = false;
+    for (int i = 0; i < bn; i++) {
+        if (chunk_be_store_is_lost(t->be, i)) {
+            any_lost = true;
+            continue; /* permanently LOST: unreachable chunks are clean no-ops */
+        }
+        if (chunk_be_store_state(t->be, i) != CHUNK_STORE_UP)
+            return false;
+    }
+    if (!any_lost && atomic_load(&t->halted))
+        return false;
+    return true;
+#else
+    (void)t;
+    return false;
+#endif
 }
 
 int tier_follower_ec(eng *db, const char *name)

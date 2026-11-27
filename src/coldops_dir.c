@@ -193,7 +193,10 @@ static int d_see_epoch(void *ctx, uint64_t e)
     if (rc == TSDB_ERR_NOMEM)
         return rc;
     int held = tier_mutant == TIER_MUT_FENCE; /* planted: the call's word taken for every store */
+    bool any_non_lost = false;
     for (int i = 0; i < chunk_be_nstores(be) && tier_mutant != TIER_MUT_FENCE; i++) {
+        if (!chunk_be_store_is_lost(be, i))
+            any_non_lost = true;
         chunk_store *st = chunk_be_store_ref(be, i);
         if (chunk_be_store_state(be, i) != CHUNK_STORE_UP || !st || chunk_store_failed(st)) {
             chunk_store_unref(st);
@@ -208,7 +211,9 @@ static int d_see_epoch(void *ctx, uint64_t e)
         else if (!d->own)
             tier_halt_store(d->t, i, "did not take the volume's epoch at its open");
     }
-    if (held == 0)
+    /* Only reachable with held == 0 && !any_non_lost in salvage mode (tier_open_salvage) when every store is
+     * permanently LOST so no store exists to hold the epoch; any non-LOST store failing to hold still fails open. */
+    if (held == 0 && any_non_lost)
         return rc ? rc : TSDB_ERR_IO;
     return 0;
 }

@@ -28,6 +28,7 @@
 
 struct eng;
 struct mk;
+struct part;
 
 /* Progress counters exported for r10-driver (`ec -> replicas=3`) and observability. */
 typedef struct ecunsettle_progress {
@@ -69,6 +70,11 @@ int ec_unsettle_apply(struct eng *db, uint64_t pos, const struct mk *m);
 
 /* Reads process-wide unsettle progress counters. */
 void ecunsettle_get_progress(ecunsettle_progress *out);
+
+/* Opens and fully verifies settled_<P.part> for an .ec part `ec` (matching header, footer, index hash,
+ * granule layout and checksums, zero padding, partition/block/level). On 0, returns a referenced pending part
+ * in `*out` ready for ec_swap_unsettle. Returns TSDB_ERR_NOTFOUND or TSDB_ERR_CORRUPT if unavailable/damaged. */
+int ecunsettle_try_settled(struct eng *db, const struct part *ec, struct part **out);
 
 /* Initializes TSDB_ECUNSETTLE_MUTANT once per process (TSDB_TEST_HOOKS only). */
 void ecunsettle_env_init(void);

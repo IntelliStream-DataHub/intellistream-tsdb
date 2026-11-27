@@ -462,7 +462,8 @@ void lt_end(eng *db, lt_sec *sec)
     ltab *t = db->lt;
     if (!t)
         return;
-    t->lgen++;
+    if (!sec->no_lgen)
+        t->lgen++;
     if (sec->win) { /* under the write lock: no lookup sees the window closed and the flushing memtable gone apart */
         pthread_mutex_lock(&t->pmu);
         atomic_store(&t->pending, false);
@@ -526,6 +527,63 @@ void lt_merge_marks(eng *db, lt_sec *sec, part **src, size_t k)
                 lt_store(t, s, &n);
                 hints_add(sec, s);
                 break; /* now LE_UNKNOWN: no later granule of s in p can match */
+            }
+        }
+    }
+}
+
+/* R15 (r15-salvage, D11): tier salvage is retiring lost .ec parts src[0..k) of one partition key, inside a write
+ * section of lt_begin and under db->lock. Every series that has rows or tombstones in src[] has its entry marked
+ * LE_UNKNOWN with a valid upper bound (handling both removed live rows and un-hidden older rows when a retired .ec
+ * part held nulls or tombstones) and is hinted to the warmer. */
+void lt_salvage_marks(eng *db, lt_sec *sec, part **src, size_t k)
+{
+    ltab *t = db->lt;
+    if (!t)
+        return;
+    for (size_t j = 0; j < k; j++) {
+        const part *p = src[j];
+        const gix *ix = &p->ix;
+        for (uint32_t r = 0; r < ix->nruns; r++) {
+            uint32_t s = ix->rser[r];
+            uint32_t a = gix_rstart(ix, r);
+            uint32_t b = r + 1 < ix->nruns ? gix_rstart(ix, r + 1) : p->ng;
+            if (b > p->ng)
+                b = p->ng;
+            int64_t rmax = b > a ? gx_ts_max(p, b - 1) : p->max_ts;
+            lt_ent e;
+            if (!lt_load(t, s, &e))
+                continue;
+            if (e.st == LE_EMPTY) {
+                if (!lt_make_pages(db, t, s >> LT_PAGE_BITS))
+                    continue;
+                lt_ent n = {LE_UNKNOWN, rmax, 0};
+                lt_store(t, s, &n);
+                hints_add(sec, s);
+            } else {
+                int64_t bound = e.ts > rmax ? e.ts : rmax;
+                lt_ent n = {LE_UNKNOWN, bound, 0};
+                lt_store(t, s, &n);
+                hints_add(sec, s);
+            }
+        }
+        for (uint32_t ti = 0; ti < p->nt; ti++) {
+            uint32_t s = p->t[ti].series;
+            int64_t tmax = p->t[ti].end > INT64_MIN ? p->t[ti].end - 1 : INT64_MIN;
+            lt_ent e;
+            if (!lt_load(t, s, &e))
+                continue;
+            if (e.st == LE_EMPTY) {
+                if (!lt_make_pages(db, t, s >> LT_PAGE_BITS))
+                    continue;
+                lt_ent n = {LE_UNKNOWN, tmax, 0};
+                lt_store(t, s, &n);
+                hints_add(sec, s);
+            } else {
+                int64_t bound = e.ts > tmax ? e.ts : tmax;
+                lt_ent n = {LE_UNKNOWN, bound, 0};
+                lt_store(t, s, &n);
+                hints_add(sec, s);
             }
         }
     }

@@ -89,7 +89,7 @@ directory) and `path`.
 
 ### Local tier metrics (single server, R15)
 
-When a standalone server opens a database with a local settled tier (`TIERS`), `/metrics` also emits four tier families (omitted on standalone servers without a tier, and in cluster mode):
+When a standalone server opens a database with a local settled tier (`TIERS`), `/metrics` also emits six tier families (omitted on standalone servers without a tier, and in cluster mode):
 
 | metric | type | meaning |
 |---|---|---|
@@ -97,6 +97,8 @@ When a standalone server opens a database with a local settled tier (`TIERS`), `
 | `tsdb_tier_settles_waiting` | gauge | number of tiered volumes currently waiting to settle because a tier store is down, above 95% full, or the tier is halted |
 | `tsdb_tier_store_state{store}` | gauge | local tier store state (0-based store index): `0` up, `1` missing, `2` other_id, `3` damaged, `4` ioerr, `5` replacing, `6` stalled; `TsdbTierStoreDown` alerts on any DOWN state (`!= 0` and `!= 5`) |
 | `tsdb_volume_full{volume}` | gauge | `1` while the tiered volume is FULL (volume filesystem integer fill percent `>= young_high_pct`, 90% default; clears below `young_high_pct - 2`), refusing inserts, appends, and non-empty replaces with `UNAVAILABLE` (`TSDB_WHY_FULL`) while deletes and drops pass; `TsdbInsertsRefusedFull` alerts on `== 1` |
+| `tsdb_tier_salvaged_parts_total` | counter | lost erasure-coded `.ec` parts retired by local tier salvage past `m` `LOST` stores (E15, §15.7) |
+| `tsdb_tier_salvaged_rows_total` | counter | upper-bound raw rows lost in erasure-coded parts retired by local tier salvage (sum of `rows` from the intact local `.ec` indices) |
 
 Alert rules for these metrics ship in `dist/alerts/tsdb.rules.yml`.
 

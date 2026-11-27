@@ -53,6 +53,7 @@
 #include "tier.h"
 #include "tierfill.h"
 #include "tierctl.h"
+#include "tiersalv.h"
 #include "tiers.h"
 #include "chunk.h"
 #include "settle.h"
@@ -2215,12 +2216,58 @@ int tsdb_tier_lost(tsdb *db, const char *store, const char *replace_path, uint32
 
 int tsdb_tier_salvage(tsdb *db, int64_t partition, int all_partitions, int force)
 {
+#ifndef TSDB_EC
     (void)db;
     (void)partition;
     (void)all_partitions;
     (void)force;
-    fprintf(stderr, "tsdb: tsdb_tier_salvage: not built\n");
+    fprintf(stderr, "tsdb: tier salvage: not built with the erasure codec (TSDB_EC)\n");
     return TSDB_ERR_INVALID;
+#else
+    if (!db)
+        return TSDB_ERR_INVALID;
+    if (db->opt.read_only || db->opt.follow)
+        return TSDB_ERR_READONLY;
+    if (db->cluster) {
+        fprintf(stderr, "tsdb: tier salvage: cluster handles do not use local tiers: refused\n");
+        return TSDB_ERR_INVALID;
+    }
+    if (!db->tier || !tier_backend(db->tier)) {
+        fprintf(stderr, "tsdb: tier salvage: database has no local tier configured\n");
+        return TSDB_ERR_INVALID;
+    }
+    int rc = tiersalv_check_stores(db->tier, force != 0);
+    if (rc != 0)
+        return rc;
+
+    pthread_rwlock_rdlock(&db->lock);
+    size_t n = db->nvols;
+    eng **v = malloc(n * sizeof *v);
+    bool *live = malloc(n * sizeof *live);
+    if (v && live) {
+        memcpy(v, db->vols, n * sizeof *v);
+        for (size_t i = 0; i < n; i++)
+            if ((live[i] = v[i] && !eng_refused(v[i])))
+                eng_ref(v[i]);
+    }
+    pthread_rwlock_unlock(&db->lock);
+    if (!v || !live) {
+        free(v);
+        free(live);
+        return TSDB_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int r = live[i] ? tiersalv_eng(v[i], partition, all_partitions != 0, force != 0, NULL)
+                        : v[i] ? TSDB_ERR_UNAVAILABLE : 0;
+        if (rc == 0 && r != 0)
+            rc = r;
+        if (live[i])
+            eng_unref(&v[i]);
+    }
+    free(v);
+    free(live);
+    return rc;
+#endif
 }
 
 int tsdb_tier_status(tsdb *db, tsdb_tier_info *out)

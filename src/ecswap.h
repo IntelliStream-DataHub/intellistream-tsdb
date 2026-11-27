@@ -49,6 +49,13 @@ int ec_swap_unsettle(eng *db, part **in, part **out, size_t n);
  * replica or single-server volume) so MK_GC waits until every log replica has applied MK_UNSETTLE. */
 int ec_swap_unsettle_at(eng *db, part **in, part **out, size_t n, uint64_t unsettle_pos);
 
+/* R15 (r15-salvage, D11): retires lost .ec parts in[0..n) of one partition key atomically via intent v5
+ * ("tsdb-intent 5 <n>", n lines `X <pX.ec> retired_<pX.ec>`, "end <xxh64>"), under publish_lock > db_pub_begin >
+ * latest_rw > db->lock, marking the key's series unknown in the latest table (bumping lgen unless `no_lgen_mut` is
+ * set for the `salvagelatest` mutant), pushing statistics removal events, and handing retired objects to ecgc.
+ * Surviving young .part files and unaffected .ec parts in the same partition are left untouched. */
+int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut);
+
 /* The open's recovery of the v4 intent `name` (its whole text in buf[0 .. len), which may be changed). 0: done, and
  * intents_recover unlinks the intent (and syncs the directory); else the open fails with it. */
 int ecswap_recover(eng *db, const char *name, char *buf, size_t len);

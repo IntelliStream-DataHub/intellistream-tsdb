@@ -994,6 +994,12 @@ static void render(sb *b)
                    "1 while the tiered volume is FULL (>= young_high_pct, refusing inserts until < young_high_pct - 2), else 0.");
             for (uint32_t i = 0; i < tm->nvols; i++)
                 sb_add(b, "tsdb_volume_full{volume=\"%u\"} %d\n", (unsigned)i, tm->vol_full[i] ? 1 : 0);
+            family(b, "tsdb_tier_salvaged_parts_total", "counter",
+                   "Lost erasure-coded parts retired by local tier salvage.");
+            sb_add(b, "tsdb_tier_salvaged_parts_total %llu\n", (unsigned long long)tm->salvaged_parts);
+            family(b, "tsdb_tier_salvaged_rows_total", "counter",
+                   "Rows lost in erasure-coded parts retired by local tier salvage (from the local index).");
+            sb_add(b, "tsdb_tier_salvaged_rows_total %llu\n", (unsigned long long)tm->salvaged_rows);
         }
         if (tm)
             free(tm->vol_full);
