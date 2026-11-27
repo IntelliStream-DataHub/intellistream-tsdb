@@ -588,7 +588,7 @@ test-units-b4:
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "nohaltstop" -- ./$(B)/test_settle --quick --case halt --mutant @M@ @D@) # a halt stops the settle
 test-units-b5:
 	./$(B)/test_eccold $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge degtwo degnoupcheck degnopositions" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
 	./$(B)/test_ecapply $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "recnodirsync v5nodirsync coldnoflushthrough ycold ecabovey" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it (part 1 of 3)
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digest --list "digestnocompare digestanyz digestnosupersede digestnocrcwalk digestrotmatches digestnojobremove" -- ./$(B)/test_ecapply --case digest --mutant @M@ @D@) # r8j: each planted bug of a replica's digest job must fail it
@@ -653,7 +653,7 @@ CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail re
     fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
     snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
     reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
-CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc r4stubs r9stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
     volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
@@ -1056,7 +1056,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants margin-mutants lease-mutants chunkpeer-mutants ecgc-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants margin-mutants lease-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1116,7 +1116,7 @@ $(B)/chunksrv.o: server/chunksrv.c server/chunksrv.h server/peerlink.h src/chunk
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # the cold ops of a cluster ec volume over its stripe group (server/chunkpeer.h, r8f); no cluster calls (test_chunkpeer
 # links it with chunksrv.o)
-$(B)/chunkpeer.o: server/chunkpeer.c server/chunkpeer.h server/chunksrv.h src/coldops.h src/chunk.h | $(B)
+$(B)/chunkpeer.o: server/chunkpeer.c server/chunkpeer.h server/chunksrv.h src/coldops.h src/chunk.h src/eccold.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/chunksrv_cluster.o: server/chunksrv_cluster.c server/chunksrv.h server/peerlink.h server/cluster.h server/meta.h src/chunk.h client/tsdb_crypto.h src/chunk_priv.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
@@ -1256,6 +1256,11 @@ ecgc-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	@$(if $(EC_OBJ),true,echo "ecgc-mutants: this build has no erasure codec (NO_EC=1): ecgc skips, nothing to plant"; false)
 	$(MUT) --name ecgc --list "gcsuspendignored gcreplicanoop" -- env TSDB_ECGC_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecgc
+# r9-degsettle: degraded settle planted bugs in tsdbd (TSDB_ECCOLD_MUTANT), each must fail test_cluster ecdegraded
+degsettle-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	@$(if $(EC_OBJ),true,echo "degsettle-mutants: this build has no erasure codec (NO_EC=1): ecdegraded skips, nothing to plant"; false)
+	$(MUT) --name ecdegraded --list "degtwo degnoupcheck degnopositions" -- env TSDB_ECCOLD_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecdegraded
 # the planned leader transfer's mutants (server/rtransfer.c, server/ctransfer.c; tests/transfer_mutants.sh)
 transfer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/transfer_mutants.sh $(SCRATCH)

@@ -697,7 +697,8 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, 
     int rc = TSDB_ERR_UNAVAILABLE;
     coldvol *cv = tier_cold_get(c->t, e->volume);
     if (cv) {
-        rc = cv->ops->obj_open(cv->ctx, r->oid, &gm, nw->sums, &nw->o);
+        rc = cv->ops->obj_open_pos ? cv->ops->obj_open_pos(cv->ctx, r->oid, &gm, nw->sums, r->positions, &nw->o)
+                                   : cv->ops->obj_open(cv->ctx, r->oid, &gm, nw->sums, &nw->o);
         nw->ops = cv->ops;
         tier_cold_put(cv);
     }

@@ -87,6 +87,21 @@ typedef struct cold_ops {
     unsigned (*nstripe)(void *ctx);
     /* R8 (r8k-gc): read a listed chunk's vuuid and writer epoch when list_names does not fill them (directory ops). */
     int (*chunk_info)(void *ctx, const chunk_listed *c, uint8_t vuuid[16], uint64_t *epoch);
+    /* R9 (r9-degsettle, E10): put only positions whose bit is set in `posmask` (0 = all k'+m); sets *written_mask_out
+     * (when non-NULL) to the bitmap actually written. NULL: fall back to put_stream (full only). */
+    int (*put_stream_pos)(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
+                          const chunk_put_src *src, uint32_t posmask, uint32_t *written_mask_out, uint64_t *sums_out);
+    /* R9 (r9-degsettle, E10): obj_open with a known written-positions bitmap (0 = all k'+m); cleared bits are known
+     * erasures (CHUNK_ST_UNWRITTEN), never requested. NULL: fall back to obj_open. */
+    int (*obj_open_pos)(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
+                        uint32_t positions, cold_obj **out);
+    /* R9 (r9-degsettle, E10): probe stripe positions in `probe_mask` (0 = all nstripe) and return bitmap of those UP
+     * (and when require_epoch > 0, holding a durable non-unsure fence >= require_epoch) in *up_mask_out, and nstripe
+     * in *npos_out. NULL: degraded settles not supported (single-server tiers). */
+    int (*stripe_up_mask)(void *ctx, uint64_t require_epoch, uint32_t probe_mask, uint32_t *up_mask_out,
+                          unsigned *npos_out);
+    /* R9 (r9-degsettle, E10): notify the server's reconcile queue of a degraded settle's unwritten position. */
+    void (*note_missing)(void *ctx, const uint8_t oid[16], unsigned pos);
 } cold_ops;
 
 /* ------------------------------------------------------------ the directory ops (src/coldops_dir.c) */

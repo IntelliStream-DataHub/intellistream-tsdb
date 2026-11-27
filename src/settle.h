@@ -58,10 +58,23 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
  * ecsettle_gc_object: hands an object no .ec part names to r7-gc. */
 struct ec_record;
 int ecsettle_put(eng *db, part *p, struct ec_record *r, uint64_t *epoch);
+int ecsettle_put_pos(eng *db, part *p, struct ec_record *r, uint64_t *epoch, uint32_t posmask,
+                     uint32_t *written_mask_out);
 int ecsettle_index(eng *db, part *p, const struct ec_record *r, part **out);
 void ecsettle_gc_object(eng *db, const struct ec_record *r);
 /* whether db is closing or halting (a settle in progress gives up: STOPPED) */
 bool ecsettle_stopping(eng *db);
+/* R9 (E10): per-engine degraded-settle wait state (src/eccold.c), owned by ecsettle_eng. */
+typedef struct eccold_deg_wait {
+    uint32_t down_mask;    /* stripe-position bitmap observed down when down_since_ms started */
+    int64_t down_since_ms; /* monotonic ms when down_mask was first seen down (0: not waiting) */
+    int64_t last_seen_ms;  /* monotonic ms of the most recent check that observed down_mask */
+    bool settled;          /* true after down_mask already waited wait_max_s and settled degraded */
+    bool one_logged;       /* logged the wait for 1 position down */
+    bool two_logged;       /* logged that >= 2 positions are down (never degraded) */
+    bool waiting;          /* last eccold_settle returned UNAVAILABLE only to wait: do not 1-hour backoff */
+} eccold_deg_wait;
+eccold_deg_wait *ecsettle_deg_wait(eng *db);
 
 /* ------------------------------------------------------------ the policy (src/ecpolicy.c, E5) */
 /* Picks what settles next in db (under db->lock, which the caller holds): the key into *key and its parts, referenced,

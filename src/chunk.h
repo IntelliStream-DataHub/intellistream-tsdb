@@ -58,7 +58,8 @@
 
 /* What a chunk (or a cell of one) is, as a reader found it. */
 enum { CHUNK_ST_OK = 0, CHUNK_ST_ABSENT, CHUNK_ST_DAMAGED, CHUNK_ST_IOERR, CHUNK_ST_VIRTUAL /* zero padding */,
-       CHUNK_ST_DOWN /* the chunk's store is not UP: it may well be there, and it comes back with the store (E15) */ };
+       CHUNK_ST_DOWN /* the chunk's store is not UP: it may well be there, and it comes back with the store (E15) */,
+       CHUNK_ST_UNWRITTEN /* E10: known erasure from a degraded settle: never requested, never CORRUPT */ };
 
 /* ---------------------------------------------------------------- geometry */
 typedef struct chunk_geom {
@@ -419,6 +420,9 @@ typedef struct chunk_source {
     /* The chunk's own sums table (chunk_pos_cells entries), valid as long as the source is; NULL with *status set to
      * CHUNK_ST_ABSENT, DAMAGED or IOERR when the chunk has none to give. */
     const uint64_t *(*sums)(void *ctx, unsigned pos, int *status);
+    /* R9 (E10): bitmap of written positions (0 = all k'+m written). Any position whose bit is cleared when non-zero
+     * is treated as a known erasure (CHUNK_ST_UNWRITTEN): never requested, never counted as CORRUPT. */
+    uint32_t positions;
 } chunk_source;
 
 typedef struct chunk_report {
@@ -449,6 +453,8 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
 typedef struct chunk_obj chunk_obj;
 int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
                    const chunk_geom *expect, const uint64_t *rec_sums, chunk_obj **out);
+int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
+                       const chunk_geom *expect, const uint64_t *rec_sums, uint32_t positions, chunk_obj **out);
 void chunk_obj_close(chunk_obj *o);
 const chunk_geom *chunk_obj_geom(const chunk_obj *o);
 int chunk_obj_read(chunk_obj *o, uint64_t off, uint64_t len, void *buf, unsigned flags, chunk_report *rep);

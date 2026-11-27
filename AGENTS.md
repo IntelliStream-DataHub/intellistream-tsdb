@@ -531,7 +531,7 @@ cgroup, so `nice` does not keep your work out of its way.
   handle open, reads go on. `src/ecpart.c`: the `.ec` file (`p<K>_<A>_<B>_<L>.ec`, the name and block range of its source,
   D2): the source's header, granule index, tombstones and footer verbatim (so `gx_*` read the index in place, unchanged),
   then the object record (oid, geometry, `object_len`, `object_xxh64`, the source's per-cell sums, `writer_epoch`,
-  `settle_ms`, the class check, `positions`, `ppos` and `stripe_version` written as 0 and refused when not: R8's) and a
+  `settle_ms`, the class check, `positions` (R9 E10: 0 everywhere, or on cluster EC volumes all `k'+m` bits or, when `m >= 2`, `k'+m-1` bits for a degraded settle; single-server tiers still refuse non-zero), `ppos` and `stripe_version` (R8, cluster EC only)) and a
   64-byte trailer that hashes both; `part_open_ec` refuses a granule that does not lie inside the object's data in index
   order (a fuzz finding: a count alone let a 536-byte file walk 10^8 granules); the open fails on an `.ec` and a `.part` of
   one name with no intent, an `.ec` without `requires=tier`, and a record whose class check failed. `tests/test_ecpart.c`
@@ -893,8 +893,12 @@ cgroup, so `nice` does not keep your work out of its way.
     wal_flushed`), `eng_leader_wait(L)`, `Z = log_end`, re-check stripe; (4) `Y` = listed non-.ec parts of P not in `I`
     (merging -> `STOPPED`); (5) write `.ec` files (`ppos = Z`, `stripe_version = sv0`) and append/wait `MK_COLD` via
     `jr_cold` (crash point `cold-after-marker` right after append; `INDETERMINATE` if deposed: engine runs on); (6)
-    `ec_swap_commit` (non-zero after committed marker fails the engine), then `lw_leave`. `tests/test_eccold.c` (mutants
-    `cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge`).
+    `ec_swap_commit` (non-zero after committed marker fails the engine), then `lw_leave`. Degraded settle (R9, E10): after
+    `ec.settle_wait_max_s` with exact 1 position DOWN and `m >= 2` (never 2: logs once and waits; wait clock restarts when
+    the down mask changes or goes stale), writes `k'+m-1` positions, records `positions`, verifies every written position
+    is UP in the current epoch right before `MK_COLD` (`TSDB_ECCOLD_TEST=pause_pre_marker=PATH` test hook), and notifies
+    `sreconcile_note_missing` after `lw_leave`. `tests/test_eccold.c` (mutants
+    `cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge degtwo degnoupcheck degnopositions`), `test_cluster ecdegraded`, `make degsettle-mutants`.
   - **A replica applies a committed MK_COLD** (R8, r8h; `src/ecapply.c`, design-cluster-data.md 2.3 step 6): it checks the
     marker (every object record names its oid, the key and the marker's Z; one `.ec` file per object; each Y's header
     check), stages the files, numbers the `.ec` parts in the leader's block order with Y above them (never the marker's

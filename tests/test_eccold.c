@@ -1799,6 +1799,173 @@ static void test_toomany(void)
     printf("  toomany: more late parts than one marker names: INVALID, nothing left behind; at the limit: settled\n");
 }
 
+/* R9 (E10): degraded settle after settle_wait_max_s with 1 position DOWN (never 2), pre-MK_COLD UP check,
+ * positions bitmap, and note_missing hook; kills degtwo, degnoupcheck, degnopositions. */
+static atomic_uint DEG_UP_MASK = 0x0fu;
+static atomic_uint DEG_NOTED_CNT = 0;
+static atomic_uint DEG_NOTED_POS = 99;
+static atomic_bool DEG_DROP_PRE_MARKER = false;
+
+static int deg_up_mask_fn(void *c, uint64_t req_epoch, uint32_t probe_mask, uint32_t *up_out, unsigned *npos_out)
+{
+    (void)c, (void)req_epoch;
+    uint32_t u = atomic_load(&DEG_UP_MASK);
+    *npos_out = 4;
+    *up_out = probe_mask ? (u & probe_mask) : u;
+    return 0;
+}
+
+static void deg_note_missing_fn(void *c, const uint8_t oid[16], unsigned pos)
+{
+    (void)c, (void)oid;
+    atomic_store(&DEG_NOTED_POS, pos);
+    atomic_fetch_add(&DEG_NOTED_CNT, 1);
+}
+
+static void deg_pre_marker_hook(eng *db, int step)
+{
+    (void)db;
+    if (step == ECCOLD_STEP_PRE_MARKER && atomic_exchange(&DEG_DROP_PRE_MARKER, false))
+        atomic_store(&DEG_UP_MASK, 0x0cu); /* drop written pos 0 (or 1) right before MK_COLD */
+}
+
+static void test_degraded(void)
+{
+    static int seq;
+    char root[PATH_MAX / 2], dir[PATH_MAX], st[4][PATH_MAX];
+    snprintf(root, sizeof root, "%s/eccold-%d-degraded-%d", S, (int)getpid(), seq++);
+    snprintf(dir, sizeof dir, "%s/db", root);
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
+    CHECK(system(cmd) == 0);
+    CHECK(mkdir(root, 0755) == 0 && mkdir(dir, 0755) == 0);
+    for (int i = 0; i < 4; i++) {
+        snprintf(st[i], sizeof st[i], "%s/st%d", root, i);
+        CHECK(mkdir(st[i], 0755) == 0);
+    }
+    char spec[5 * PATH_MAX];
+    snprintf(spec, sizeof spec, "k=2,m=2,dirs=%s:%s:%s:%s,grace_s=%lld", st[0], st[1], st[2], st[3], (long long)GRACE_S);
+    setenv("TSDB_TEST_TIER", spec, 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+
+    tsdb_options o;
+    opts(&o);
+    eng *db = NULL;
+    uint32_t s0 = 0;
+    CHECK(eng_open(dir, &o, &db) == 0 && db);
+    CHECK(eng_series(db, "ds0", TSDB_FLOAT32, &s0) == 0);
+    CHECK(eng_close(db) == 0);
+    int fd = open(dir, O_RDONLY | O_DIRECTORY);
+    CHECK(fd >= 0 && meta_require(fd, true, META_REQ_CLUSTER | META_REQ_REPLICA | META_REQ_EC) == 0);
+    if (fd >= 0)
+        close(fd);
+    {
+        char mp[PATH_MAX + 16];
+        snprintf(mp, sizeof mp, "%s/META", dir);
+        FILE *mf = fopen(mp, "a");
+        CHECK(mf && fputs("volume_uuid=6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b\n", mf) >= 0 && fclose(mf) == 0);
+    }
+
+    cold_ops dops = coldops_dir;
+    dops.stripe_version = w_sv;
+    dops.stripe_up_mask = deg_up_mask_fn;
+    dops.note_missing = deg_note_missing_fn;
+
+    tier *t = NULL;
+    CHECK(tier_open(dir, &o, &t) == 0 && t);
+    tier_settings set = {.k = 2, .m = 2, .grace_s = GRACE_S, .keep_s = 3600, .coarse_s = 86400, .cache_mb = 16,
+                         .force_s = 3600, .wait_max_s = 1};
+    tier_attach a = {.ops = &dops, .make = w_make, .settings = &set};
+    tier_want_attach(t, 0, &a);
+    db = NULL;
+    CHECK(eng_open(dir, &o, &db) == 0 && db);
+    tier_want(NULL, 0);
+
+    xport xp;
+    memset(&xp, 0, sizeof xp);
+    pthread_mutex_init(&xp.mu, NULL);
+    struct jr_ops jops = {.ctx = &xp, .admit = xp_admit, .bytes = xp_bytes, .synced = xp_synced, .ship = xp_ship,
+                          .wait = xp_wait, .seg_done = xp_seg_done};
+    CHECK(eng_leader_attach(db, &jops) == 0);
+
+    CHECK(rows(db, s0, 0, 0, 500, 1.0f) == 0);
+    CHECK(eng_optimize(db) == 0);
+
+    /* A. 2 positions DOWN (pos 0 and pos 1): must NEVER settle even past wait_max_s (kills degtwo) */
+    atomic_store(&DEG_UP_MASK, 0x0cu);
+    CHECK(settle_key(db, KEY) == TSDB_ERR_UNAVAILABLE);
+    msleep(1150);
+    CHECK(settle_key(db, KEY) == TSDB_ERR_UNAVAILABLE);
+    {
+        part *ec[4];
+        size_t n = parts_of(db, KEY, ec, 4, true);
+        CHECK(n == 0);
+        unref_all(ec, n);
+    }
+
+    /* B. 1 position DOWN (pos 0): waits wait_max_s (1 s), then settles degraded with k'+m-1 bits (kills degnopositions) */
+    atomic_store(&DEG_UP_MASK, 0x0eu);
+    atomic_store(&DEG_NOTED_CNT, 0);
+    atomic_store(&DEG_NOTED_POS, 99);
+    int64_t t0 = now_ms();
+    CHECK(settle_key(db, KEY) == TSDB_ERR_UNAVAILABLE && now_ms() - t0 < 500);
+    eccold_deg_wait *dw = ecsettle_deg_wait(db);
+    CHECK(dw && dw->waiting);
+    msleep(1100);
+    CHECK(settle_key(db, KEY) == 0);
+    eccold_cut c;
+    eccold_test_last(&c);
+    CHECK(c.rc == 0 && c.degraded && c.positions != 0);
+    part *ec[4];
+    size_t nec = parts_of(db, KEY, ec, 4, true);
+    CHECK(nec == 1);
+    if (nec == 1) {
+        struct ecpart *ep = atomic_load(&ec[0]->ec);
+        unsigned npos = (unsigned)ep->rec.k + (unsigned)ep->rec.m;
+        uint32_t want = ((1u << npos) - 1u) & ~1u;
+        CHECK(ep->rec.positions == want);
+        CHECK(__builtin_popcount(ep->rec.positions) == (int)(npos - 1));
+    }
+    unref_all(ec, nec);
+    CHECK(atomic_load(&DEG_NOTED_CNT) == 1 && atomic_load(&DEG_NOTED_POS) == 0);
+    CHECK(holds(db, s0, 0, 0, 500, 1.0f));
+
+    /* B2. Rolling outage: pos 0 recovers with NO settle attempt, then pos 1 goes down -> wait clock MUST restart! */
+    int64_t key2 = KEY + 2;
+    CHECK(rows(db, s0, 2, 0, 500, 200.0f) == 0);
+    CHECK(eng_optimize(db) == 0);
+    atomic_store(&DEG_UP_MASK, 0x0du); /* pos 0 back, pos 1 down (no settle attempt saw all-UP) */
+    t0 = now_ms();
+    CHECK(settle_key(db, key2) == TSDB_ERR_UNAVAILABLE && now_ms() - t0 < 500);
+    CHECK(dw && dw->waiting);
+    msleep(1100);
+    CHECK(settle_key(db, key2) == 0);
+    CHECK(atomic_load(&DEG_NOTED_CNT) == 2 && atomic_load(&DEG_NOTED_POS) == 1);
+    CHECK(holds(db, s0, 2, 0, 500, 200.0f));
+
+    /* C. Pre-MK_COLD UP check: write day 1, keep pos 1 down, drop written pos 0 at ECCOLD_STEP_PRE_MARKER -> aborts */
+    int64_t key1 = KEY + 1;
+    CHECK(rows(db, s0, 1, 0, 500, 100.0f) == 0);
+    CHECK(eng_optimize(db) == 0);
+    atomic_store(&DEG_UP_MASK, 0x0du);
+    atomic_store(&DEG_DROP_PRE_MARKER, true);
+    atomic_store(&CASE_HOOK, deg_pre_marker_hook);
+    CHECK(settle_key(db, key1) == TSDB_ERR_UNAVAILABLE);
+    atomic_store(&CASE_HOOK, NULL);
+    nec = parts_of(db, key1, ec, 4, true);
+    CHECK(nec == 0);
+    unref_all(ec, nec);
+
+    CHECK(eng_close(db) == 0);
+    tier_put(t);
+    free(xp.cold);
+    pthread_mutex_destroy(&xp.mu);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
+    CHECK(system(cmd) == 0);
+    printf("  degraded: 2 down waits (degtwo); 1 down settles after wait_max_s with k+m-1 (degnopositions); "
+           "pre-MK_COLD UP check aborts on drop (degnoupcheck)\n");
+}
+
 static void alarm_exit(int sig)
 {
     (void)sig;
@@ -1868,7 +2035,7 @@ int main(int argc, char **argv)
                  {"swapfail", test_swapfail}, {"deposeappend", test_deposeappend}, {"crash", test_crash},
                  {"drop", test_drop},     {"indexfail", test_indexfail}, {"ymerging", test_ymerging},
                  {"swappower", test_swappower}, {"toomany", test_toomany}, {"turns", test_turns},
-                 {"ticket", test_ticket}, {"jrpair", test_jrpair}};
+                 {"ticket", test_ticket}, {"jrpair", test_jrpair}, {"degraded", test_degraded}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();

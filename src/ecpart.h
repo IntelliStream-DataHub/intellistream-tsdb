@@ -91,7 +91,7 @@ typedef struct ec_record {
     uint32_t level;
     uint16_t k, m;
     uint32_t cell_bytes;
-    uint32_t positions; /* R9 (E10); 0 */
+    uint32_t positions; /* R9 (E10): bitmap of written positions (0 = all k'+m); cluster EC only */
     uint64_t object_len, object_xxh64;
     uint64_t writer_epoch;
     int64_t settle_ms;
@@ -120,8 +120,8 @@ int ec_record_encode(const ec_record *r, uint8_t *buf, size_t cap);
 /* Safe on any bytes; refuses another version (TSDB_ERR_CORRUPT) and allocates r->sums. */
 int ec_record_decode(const uint8_t *buf, size_t len, ec_record *r);
 /* The same for a volume that may say more: `cluster_ec` (an erasure-coded cluster volume's engine, eng.ec_cluster)
- * admits ppos and stripe_version != 0 (R8); without it, as the two above, both must be 0. positions != 0 is refused
- * either way (E10 is R9's). */
+ * admits ppos and stripe_version != 0 (R8), and positions != 0 (R9 E10: all k'+m bits or, for m >= 2, k'+m-1 bits
+ * for a degraded settle); without it, as the two above, all three must be 0. */
 int ec_record_encode_as(const ec_record *r, uint8_t *buf, size_t cap, bool cluster_ec);
 int ec_record_decode_as(const uint8_t *buf, size_t len, ec_record *r, bool cluster_ec);
 void ec_record_free(ec_record *r);

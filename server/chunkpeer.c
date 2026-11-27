@@ -11,6 +11,7 @@
 
 #include "../include/tsdb.h"
 #include "../src/compat.h"
+#include "../src/eccold.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -173,6 +174,8 @@ static int stage_cell(void *ctx, unsigned pos, uint64_t idx, const uint8_t *data
     stage *s = ctx;
     if (pos >= s->npos)
         return TSDB_ERR_INVALID;
+    if (s->fd[pos] < 0)
+        return 0; /* E10: unwritten position of a degraded settle (sums still computed by chunk_encode_stream) */
     uint64_t off = 8 * chunk_pos_cells(s->g, pos) + idx * (uint64_t)s->g->cell;
     for (size_t done = 0; done < len;) {
         ssize_t w = pwrite(s->fd[pos], data + done, len - done, (off_t)(off + done));
@@ -294,11 +297,14 @@ static int put_check_pos(pctx *p, const put_batch *b, unsigned i)
     return r;
 }
 
-static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
-                        const chunk_put_src *src, uint64_t *sums_out)
+static int p_put_stream_pos(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
+                            const chunk_put_src *src, uint32_t posmask, uint32_t *written_mask_out,
+                            uint64_t *sums_out)
 {
     pctx *p = ctx;
     struct chunkpeer *cp = p->cp;
+    if (written_mask_out)
+        *written_mask_out = 0;
     if (!p_writable(p))
         return TSDB_ERR_UNAVAILABLE;
     struct chunkpeer_view v;
@@ -311,17 +317,28 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
                         "metadata copy (%u+%u): the put is refused\n", p->volume, g->k, g->m, v.k, v.m);
         return TSDB_ERR_INVALID;
     }
+    uint32_t full = npos < 32 ? ((1u << npos) - 1u) : ~0u;
+    uint32_t target = posmask ? (posmask & full) : full;
+    unsigned ntarget = (unsigned)__builtin_popcount(target);
+    if (ntarget != npos) {
+        unsigned max_skip = eccold_mutant == ECCOLD_MUT_DEGTWO ? 2u : 1u;
+        if (g->m < 2 || ntarget < g->k || npos - ntarget > max_skip)
+            return TSDB_ERR_UNAVAILABLE;
+    }
     uint64_t *own = NULL;
     if (!sums_out && !(sums_out = own = malloc(chunk_sums_total(g) * sizeof *own)))
         return TSDB_ERR_NOMEM;
     uint64_t total_stage = 0;
     for (unsigned i = 0; i < npos; i++)
-        total_stage += 8 * chunk_pos_cells(g, i) + chunk_pos_len(g, i);
+        if (target & (1u << i))
+            total_stage += 8 * chunk_pos_cells(g, i) + chunk_pos_len(g, i);
     bool use_memfd = total_stage <= CP_MEMFD_MAX;
     stage s = {.g = g, .npos = npos};
     for (unsigned i = 0; i < npos; i++)
         s.fd[i] = -1;
     for (unsigned i = 0; i < npos && rc == 0; i++) {
+        if (!(target & (1u << i)))
+            continue;
         s.fd[i] = stage_open_fd(cp->stage_dir, use_memfd);
         if (s.fd[i] < 0) {
             fprintf(stderr, "tsdbd: volume %" PRIu32 ": a put cannot be staged in %s: %s\n", p->volume, cp->stage_dir,
@@ -332,9 +349,15 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
     if (rc == 0)
         rc = chunk_encode_stream(g, src, stage_cell, &s, sums_out);
     for (unsigned i = 0; i < npos && rc == 0; i++)
-        rc = stage_sums(s.fd[i], sums_out + chunk_sums_base(g, i), chunk_pos_cells(g, i));
-    /* Upload all k+m positions concurrently; every position must commit before the settle goes on (no degraded settle). */
-    if (rc == 0 && npos > 0) {
+        if (target & (1u << i))
+            rc = stage_sums(s.fd[i], sums_out + chunk_sums_base(g, i), chunk_pos_cells(g, i));
+    /* Upload all targeted positions concurrently (k'+m for full, k'+m-1 for degraded E10); every targeted position
+     * must commit before the settle goes on. */
+    if (rc == 0 && ntarget > 0) {
+        unsigned todo[CHUNK_POS_MAX], ntodo = 0;
+        for (unsigned i = 0; i < npos; i++)
+            if (target & (1u << i))
+                todo[ntodo++] = i;
         put_batch b;
         memset(&b, 0, sizeof b);
         pthread_mutex_init(&b.mu, NULL);
@@ -351,33 +374,34 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
         unsigned start = 0;
 #ifdef TSDB_TEST_HOOKS
         if (chunkpeer_test_serial_put) {
-            put_pos_run(&b, 0);
-            rc = put_check_pos(p, &b, 0);
+            put_pos_run(&b, todo[0]);
+            rc = put_check_pos(p, &b, todo[0]);
             start = 1;
         }
 #endif
-        if (rc == 0 && start < npos) {
+        if (rc == 0 && start < ntodo) {
             unsigned submitted = 0;
             bool inline_run[CHUNK_POS_MAX] = {false};
             inline_run[start] = true;
-            for (unsigned i = start + 1; i < npos; i++) {
+            for (unsigned t = start + 1; t < ntodo; t++) {
+                unsigned i = todo[t];
                 b.jobs[i] = (put_pos_job){.job = {.fn = put_pos_work, .arg = &b.jobs[i]}, .b = &b, .i = i};
                 if (pool_submit(&b.jobs[i].job) == 0)
                     submitted++;
                 else
-                    inline_run[i] = true;
+                    inline_run[t] = true;
             }
-            for (unsigned i = start; i < npos; i++)
-                if (inline_run[i])
-                    put_pos_run(&b, i);
+            for (unsigned t = start; t < ntodo; t++)
+                if (inline_run[t])
+                    put_pos_run(&b, todo[t]);
             if (submitted > 0) {
                 pthread_mutex_lock(&b.mu);
                 while (b.done < submitted)
                     pthread_cond_wait(&b.cv, &b.mu);
                 pthread_mutex_unlock(&b.mu);
             }
-            for (unsigned i = start; i < npos; i++) {
-                int r = put_check_pos(p, &b, i);
+            for (unsigned t = start; t < ntodo; t++) {
+                int r = put_check_pos(p, &b, todo[t]);
                 if (r && rc == 0)
                     rc = r;
             }
@@ -385,11 +409,19 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
         pthread_cond_destroy(&b.cv);
         pthread_mutex_destroy(&b.mu);
     }
+    if (rc == 0 && written_mask_out)
+        *written_mask_out = target;
     for (unsigned i = 0; i < npos; i++)
         if (s.fd[i] >= 0)
             close(s.fd[i]);
     free(own);
     return rc;
+}
+
+static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
+                        const chunk_put_src *src, uint64_t *sums_out)
+{
+    return p_put_stream_pos(ctx, oid, g, epoch, src, 0, NULL, sums_out);
 }
 
 /* ---------------------------------------------------------------- per-server latency, hedging & read-avoid (E31) */
@@ -661,6 +693,7 @@ struct cold_obj {
     uint8_t vuuid[16], oid[16];
     chunk_geom g;
     unsigned npos;
+    uint32_t positions;          /* R9 (E10): written-positions bitmap (0 = all k'+m) */
     uint32_t node[CHUNK_POS_MAX];
     int st[CHUNK_POS_MAX];       /* the open's status of each position */
     bool avoided[CHUNK_POS_MAX]; /* skipped at open because its peer was in read-avoid */
@@ -1119,6 +1152,7 @@ typedef struct read_race {
     uint8_t vuuid[16], oid[16];
     chunk_geom g;
     unsigned npos;
+    uint32_t positions;          /* R9 (E10): written-positions bitmap (0 = all k'+m) */
     uint32_t node[CHUNK_POS_MAX];
     int st_open[CHUNK_POS_MAX];
     bool avoided_open[CHUNK_POS_MAX];
@@ -1185,6 +1219,7 @@ static void race_hedge_run(void *arg)
     memcpy(ho.oid, rr->oid, 16);
     ho.g = rr->g;
     ho.npos = rr->npos;
+    ho.positions = rr->positions;
     memcpy(ho.node, rr->node, sizeof ho.node);
     memcpy(ho.st, rr->st_open, sizeof ho.st);
     memcpy(ho.avoided, rr->avoided_open, sizeof ho.avoided);
@@ -1199,7 +1234,7 @@ static void race_hedge_run(void *arg)
     hctx.allow_hedge = false;
     hctx.skip_mask = rr->skip_mask;
 
-    chunk_source hsrc = {.ctx = &hctx, .read = src_read, .sums = src_sums};
+    chunk_source hsrc = {.ctx = &hctx, .read = src_read, .sums = src_sums, .positions = ho.positions};
     for (int i = 0; i < 16; i++)
         snprintf(hsrc.name + 2 * i, sizeof hsrc.name - 2 * (size_t)i, "%02x", rr->oid[i]);
     chunk_report rep;
@@ -1297,6 +1332,7 @@ static int hedge_read_cell(read_ctx *rctx, unsigned pos, uint64_t off, void *buf
     memcpy(rr->oid, o->oid, 16);
     rr->g = o->g;
     rr->npos = o->npos;
+    rr->positions = o->positions;
     memcpy(rr->node, o->node, sizeof rr->node);
     memcpy(rr->st_open, o->st, sizeof rr->st_open);
     memcpy(rr->avoided_open, o->avoided, sizeof rr->avoided_open);
@@ -1503,8 +1539,8 @@ static int none_ok(const int *st, unsigned n)
     return away ? TSDB_ERR_UNAVAILABLE : damaged ? TSDB_ERR_CORRUPT : TSDB_ERR_NOTFOUND;
 }
 
-static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
-                      cold_obj **out)
+static int p_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
+                          uint32_t positions, cold_obj **out)
 {
     pctx *p = ctx;
     *out = NULL;
@@ -1519,6 +1555,7 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
     o->timeout_ms = timeout_of(p->cp);
     o->volume = p->volume;
     o->epoch = v.epoch;
+    o->positions = positions;
     memcpy(o->vuuid, p->vuuid, 16);
     memcpy(o->oid, oid, 16);
     for (unsigned i = 0; i < v.nstripe; i++)
@@ -1526,27 +1563,42 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
     if (expect) {
         o->g = *expect;
     } else { /* the geometry from the first header found (positions are placed whatever k' is: E9) */
-        fan *f = fan_new(p->cp, o->volume, o->epoch, o->node, v.nstripe);
+        uint32_t probe_nodes[CHUNK_POS_MAX];
+        unsigned probe_pos[CHUNK_POS_MAX], nprobe = 0;
+        for (unsigned i = 0; i < v.nstripe; i++) {
+            if (positions != 0 && !(positions & (1u << i)))
+                continue;
+            probe_nodes[nprobe] = o->node[i];
+            probe_pos[nprobe] = i;
+            nprobe++;
+        }
+        if (nprobe == 0) {
+            p_obj_close(o);
+            return TSDB_ERR_CORRUPT;
+        }
+        fan *f = fan_new(p->cp, o->volume, o->epoch, probe_nodes, nprobe);
         if (!f) {
             p_obj_close(o);
             return TSDB_ERR_NOMEM;
         }
+        for (unsigned j = 0; j < nprobe; j++)
+            f->pos[j] = probe_pos[j];
         memcpy(f->vuuid, o->vuuid, 16);
         memcpy(f->oid, oid, 16);
         ask a[CHUNK_POS_MAX];
         fan_run(f, 1, 0, false, a, CHUNK_ST_DOWN);
         int st[CHUNK_POS_MAX];
         bool found = false;
-        for (unsigned i = 0; i < v.nstripe; i++) {
-            st[i] = a[i].st;
-            if (a[i].st == CHUNK_ST_OK && !found) {
-                o->g = a[i].g;
+        for (unsigned j = 0; j < nprobe; j++) {
+            st[j] = a[j].st;
+            if (a[j].st == CHUNK_ST_OK && !found) {
+                o->g = a[j].g;
                 found = true;
             }
         }
         if (!found) {
             p_obj_close(o);
-            return none_ok(st, v.nstripe);
+            return none_ok(st, nprobe);
         }
     }
     o->npos = chunk_npos(&o->g);
@@ -1558,6 +1610,10 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
     unsigned active_pos[CHUNK_POS_MAX];
     unsigned nactive = 0;
     for (unsigned i = 0; i < o->npos; i++) {
+        if (positions != 0 && !(positions & (1u << i))) {
+            o->st[i] = CHUNK_ST_UNWRITTEN; /* E10: known erasure, never asked */
+            continue;
+        }
         if (cp_peer_is_avoid(o->node[i], false)) {
             o->avoided[i] = true;
             o->st[i] = rec_sums ? CHUNK_ST_OK : CHUNK_ST_DOWN;
@@ -1592,10 +1648,14 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
     }
     if (ok == 0) {
         int st_all[CHUNK_POS_MAX];
-        for (unsigned i = 0; i < o->npos; i++)
-            st_all[i] = o->avoided[i] ? CHUNK_ST_DOWN : o->st[i];
-        int rc0 = none_ok(st_all, o->npos);
-        if (nactive < o->npos && rc0 == TSDB_ERR_UNAVAILABLE && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
+        unsigned nchk = 0;
+        for (unsigned i = 0; i < o->npos; i++) {
+            if (o->st[i] == CHUNK_ST_UNWRITTEN)
+                continue;
+            st_all[nchk++] = o->avoided[i] ? CHUNK_ST_DOWN : o->st[i];
+        }
+        int rc0 = nchk ? none_ok(st_all, nchk) : TSDB_ERR_CORRUPT;
+        if (nactive < nchk && rc0 == TSDB_ERR_UNAVAILABLE && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
             rc0 = TSDB_ERR_CORRUPT;
         p_obj_close(o);
         return rc0;
@@ -1612,6 +1672,12 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
     return 0;
 }
 
+static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
+                      cold_obj **out)
+{
+    return p_obj_open_pos(ctx, oid, expect, rec_sums, 0, out);
+}
+
 static int p_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsigned flags, chunk_report *rep)
 {
     chunk_report local_rep;
@@ -1626,7 +1692,7 @@ static int p_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsign
         rctx.c0 = off / o->g.cell;
         rctx.c1 = (off + len - 1) / o->g.cell;
     }
-    chunk_source src = {.ctx = &rctx, .read = src_read, .sums = src_sums};
+    chunk_source src = {.ctx = &rctx, .read = src_read, .sums = src_sums, .positions = o->positions};
     for (int i = 0; i < 16; i++)
         snprintf(src.name + 2 * i, sizeof src.name - 2 * (size_t)i, "%02x", o->oid[i]);
     int rc = chunk_read_range(&src, &o->g, o->rec, off, len, buf, flags, rep);
@@ -1967,6 +2033,66 @@ static unsigned p_nstripe(void *ctx)
     return view_of(ctx, &v) == 0 ? v.nstripe : 0;
 }
 
+/* R9 (E10): probe stripe positions in `probe_mask` (0 = all nstripe) with bounded timeout; returns bitmap of UP
+ * positions (and when require_epoch > 0, holding a durable non-unsure fence >= require_epoch). */
+static int p_stripe_up_mask(void *ctx, uint64_t require_epoch, uint32_t probe_mask, uint32_t *up_mask_out,
+                            unsigned *npos_out)
+{
+    pctx *p = ctx;
+    *up_mask_out = 0;
+    *npos_out = 0;
+    struct chunkpeer_view v;
+    int rc = view_of(p, &v);
+    if (rc)
+        return rc;
+    *npos_out = v.nstripe;
+    uint32_t full = v.nstripe < 32 ? ((1u << v.nstripe) - 1u) : ~0u;
+    uint32_t want = probe_mask ? (probe_mask & full) : full;
+    uint32_t nodes[CHUNK_POS_MAX];
+    unsigned pidx[CHUNK_POS_MAX], n = 0;
+    for (unsigned i = 0; i < v.nstripe; i++) {
+        if (!(want & (1u << i)))
+            continue;
+        nodes[n] = v.stripe[i];
+        pidx[n] = i;
+        n++;
+    }
+    if (n == 0)
+        return 0;
+    fan *f = fan_new(p->cp, p->volume, require_epoch, nodes, n);
+    if (!f)
+        return TSDB_ERR_NOMEM;
+    f->epoch_op = true;
+    if (f->tmo > 1000)
+        f->tmo = 1000; /* bounded probe so a SIGSTOPped member does not stall the settle thread or gate */
+    ask a[CHUNK_POS_MAX];
+    fan_run(f, 0, 0, false, a, TSDB_ERR_UNAVAILABLE);
+    uint32_t up = 0;
+    for (unsigned j = 0; j < n; j++) {
+        if (a[j].st != 0)
+            continue;
+        see_fence(p, a[j].fence);
+        if (require_epoch > 0) {
+            if (a[j].fence >= require_epoch && !a[j].unsure)
+                up |= 1u << pidx[j];
+        } else if (chunkpeer_mutant == CP_MUT_UNSUREDOWN) {
+            if (!a[j].unsure)
+                up |= 1u << pidx[j];
+        } else {
+            up |= 1u << pidx[j];
+        }
+    }
+    *up_mask_out = up;
+    return 0;
+}
+
+static void p_note_missing(void *ctx, const uint8_t oid[16], unsigned pos)
+{
+    pctx *p = ctx;
+    if (p->cp->note_missing)
+        p->cp->note_missing(p->volume, oid, pos);
+}
+
 static void p_free(void *ctx) { free(ctx); }
 
 const cold_ops coldops_peer = {
@@ -1988,6 +2114,10 @@ const cold_ops coldops_peer = {
     .del_gc = p_del_gc,
     .gc_suspended = p_gc_suspended,
     .nstripe = p_nstripe,
+    .put_stream_pos = p_put_stream_pos,
+    .obj_open_pos = p_obj_open_pos,
+    .stripe_up_mask = p_stripe_up_mask,
+    .note_missing = p_note_missing,
 };
 
 /* ---------------------------------------------------------------- in-process delivery */

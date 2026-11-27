@@ -3046,6 +3046,110 @@ static void test_p37_ftr_and_plan_cache(void)
     printf("  p37: ftr_hash bit-identity (12 shapes) + cached RS plan across constant and changing stripe masks\n");
 }
 
+/* R9 (E10): known-erasure read path (chunk_source.positions & chunk_obj_open_pos). */
+typedef struct ke_ctx {
+    msrc *m;
+    unsigned read_calls[CHUNK_POS_MAX];
+    unsigned sums_calls[CHUNK_POS_MAX];
+} ke_ctx;
+
+static int ke_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len)
+{
+    ke_ctx *k = ctx;
+    k->read_calls[pos]++;
+    return ms_read(k->m, pos, off, buf, len);
+}
+
+static const uint64_t *ke_sums(void *ctx, unsigned pos, int *status)
+{
+    ke_ctx *k = ctx;
+    k->sums_calls[pos]++;
+    return ms_sums(k->m, pos, status);
+}
+
+static void test_known_erasures(void)
+{
+    chunk_geom g;
+    CHECK(chunk_geom_make(&g, 4, 2, 64, 64 * 10 + 19) == 0);
+    uint8_t *obj = malloc(g.len), *out = malloc(g.len);
+    for (size_t i = 0; i < g.len; i++)
+        obj[i] = (uint8_t)(i * 13 + (i >> 4) + 7);
+    msrc m;
+    ms_build(&m, &g, obj);
+
+    /* Position 1 is unwritten (known erasure); poison m.fail[1] so any accidental request fails loudly */
+    m.fail[1] = CHUNK_ST_ABSENT;
+    ke_ctx kc = {.m = &m};
+    chunk_source src = {.ctx = &kc, .read = ke_read, .sums = ke_sums, .positions = 0x3fu & ~(1u << 1)};
+    snprintf(src.name, sizeof src.name, "known-erasure");
+
+    /* 1. Whole-cell and RAW reads succeed bit-exact; unwritten position 1 is NEVER requested */
+    for (int raw = 0; raw < 2; raw++) {
+        memset(kc.read_calls, 0, sizeof kc.read_calls);
+        memset(kc.sums_calls, 0, sizeof kc.sums_calls);
+        memset(out, 0, g.len);
+        chunk_report rep;
+        CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, raw ? CHUNK_RR_RAW : 0, &rep) == 0);
+        CHECK(memcmp(out, obj, g.len) == 0);
+        CHECK(kc.read_calls[1] == 0 && kc.sums_calls[1] == 0);
+        CHECK(rep.st[1] == CHUNK_ST_UNWRITTEN);
+    }
+
+    /* 2. One written position DOWN (pos 2): 4 written positions remain (== k = 4) -> still decodes bit-exact */
+    m.fail[2] = CHUNK_ST_DOWN;
+    memset(kc.read_calls, 0, sizeof kc.read_calls);
+    memset(out, 0, g.len);
+    chunk_report rep;
+    CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, 0, &rep) == 0);
+    CHECK(memcmp(out, obj, g.len) == 0);
+    CHECK(kc.read_calls[1] == 0 && kc.sums_calls[1] == 0);
+
+    /* 3. Two written positions DOWN (pos 2, pos 3): only 3 written reachable (< k) -> UNAVAILABLE, never CORRUPT */
+    m.fail[3] = CHUNK_ST_DOWN;
+    memset(kc.read_calls, 0, sizeof kc.read_calls);
+    CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, 0, &rep) == TSDB_ERR_UNAVAILABLE);
+    CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, CHUNK_RR_RAW, &rep) == TSDB_ERR_UNAVAILABLE);
+    CHECK(kc.read_calls[1] == 0 && kc.sums_calls[1] == 0);
+
+    /* 4. One written DAMAGED (pos 2) + one written DOWN (pos 3): 3 good + 1 down == k -> UNAVAILABLE */
+    m.fail[2] = CHUNK_ST_DAMAGED;
+    CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, 0, &rep) == TSDB_ERR_UNAVAILABLE);
+    CHECK(kc.read_calls[1] == 0);
+
+    /* 5. Two written DAMAGED (pos 2, pos 3): 3 good + 0 down < k -> CORRUPT */
+    m.fail[3] = CHUNK_ST_DAMAGED;
+    CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, 0, &rep) == TSDB_ERR_CORRUPT);
+    CHECK(kc.read_calls[1] == 0);
+
+    /* 6. chunk_obj_open_pos on a real 6-store backend where pos 1 was never written */
+    char dir[PATH_MAX + 32], sp[6][PATH_MAX + 64];
+    const char *pp[6];
+    fresh("known_erasure", dir, sizeof dir);
+    for (int i = 0; i < 6; i++) {
+        snprintf(sp[i], sizeof sp[i], "%s/st%d", dir, i);
+        CHECK(chunk_store_init(sp[i], NULL, NULL) == 0);
+        pp[i] = sp[i];
+    }
+    chunk_backend *be = NULL;
+    CHECK(chunk_be_open(&be, pp, 6, NULL) == 0 && be);
+    uint8_t vuuid[16] = {1}, oid[16] = {2};
+    uint32_t wmask = 0x3fu & ~(1u << 1);
+    uint64_t *sums = calloc(chunk_sums_total(&g), 8);
+    CHECK(chunk_be_put_object(be, 1, vuuid, oid, &g, 1, obj, wmask, sums) == 0);
+    chunk_obj *co = NULL;
+    CHECK(chunk_obj_open_pos(be, 1, vuuid, oid, &g, sums, wmask, &co) == 0 && co);
+    memset(out, 0, g.len);
+    CHECK(chunk_obj_read(co, 0, g.len, out, 0, &rep) == 0);
+    CHECK(memcmp(out, obj, g.len) == 0 && rep.st[1] == CHUNK_ST_UNWRITTEN);
+    chunk_obj_close(co);
+    chunk_be_close(be);
+    free(sums);
+    ms_free(&m);
+    free(obj);
+    free(out);
+    printf("  known_erasures: unwritten position never requested; decodes from k written; UNAVAILABLE vs CORRUPT exact\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 5 && strcmp(argv[1], "--child") == 0) {
@@ -3112,6 +3216,9 @@ int main(int argc, char **argv)
     test_stream_put();
     test_p26_open_and_par_read();
     test_p37_ftr_and_plan_cache();
+    quiet(true);
+    test_known_erasures();
+    quiet(false);
     test_threads();
     test_crashfs();
     if (failures) {

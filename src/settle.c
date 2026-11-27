@@ -224,12 +224,18 @@ struct ecsettle_tier {
 
 struct ecsettle_eng {
     ecpolicy_state pol;
+    eccold_deg_wait deg;  /* R9 (E10): degraded-settle wait tracking (single settle thread per tier) */
     atomic_bool stopping; /* ecsettle_eng_stop ran: a settle of this engine unwinds */
 };
 
 ecpolicy_state *ecpolicy_of(eng *db)
 {
     return db->ecstate && db->ecstate->settle ? &db->ecstate->settle->pol : NULL;
+}
+
+eccold_deg_wait *ecsettle_deg_wait(eng *db)
+{
+    return db->ecstate && db->ecstate->settle ? &db->ecstate->settle->deg : NULL;
 }
 
 static bool eng_stopping(eng *db)
@@ -506,9 +512,12 @@ static int fail_take_of(int a, int b)
 }
 static int fail_take(void) { return fail_take_of(0, 0); }
 
-static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, int fail_at)
+static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, uint32_t posmask,
+                         uint32_t *written_mask_out, int fail_at)
 {
     memset(r, 0, sizeof *r);
+    if (written_mask_out)
+        *written_mask_out = 0;
     coldvol *cv = tier_cold(db);
     if (!cv)
         return TSDB_ERR_UNAVAILABLE;
@@ -542,7 +551,15 @@ static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, in
     if ((rc = sfill_prepare(&f)) != 0)
         goto out;
     chunk_put_src src = {.ctx = &f, .fill = settle_fill};
-    rc = cv->ops->put_stream(cv->ctx, r->oid, &g, r->writer_epoch, &src, r->sums);
+    unsigned npos = chunk_npos(&g);
+    uint32_t full = npos < 32 ? ((1u << npos) - 1u) : ~0u;
+    uint32_t written = full;
+    if (posmask && cv->ops->put_stream_pos)
+        rc = cv->ops->put_stream_pos(cv->ctx, r->oid, &g, r->writer_epoch, &src, posmask, &written, r->sums);
+    else if (posmask && (posmask & full) != full)
+        rc = TSDB_ERR_UNAVAILABLE;
+    else
+        rc = cv->ops->put_stream(cv->ctx, r->oid, &g, r->writer_epoch, &src, r->sums);
     if (rc == 0 && fail_at == SETTLE_FAIL_PUT)
         rc = TSDB_ERR_IO;
     if (rc) {
@@ -553,6 +570,8 @@ static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, in
         }
         goto out;
     }
+    if (written_mask_out)
+        *written_mask_out = written;
     ecswap_crash_point(ECSWAP_CRASH_AFTER_PUT);
     r->object_xxh64 = f.hash;
     r->settle_ms = eng_now_ms(db);
@@ -596,7 +615,12 @@ static int settle_index_as(eng *db, part *p, const ec_record *r, part **out, int
 
 int ecsettle_put(eng *db, part *p, ec_record *r, uint64_t *epoch)
 {
-    return settle_put_as(db, p, r, epoch, fail_take_of(SETTLE_FAIL_PUT, SETTLE_FAIL_PUT));
+    return settle_put_as(db, p, r, epoch, 0, NULL, fail_take_of(SETTLE_FAIL_PUT, SETTLE_FAIL_PUT));
+}
+
+int ecsettle_put_pos(eng *db, part *p, ec_record *r, uint64_t *epoch, uint32_t posmask, uint32_t *written_mask_out)
+{
+    return settle_put_as(db, p, r, epoch, posmask, written_mask_out, fail_take_of(SETTLE_FAIL_PUT, SETTLE_FAIL_PUT));
 }
 
 int ecsettle_index(eng *db, part *p, const ec_record *r, part **out)
@@ -610,7 +634,7 @@ static int settle_one(eng *db, part *p, part **out)
     *out = NULL;
     int fail_at = fail_take();
     ec_record r;
-    int rc = settle_put_as(db, p, &r, NULL, fail_at);
+    int rc = settle_put_as(db, p, &r, NULL, 0, NULL, fail_at);
     if (rc)
         return rc;
     rc = settle_index_as(db, p, &r, out, fail_at);
@@ -975,6 +999,9 @@ static bool settle_engine(eng *db)
     pthread_mutex_lock(&db->lock);
     size_t n = ecpolicy_pick_locked(db, now, &key, sel, cap);
     pthread_mutex_unlock(&db->lock);
+    eccold_deg_wait *dw = ecsettle_deg_wait(db);
+    if (dw)
+        dw->waiting = false;
     int rc = n ? eng_settle(db, key, sel, n, NULL) : 0;
     for (size_t i = 0; i < n; i++)
         part_unref(sel[i]);
@@ -984,8 +1011,10 @@ static bool settle_engine(eng *db)
         return false;
     if (rc == 0)
         ecpolicy_settled(db, now);
-    else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND)
-        ecpolicy_failed(db, key, now);
+    else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND) {
+        if (!dw || !dw->waiting)
+            ecpolicy_failed(db, key, now);
+    }
     return rc == 0;
 }
 

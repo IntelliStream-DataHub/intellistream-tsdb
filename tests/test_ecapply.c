@@ -2188,6 +2188,163 @@ static void test_digestpower(void)
     printf("  digestpower: power lost just after the DIGEST's apply: its job is armed at the open and MATCHED\n");
 }
 
+/* R9 (E10): degraded MK_COLD record applied on a replica (k+m-1 positions accepted on cluster EC, k+m-2 and
+ * single-server partial positions refused; replica reads back bit-exact with known erasure). */
+static atomic_uint EA_DEG_UP = 0x0eu; /* pos 0 down on a 2+2 stripe */
+static int ea_deg_up_mask(void *c, uint64_t req_epoch, uint32_t probe_mask, uint32_t *up_out, unsigned *npos_out)
+{
+    (void)c, (void)req_epoch;
+    uint32_t u = atomic_load(&EA_DEG_UP);
+    *npos_out = 4;
+    *up_out = probe_mask ? (u & probe_mask) : u;
+    return 0;
+}
+
+static void test_degraded(void)
+{
+    static int seq;
+    char root[PATH_MAX / 2], ldir[PATH_MAX], rdir[PATH_MAX], st[4][PATH_MAX];
+    snprintf(root, sizeof root, "%s/ecapply-%d-degraded-%d", S, (int)getpid(), seq++);
+    snprintf(ldir, sizeof ldir, "%s/db", root);
+    snprintf(rdir, sizeof rdir, "%s/rep", root);
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
+    CHECK(system(cmd) == 0);
+    CHECK(mkdir(root, 0755) == 0 && mkdir(ldir, 0755) == 0 && mkdir(rdir, 0755) == 0);
+    for (int i = 0; i < 4; i++) {
+        snprintf(st[i], sizeof st[i], "%s/st%d", root, i);
+        CHECK(mkdir(st[i], 0755) == 0);
+    }
+    char spec[5 * PATH_MAX];
+    snprintf(spec, sizeof spec, "k=2,m=2,dirs=%s:%s:%s:%s,grace_s=%lld", st[0], st[1], st[2], st[3], (long long)GRACE_S);
+    setenv("TSDB_TEST_TIER", spec, 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+
+    tsdb_options o;
+    opts(&o);
+    eng *db = NULL;
+    uint32_t s0 = 0;
+    CHECK(eng_open(ldir, &o, &db) == 0 && db);
+    CHECK(eng_series(db, "s0", TSDB_FLOAT32, &s0) == 0);
+    CHECK(eng_close(db) == 0);
+    int fd = open(ldir, O_RDONLY | O_DIRECTORY);
+    CHECK(fd >= 0 && meta_require(fd, true, META_REQ_CLUSTER | META_REQ_REPLICA | META_REQ_EC) == 0);
+    if (fd >= 0)
+        close(fd);
+    {
+        char mp[PATH_MAX + 16];
+        snprintf(mp, sizeof mp, "%s/META", ldir);
+        FILE *mf = fopen(mp, "a");
+        CHECK(mf && fputs("volume_uuid=7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c\n", mf) >= 0 && fclose(mf) == 0);
+    }
+
+    /* Open leader with 2+2 degraded cold ops */
+    cold_ops dops = coldops_dir;
+    dops.stripe_version = w_sv;
+    dops.stripe_up_mask = ea_deg_up_mask;
+
+    rec_reset();
+    tier *t = NULL;
+    CHECK(tier_open(ldir, &o, &t) == 0 && t);
+    tier_settings set = {.k = 2, .m = 2, .grace_s = GRACE_S, .keep_s = 3600, .coarse_s = 86400, .cache_mb = 16,
+                         .force_s = 3600, .wait_max_s = 1};
+    tier_attach a = {.ops = &dops, .make = w_make, .settings = &set};
+    tier_want_attach(t, 0, &a);
+    db = NULL;
+    CHECK(eng_open(ldir, &o, &db) == 0 && db);
+    tier_want(NULL, 0);
+
+    /* Initialize replica directory (FNO + SERIES) and copy leader's META (requires= and vuuid) */
+    {
+        eng *init_r = NULL;
+        uint32_t rs0 = 0;
+        CHECK(eng_open(rdir, &o, &init_r) == 0 && init_r);
+        if (init_r) {
+            CHECK(eng_series(init_r, "s0", TSDB_FLOAT32, &rs0) == 0 && rs0 == s0);
+            CHECK(eng_close(init_r) == 0);
+        }
+        char a1[PATH_MAX + 32], a2[PATH_MAX + 32];
+        snprintf(a1, sizeof a1, "%s/META", ldir), snprintf(a2, sizeof a2, "%s/META", rdir);
+        CHECK(copy_file(a1, a2));
+    }
+
+    xport xp;
+    memset(&xp, 0, sizeof xp);
+    pthread_mutex_init(&xp.mu, NULL);
+    struct jr_ops jops = {.ctx = &xp, .admit = xp_admit, .bytes = rx_bytes, .synced = xp_synced, .ship = rx_ship,
+                          .wait = xp_wait, .seg_done = xp_seg_done};
+    CHECK(eng_leader_attach(db, &jops) == 0);
+
+    CHECK(rows(db, s0, 0, 0, 500, 1.0f) == 0);
+    CHECK(eng_optimize(db) == 0);
+
+    /* Trigger degraded settle on leader with pos 0 down */
+    atomic_store(&EA_DEG_UP, 0x0eu);
+    CHECK(settle_key(db, KEY) == TSDB_ERR_UNAVAILABLE);
+    msleep(1100);
+    CHECK(settle_key(db, KEY) == 0);
+    uint32_t leader_pos = 0;
+    {
+        part *ec[4];
+        size_t n = parts_of(db, KEY, ec, 4, true);
+        CHECK(n == 1);
+        if (n == 1) {
+            struct ecpart *ep = atomic_load(&ec[0]->ec);
+            leader_pos = ep->rec.positions;
+            unsigned npos = (unsigned)ep->rec.k + (unsigned)ep->rec.m;
+            CHECK(leader_pos != 0 && __builtin_popcount(leader_pos) == (int)(npos - 1) && !(leader_pos & 1u));
+        }
+        unref_all(ec, n);
+    }
+    uint64_t last = LAST;
+    CHECK(eng_close(db) == 0);
+    tier_put(t);
+
+    /* Open replica over the same 4 stores and apply the recorded log (including degraded MK_COLD) */
+    tier *rtier = NULL;
+    eng *rdb = NULL;
+    CHECK(tier_open(rdir, &o, &rtier) == 0 && rtier);
+    tier_want_attach(rtier, 0, &a);
+    CHECK(eng_open_replica(rdir, &o, 0, &rdb) == 0 && rdb);
+    tier_want(NULL, 0);
+    rt R = {.t = rtier, .db = rdb};
+    snprintf(R.dir, sizeof R.dir, "%s", rdir);
+    CHECK(feed(&R, last) == 0);
+
+    /* Replica must list the degraded .ec part with the exact k'+m-1 positions bitmap and serve exact rows */
+    {
+        part *ec[4];
+        size_t n = parts_of(rdb, KEY, ec, 4, true);
+        CHECK(n == 1);
+        if (n == 1) {
+            struct ecpart *ep = atomic_load(&ec[0]->ec);
+            CHECK(ep->rec.positions == leader_pos);
+            /* Single-server decode of this degraded record must be refused; k+m-2 on cluster EC must be refused */
+            size_t rl = ec_record_size(&ep->rec);
+            uint8_t *rb = malloc(rl);
+            CHECK(rb && ec_record_encode_as(&ep->rec, rb, rl, true) == 0);
+            ec_record tmp;
+            CHECK(ec_record_decode_as(rb, rl, &tmp, false) == TSDB_ERR_CORRUPT);
+            uint32_t bad2 = leader_pos & ~(leader_pos & (uint32_t)(-(int32_t)leader_pos)); /* clear 1 more bit */
+            memcpy(rb + EC_REC_POSITIONS, &bad2, 4);
+            CHECK(ec_record_decode_as(rb, rl, &tmp, true) == TSDB_ERR_CORRUPT);
+            free(rb);
+        }
+        unref_all(ec, n);
+    }
+    CHECK(holds(rdb, s0, 0, 0, 500, 1.0f));
+
+    CHECK(eng_close(rdb) == 0);
+    tier_put(rtier);
+    free(xp.cold);
+    pthread_mutex_destroy(&xp.mu);
+    rec_reset();
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
+    CHECK(system(cmd) == 0);
+    printf("  degraded: replica applied degraded MK_COLD (positions 0x%x), read back bit-exact, refused k+m-2 and "
+           "single-server partial bitmap\n", leader_pos);
+}
+
 int main(int argc, char **argv)
 {
     const char *only = NULL, *power_root = NULL, *lpower_root = NULL, *recover_root = NULL, *dpower_root = NULL;
@@ -2254,7 +2411,7 @@ int main(int argc, char **argv)
                  {"multi", test_multi}, {"twice", test_twice}, {"tamper", test_tamper}, {"leader", test_leader},
                  {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power},
                  {"recover", test_recover}, {"recpower", test_recpower}, {"digest", test_digest},
-                 {"digestpower", test_digestpower}};
+                 {"digestpower", test_digestpower}, {"degraded", test_degraded}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();

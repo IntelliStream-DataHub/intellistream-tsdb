@@ -69,23 +69,28 @@ typedef struct eccold_cut {
     int64_t key;
     size_t nobjs, ny;
     char y[ECCOLD_TEST_Y_MAX][64];
-    bool flushed, gated;
+    bool flushed, gated, degraded;
+    uint32_t positions; /* R9 (E10): written-positions bitmap of the last object (0 = full) */
     int rc;
     int64_t hold_us; /* from lw_enter to lw_leave (0: never gated) */
 } eccold_cut;
 void eccold_test_last(eccold_cut *out);
 /* Steps a settle passes, for tests to act at (the hook runs on the settle's thread, no engine lock held but those
  * named): PUT (objects put, nothing taken), GATED (lw_enter done: jr_serial held, the fence up), CUT (Z and Y taken),
- * MARKER (the marker committed, before the swap). */
-enum { ECCOLD_STEP_PUT = 1, ECCOLD_STEP_GATED, ECCOLD_STEP_CUT, ECCOLD_STEP_MARKER };
+ * PRE_MARKER (after .ec files indexed, right before the pre-MK_COLD UP check), MARKER (the marker committed, before
+ * the swap). */
+enum { ECCOLD_STEP_PUT = 1, ECCOLD_STEP_GATED, ECCOLD_STEP_CUT, ECCOLD_STEP_PRE_MARKER, ECCOLD_STEP_MARKER };
 extern void (*_Atomic eccold_test_hook)(struct eng *db, int step);
 /* Planted bugs (tests/test_eccold.c --mutant NAME, or TSDB_ECCOLD_MUTANT=NAME): cutnogate: Y and Z taken without
  * lw_enter (no fence, no jr_serial); cutnowait: Z without waiting for the commit point to pass L; ttlsettling: the TTL
  * pass takes a key with a settling part in a cluster; cutnorotate: no flush at the cut (F inside the active segment,
  * the key's memtable rows in no part); fencekeyonly: the fence covers only the buckets of the series in the settled
- * parts; stripewaitfenced: the wait for the positions runs under the fence. */
+ * parts; stripewaitfenced: the wait for the positions runs under the fence; degtwo: allows degraded settle with 2
+ * positions down; degnoupcheck: skips the pre-MK_COLD UP verification; degnopositions: writes full positions bitmap
+ * instead of k+m-1 on a degraded settle. */
 enum { ECCOLD_MUT_NONE = 0, ECCOLD_MUT_CUTNOGATE, ECCOLD_MUT_CUTNOWAIT, ECCOLD_MUT_TTLSETTLING,
-       ECCOLD_MUT_CUTNOROTATE, ECCOLD_MUT_FENCEKEYONLY, ECCOLD_MUT_STRIPEWAITFENCED };
+       ECCOLD_MUT_CUTNOROTATE, ECCOLD_MUT_FENCEKEYONLY, ECCOLD_MUT_STRIPEWAITFENCED,
+       ECCOLD_MUT_DEGTWO, ECCOLD_MUT_DEGNOUPCHECK, ECCOLD_MUT_DEGNOPOSITIONS };
 extern int eccold_mutant;
 /* the number of files one marker may name in place of MK_FILES_MAX (0: MK_FILES_MAX), for test_eccold's toomany */
 extern _Atomic size_t eccold_test_files_max;

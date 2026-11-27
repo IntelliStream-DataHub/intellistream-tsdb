@@ -74,6 +74,8 @@ struct chunkpeer {
     struct chunksrv *local; /* this member's chunk server (the ownepoch mutant reads its stores' own fence) */
     char stage_dir[PATH_MAX]; /* where puts are staged (unlinked temporaries) */
     int timeout_ms;           /* per request or put; 0: 30,000 */
+    /* R9 (E10): optional reconcile hook notified after a degraded settle commits (NULL in standalone tests). */
+    void (*note_missing)(uint32_t volume, const uint8_t oid[16], unsigned pos);
 };
 
 extern const cold_ops coldops_peer;

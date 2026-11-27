@@ -16506,6 +16506,410 @@ static void scen_ecgc(void)
            ecb_chunks(num));
 }
 
+#ifdef TSDB_EC
+static int ecd_chunks_of(int srv, uint32_t num)
+{
+    char p[PATH_MAX + 80];
+    snprintf(p, sizeof p, "%s/ecs%d/s%" PRIu32, base, srv, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        n += e->d_name[0] == 'o' && l > 6 && !strcmp(e->d_name + l - 6, ".chunk");
+    }
+    closedir(dd);
+    return n;
+}
+
+static uint16_t ecd_le16(const uint8_t *b) { return (uint16_t)(b[0] | ((uint16_t)b[1] << 8)); }
+static uint32_t ecd_le32(const uint8_t *b)
+{
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static uint64_t ecd_le64(const uint8_t *b)
+{
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--)
+        v = (v << 8) | b[i];
+    return v;
+}
+
+/* Inspect every live .ec file in server `srv`'s v<num>: checks k, m and exact `want_pos` bitmap in ec_record. */
+static int ecd_check_ec_positions(int srv, uint32_t num, uint16_t want_k, uint16_t want_m, uint32_t want_pos)
+{
+    char d[PATH_MAX + 80], dirp[PATH_MAX + 120];
+    server_dir(srv, d, sizeof d);
+    snprintf(dirp, sizeof dirp, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(dirp);
+    if (!dd)
+        die("opendir %s: %s", dirp, strerror(errno));
+    int count = 0;
+    for (struct dirent *de; (de = readdir(dd));) {
+        size_t l = strlen(de->d_name);
+        if (l <= 3 || strcmp(de->d_name + l - 3, ".ec") != 0 || strncmp(de->d_name, "retired_", 8) == 0)
+            continue;
+        char fp[PATH_MAX + 256];
+        snprintf(fp, sizeof fp, "%s/%s", dirp, de->d_name);
+        int fd = open(fp, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            die("open %s: %s", fp, strerror(errno));
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size < 64 + 216)
+            die("%s: short .ec file (%lld)", fp, (long long)st.st_size);
+        uint8_t tr[64], rhdr[64];
+        if (pread(fd, tr, 64, st.st_size - 64) != 64 || memcmp(tr, "TSDB-EC\n", 8) != 0)
+            die("%s: bad .ec trailer", fp);
+        uint64_t roff = ecd_le64(tr + 16), rlen = ecd_le64(tr + 24);
+        if (rlen < 216 || roff + rlen + 64 != (uint64_t)st.st_size)
+            die("%s: bad record offset/len", fp);
+        if (pread(fd, rhdr, 64, (off_t)roff) != 64)
+            die("%s: short record read", fp);
+        close(fd);
+        uint16_t k = ecd_le16(rhdr + 52), m = ecd_le16(rhdr + 54);
+        uint32_t pos = ecd_le32(rhdr + 60);
+        if (k != want_k || m != want_m)
+            die("%s: geometry %u+%u, want %u+%u", fp, k, m, want_k, want_m);
+        if (pos != want_pos)
+            die("%s: record positions 0x%x (popcount %d), want 0x%x (degnopositions?)", fp, pos,
+                __builtin_popcount(pos), want_pos);
+        count++;
+    }
+    closedir(dd);
+    return count;
+}
+#endif
+
+/* ecdegraded (r9-degsettle, E10): 4+2 on 7 nodes with ec.settle_wait_max_s = 5 s.
+ * 1. SIGSTOP 1 stripe holder -> day settles degraded after 5 s with 5 positions (verified in .ec record + store chunks +
+ *    reconcile_note_missing log + replica apply); reads equal oracle.
+ * 2. SIGSTOP a 2nd holder -> reads still answer from the 4 written positions (k = 4).
+ * 3. SIGSTOP a 3rd holder -> UNAVAILABLE, never CORRUPT.
+ * 4. SIGCONT all 3 -> whole answers (known-erasure position never causes CORRUPT).
+ * 5. SIGSTOP 2 holders -> a new day does NOT settle past 5 s (kills degtwo).
+ * 6. Pre-MK_COLD UP check: pause_pre_marker hook + SIGSTOP a written holder before MK_COLD -> aborts (kills degnoupcheck). */
+static int ecd_committed_ec_parts(int i, uint32_t num)
+{
+    char d[PATH_MAX + 80], p[PATH_MAX + 120];
+    server_dir(i, d, sizeof d);
+    snprintf(p, sizeof p, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        n += l > 4 && e->d_name[0] == 'p' && !strcmp(e->d_name + l - 3, ".ec");
+    }
+    closedir(dd);
+    return n;
+}
+
+static void scen_ecdegraded(void)
+{
+    scenario("ecdegraded");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    epoll_after_two = 1;
+    static char pmenv[PATH_MAX + 256], pmpath[PATH_MAX + 96];
+    snprintf(pmpath, sizeof pmpath, "%s/pause_pre_marker", base);
+    snprintf(pmenv, sizeof pmenv, "TSDB_ECCOLD_TEST=pause_pre_marker=%s", pmpath);
+    for (int i = 0; i < 7; i++) {
+        penv[i] = pmenv;
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want_v = 5;
+    await_view(0, p_voters, &want_v, "five voters of seven members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    int voter_srv[7] = {0};
+    for (int i = 0; i < 7; i++)
+        voter_srv[i] = is_voter(&v, ids[i]) != 0;
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    for (int i = 0; i < 7; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i],
+                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --ec-settle-wait-max-s 5 "
+                 "--merge-idle-s 1 --flush-interval-ms 200 --ec-cache-mb 16", sd);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with their volumes open");
+
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ec=4+2 on 7 nodes: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("twin t42: %s", cluster_strerror(rc));
+
+    struct meta_volume e, tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("e42 has no leader 30 s after add");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("t42 has no leader 30 s after add");
+    int L = server_of(e.leader), Lt = server_of(tv.leader);
+    if (L < 0 || Lt < 0)
+        die("bad leader index L=%d Lt=%d", L, Lt);
+
+    /* Ensure at least one non-voter in e42's stripe is not L (so stopping 3 stripe members leaves >= 3 voters UP). */
+    int nv_in_stripe = 0;
+    for (uint32_t p = 0; p < e.nstripe; p++) {
+        int s = server_of(e.stripe[p]);
+        if (s >= 0 && !voter_srv[s] && s != L)
+            nv_in_stripe++;
+    }
+    if (nv_in_stripe == 0 && !voter_srv[L]) {
+        int tgt = -1;
+        for (uint32_t k = 0; k < e.nrep && tgt < 0; k++) {
+            int s = server_of(e.rep[k].node);
+            if (s >= 0 && s != L && voter_srv[s])
+                tgt = s;
+        }
+        if (tgt >= 0) {
+            char why[256];
+            for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[tgt], why, sizeof why)) != 0; usleep(200000))
+                if (now_ms() - t0 > 30000)
+                    die("transfer e42 to voter %d: %s (%s)", tgt, cluster_strerror(rc), why);
+            for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || server_of(e.leader) != tgt; usleep(50000))
+                if (now_ms() - t0 > 30000)
+                    die("e42 did not move to voter %d", tgt);
+            L = tgt;
+        }
+    }
+    char lead_line[96];
+    snprintf(lead_line, sizeof lead_line, "volume %" PRIu32 ": leads epoch %" PRIu64 " ", num, e.epoch);
+    for (uint64_t t0 = now_ms(); !log_has(L, lead_line); usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("leader %d did not log %s", L, lead_line);
+    await_isr(L, "e42", 3, 30000, "e42 full ISR before degraded settle");
+
+    /* Write day 0 to oracle twin t42 and compute oracle hashes while all 7 nodes are UP. */
+    const int64_t day0 = 1704067200000LL;
+    tsdbc *ct = client(Lt);
+    tsdb_sid idt[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecd.s%d", s);
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+    ecb_write_day(ct, idt, day0);
+    struct ecb_sum twin[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++)
+        if ((rc = ecb_read(ct, idt[s], &twin[s])) != 0 || twin[s].n != 2 * ECB_ROWS)
+            die("oracle read series %d: %s (%" PRIu64 " rows)", s, ers(rc), twin[s].n);
+    tsdbc_close(ct);
+
+    /* Pick 3 stripe victims (v0, v1, v2) at positions (p0, p1, p2): none is L or ml; v0 and v1 are not log replicas
+     * of e42 (so e42 keeps full 3/3 ISR during writes!); and at least 1 of {v0, v1, v2} is a non-voter (so Raft keeps
+     * >= 3 of 5 voters UP even with all 3 stopped!). */
+    int ml = leader_of(L);
+    int victims[3] = {-1, -1, -1};
+    unsigned vpos[3] = {0, 0, 0};
+    int nv = 0;
+    for (int pass = 0; pass < 4 && nv < 3; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && nv < 3; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == L || s == ml)
+                continue;
+            int already = 0;
+            for (int j = 0; j < nv; j++)
+                already |= victims[j] == s;
+            if (already)
+                continue;
+            bool rep = ecb_is_rep(&e, s);
+            bool vot = voter_srv[s] != 0;
+            bool match = (pass == 0 && !rep && !vot) || (pass == 1 && !rep && vot) ||
+                         (pass == 2 && rep && !vot) || (pass == 3 && rep && vot);
+            if (!match)
+                continue;
+            /* Ensure the 3rd victim includes a non-voter if the first two were both voters */
+            if (nv == 2 && voter_srv[victims[0]] && voter_srv[victims[1]] && vot)
+                continue;
+            victims[nv] = s;
+            vpos[nv] = p;
+            nv++;
+        }
+    }
+    if (nv < 3 || ecb_is_rep(&e, victims[0]) || ecb_is_rep(&e, victims[1]))
+        die("could not pick 3 stripe victims (nv=%d, v0=%d rep=%d, v1=%d rep=%d)", nv, victims[0],
+            victims[0] >= 0 ? ecb_is_rep(&e, victims[0]) : -1, victims[1],
+            victims[1] >= 0 ? ecb_is_rep(&e, victims[1]) : -1);
+    printf("  e42 (vol %" PRIu32 ") led by %d (ml=%d); victims: srv %d (pos %u), srv %d (pos %u), srv %d (pos %u)\n",
+           num, L, ml, victims[0], vpos[0], victims[1], vpos[1], victims[2], vpos[2]);
+
+    /* ---- Phase 1: SIGSTOP 1 stripe holder (v0, pos p0) -> key settles degraded after 5 s with 5 positions ---- */
+    tsdbc *c = client(L);
+    tsdb_sid ide[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecd.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+    }
+    pause_server(victims[0], 1);
+    ecb_write_day(c, ide, day0);
+    uint64_t t_wait = now_ms();
+    int nec = 0;
+    for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) == 0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("e42 did not settle degraded with 1 holder stopped in 90 s");
+    uint64_t settled_ms = now_ms() - t_wait;
+    char live[1024];
+    int nlive = 0;
+    for (uint64_t t0 = now_ms(); (nlive = ecb_live_parts(L, num, live, sizeof live)) != 0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("%d .part file(s) left in leader v%" PRIu32 " after degraded settle:%s", nlive, num, live);
+    nec = ecb_ec_parts(L, num);
+    if (settled_ms < 3500)
+        die("degraded settle completed too quickly (%" PRIu64 " ms < 3500 ms; ec.settle_wait_max_s = 5)", settled_ms);
+    int total_ch = ecb_chunks_n(num, 7);
+    int v0_ch = ecd_chunks_of(victims[0], num);
+    if (total_ch != nec * 5 || v0_ch != 0)
+        die("degraded settle wrote %d chunks (want %d = %d * 5), stopped holder %d has %d chunks", total_ch, nec * 5,
+            nec, victims[0], v0_ch);
+    uint32_t want_pos = 0x3fu & ~(1u << vpos[0]);
+    int checked = ecd_check_ec_positions(L, num, 4, 2, want_pos);
+    if (checked != nec)
+        die("checked %d .ec files on leader, expected %d", checked, nec);
+    if (!log_has(L, "reconcile noted missing position"))
+        die("leader %d did not log sreconcile_note_missing after degraded settle", L);
+    /* Verify a follower replica also applied the degraded .ec record with identical positions bitmap */
+    int frep = -1;
+    for (uint32_t k = 0; k < e.nrep && frep < 0; k++) {
+        int s = server_of(e.rep[k].node);
+        if (s >= 0 && s != L)
+            frep = s;
+    }
+    if (frep >= 0) {
+        for (uint64_t t0 = now_ms(); ecb_ec_parts(frep, num) < nec; usleep(200000))
+            if (now_ms() - t0 > 30000)
+                die("follower %d has %d .ec parts, leader has %d", frep, ecb_ec_parts(frep, num), nec);
+        ecd_check_ec_positions(frep, num, 4, 2, want_pos);
+    }
+    for (int s = 0; s < 2; s++) {
+        struct ecb_sum a;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0 || a.n != twin[s].n || a.h != twin[s].h)
+            die("phase 1 read series %d: %s (%" PRIu64 " vs %" PRIu64 ")", s, ers(rc), a.n, twin[s].n);
+    }
+    printf("  phase 1: settled degraded in %" PRIu64 " ms (%d .ec, %d chunks = 5/obj, positions 0x%x); reads == oracle\n",
+           settled_ms, nec, total_ch, want_pos);
+
+    /* ---- Phase 2: SIGSTOP 2nd holder (v1) -> reads still answer from 4 written positions (k = 4) ---- */
+    pause_server(victims[1], 1);
+    for (int s = 2; s < 4; s++) {
+        struct ecb_sum a;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0 || a.n != twin[s].n || a.h != twin[s].h)
+            die("phase 2 read series %d with 2 holders stopped: %s (%" PRIu64 " vs %" PRIu64 ")", s, ers(rc), a.n,
+                twin[s].n);
+    }
+    printf("  phase 2: 2nd holder (srv %d) SIGSTOPped: reads decoded from 4 written positions == oracle\n", victims[1]);
+
+    /* ---- Phase 3: SIGSTOP 3rd holder (v2) -> UNAVAILABLE, never CORRUPT ---- */
+    pause_server(victims[2], 1);
+    int nun = 0;
+    for (int s = 4; s < ECB_SERIES; s++) {
+        struct ecb_sum a;
+        rc = ecb_read(c, ide[s], &a);
+        if (rc == TSDB_ERR_UNAVAILABLE) {
+            nun++;
+            continue;
+        }
+        if (rc != 0 || a.n != twin[s].n || a.h != twin[s].h)
+            die("phase 3 read series %d with 3 holders stopped: %s (want UNAVAILABLE or oracle, never CORRUPT)", s,
+                ers(rc));
+    }
+    if (nun == 0)
+        die("phase 3: 0 series returned UNAVAILABLE with 3 stripe holders stopped");
+    if (log_has(L, "not readable") || log_has(L, "its object lost more chunks") || log_has(L, "fail its checksum"))
+        die("phase 3: leader %d logged corruption with 3 holders stopped", L);
+    printf("  phase 3: 3rd holder (srv %d) SIGSTOPped: %d/%d series UNAVAILABLE, zero CORRUPT\n", victims[2], nun,
+           ECB_SERIES - 4);
+
+    /* ---- Phase 4: SIGCONT all 3 -> whole answers (known-erasure holder UP with 0 chunks never causes CORRUPT) ---- */
+    pause_server(victims[0], 0);
+    pause_server(victims[1], 0);
+    pause_server(victims[2], 0);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a;
+        for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &a)) != 0; usleep(200000))
+            if (rc != TSDB_ERR_UNAVAILABLE || now_ms() - t0 > 60000)
+                die("phase 4 read series %d after SIGCONT: %s", s, ers(rc));
+        if (a.n != twin[s].n || a.h != twin[s].h)
+            die("phase 4 series %d after SIGCONT: %" PRIu64 " vs %" PRIu64, s, a.n, twin[s].n);
+    }
+    if (log_has(L, "not readable") || log_has(L, "its object lost more chunks") || log_has(L, "fail its checksum"))
+        die("phase 4: leader %d logged corruption after SIGCONT", L);
+    printf("  phase 4: SIGCONT all 3: all %d series read whole == oracle\n", ECB_SERIES);
+
+    /* ---- Phase 5: 2 holders stopped (v0 + v1) must NOT settle past wait_max_s = 5 s (kills degtwo) ---- */
+    int nec_before = ecd_committed_ec_parts(L, num);
+    pause_server(victims[0], 1);
+    pause_server(victims[1], 1);
+    ecb_write_day(c, ide, day0 + 2 * 86400000LL);
+    usleep(9000000); /* 1 s merge + > 5 s wait_max_s */
+    int nec_after2 = ecd_committed_ec_parts(L, num);
+    if (nec_after2 != nec_before)
+        die("phase 5: settled with 2 stripe holders stopped (%d -> %d .ec parts; degtwo!)", nec_before, nec_after2);
+    if (!log_has(L, "at most 1 may be down for a degraded settle"))
+        die("phase 5: leader %d did not log the 2-down refusal line", L);
+    printf("  phase 5: 2 holders stopped: did not settle past wait_max_s (stayed %d .ec parts)\n", nec_before);
+
+    /* ---- Phase 6: Pre-MK_COLD UP check (kills degnoupcheck) ----
+     * Resume v1 (leaving only v0 stopped), arm pause_pre_marker so the leader pauses right after putting 5 chunks
+     * and indexing .ec, then SIGSTOP written holder v1 and resume -> pre-MK_COLD check must abort without MK_COLD! */
+    FILE *pf = fopen(pmpath, "w");
+    if (!pf)
+        die("fopen %s: %s", pmpath, strerror(errno));
+    fclose(pf);
+    int pm0 = log_count(L, "pause_pre_marker: paused before MK_COLD");
+    pause_server(victims[1], 0);
+    for (uint64_t t0 = now_ms(); log_count(L, "pause_pre_marker: paused before MK_COLD") <= pm0; usleep(100000))
+        if (now_ms() - t0 > 90000)
+            die("phase 6: leader %d did not reach pause_pre_marker within 90 s", L);
+    pause_server(victims[1], 1); /* drop written holder v1 right before MK_COLD! */
+    int res0 = log_count(L, "pause_pre_marker: resumed before MK_COLD");
+    int ab0 = log_count(L, "dropped before MK_COLD: aborting");
+    unlink(pmpath);
+    for (uint64_t t0 = now_ms(); log_count(L, "pause_pre_marker: resumed before MK_COLD") <= res0; usleep(100000))
+        if (now_ms() - t0 > 30000)
+            die("phase 6: leader %d did not resume from pause_pre_marker within 30 s", L);
+    for (uint64_t t0 = now_ms(); log_count(L, "dropped before MK_COLD: aborting") <= ab0; usleep(100000)) {
+        int nec_now = ecd_committed_ec_parts(L, num);
+        if (nec_now != nec_before)
+            die("phase 6: MK_COLD committed after written holder %d dropped before marker (%d -> %d .ec; degnoupcheck!)",
+                victims[1], nec_before, nec_now);
+        if (now_ms() - t0 > 30000)
+            die("phase 6: leader %d neither aborted nor committed within 30 s after pause_pre_marker resume", L);
+    }
+    int nec_after6 = ecd_committed_ec_parts(L, num);
+    if (nec_after6 != nec_before)
+        die("phase 6: MK_COLD committed after written holder %d dropped before marker (%d -> %d .ec; degnoupcheck!)",
+            victims[1], nec_before, nec_after6);
+    printf("  phase 6: written holder dropped before MK_COLD: pre-marker UP check aborted cleanly\n");
+
+    pause_server(victims[0], 0);
+    pause_server(victims[1], 0);
+    tsdbc_close(c);
+#endif
+}
+
 static void scen_ecadd(void)
 {
     scenario("ecadd");
@@ -21392,7 +21796,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"snapmove", scen_snapmove}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast},

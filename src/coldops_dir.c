@@ -37,18 +37,30 @@ static void ident(const dirctx *d, const uint8_t oid[16], unsigned pos, chunk_id
     id->pos = (uint16_t)pos;
 }
 
-static int d_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
-                        const chunk_put_src *src, uint64_t *sums_out)
+static int d_put_stream_pos(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
+                            const chunk_put_src *src, uint32_t posmask, uint32_t *written_mask_out, uint64_t *sums_out)
 {
     dirctx *d = ctx;
     chunk_backend *be = wbe(d);
     if (!be)
         return TSDB_ERR_UNAVAILABLE;
-    return chunk_be_put_stream(be, d->volume, d->vuuid, oid, g, epoch, src, ~0u, sums_out);
+    unsigned npos = chunk_npos(g);
+    uint32_t full = npos < 32 ? ((1u << npos) - 1u) : ~0u;
+    uint32_t target = posmask ? (posmask & full) : full;
+    int rc = chunk_be_put_stream(be, d->volume, d->vuuid, oid, g, epoch, src, target, sums_out);
+    if (rc == 0 && written_mask_out)
+        *written_mask_out = target;
+    return rc;
 }
 
-static int d_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
-                      cold_obj **out)
+static int d_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
+                        const chunk_put_src *src, uint64_t *sums_out)
+{
+    return d_put_stream_pos(ctx, oid, g, epoch, src, 0, NULL, sums_out);
+}
+
+static int d_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
+                          uint32_t positions, cold_obj **out)
 {
     dirctx *d = ctx;
     int rc = 0;
@@ -56,9 +68,15 @@ static int d_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
     if (!be)
         return rc ? rc : TSDB_ERR_UNAVAILABLE;
     chunk_obj *o = NULL;
-    rc = chunk_obj_open(be, d->volume, d->vuuid, oid, expect, rec_sums, &o);
+    rc = chunk_obj_open_pos(be, d->volume, d->vuuid, oid, expect, rec_sums, positions, &o);
     *out = rc ? NULL : (cold_obj *)o; /* a chunk_obj holds the backend, which the tier keeps open until it closes */
     return rc;
+}
+
+static int d_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
+                      cold_obj **out)
+{
+    return d_obj_open_pos(ctx, oid, expect, rec_sums, 0, out);
 }
 
 static int d_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsigned flags, chunk_report *rep)
@@ -206,6 +224,8 @@ const cold_ops coldops_dir = {
     .all_up = d_all_up,
     .ctx_free = d_free,
     .chunk_info = d_chunk_info,
+    .put_stream_pos = d_put_stream_pos,
+    .obj_open_pos = d_obj_open_pos,
 };
 
 int coldops_dir_make(void *arg, struct tier *t, uint32_t volume, const uint8_t vuuid[16], void **ctx)

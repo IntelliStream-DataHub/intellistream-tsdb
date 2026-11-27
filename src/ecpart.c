@@ -18,6 +18,7 @@
  */
 #include "ecpart.h"
 #include "chunk.h"
+#include "eccold.h"
 #include "ecgc.h"
 #include "tier.h"
 
@@ -87,16 +88,39 @@ static bool source_ok(const char *s)
  * derived from settings), the sums of exactly that geometry, a block range in order, a source name. The marker's log
  * position (`ppos`) and the stripe list's version are R8's and set only in an erasure-coded cluster volume
  * (`cluster_ec`: META says requires=cluster and ec); a single server's tier keeps them 0, so a record that sets one
- * there is not this volume's. A degraded settle's mask of positions (E10) is R9's and always 0: a record that sets it
- * says something this build cannot honour (it would read a degraded object as fully written). */
+ * there is not this volume's. A degraded settle's mask of written positions (E10, R9) is admitted on cluster EC
+ * volumes only: 0 (all k'+m), all k'+m bits set, or (when m >= 2 so margin m - 1 >= 1) k'+m-1 bits set; single-server
+ * tiers keep refusing non-zero positions. */
+static bool positions_valid(const ec_record *r, bool cluster_ec)
+{
+    if (r->positions == 0)
+        return true;
+    if (!cluster_ec)
+        return false;
+    unsigned npos = (unsigned)r->k + (unsigned)r->m;
+    if (npos == 0 || npos > CHUNK_POS_MAX)
+        return false;
+    uint32_t full = (1u << npos) - 1u;
+    if ((r->positions & ~full) != 0)
+        return false;
+    unsigned bits = (unsigned)__builtin_popcount(r->positions);
+    if (bits == npos)
+        return true;
+    if (r->m >= 2 && bits == npos - 1)
+        return true;
+    if (eccold_mutant == ECCOLD_MUT_DEGTWO && r->m >= 2 && bits == npos - 2)
+        return true; /* planted degtwo: allows settling with 2 positions down */
+    return false;
+}
+
 static bool record_valid(const ec_record *r, bool cluster_ec)
 {
     chunk_geom g;
     bool r8 = cluster_ec || mk_test_mutant == MK_MUT_PPOS_LOOSE;
     return r->version == EC_RECORD_VERSION && r->class_check <= EC_CLS_FAILED && r->min_block <= r->max_block &&
-           r->positions == 0 && (r8 || (r->ppos == 0 && r->stripe_version == 0)) &&
+           (r8 || (r->ppos == 0 && r->stripe_version == 0)) &&
            chunk_geom_make(&g, r->k, r->m, r->cell_bytes, r->object_len) == 0 && r->nsums == chunk_sums_total(&g) &&
-           source_ok(r->source);
+           positions_valid(r, cluster_ec) && source_ok(r->source);
 }
 
 int ec_record_encode(const ec_record *r, uint8_t *buf, size_t cap)

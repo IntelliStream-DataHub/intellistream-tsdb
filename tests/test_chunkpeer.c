@@ -1262,6 +1262,92 @@ static void test_parallel_put(void)
     cluster_down();
 }
 
+/* R9 (E10): degraded put (k+m-1), stripe_up_mask, pre-marker UP check, known-erasure read, and note_missing hook. */
+static atomic_uint deg_noted_cnt;
+static atomic_uint deg_noted_pos;
+static void deg_note_cb(uint32_t volume, const uint8_t oid[16], unsigned pos)
+{
+    (void)volume;
+    (void)oid;
+    atomic_store(&deg_noted_pos, pos);
+    atomic_fetch_add(&deg_noted_cnt, 1);
+}
+
+static void test_degraded_put_read(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("degput", dir, sizeof dir);
+    CP.note_missing = deg_note_cb;
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+
+    /* 1. Member 2 (pos 1) down -> stripe_up_mask reports 5 of 6 UP */
+    atomic_store(&F.down, 1u << 2);
+    uint32_t up = 0;
+    unsigned npos = 0;
+    CHECK(coldops_peer.stripe_up_mask(ctx, 0, 0, &up, &npos) == 0 && npos == 6 && up == (0x3fu & ~(1u << 1)));
+
+    /* 2. put_stream_pos with 2 missing positions (0x3c) is refused */
+    obj o;
+    obj_make(&o, 512u << 10, 41);
+    chunk_put_src psrc = {.ctx = o.bytes, .fill = fill};
+    uint32_t written = 0;
+    CHECK(coldops_peer.put_stream_pos(ctx, o.oid, &o.g, 5, &psrc, 0x3cu, &written, o.sums) == TSDB_ERR_UNAVAILABLE);
+
+    /* 3. put_stream_pos with 5 reachable positions succeeds and writes only those 5 */
+    CHECK(coldops_peer.put_stream_pos(ctx, o.oid, &o.g, 5, &psrc, up, &written, o.sums) == 0 && written == up);
+    /* Pre-MK_COLD check: every written position is UP in epoch 5 */
+    uint32_t up_e = 0;
+    CHECK(coldops_peer.stripe_up_mask(ctx, 5, written, &up_e, &npos) == 0 && (up_e & written) == written);
+    /* note_missing hook fires cleanly */
+    atomic_store(&deg_noted_cnt, 0);
+    coldops_peer.note_missing(ctx, o.oid, 1);
+    CHECK(atomic_load(&deg_noted_cnt) == 1 && atomic_load(&deg_noted_pos) == 1);
+
+    /* 4. Bring member 2 back UP (still holds NO chunk of o): reads with `written` bitmap NEVER request member 2 */
+    atomic_store(&F.down, 0);
+    atomic_store(&F.read_calls[2], 0);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open_pos(ctx, o.oid, &o.g, o.sums, written, &h) == 0 && h);
+    uint8_t *got = malloc(o.g.len);
+    chunk_report rep;
+    CHECK(coldops_peer.obj_read(h, 0, o.g.len, got, 0, &rep) == 0);
+    CHECK(memcmp(got, o.bytes, o.g.len) == 0 && rep.st[1] == CHUNK_ST_UNWRITTEN);
+    CHECK(atomic_load(&F.read_calls[2]) == 0);
+    coldops_peer.obj_close(h);
+
+    /* 5. Member 3 (pos 2) down -> 4 written positions remain (k = 4) -> reads still succeed bit-exact */
+    atomic_store(&F.down, 1u << 3);
+    h = NULL;
+    CHECK(coldops_peer.obj_open_pos(ctx, o.oid, &o.g, o.sums, written, &h) == 0 && h);
+    memset(got, 0, o.g.len);
+    CHECK(coldops_peer.obj_read(h, 0, o.g.len, got, 0, &rep) == 0);
+    CHECK(memcmp(got, o.bytes, o.g.len) == 0 && atomic_load(&F.read_calls[2]) == 0);
+    coldops_peer.obj_close(h);
+
+    /* 6. Member 4 (pos 3) ALSO down -> 3 written positions remain (< k) -> UNAVAILABLE, never CORRUPT */
+    atomic_store(&F.down, (1u << 3) | (1u << 4));
+    h = NULL;
+    CHECK(coldops_peer.obj_open_pos(ctx, o.oid, &o.g, o.sums, written, &h) == 0 && h);
+    CHECK(coldops_peer.obj_read(h, 0, o.g.len, got, 0, &rep) == TSDB_ERR_UNAVAILABLE);
+    CHECK(atomic_load(&F.read_calls[2]) == 0);
+    coldops_peer.obj_close(h);
+
+    /* 7. All members back -> reads succeed again */
+    atomic_store(&F.down, 0);
+    h = NULL;
+    CHECK(coldops_peer.obj_open_pos(ctx, o.oid, &o.g, o.sums, written, &h) == 0 && h);
+    memset(got, 0, o.g.len);
+    CHECK(coldops_peer.obj_read(h, 0, o.g.len, got, 0, &rep) == 0 && memcmp(got, o.bytes, o.g.len) == 0);
+    coldops_peer.obj_close(h);
+
+    free(got);
+    obj_free(&o);
+    CP.note_missing = NULL;
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
 int main(int argc, char **argv)
 {
     const char *base = "/tmp";
@@ -1284,6 +1370,7 @@ int main(int argc, char **argv)
     }
     test_put_read();
     test_parallel_put();
+    test_degraded_put_read();
     test_sum();
     test_fence_del();
     test_unsure();

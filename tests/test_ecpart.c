@@ -1383,6 +1383,92 @@ static void test_single_copy_ecpart(void)
     printf("  single-copy (m = 0, k = 1): .ec record round-trip, part_open_ec, and chunk_obj_read bit-exact\n");
 }
 
+/* R9 (E10): positions bitmap validation on cluster EC vs single-server tiers. */
+static void test_degraded_positions(void)
+{
+    ec_record r, dec;
+    memset(&r, 0, sizeof r);
+    chunk_geom g;
+    CHECK(chunk_geom_make(&g, 4, 2, 65536, 4 * 65536 + 17) == 0);
+    r.version = EC_RECORD_VERSION;
+    r.class_check = EC_CLS_PASSED;
+    CHECK(chunk_random(r.oid, 16) == 0);
+    r.key = 100;
+    r.min_block = 1;
+    r.max_block = 4;
+    r.level = 1;
+    r.k = g.k;
+    r.m = g.m;
+    r.cell_bytes = g.cell;
+    r.object_len = g.len;
+    r.writer_epoch = 2;
+    r.ppos = 99;
+    r.stripe_version = 3;
+    snprintf(r.source, sizeof r.source, "p100_1_4_1.part");
+    r.nsums = chunk_sums_total(&g);
+    r.sums = calloc(r.nsums, 8);
+    CHECK(r.sums != NULL);
+    size_t n = ec_record_size(&r);
+    uint8_t *buf = malloc(n);
+    CHECK(buf != NULL);
+
+    /* Cluster EC accepts 0 (all), full (0x3f), and k+m-1 (5 bits for 4+2) */
+    uint32_t ok_masks[] = {0u, 0x3fu, 0x3eu, 0x3du, 0x1fu};
+    for (size_t i = 0; i < sizeof ok_masks / sizeof *ok_masks; i++) {
+        r.positions = ok_masks[i];
+        CHECK(ec_record_encode_as(&r, buf, n, true) == 0);
+        CHECK(ec_record_decode_as(buf, n, &dec, true) == 0 && records_equal(&r, &dec));
+        ec_record_free(&dec);
+        /* Single-server tiers refuse any non-zero positions (even with ppos/sv == 0) */
+        if (ok_masks[i] != 0) {
+            ec_record ss = r;
+            ss.ppos = 0;
+            ss.stripe_version = 0;
+            CHECK(ec_record_encode(&ss, buf, n) == TSDB_ERR_INVALID);
+            CHECK(ec_record_encode_as(&ss, buf, n, false) == TSDB_ERR_INVALID);
+            /* Raw buffer encoded for cluster with ppos=sv=0 must still fail single-server decode */
+            CHECK(ec_record_encode_as(&ss, buf, n, true) == 0);
+            CHECK(ec_record_decode(buf, n, &dec) == TSDB_ERR_CORRUPT && dec.sums == NULL);
+            CHECK(ec_record_decode_as(buf, n, &dec, false) == TSDB_ERR_CORRUPT && dec.sums == NULL);
+        }
+    }
+
+    /* Cluster EC refuses k+m-2 (4 bits), out-of-range bit (0x7f), and single-bit masks */
+    uint32_t bad_masks[] = {0x3cu, 0x0fu, 0x7fu, 0x40u, 0x01u};
+    for (size_t i = 0; i < sizeof bad_masks / sizeof *bad_masks; i++) {
+        r.positions = bad_masks[i];
+        CHECK(ec_record_encode_as(&r, buf, n, true) == TSDB_ERR_INVALID);
+    }
+    /* Tampered wire bytes with k+m-2 bits must fail decode_as(true) */
+    r.positions = 0x3eu;
+    CHECK(ec_record_encode_as(&r, buf, n, true) == 0);
+    uint32_t bad4 = 0x3cu;
+    memcpy(buf + EC_REC_POSITIONS, &bad4, 4);
+    CHECK(ec_record_decode_as(buf, n, &dec, true) == TSDB_ERR_CORRUPT && dec.sums == NULL);
+
+    /* m == 1: k+m-1 would be margin 0 at birth, so partial positions must be refused on cluster EC too */
+    free(buf);
+    free(r.sums);
+    CHECK(chunk_geom_make(&g, 2, 1, 65536, 2 * 65536 + 5) == 0);
+    r.k = g.k;
+    r.m = g.m;
+    r.cell_bytes = g.cell;
+    r.object_len = g.len;
+    r.nsums = chunk_sums_total(&g);
+    r.sums = calloc(r.nsums, 8);
+    n = ec_record_size(&r);
+    buf = malloc(n);
+    r.positions = 0x06u; /* 2 of 3 bits (m == 1): refused */
+    CHECK(ec_record_encode_as(&r, buf, n, true) == TSDB_ERR_INVALID);
+    r.positions = 0x07u; /* all 3 bits: accepted on cluster EC, refused on single-server */
+    CHECK(ec_record_encode_as(&r, buf, n, true) == 0);
+    CHECK(ec_record_decode_as(buf, n, &dec, true) == 0 && dec.positions == 0x07u);
+    ec_record_free(&dec);
+    free(buf);
+    free(r.sums);
+    printf("  degraded positions: cluster EC accepts 0, full, and k+m-1 (m>=2); refuses k+m-2, m<2, and single-server\n");
+}
+
 int main(int argc, char **argv)
 {
     int ai = 1;
@@ -1426,6 +1512,7 @@ int main(int argc, char **argv)
     test_replay();
     test_fno();
     test_single_copy_ecpart();
+    test_degraded_positions();
     if (failures) {
         fprintf(stderr, "test_ecpart: %d failures\n", failures);
         return 1;

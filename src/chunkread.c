@@ -270,6 +270,11 @@ static void note(rr *r, unsigned pos, int st)
     r->rep->bad_cells++;
 }
 
+static inline bool pos_written(uint32_t positions, unsigned pos)
+{
+    return positions == 0 || (pos < 32 && (positions & (1u << pos)) != 0);
+}
+
 static uint8_t *rr_slot(rr *r, unsigned pos, size_t need)
 {
     if (need == 0)
@@ -381,6 +386,11 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
     for (unsigned p = 0; p < k + m && ngood < k; p++) { /* data first, then parity */
         if (isbad[p])
             continue;
+        if (!pos_written(r->src->positions, p)) {
+            sts[p] = CHUNK_ST_UNWRITTEN;
+            r->rep->st[p] = CHUNK_ST_UNWRITTEN;
+            continue; /* E10 known erasure: never requested, never CORRUPT */
+        }
         uint64_t c = p < k ? s * k + p : 0, cl = p < k ? chunk_cell_len(g, c) : Ls;
         uint8_t *b = rr_slot(r, p, need);
         if (!b)
@@ -414,20 +424,24 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
         ngood++;
     }
     if (ngood < k) {
-        unsigned absent = 0, damaged = 0, io = 0;
-        for (unsigned p = 0; p < k + m; p++)
-            absent += sts[p] == CHUNK_ST_ABSENT, damaged += sts[p] == CHUNK_ST_DAMAGED, io += sts[p] == CHUNK_ST_IOERR;
+        unsigned absent = 0, damaged = 0, io = 0, unwritten = 0;
         unsigned nbad = 0, down = 0;
         for (unsigned p = 0; p < k + m; p++) {
-            nbad += isbad[p] || sts[p];
+            int pst = sts[p] ? sts[p] : (isbad[p] ? r->rep->st[p] : 0);
+            if (pst)
+                nbad++;
+            absent += pst == CHUNK_ST_ABSENT;
+            damaged += pst == CHUNK_ST_DAMAGED;
+            io += pst == CHUNK_ST_IOERR;
+            unwritten += pst == CHUNK_ST_UNWRITTEN;
             /* a position whose store is merely away: the cell may be fine (E15: unavailable, never lost) */
-            down += (sts[p] ? sts[p] : isbad[p] ? r->rep->st[p] : 0) == CHUNK_ST_DOWN;
+            down += pst == CHUNK_ST_DOWN;
         }
         bool away = ngood + down >= k;
         if (!chunk_log_quiet)
             fprintf(stderr, "tsdb: object %s: stripe %llu has %u good chunks of the %u it needs (%u of %u positions "
-                        "unusable: %u absent, %u damaged, %u unreadable, %u on stores that are down): %s\n",
-                    r->src->name, (unsigned long long)s, ngood, k, nbad, k + m, absent, damaged, io, down,
+                        "unusable: %u absent, %u damaged, %u unreadable, %u on stores that are down, %u unwritten): %s\n",
+                    r->src->name, (unsigned long long)s, ngood, k, nbad, k + m, absent, damaged, io, down, unwritten,
                     away ? "unavailable while they are" : "not readable");
         return away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
     }
@@ -668,7 +682,10 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
     unsigned k = g->k;
     uint64_t c0 = off / g->cell, c1 = (off + len - 1) / g->cell;
     bool raw = (flags & CHUNK_RR_RAW) != 0;
-    if (src->read == obj_read && k > 1 && c1 > c0 && len >= CR_PAR_MIN_BYTES && chunk_fault_read == 0) {
+    uint32_t data_mask = (1u << k) - 1u;
+    bool all_data_written = src->positions == 0 || (src->positions & data_mask) == data_mask;
+    if (src->read == obj_read && all_data_written && k > 1 && c1 > c0 && len >= CR_PAR_MIN_BYTES &&
+        chunk_fault_read == 0) {
         if (try_read_parallel((const chunk_obj *)src->ctx, g, rec_sums, off, len, buf, raw, c0, c1))
             return 0;
     }
@@ -696,6 +713,12 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
             uint64_t a = off > cs ? off : cs, b = off + len < cs + cl ? off + len : cs + cl;
             xs[i] = a - cs;
             ys[i] = b - cs;
+            if (!pos_written(src->positions, i)) {
+                rep->st[i] = CHUNK_ST_UNWRITTEN;
+                bad[i] = true;
+                any = true;
+                continue;
+            }
             uint8_t *dst = buf + (a - off);
             int st;
             if (r.raw) {
@@ -734,6 +757,7 @@ struct chunk_obj {
     uint32_t volume;
     uint8_t vuuid[16], oid[16];
     chunk_geom g;
+    uint32_t positions;               /* R9 (E10): written-positions bitmap (0 = all k'+m) */
     pthread_mutex_t mu;               /* serializes lazy open of deferred parity positions */
     atomic_bool tried[CHUNK_POS_MAX]; /* release-stored once rd[p]/st[p] are populated */
     chunk_rd *rd[CHUNK_POS_MAX];
@@ -793,7 +817,9 @@ static void obj_ensure_pos(chunk_obj *o, unsigned pos)
         return;
     pthread_mutex_lock(&o->mu);
     if (!atomic_load_explicit(&o->tried[pos], memory_order_relaxed)) {
-        if (pos < chunk_npos(&o->g)) {
+        if (!pos_written(o->positions, pos)) {
+            o->st[pos] = CHUNK_ST_UNWRITTEN;
+        } else if (pos < chunk_npos(&o->g)) {
             bool have = true;
             (void)obj_open_pos(o, pos, &have, NULL);
             if (!o->rd[pos] && o->st[pos] == CHUNK_ST_ABSENT &&
@@ -833,8 +859,8 @@ static const uint64_t *obj_sums(void *ctx, unsigned pos, int *status)
     return chunk_rd_sums(o->rd[pos]);
 }
 
-int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
-                   const chunk_geom *expect, const uint64_t *rec_sums, chunk_obj **out)
+int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
+                       const chunk_geom *expect, const uint64_t *rec_sums, uint32_t positions, chunk_obj **out)
 {
     chunk_obj *o = calloc(1, sizeof *o);
     if (!o)
@@ -843,6 +869,7 @@ int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], 
     o->volume = volume;
     memcpy(o->vuuid, vuuid, 16);
     memcpy(o->oid, oid, 16);
+    o->positions = positions;
     o->rec = rec_sums;
     pthread_mutex_init(&o->mu, NULL);
     chunk_oid_hex(oid, o->name);
@@ -854,13 +881,18 @@ int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], 
     /* Healthy path: open only data positions 0 .. k-1; parity positions k .. k+m-1 open lazily in obj_ensure_pos()
      * when degrade() or heal actually needs them. If geometry is unknown (!have), scan until the first valid header
      * discovers o->g (then finish up to k-1). If all data positions failed (!alive), scan parity too so an object
-     * surviving only on parity chunks still opens. */
+     * surviving only on parity chunks still opens. Positions cleared in `positions` are known erasures (never opened). */
     unsigned p = 0;
     for (; p < CHUNK_POS_MAX; p++) {
         if (have && alive && p >= o->g.k)
             break;
         if (have && p >= chunk_npos(&o->g))
             break;
+        if (!pos_written(positions, p)) {
+            o->st[p] = CHUNK_ST_UNWRITTEN;
+            atomic_store_explicit(&o->tried[p], true, memory_order_relaxed);
+            continue;
+        }
         int rc = obj_open_pos(o, p, &have, &worst);
         atomic_store_explicit(&o->tried[p], true, memory_order_relaxed);
         if (rc == 0)
@@ -900,6 +932,12 @@ int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], 
     }
     *out = o;
     return 0;
+}
+
+int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
+                   const chunk_geom *expect, const uint64_t *rec_sums, chunk_obj **out)
+{
+    return chunk_obj_open_pos(be, volume, vuuid, oid, expect, rec_sums, 0, out);
 }
 
 void chunk_obj_close(chunk_obj *o)
@@ -949,6 +987,7 @@ int chunk_obj_source(chunk_obj *o, chunk_source *src)
     memcpy(src->name, o->name, sizeof o->name);
     src->read = obj_read;
     src->sums = obj_sums;
+    src->positions = o->positions;
     return 0;
 }
 

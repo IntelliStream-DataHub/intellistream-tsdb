@@ -66,4 +66,10 @@ uint32_t sfill_report(struct sfill *sf, struct sfill_report *out, uint32_t cap);
 int sreconcile_trigger(struct sfill *sf, uint32_t volume, uint32_t pos, uint64_t stripe_version);
 void sreconcile_on_start(struct sfill *sf);
 
+/* Record a missing chunk position from a degraded settle (E10, r9-degsettle) for r9-reconcile to fill when its
+ * holder returns or goes OUT. Thread-safe; records in a bounded in-memory ring and logs (not durable across restarts:
+ * r9-reconcile rebuilds missing positions from committed .ec records' `positions` bitmaps on start/return). */
+void sreconcile_note_missing(uint32_t volume, const uint8_t oid[16], unsigned pos);
+uint64_t sreconcile_missing_count(void);
+
 #endif

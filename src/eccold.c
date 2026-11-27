@@ -83,8 +83,9 @@ static eccold_cut last_cut;
 
 int eccold_mutant_parse(const char *name)
 {
-    static const char *const names[] = {"",            "cutnogate",    "cutnowait",       "ttlsettling",
-                                        "cutnorotate", "fencekeyonly", "stripewaitfenced"};
+    static const char *const names[] = {"",            "cutnogate",      "cutnowait",        "ttlsettling",
+                                        "cutnorotate", "fencekeyonly",   "stripewaitfenced", "degtwo",
+                                        "degnoupcheck", "degnopositions"};
     for (int i = 1; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
@@ -93,12 +94,28 @@ int eccold_mutant_parse(const char *name)
 
 #ifdef TSDB_TEST_HOOKS
 static pthread_once_t mut_once = PTHREAD_ONCE_INIT;
+static char pause_pre_marker_path[512];
 static void mut_env(void)
 {
     const char *m = getenv("TSDB_ECCOLD_MUTANT");
     int v = m && *m ? eccold_mutant_parse(m) : -1;
     if (v > 0)
         eccold_mutant = v;
+    const char *th = getenv("TSDB_ECCOLD_TEST");
+    if (th && strncmp(th, "pause_pre_marker=", 17) == 0)
+        snprintf(pause_pre_marker_path, sizeof pause_pre_marker_path, "%s", th + 17);
+}
+
+static void pause_pre_marker_hook(void)
+{
+    if (!pause_pre_marker_path[0] || access(pause_pre_marker_path, F_OK) != 0)
+        return;
+    fprintf(stderr, "tsdb: test: pause_pre_marker: paused before MK_COLD\n");
+    while (access(pause_pre_marker_path, F_OK) == 0) {
+        struct timespec ts = {0, 50 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "tsdb: test: pause_pre_marker: resumed before MK_COLD\n");
 }
 
 void eccold_mutant_init(void)
@@ -106,6 +123,7 @@ void eccold_mutant_init(void)
     pthread_once(&mut_once, mut_env);
 }
 #else
+static void pause_pre_marker_hook(void) {}
 void eccold_mutant_init(void) {}
 #endif
 
@@ -211,7 +229,27 @@ static bool stripe_ok(const coldvol *cv, uint64_t epoch, uint64_t sv)
     return coldvol_epoch(cv) == epoch && stripe_of(cv) == sv;
 }
 
-static int stripe_wait(eng *db, const coldvol *cv, uint64_t epoch, uint64_t sv)
+/* R9 (E10): for a degraded settle (`written_mask != 0`), verify every position actually written by this settle's
+ * objects is still UP and holds a durable non-unsure fence >= epoch under the current epoch and stripe version. For a
+ * full settle (`written_mask == 0`), keep R8's stripe_ok() semantics (p_all_up allows unsure stores as UP and does not
+ * probe positions unused by k' < k objects). */
+static bool stripe_written_ok(const coldvol *cv, uint64_t epoch, uint64_t sv, uint32_t written_mask)
+{
+    const cold_ops *o = cv->ops;
+    if (written_mask == 0 || !o->stripe_up_mask)
+        return stripe_ok(cv, epoch, sv);
+    if (o->writable && !o->writable(cv->ctx))
+        return false;
+    if (coldvol_epoch(cv) != epoch || stripe_of(cv) != sv)
+        return false;
+    uint32_t up = 0;
+    unsigned nstripe = 0;
+    if (o->stripe_up_mask(cv->ctx, epoch, written_mask, &up, &nstripe) != 0 || nstripe == 0 || nstripe > CHUNK_POS_MAX)
+        return false;
+    return (up & written_mask) == written_mask;
+}
+
+static int stripe_wait(eng *db, const coldvol *cv, uint64_t epoch, uint64_t sv, uint32_t written_mask)
 {
     int64_t max_s = cv->set.wait_max_s > 0 ? cv->set.wait_max_s : ECCOLD_WAIT_MAX_S_DEFAULT;
     int64_t until = mono_ms() + max_s * 1000;
@@ -220,11 +258,11 @@ static int stripe_wait(eng *db, const coldvol *cv, uint64_t epoch, uint64_t sv)
             return TSDB_ERR_IO;
         if (ecsettle_stopping(db) || !eccold_leader(db))
             return TSDB_ERR_STOPPED;
-        if (stripe_ok(cv, epoch, sv))
+        if (stripe_written_ok(cv, epoch, sv, written_mask))
             return 0;
         if (mono_ms() >= until) {
-            fprintf(stderr, "tsdb: %s: settle: the positions were not all UP under the stripe version and epoch the "
-                            "objects were put by within %lld s: given up, the objects go to r7-gc\n",
+            fprintf(stderr, "tsdb: %s: settle: the written positions were not all UP under the stripe version and epoch "
+                            "the objects were put by within %lld s: given up, the objects go to r7-gc\n",
                     db->dir, (long long)max_s);
             return TSDB_ERR_UNAVAILABLE;
         }
@@ -475,6 +513,9 @@ static void leader_digest(eng *db, int64_t key, uint64_t z, part **pin, size_t n
 int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
 {
     eccold_mutant_init();
+    eccold_deg_wait *dw = ecsettle_deg_wait(db);
+    if (dw)
+        dw->waiting = false;
     coldvol *cv = tier_cold(db);
     if (!cv)
         return TSDB_ERR_UNAVAILABLE;
@@ -495,15 +536,118 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     uint64_t epoch = 0, sv = stripe_of(cv);
     cut.stripe_version = sv;
     int64_t t_gate = 0;
-    if (!stripe_ok(cv, coldvol_epoch(cv), sv)) { /* a position already not UP: no put, no wait on the tier's thread */
+    bool degraded = false;
+    uint32_t posmask = 0;
+    uint32_t written_union = 0;
+    if (cv->ops->stripe_up_mask) {
+        /* Note: after a leader change while a stripe member is down, chunkpeer's p_writable() requires every stripe
+         * member to hold the new epoch before puts resume (fail-safe: no degraded settle until the epoch is fenced). */
+        if ((cv->ops->writable && !cv->ops->writable(cv->ctx)) || coldvol_epoch(cv) == 0) {
+            rc = TSDB_ERR_UNAVAILABLE;
+            goto out;
+        }
+        uint32_t up_mask = 0;
+        unsigned nstripe = 0;
+        if (cv->ops->stripe_up_mask(cv->ctx, 0, 0, &up_mask, &nstripe) != 0 || nstripe == 0 ||
+            nstripe > CHUNK_POS_MAX) {
+            rc = TSDB_ERR_UNAVAILABLE;
+            goto out;
+        }
+        uint32_t full = (1u << nstripe) - 1u;
+        up_mask &= full;
+        uint32_t down_mask = full & ~up_mask;
+        unsigned nup = (unsigned)__builtin_popcount(up_mask);
+        unsigned ndown = nstripe - nup;
+        if (ndown == 0) {
+            if (dw) {
+                dw->down_mask = 0;
+                dw->down_since_ms = 0;
+                dw->last_seen_ms = 0;
+                dw->settled = false;
+                dw->one_logged = false;
+                dw->two_logged = false;
+            }
+        } else {
+            unsigned max_down = eccold_mutant == ECCOLD_MUT_DEGTWO ? 2u : 1u;
+            bool can_deg = cv->set.m >= 2 && cv->ops->put_stream_pos != NULL && ndown <= max_down &&
+                           nup >= (unsigned)cv->set.k;
+            if (!can_deg || !dw) {
+                if (dw) {
+                    dw->down_mask = 0;
+                    dw->down_since_ms = 0;
+                    dw->last_seen_ms = 0;
+                    dw->settled = false;
+                    dw->one_logged = false;
+                    if (ndown >= 2 && cv->set.m >= 2) {
+                        if (!dw->two_logged) {
+                            fprintf(stderr, "tsdb: %s: settle: %u of %u stripe positions are down (at most 1 may be "
+                                            "down for a degraded settle): waiting\n", db->dir, ndown, nstripe);
+                            dw->two_logged = true;
+                        }
+                        dw->waiting = true;
+                    }
+                }
+                rc = TSDB_ERR_UNAVAILABLE;
+                goto out;
+            }
+            int64_t now = mono_ms();
+            int64_t max_s = cv->set.wait_max_s > 0 ? cv->set.wait_max_s : ECCOLD_WAIT_MAX_S_DEFAULT;
+            int64_t max_ms = max_s * 1000;
+            /* Restart the wait clock whenever the down position(s) change or the previous observation is stale
+             * (after a degraded settle, an idle gap > 5 s forces a fresh wait; while waiting, a gap > wait_max + 5 s
+             * means no polls ran during the interval). */
+            int64_t gap_ms = dw->settled ? 5000 : (max_ms + 5000);
+            dw->two_logged = false;
+            if (dw->down_mask != down_mask || dw->down_since_ms == 0 ||
+                (dw->last_seen_ms > 0 && now - dw->last_seen_ms > gap_ms)) {
+                dw->down_mask = down_mask;
+                dw->down_since_ms = now;
+                dw->settled = false;
+                dw->one_logged = false;
+            }
+            dw->last_seen_ms = now;
+            if (now - dw->down_since_ms < max_ms) {
+                if (!dw->one_logged) {
+                    fprintf(stderr, "tsdb: %s: settle: %u of %u stripe position%s down; waiting %lld s before "
+                                    "degraded settle\n",
+                            db->dir, ndown, nstripe, ndown == 1 ? "" : "s", (long long)max_s);
+                    dw->one_logged = true;
+                }
+                dw->waiting = true;
+                rc = TSDB_ERR_UNAVAILABLE;
+                goto out;
+            }
+            degraded = true;
+            posmask = up_mask;
+            cut.degraded = true;
+            fprintf(stderr, "tsdb: %s: settle: %u of %u stripe position%s still down after %lld s: settling degraded "
+                            "(%u of %u positions)\n",
+                    db->dir, ndown, nstripe, ndown == 1 ? "" : "s", (long long)max_s, nup, nstripe);
+        }
+    } else if (!stripe_ok(cv, coldvol_epoch(cv), sv)) {
+        /* a position already not UP: no put, no wait on the tier's thread */
         rc = TSDB_ERR_UNAVAILABLE;
         goto out;
     }
     /* 1: the objects, no engine lock held */
     for (; nput < np; nput++) {
         uint64_t e = 0;
-        if ((rc = ecsettle_put(db, pin[nput], &recs[nput], &e)) != 0)
+        uint32_t wmask = 0;
+        if (degraded)
+            rc = ecsettle_put_pos(db, pin[nput], &recs[nput], &e, posmask, &wmask);
+        else
+            rc = ecsettle_put(db, pin[nput], &recs[nput], &e);
+        if (rc != 0)
             break; /* this one's object went to r7-gc and its record was freed */
+        if (degraded) {
+            unsigned onpos = (unsigned)recs[nput].k + (unsigned)recs[nput].m;
+            uint32_t ofull = onpos < 32 ? ((1u << onpos) - 1u) : ~0u;
+            written_union |= (wmask & ofull);
+            if ((wmask & ofull) != ofull) {
+                recs[nput].positions = eccold_mutant == ECCOLD_MUT_DEGNOPOSITIONS ? ofull : (wmask & ofull);
+                cut.positions = recs[nput].positions;
+            }
+        }
         if (nput == 0) {
             epoch = e;
         } else if (e != epoch) { /* the epoch moved between two puts: the earlier ones are under an older fence */
@@ -514,12 +658,14 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     }
     if (rc)
         goto out;
+    uint32_t check_mask = degraded ? (written_union ? written_union : posmask) : 0;
     step(db, ECCOLD_STEP_PUT);
     int64_t plo, phi;
     partition_range(db, key, &plo, &phi);
     int64_t hi = phi == INT64_MAX ? INT64_MAX : phi - 1;
     /* 2: the stripe check, before the gate (stripewaitfenced: under it) */
-    if (eccold_mutant != ECCOLD_MUT_STRIPEWAITFENCED && (rc = stripe_wait(db, cv, epoch, sv)) != 0)
+    if (eccold_mutant != ECCOLD_MUT_STRIPEWAITFENCED &&
+        (rc = stripe_wait(db, cv, epoch, sv, check_mask)) != 0)
         goto out;
     /* 3: the gate */
     if ((rc = fence_make(&f, plo, hi, pin, np)) != 0)
@@ -533,7 +679,8 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     cut.gated = gated;
     cut.l = log_end(db);
     step(db, ECCOLD_STEP_GATED);
-    if (eccold_mutant == ECCOLD_MUT_STRIPEWAITFENCED && (rc = stripe_wait(db, cv, epoch, sv)) != 0)
+    if (eccold_mutant == ECCOLD_MUT_STRIPEWAITFENCED &&
+        (rc = stripe_wait(db, cv, epoch, sv, check_mask)) != 0)
         goto out;
     if (pending && mt_may_hold(db, plo, hi) && eccold_mutant != ECCOLD_MUT_CUTNOROTATE) {
         if ((rc = mt_flush(db)) != 0)
@@ -546,7 +693,7 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     if (eccold_mutant != ECCOLD_MUT_CUTNOWAIT && (rc = eng_leader_wait(db, cut.l, false)) != 0)
         goto out;
     cut.z = log_end(db);
-    if (!stripe_ok(cv, epoch, sv)) {
+    if (eccold_mutant != ECCOLD_MUT_DEGNOUPCHECK && !stripe_written_ok(cv, epoch, sv, check_mask)) {
         rc = TSDB_ERR_UNAVAILABLE;
         goto out;
     }
@@ -586,6 +733,15 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     }
     nput = 0; /* from here on the .ec parts name them */
     cut.nobjs = np;
+    step(db, ECCOLD_STEP_PRE_MARKER);
+    pause_pre_marker_hook();
+    /* E10: just before MK_COLD, verify every written position is still UP in the current epoch. */
+    if (eccold_mutant != ECCOLD_MUT_DEGNOUPCHECK && !stripe_written_ok(cv, epoch, sv, check_mask)) {
+        fprintf(stderr, "tsdb: %s: settle: a written stripe position dropped before MK_COLD: aborting\n", db->dir);
+        drop_ec(db, ec, np, true);
+        rc = TSDB_ERR_UNAVAILABLE;
+        goto out;
+    }
     uint64_t pos = 0;
     rc = cold_marker(db, &cut, recs, ec, np, y, ny, &pos);
     cut.pos = pos;
@@ -606,6 +762,9 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
             eng_fail(db, "a settle's swap was refused after its COLD marker committed", rc);
         drop_ec(db, ec, np, false);
         rc = TSDB_ERR_IO;
+    } else if (degraded && dw) {
+        dw->settled = true;
+        dw->last_seen_ms = mono_ms();
     }
 out:
     if (gated) {
@@ -613,8 +772,20 @@ out:
         cut.hold_us = mono_us() - t_gate;
     } else
         free(f.r);
-    if (rc == 0) /* 7: E26's digest of I and Y and its marker (src/ecdigest.c): the gate released, Y still pinned */
+    if (rc == 0) {
+        if (degraded && cv->ops->note_missing) {
+            for (size_t i = 0; i < np; i++) {
+                unsigned onpos = (unsigned)recs[i].k + (unsigned)recs[i].m;
+                uint32_t ofull = onpos < 32 ? ((1u << onpos) - 1u) : ~0u;
+                uint32_t w = recs[i].positions ? recs[i].positions : ofull;
+                for (unsigned p = 0; p < onpos; p++)
+                    if (!(w & (1u << p)))
+                        cv->ops->note_missing(cv->ctx, recs[i].oid, p);
+            }
+        }
+        /* 7: E26's digest of I and Y and its marker (src/ecdigest.c): the gate released, Y still pinned */
         leader_digest(db, key, cut.z, pin, np, y, ny, recs);
+    }
     if (ny) {
         pthread_mutex_lock(&db->lock);
         for (size_t i = 0; i < ny; i++)

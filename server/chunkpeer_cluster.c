@@ -22,6 +22,7 @@
 #include "cluster.h"
 #include "meta.h"
 #include "repld.h"
+#include "sfill.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -280,6 +281,7 @@ int chunkpeer_cluster_start(const char *stage_dir)
     G.net = (struct chunkpeer_net){.call = net_call, .put = net_put, .arg = &G};
     G.view = view;
     G.view_arg = &G;
+    G.note_missing = sreconcile_note_missing;
     snprintf(G.stage_dir, sizeof G.stage_dir, "%s", stage_dir);
     tier_set_cluster(attach, &G, g_ec_cfg.cache_bytes >> 20);
     if (pthread_create(&src_th, NULL, src_main, NULL) != 0)

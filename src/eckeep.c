@@ -337,7 +337,8 @@ static int digest_part(eng *db, struct eckeep_eng *k, part *p, const char *name,
         int rc = !cv ? TSDB_ERR_UNAVAILABLE : !cv->ops->all_up(cv->ctx) ? TSDB_ERR_UNAVAILABLE
                  : chunk_geom_make(&g, r->k, r->m, r->cell_bytes, r->object_len);
         if (rc == 0)
-            rc = cv->ops->obj_open(cv->ctx, r->oid, &g, r->sums, &o);
+            rc = cv->ops->obj_open_pos ? cv->ops->obj_open_pos(cv->ctx, r->oid, &g, r->sums, r->positions, &o)
+                                       : cv->ops->obj_open(cv->ctx, r->oid, &g, r->sums, &o);
         if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_IO ||
             (rc && eckeep_mutant == ECKEEP_MUT_OPENWAIT)) {
             close(fd);
