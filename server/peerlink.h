@@ -244,6 +244,11 @@ void peerlink_set_bulk_rate(struct peerlink *pl, uint64_t bytes_per_s);
 /* The rate of one data kind's bucket (bytes/s; 0: the peerlink's rate, PL_RATE_UNLIMITED: none); PL_E_INVALID for a
  * kind that is not a data kind */
 int peerlink_set_kind_rate(struct peerlink *pl, int kind, uint64_t bytes_per_s);
+/* Optional per-kind rate hook (R9 D18, r9-pace): when installed on a data kind (e.g. PL_KIND_SNAP, PL_KIND_CHUNKR),
+ * bulk sends on that kind delegate to `fn(arg, kind, n)` instead of peerlink's fixed-rate bucket.
+ * `fn` must be non-blocking and return 0 when `n` bytes are admitted, or nanoseconds to wait before retrying. */
+typedef uint64_t (*pl_pace_fn)(void *arg, int kind, size_t n);
+int peerlink_set_kind_pacer(struct peerlink *pl, int kind, pl_pace_fn fn, void *arg);
 
 /* A link to `addr` (host:port, the peer's peer port), persistent. want_id: the node id the peer must answer as (0:
  * any). The result lives until peerlink_free. */

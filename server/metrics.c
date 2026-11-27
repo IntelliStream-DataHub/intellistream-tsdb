@@ -94,13 +94,16 @@ typedef struct metrics_shard {
     atomic_uint_fast64_t requests[NOPS + 1];
     atomic_uint_fast64_t hist_sum_ns[NQOPS];
     atomic_uint_fast64_t hist[NQOPS][NBUCKETS + 1]; /* per bucket, not cumulative; the last is above 30 s */
+    atomic_uint_fast64_t wal_sync_hist[NBUCKETS + 1]; /* WAL sync duration buckets (for §8.4 p99 halving) */
 } metrics_shard;
 _Static_assert(sizeof(metrics_shard) % 64 == 0, "metrics_shard must fill whole cache lines");
+_Static_assert(NBUCKETS + 1 == METRICS_HIST_BUCKETS, "METRICS_HIST_BUCKETS must equal NBUCKETS + 1");
 
 typedef struct metrics_totals {
     uint64_t requests[NOPS + 1];
     uint64_t hist[NQOPS][NBUCKETS + 1];
     uint64_t hist_sum_ns[NQOPS];
+    uint64_t wal_sync_hist[NBUCKETS + 1];
     uint64_t errors[NERR];
     uint64_t rows_inserted;
     uint64_t multi_series, multi_deferred;
@@ -186,6 +189,8 @@ static void shard_fold_into(metrics_totals *dst, const metrics_shard *s)
         for (int b = 0; b <= NBUCKETS; b++)
             dst->hist[q][b] += atomic_load_explicit(&s->hist[q][b], memory_order_relaxed);
     }
+    for (int b = 0; b <= NBUCKETS; b++)
+        dst->wal_sync_hist[b] += atomic_load_explicit(&s->wal_sync_hist[b], memory_order_relaxed);
 }
 
 static void shard_dtor(void *p)
@@ -300,6 +305,126 @@ int metrics_bucket_for(double seconds)
     while (b < NBUCKETS && seconds > bucket_le[b])
         b++;
     return b;
+}
+
+void metrics_wal_sync(int64_t ns)
+{
+    HOOK_OFF();
+    metrics_shard *s = shard_get();
+    if (!s)
+        return;
+    int b = metrics_bucket_for(ns > 0 ? (double)ns / 1e9 : 0.0);
+    shard_add(&s->wal_sync_hist[b], 1);
+}
+
+double metrics_hist_p99(const uint64_t delta[METRICS_HIST_BUCKETS])
+{
+    uint64_t total = 0;
+    for (int b = 0; b < METRICS_HIST_BUCKETS; b++)
+        total += delta[b];
+    if (total == 0)
+        return 0.0;
+    double target = 0.99 * (double)total;
+    uint64_t cum = 0;
+    for (int b = 0; b < NBUCKETS; b++) {
+        uint64_t next = cum + delta[b];
+        if ((double)next >= target && delta[b] > 0) {
+            double lo = b == 0 ? 0.0 : bucket_le[b - 1];
+            double hi = bucket_le[b];
+            double frac = (target - (double)cum) / (double)delta[b];
+            if (frac < 0.0)
+                frac = 0.0;
+            if (frac > 1.0)
+                frac = 1.0;
+            return lo + (hi - lo) * frac;
+        }
+        cum = next;
+    }
+    return bucket_le[NBUCKETS - 1];
+}
+
+void metrics_p99_win_init(metrics_p99_win *w)
+{
+    if (w)
+        memset(w, 0, sizeof *w);
+}
+
+static void p99_series_step(metrics_p99_series *s, const uint64_t cum[METRICS_HIST_BUCKETS])
+{
+    if (!cum)
+        return;
+    int cur_idx = s->sec_head;
+    memcpy(s->sec_ring[cur_idx], cum, METRICS_HIST_BUCKETS * sizeof cum[0]);
+    s->sec_head = (s->sec_head + 1) % 61;
+    if (s->sec_count < 61)
+        s->sec_count++;
+    if (s->sec_count < 2) {
+        s->last_p99_1m = 0.0;
+        return;
+    }
+    int old_idx = (s->sec_head - s->sec_count + 61) % 61;
+    uint64_t delta[METRICS_HIST_BUCKETS];
+    for (int b = 0; b < METRICS_HIST_BUCKETS; b++) {
+        uint64_t c = s->sec_ring[cur_idx][b];
+        uint64_t o = s->sec_ring[old_idx][b];
+        delta[b] = c >= o ? c - o : 0;
+    }
+    double p99 = metrics_hist_p99(delta);
+    s->last_p99_1m = p99;
+    if (++s->sec_in_min >= 60) {
+        s->sec_in_min = 0;
+        if (p99 > 0.0) {
+            s->min_p99[s->min_head] = p99;
+            s->min_head = (s->min_head + 1) % 60;
+            if (s->min_count < 60)
+                s->min_count++;
+        }
+    }
+    if (s->min_count > 0) {
+        double tmp[60];
+        int n = s->min_count;
+        for (int i = 0; i < n; i++) {
+            double v = s->min_p99[i];
+            int j = i;
+            while (j > 0 && tmp[j - 1] > v) {
+                tmp[j] = tmp[j - 1];
+                j--;
+            }
+            tmp[j] = v;
+        }
+        s->last_median_1h = (n & 1) ? tmp[n / 2] : 0.5 * (tmp[n / 2 - 1] + tmp[n / 2]);
+    } else {
+        s->last_median_1h = 0.0;
+    }
+}
+
+int metrics_p99_win_step(metrics_p99_win *w, const uint64_t query_cum[METRICS_HIST_BUCKETS],
+                         const uint64_t wal_cum[METRICS_HIST_BUCKETS])
+{
+    if (!w)
+        return 0;
+    p99_series_step(&w->query, query_cum);
+    p99_series_step(&w->wal_sync, wal_cum);
+    int q_hi = w->query.last_p99_1m > 0.0 && w->query.last_median_1h > 0.0 &&
+               w->query.last_p99_1m > 2.0 * w->query.last_median_1h;
+    int w_hi = w->wal_sync.last_p99_1m > 0.0 && w->wal_sync.last_median_1h > 0.0 &&
+               w->wal_sync.last_p99_1m > 2.0 * w->wal_sync.last_median_1h;
+    w->halved = (q_hi || w_hi) ? 1 : 0;
+    return w->halved;
+}
+
+void metrics_p99_snapshot(uint64_t query_cum[METRICS_HIST_BUCKETS], uint64_t wal_cum[METRICS_HIST_BUCKETS])
+{
+    metrics_totals tot;
+    metrics_snapshot(&tot);
+    if (query_cum) {
+        memset(query_cum, 0, METRICS_HIST_BUCKETS * sizeof query_cum[0]);
+        for (int q = 0; q < NQOPS; q++)
+            for (int b = 0; b < METRICS_HIST_BUCKETS; b++)
+                query_cum[b] += tot.hist[q][b];
+    }
+    if (wal_cum)
+        memcpy(wal_cum, tot.wal_sync_hist, METRICS_HIST_BUCKETS * sizeof wal_cum[0]);
 }
 
 void metrics_request_end(uint8_t op, int64_t began)
@@ -789,6 +914,28 @@ static void render(sb *b)
         sb_add(b, "tsdb_snapshot_install_last_seconds %.3f\n", sn.install_seconds);
     }
 
+    if (cfg.pace) { /* rebuild and balancer pacing (R9 D18, E13, §8.4; server/pace.h) */
+        static const char *const pdir[2] = {"send", "recv"};
+        static const char *const pcls[METRICS_PACE_CLASSES] = {"margin0", "margin1", "margin2plus", "balance"};
+        metrics_pace pc;
+        memset(&pc, 0, sizeof pc);
+        cfg.pace(&pc);
+        family(b, "tsdb_pace_rate_bytes_per_second", "gauge",
+               "Current effective rebuild/balance pace rate in bytes/s by direction (0 when unlimited at margin 0).");
+        for (int d = 0; d < 2; d++)
+            sb_add(b, "tsdb_pace_rate_bytes_per_second{dir=\"%s\"} %llu\n", pdir[d],
+                   (unsigned long long)pc.rate_bytes_s[d]);
+        family(b, "tsdb_pace_halved", "gauge",
+               "1 while rebuild/balance pacing is halved for elevated foreground query or WAL sync p99 latency, else 0.");
+        sb_add(b, "tsdb_pace_halved %d\n", pc.halved ? 1 : 0);
+        family(b, "tsdb_pace_bytes_total", "counter",
+               "Bytes paced by direction and margin class (margin0, margin1, margin2plus, balance).");
+        for (int d = 0; d < 2; d++)
+            for (int c = 0; c < METRICS_PACE_CLASSES; c++)
+                sb_add(b, "tsdb_pace_bytes_total{dir=\"%s\",class=\"%s\"} %llu\n", pdir[d], pcls[c],
+                       (unsigned long long)pc.bytes[d][c]);
+    }
+
     family(b, "tsdb_query_duration_seconds", "histogram",
            "Time a worker spent on a query request, from taking it to handing the reply to the kernel (a slow client can add to it).");
     for (unsigned o = 1; o < NOPS; o++) {
@@ -986,9 +1133,23 @@ static void *metrics_main(void *arg)
 {
     (void)arg;
     struct pollfd pf[MAX_PEND + 1];
+    metrics_p99_win p99w;
+    metrics_p99_win_init(&p99w);
+    int64_t next_p99_ms = mono_ms_now() + 1000;
     while (!atomic_load(&stop_flag)) {
-        pf[0] = (struct pollfd){.fd = cfg.listen_fd, .events = POLLIN};
         int64_t now = mono_ms_now(), wake = now + 200; /* also the latency of stopping */
+        if (cfg.on_p99_halved && now >= next_p99_ms) {
+            next_p99_ms = now + 1000;
+            uint64_t qcum[METRICS_HIST_BUCKETS], wcum[METRICS_HIST_BUCKETS];
+            metrics_p99_snapshot(qcum, wcum);
+            cfg.on_p99_halved(metrics_p99_win_step(&p99w, qcum, wcum));
+        }
+        if (cfg.listen_fd < 0) {
+            /* Headless mode (cluster server without --metrics-port): only step the 1-s p99 halving window. */
+            (void)poll(NULL, 0, (int)(wake > now ? wake - now : 0));
+            continue;
+        }
+        pf[0] = (struct pollfd){.fd = cfg.listen_fd, .events = POLLIN};
         for (size_t i = 0; i < npend; i++) {
             pf[i + 1] = (struct pollfd){.fd = P[i].fd, .events = P[i].out ? POLLOUT : POLLIN};
             if (P[i].deadline < wake)
@@ -1059,9 +1220,11 @@ int metrics_start(const metrics_cfg *c)
 {
     cfg = *c;
     start_time = time(NULL);
-    int fl = fcntl(cfg.listen_fd, F_GETFL);
-    if (fl < 0 || fcntl(cfg.listen_fd, F_SETFL, fl | O_NONBLOCK) != 0) /* accept_some loops until EAGAIN */
-        return -errno;
+    if (cfg.listen_fd >= 0) {
+        int fl = fcntl(cfg.listen_fd, F_GETFL);
+        if (fl < 0 || fcntl(cfg.listen_fd, F_SETFL, fl | O_NONBLOCK) != 0) /* accept_some loops until EAGAIN */
+            return -errno;
+    }
     atomic_store(&stop_flag, false);
     int rc = tsdb_thread_create(&thread, metrics_main, NULL);
     if (rc)
@@ -1076,6 +1239,7 @@ void metrics_stop(void)
         return;
     atomic_store(&stop_flag, true);
     pthread_join(thread, NULL);
-    close(cfg.listen_fd);
+    if (cfg.listen_fd >= 0)
+        close(cfg.listen_fd);
     started = false;
 }

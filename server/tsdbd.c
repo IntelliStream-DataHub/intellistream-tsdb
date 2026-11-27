@@ -133,6 +133,7 @@ _Static_assert(METRICS_RDMA_FB_MAX == PL_RDMA_FB_MAX, "metrics RDMA fallback tab
 #include "../src/cvol.h"
 #include "crashpt.h"
 #include "margins.h"
+#include "pace.h"
 /* The engine's "outcome unknown" (src/internal.h, which tsdbd does not include): a replicated write that was appended
  * but whose leader was deposed or failed before the commit point passed it. It reaches tsdbd through the public calls
  * unchanged and must never reach a client (frame_put). */
@@ -4251,6 +4252,20 @@ static void snap_metrics(metrics_snap *out)
                           (double)s.install_ms / 1000};
 }
 
+_Static_assert(METRICS_PACE_CLASSES == PACE_CLS_MAX, "metrics pace class count mismatch");
+
+static void pace_metrics(metrics_pace *out)
+{
+    struct pace_stats ps;
+    pace_stats(&ps);
+    out->halved = ps.halved;
+    for (int d = 0; d < 2; d++) {
+        out->rate_bytes_s[d] = ps.rate_bytes_s[d] == PACE_RATE_UNLIMITED ? 0 : ps.rate_bytes_s[d];
+        for (int c = 0; c < METRICS_PACE_CLASSES; c++)
+            out->bytes[d][c] = ps.class_bytes[d][c];
+    }
+}
+
 static void fwd_close_client(conn *c) /* an outcome nobody knows (D12): the client learns it from the closed connection */
 {
     atomic_store(&c->closing, true);
@@ -7131,8 +7146,10 @@ int main(int argc, char **argv)
         }
     }
     int mfd = -1;
-    if (metrics_on)
-        metrics_enable(); /* before any connection: the hooks count from the start */
+    if (metrics_on || cluster_on) {
+        metrics_enable(); /* before any connection: histograms feed /metrics and §8.4 p99 halving */
+        eng_set_wal_sync_observer(metrics_wal_sync);
+    }
     if (metrics_on && (mfd = listen_on(metrics_addr ? metrics_addr : addr, &metrics_port)) < 0)
         return 1;
     wake_fd = wake_open();
@@ -7200,7 +7217,7 @@ int main(int argc, char **argv)
         if (dyn < pack_keep.arr)
             pack_keep.arr = dyn;
     }
-    if (mfd >= 0) {
+    if (mfd >= 0 || cluster_on) {
         metrics_cfg mc = {.db = db,
                           .listen_fd = mfd,
                           .io = io == IO_URING ? "io_uring" : "epoll",
@@ -7214,13 +7231,16 @@ int main(int argc, char **argv)
                           .margins = cluster_on ? metrics_margins : NULL,
                           .peer_links = cluster_on ? peerlink_up_by_check : NULL,
                           .peer_rdma = cluster_on ? tsdbd_peer_rdma_metrics : NULL,
-                          .chunk_peers = cluster_on ? chunk_peer_metrics_rows : NULL};
+                          .chunk_peers = cluster_on ? chunk_peer_metrics_rows : NULL,
+                          .pace = cluster_on ? pace_metrics : NULL,
+                          .on_p99_halved = cluster_on ? pace_set_p99_halved : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));
             return 1;
         }
-        fprintf(stderr, "tsdbd: metrics on %s:%d\n", metrics_addr ? metrics_addr : addr, metrics_port);
+        if (mfd >= 0)
+            fprintf(stderr, "tsdbd: metrics on %s:%d\n", metrics_addr ? metrics_addr : addr, metrics_port);
     }
     pthread_t acceptor, failwatch;
     for (int i = 0; i < nworkers; i++) {
@@ -7395,8 +7415,9 @@ int main(int argc, char **argv)
     pthread_join(acceptor, NULL);
     pthread_join(failwatch, NULL);
     close(lfd);
-    if (mfd >= 0)
+    if (mfd >= 0 || cluster_on)
         metrics_stop(); /* before tsdb_close: it reads the database */
+    eng_set_wal_sync_observer(NULL);
     if (cluster_on) {
         cluster_stop();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */

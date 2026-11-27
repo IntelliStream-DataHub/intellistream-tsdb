@@ -2866,6 +2866,17 @@ static inline int64_t eng_mono_ms(void)
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
+
+static inline int64_t eng_mono_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+}
+
+/* Optional WAL fdatasync latency observer (defined in src/memtable.c, set via eng_set_wal_sync_observer). */
+typedef void (*eng_wal_sync_fn)(int64_t ns);
+extern _Atomic eng_wal_sync_fn eng_wal_sync_obs;
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
 int eng_series_reload(eng *db); /* followers: SERIES appended since, when it grew */

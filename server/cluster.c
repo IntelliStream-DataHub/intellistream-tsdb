@@ -102,6 +102,7 @@
 
 #include "crashpt.h"
 #include "meta.h"
+#include "pace.h"
 #include "peerlink.h"
 #include "place.h"
 #include "raft/raft.h"
@@ -2226,6 +2227,7 @@ static void copy_publish(void)
         s->sum = cc_sum(s); /* only the hold check reads it: not paid on every publish */
     cc_swap(s);
     atomic_fetch_add_explicit(&cc_builds, 1, memory_order_release);
+    pace_configure(&(struct pace_cfg){(uint64_t)C.sm.set.rebuild_mb_s << 20, (uint64_t)C.sm.set.balance_mb_s << 20});
 }
 
 const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy *c, uint32_t id)

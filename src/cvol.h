@@ -63,4 +63,9 @@ extern void *tsdb_cvol_test_replace_arg;
  * tsdbd reports it (r8i). */
 int tsdb_volume_diverged(tsdb *t, size_t vol);
 
+/* Optional process-wide WAL fdatasync latency observer (nanoseconds), registered by tsdbd to feed the §8.4 p99
+ * halving window (server/metrics.c:metrics_wal_sync). NULL when disabled (zero overhead on embedded callers).
+ * Uses eng_* naming so libtsdb.so does not export it as public API (tools/libtsdb.map). */
+void eng_set_wal_sync_observer(void (*fn)(int64_t ns));
+
 #endif

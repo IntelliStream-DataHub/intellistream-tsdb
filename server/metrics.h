@@ -57,6 +57,32 @@ typedef struct metrics_peer_rdma {
     uint64_t qp_errors;
 } metrics_peer_rdma;
 
+/* rebuild and balancer pacing state and per-class counters (R9 D18, E13, §8.4; server/pace.h) */
+#define METRICS_PACE_CLASSES 4 /* margin0, margin1, margin2plus, balance */
+typedef struct metrics_pace {
+    uint64_t rate_bytes_s[2];                /* [0=send, 1=recv]; 0 = unlimited (margin 0) */
+    uint64_t bytes[2][METRICS_PACE_CLASSES]; /* bytes paced by direction and margin class */
+    int halved;                              /* 1 while foreground p99 halving is active, else 0 */
+} metrics_pace;
+
+/* 1-minute p99 vs 1-hour median sliding-window tracker (§8.4, r9-pace), stepped once per second. */
+#define METRICS_HIST_BUCKETS 16 /* 15 finite le bounds (0.5 ms .. 30 s) + +Inf */
+typedef struct metrics_p99_series {
+    uint64_t sec_ring[61][METRICS_HIST_BUCKETS];
+    int sec_head, sec_count;
+    double min_p99[60];
+    int min_head, min_count;
+    int sec_in_min;
+    double last_p99_1m;
+    double last_median_1h;
+} metrics_p99_series;
+
+typedef struct metrics_p99_win {
+    metrics_p99_series query;
+    metrics_p99_series wal_sync;
+    int halved;
+} metrics_p99_win;
+
 typedef struct metrics_cfg {
     tsdb *db;
     int listen_fd;           /* bound and listening; metrics_start takes it over */
@@ -78,6 +104,10 @@ typedef struct metrics_cfg {
     void (*peer_rdma)(metrics_peer_rdma *out);
     /* chunk read hedging, read-avoid and decoded cell counters per storage peer (E31); NULL: not a cluster server */
     size_t (*chunk_peers)(metrics_chunk_peer *out, size_t cap);
+    /* rebuild and balancer pacing counters (R9 D18); NULL: not a cluster server */
+    void (*pace)(metrics_pace *out);
+    /* foreground p99 halving callback (§8.4), invoked once per second on the metrics thread; NULL: disabled */
+    void (*on_p99_halved)(int halved);
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */
@@ -100,6 +130,16 @@ int64_t metrics_request_begin(uint8_t op);
 void metrics_request_end(uint8_t op, int64_t began);
 /* The histogram bucket for a duration: 0..14 for the `le` bounds 0.5 ms .. 30 s, 15 for +Inf. */
 int metrics_bucket_for(double seconds);
+/* Record a WAL sync duration (ns) into the per-thread shard's WAL sync histogram (relaxed atomic). */
+void metrics_wal_sync(int64_t ns);
+/* Compute interpolated p99 (seconds) from a delta histogram of METRICS_HIST_BUCKETS buckets (0.0 if empty). */
+double metrics_hist_p99(const uint64_t delta[METRICS_HIST_BUCKETS]);
+/* Initialize / advance the 1-minute p99 vs 1-hour median halving tracker (returns 1 if halved, else 0). */
+void metrics_p99_win_init(metrics_p99_win *w);
+int metrics_p99_win_step(metrics_p99_win *w, const uint64_t query_cum[METRICS_HIST_BUCKETS],
+                         const uint64_t wal_cum[METRICS_HIST_BUCKETS]);
+/* Snapshot current cumulative query and WAL sync histograms across all thread shards. */
+void metrics_p99_snapshot(uint64_t query_cum[METRICS_HIST_BUCKETS], uint64_t wal_cum[METRICS_HIST_BUCKETS]);
 void metrics_error(int32_t status); /* a reply with a non-zero status */
 void metrics_rows_inserted(uint64_t n);
 void metrics_multi_series(uint64_t n); /* series a QUERY_MULTI answered */

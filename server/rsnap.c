@@ -58,6 +58,7 @@
 
 #include "../src/cvol.h"
 #include "../src/snapshot.h"
+#include "pace.h"
 #include "peerlink.h"
 #include "repld.h"
 #include "rsnap.h"
@@ -97,6 +98,8 @@ struct rjob {
     uint32_t vol, peer;
     uint64_t req, epoch, set_version;
     uint64_t rate;           /* source: rebuild_mb_s in bytes/s */
+    int margin;              /* R9 D18/E13: pacing margin (0 unlimited, 1 = 4x on 4+ replica group, >=2 = rebuild_mb_s) */
+    uint64_t pace_id;        /* active job id registered with server/pace.c (0: none) */
     struct snap_epoch *hist; /* source: the leader's epoch history for the make */
     size_t nhist;
     char dir[PATH_MAX + 32]; /* source: the snapshot (once made); receiver: v<N>.snap */
@@ -334,12 +337,40 @@ static void task_add(int what, struct rjob *j)
     pthread_cond_broadcast(&S.cv);
 }
 
+/* R9 D18/E13 pacing margin for a log replica snapshot:
+ * - nisr <= 1: margin 0 (unlimited, never halved: only 1 in-sync copy left);
+ * - nisr == 2 on a 4+ non-learner replica group (e.g. ec=k+4 5-replica log group): margin 1 (4x rebuild_mb_s);
+ * - replicas=3 with nisr >= 2 (normal single-node loss, design-cluster.md §8.4 200 MB/s baseline and R4 snaplarge /
+ *   snapsrckill tests) or nisr >= 3: margin >= 2 (rebuild_mb_s). */
+static int snap_pace_margin(const struct cluster_vol_rec *rec)
+{
+    uint32_t full = 0;
+    for (uint32_t k = 0; k < rec->nrep; k++)
+        if (!rec->rep[k].learner)
+            full++;
+    if (rec->nisr <= 1)
+        return 0;
+    int m = (int)rec->nisr - 1;
+    if (m == 1 && full <= 3)
+        return 2;
+    return m;
+}
+
+static void job_pace_end(struct rjob *j)
+{
+    if (j->pace_id) {
+        pace_job_end_ex(j->role == R_SRC ? PACE_SEND : PACE_RECV, j->pace_id);
+        j->pace_id = 0;
+    }
+}
+
 /* the job is over: no frame or file of it is taken any more; the worker removes its directory and frees it */
 static void job_drop(struct rjob *j)
 {
     if (j->dead)
         return;
     j->dead = 1;
+    job_pace_end(j);
     task_add(W_DROP, j);
 }
 
@@ -368,6 +399,7 @@ static void src_abort(struct rjob *j, const char *why)
 
 static void job_free(struct rjob *j)
 {
+    job_pace_end(j);
     if (j->fd >= 0)
         close(j->fd);
     snap_man_free(&j->man);
@@ -445,6 +477,8 @@ void rsnap_need(struct rvol *rv, int src)
     if (!j->req)
         j->req = 1;
     j->set_version = rv->rec.set_version, j->epoch = rv->epoch;
+    j->margin = snap_pace_margin(&rv->rec);
+    j->pace_id = pace_job_begin_ex(PACE_RECV, j->margin, 0);
     j->start_ms = j->last_ms = now;
     snprintf(j->dir, sizeof j->dir, "%s/v%" PRIu32 ".snap", G.dir, rv->number);
     j->next = S.jobs;
@@ -607,8 +641,14 @@ int rsnap_bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, cons
         return -1;
     }
     int fd = j->fd;
+    int margin = j->margin;
+    uint32_t idx = j->cur_idx;
     j->busy++;
     pthread_mutex_unlock(&S.mu);
+    if (idx != RS_MAN) /* R9 D18: receive-side pacing before writing/acknowledging the next snapshot window;
+                        * capped at 500 ms per chunk (a 1 MiB read pass holds <= 4 chunks -> <= 2 s, well below
+                        * peerlink dead_ms = 5 s) so the link never times out under low halved rates. */
+        pace_take_capped(PACE_RECV, (uint64_t)n, margin, 500ull * 1000000ull);
     int bad = 0;
     for (size_t done = 0; done < n;) {
         ssize_t w = pwrite(fd, (const uint8_t *)p + done, n - done, (off_t)(off + done));
@@ -703,7 +743,7 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
         snprintf(hp, sizeof hp, "%s/snappromoting", G.dir);
         hook = access(hp, F_OK) == 0;
     }
-    int why = 0, member = 0;
+    int why = 0, member = 0, margin = 2;
     uint64_t rate = 0, max = 2, my_setv = 0, my_epoch = 0;
     struct snap_epoch *hist = NULL;
     size_t nhist = 0;
@@ -720,6 +760,7 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
     if (!why) {
         rate = (uint64_t)(rv->rec.rebuild_mb_s ? rv->rec.rebuild_mb_s : 200) << 20;
         max = rv->rec.rebuild_max ? rv->rec.rebuild_max : 2;
+        margin = snap_pace_margin(&rv->rec);
         if (rv->nhist && (hist = calloc(rv->nhist, sizeof *hist)))
             for (uint32_t i = 0; i < rv->nhist; i++)
                 hist[i].epoch = rv->hist[i].epoch, hist[i].first = rv->hist[i].start;
@@ -755,7 +796,8 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
         return;
     }
     j->role = R_SRC, j->state = S_MAKING, j->vol = vol, j->peer = from, j->req = req, j->epoch = epoch, j->fd = -1;
-    j->set_version = setv, j->rate = rate, j->hist = hist, j->nhist = nhist;
+    j->set_version = setv, j->rate = rate, j->margin = margin, j->hist = hist, j->nhist = nhist;
+    j->pace_id = pace_job_begin_ex(PACE_SEND, margin, 0);
     j->start_ms = j->last_ms = ms_now();
     j->next = S.jobs;
     S.jobs = j;
@@ -827,10 +869,14 @@ static const char *src_queue(struct rjob *j, uint32_t idx)
         free(t);
         return "no link to the receiver";
     }
-    /* rebuild_mb_s (D16): a cluster setting, the same in every record; kind 5's bucket only (D7) */
-    peerlink_set_kind_rate(G.pl, PL_KIND_SNAP, j->rate);
-    if (G.mutant == RM_SNAPSAMELINK)
+    /* R9 D18: kind 5's sends go through the server-wide PACE_SEND bucket (tracks lowest active margin and p99 halving);
+     * RM_SNAPSAMELINK keeps the planted kind-2 fixed-rate path so scen_snaplarge catches it. */
+    if (G.mutant == RM_SNAPSAMELINK) {
+        peerlink_set_kind_rate(G.pl, PL_KIND_SNAP, j->rate);
         peerlink_set_kind_rate(G.pl, PL_KIND_BULK, j->rate);
+    } else {
+        peerlink_set_kind_pacer(G.pl, PL_KIND_SNAP, pace_peerlink_send, NULL);
+    }
     pthread_mutex_lock(&G.mu);
     uint64_t fileno = ++G.fileno;
     pthread_mutex_unlock(&G.mu);
@@ -921,9 +967,15 @@ void rsnap_tick(struct rvol *rv)
         return;
     }
     v->tick_ms = now;
+    int cur_margin = snap_pace_margin(&rv->rec);
     for (struct rjob *j = S.jobs; j; j = j->next) {
         if (j->dead || j->vol != rv->number)
             continue;
+        if (j->margin != cur_margin) {
+            j->margin = cur_margin;
+            if (j->pace_id)
+                pace_job_update_ex(j->role == R_SRC ? PACE_SEND : PACE_RECV, j->pace_id, cur_margin);
+        }
         if (j->role == R_DST) {
             if (rv->mode != M_REPLICA)
                 dst_abandon(j, "this member is no longer a replica", 1);
@@ -1237,6 +1289,7 @@ static void w_finish(struct rjob *j)
         return;
     }
     j->dead = 1;
+    job_pace_end(j);
     vs_get(j->vol)->retry_at = ms_now() + RS_STUB_WAIT_MS;
     pthread_mutex_unlock(&S.mu);
     int ok = 1;

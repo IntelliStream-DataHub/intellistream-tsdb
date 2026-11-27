@@ -721,6 +721,9 @@ struct peerlink {
     uint64_t vt[PL_KIND_DATA_MAX + 1];
     _Atomic uint64_t rate;                          /* every kind without a rate of its own */
     _Atomic uint64_t krate[PL_KIND_DATA_MAX + 1]; /* 0: `rate` */
+    _Atomic int kpace_on[PL_KIND_DATA_MAX + 1];   /* fast-path flag: 1 when kpace[kind] != NULL */
+    pl_pace_fn kpace[PL_KIND_DATA_MAX + 1];       /* optional per-kind external pacer (under bmu) */
+    void *kpace_arg[PL_KIND_DATA_MAX + 1];
     struct pl_stats st;
 };
 
@@ -1083,6 +1086,15 @@ int plink_bulk_send(struct plink *l, const struct pl_job *job)
 /* ---- the token bucket: 0 when `n` bytes may go now (and are counted), else the nanoseconds to wait */
 static uint64_t bucket_take(struct peerlink *pl, int kind, size_t n)
 {
+    if (kind >= PL_KIND_LOG && kind <= PL_KIND_DATA_MAX && peerlink_mutant != PL_MUT_KINDBUCKET &&
+        peerlink_mutant != PL_MUT_NOTHROTTLE && atomic_load_explicit(&pl->kpace_on[kind], memory_order_acquire)) {
+        pthread_mutex_lock(&pl->bmu);
+        pl_pace_fn fn = pl->kpace[kind];
+        void *arg = pl->kpace_arg[kind];
+        pthread_mutex_unlock(&pl->bmu);
+        if (fn)
+            return fn(arg, kind, n);
+    }
     if (kind < 0 || kind > PL_KIND_DATA_MAX || peerlink_mutant == PL_MUT_KINDBUCKET)
         kind = 0; /* PL_MUT_KINDBUCKET: every kind in one bucket at the node-wide rate (r3d's) */
     uint64_t rate = peerlink_mutant == PL_MUT_KINDBUCKET ? 0 : atomic_load(&pl->krate[kind]);
@@ -1112,6 +1124,18 @@ int peerlink_set_kind_rate(struct peerlink *pl, int kind, uint64_t bytes_per_s)
     if (kind < PL_KIND_LOG || kind > PL_KIND_DATA_MAX)
         return PL_E_INVALID;
     atomic_store(&pl->krate[kind], bytes_per_s);
+    return PL_OK;
+}
+
+int peerlink_set_kind_pacer(struct peerlink *pl, int kind, pl_pace_fn fn, void *arg)
+{
+    if (!pl || kind < PL_KIND_LOG || kind > PL_KIND_DATA_MAX)
+        return PL_E_INVALID;
+    pthread_mutex_lock(&pl->bmu);
+    pl->kpace[kind] = fn;
+    pl->kpace_arg[kind] = arg;
+    atomic_store_explicit(&pl->kpace_on[kind], fn != NULL ? 1 : 0, memory_order_release);
+    pthread_mutex_unlock(&pl->bmu);
     return PL_OK;
 }
 

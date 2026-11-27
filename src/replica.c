@@ -2488,6 +2488,8 @@ int replica_sync(eng *db)
     uint64_t target = db->fno_next, gen = rp->cut_gen;
     pthread_mutex_unlock(&rp->mu);
     if (db->opt.fsync) {
+        eng_wal_sync_fn obs = atomic_load_explicit(&eng_wal_sync_obs, memory_order_acquire);
+        int64_t t0 = obs ? eng_mono_ns() : 0;
         int err = fd < 0 ? errno : tsdb_fdatasync(fd) != 0 ? errno : 0;
         if (fd >= 0)
             close(fd);
@@ -2495,6 +2497,8 @@ int replica_sync(eng *db)
             eng_fail(db, "replica WAL fdatasync", err);
             return TSDB_ERR_IO;
         }
+        if (obs)
+            obs(eng_mono_ns() - t0);
         atomic_fetch_add_explicit(&db->st_wal_syncs, 1, memory_order_relaxed);
     }
     if (replica_test_sync_hook)

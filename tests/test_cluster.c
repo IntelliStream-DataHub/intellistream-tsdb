@@ -21753,6 +21753,196 @@ static void scen_replfault(void)
     printf("  replfault: continuous LOCAL_FAULT on vol 1 node 3 emitted replace-replica request while server stayed UP\n");
 }
 
+/* pace (R9 D18, E13, §8.4, r9-pace): margin-based rebuild pacing on both send and receive sides and Prometheus pace
+ * metrics. Five nodes (5 voters, quorum 3) with rebuild_mb_s=2 and --metrics-port auto:
+ *  1) pvol4 (4 replicas), 1 replica down (nisr=3 -> margin 2): snapshot runs at ~rebuild_mb_s (2 MiB/s), counted under
+ *     tsdb_pace_bytes_total{dir="send"|"recv",class="margin2plus"} and tsdb_pace_rate_bytes_per_second.
+ *  2) pvol4 with 2 replicas down (nisr=2 -> margin 1 on 4-replica group): snapshot accelerates to 4*rebuild_mb_s
+ *     (8 MiB/s), counted under class="margin1".
+ *  3) pvol3 (3 replicas), 2 replicas down (nisr=1 -> margin 0): snapshot runs unlimited, counted under class="margin0". */
+static uint64_t pace_metric_u64(int mport, const char *key)
+{
+    static char mbuf[1 << 20];
+    metrics_get(mport, mbuf, sizeof mbuf);
+    const char *p = strstr(mbuf, key);
+    if (!p)
+        die("metrics on port %d missing '%s'", mport, key);
+    return strtoull(p + strlen(key), NULL, 10);
+}
+
+static void scen_pace(void)
+{
+    scenario("pace");
+    int mports[5] = {0};
+    init_retain_s = 2;
+    init_rebuild_mb_s = 2;
+    for (int i = 0; i < 5; i++) {
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    init_rebuild_mb_s = 0;
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters");
+
+    uint32_t v4 = 0, v3 = 0;
+    int rc = vol_add(0, "pvol4", 4, &v4);
+    if (rc != 0)
+        die("volume add pvol4: %s", cluster_strerror(rc));
+
+    struct meta_volume mv4;
+    if (!vol_rec(0, "pvol4", &mv4))
+        die("missing pvol4 record");
+    int L4 = server_of(mv4.leader), R4a = -1, R4b = -1;
+    for (uint32_t k = 0; k < mv4.nrep; k++) {
+        int srv = server_of(mv4.rep[k].node);
+        await_open_gen(0, "pvol4", srv, 1, 0);
+        if (srv != L4) {
+            if (R4a < 0)
+                R4a = srv;
+            else if (R4b < 0)
+                R4b = srv;
+        }
+    }
+
+    /* Verify configured pace rate and halved=0 on leader L4 before any snapshot. */
+    uint64_t r_send = pace_metric_u64(mports[L4], "\ntsdb_pace_rate_bytes_per_second{dir=\"send\"} ");
+    uint64_t r_recv = pace_metric_u64(mports[L4], "\ntsdb_pace_rate_bytes_per_second{dir=\"recv\"} ");
+    uint64_t halved = pace_metric_u64(mports[L4], "\ntsdb_pace_halved ");
+    if (r_send != (2ull << 20) || r_recv != (2ull << 20) || halved != 0)
+        die("initial pace metrics on L4: send=%" PRIu64 " recv=%" PRIu64 " halved=%" PRIu64, r_send, r_recv, halved);
+
+    /* Populate pvol4 with ~3M rows (~10+ MiB snapshot); pvol3 is created only in Phase 3 so it cannot interfere
+     * with pvol4's margin classes during Phases 1 and 2. */
+    tsdbc *c4 = client(L4);
+    tsdb_sid id4 = rep_series(c4, "pace.s4", "pvol4", 30000);
+    int64_t t4 = 1000;
+    snap_rows(c4, id4, &t4, 3000000);
+    await_isr(L4, "pvol4", 4, 20000, "pvol4 all 4 in ISR");
+
+    /* Phase 1: pvol4 margin 2 (1 replica stopped -> nisr=3 -> 2 MiB/s). */
+    stop(R4a, SIGKILL);
+    await_isr(L4, "pvol4", 3, 15000, "pvol4 R4a stopped");
+    struct timespec s1 = {1, 0};
+    for (int r = 0; r < 5; r++) {
+        snap_rows(c4, id4, &t4, 100);
+        if ((rc = tsdbc_flush(c4)) != 0)
+            die("flush pvol4: %s", ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    snap_rows(c4, id4, &t4, 1);
+
+    penv[R4a] = "TSDB_REPLD_TEST=snaphold";
+    start(R4a);
+    mports[R4a] = th_mport;
+    await_log(R4a, "(snaphold)", 90000, "Phase 1 (margin 2) snapshot never arrived");
+    size_t nf = 0;
+    uint64_t bytes4 = snap_verify_held(R4a, v4, &nf);
+    char line[4096];
+    log_line(R4a, "snapshot received from node", line, sizeof line);
+    const char *in = strstr(line, " bytes in ");
+    double secs_m2 = in ? strtod(in + 10, NULL) : 0.0;
+    double least_m2 = (double)bytes4 / (double)(2ull << 20);
+    if (secs_m2 < least_m2 * 0.8)
+        die("margin-2 snapshot (%" PRIu64 " bytes) finished in %.2f s at 2 MiB/s (want >= %.2f s)", bytes4, secs_m2,
+            least_m2 * 0.8);
+    uint64_t m2_send = pace_metric_u64(mports[L4], "\ntsdb_pace_bytes_total{dir=\"send\",class=\"margin2plus\"} ");
+    uint64_t m2_recv = pace_metric_u64(mports[R4a], "\ntsdb_pace_bytes_total{dir=\"recv\",class=\"margin2plus\"} ");
+    if (m2_send < bytes4 || m2_recv < bytes4)
+        die("margin-2 pace bytes: send=%" PRIu64 " recv=%" PRIu64 " want >= %" PRIu64, m2_send, m2_recv, bytes4);
+
+    /* Phase 2: pvol4 margin 1 (2 replicas stopped -> nisr=2 of 4 -> 4 * 2 = 8 MiB/s).
+     * R4a never installed its held snapshot, so restarting R4a with R4b stopped immediately requests a new snapshot. */
+    stop(R4a, SIGKILL);
+    stop(R4b, SIGKILL);
+    await_isr(L4, "pvol4", 2, 15000, "pvol4 R4a+R4b stopped (margin 1)");
+    start(R4a);
+    mports[R4a] = th_mport;
+    await_log_count(R4a, "(snaphold)", 2, 90000);
+    uint64_t bytes4_p2 = snap_verify_held(R4a, v4, &nf);
+    log_line(R4a, "snapshot received from node", line, sizeof line);
+    in = strstr(line, " bytes in ");
+    double secs_m1 = in ? strtod(in + 10, NULL) : 0.0;
+    uint64_t m1_send = pace_metric_u64(mports[L4], "\ntsdb_pace_bytes_total{dir=\"send\",class=\"margin1\"} ");
+    uint64_t m1_recv = pace_metric_u64(mports[R4a], "\ntsdb_pace_bytes_total{dir=\"recv\",class=\"margin1\"} ");
+    if (m1_send < bytes4_p2 || m1_recv < bytes4_p2)
+        die("margin-1 pace bytes: send=%" PRIu64 " recv=%" PRIu64 " want >= %" PRIu64, m1_send, m1_recv, bytes4_p2);
+    if (secs_m1 >= secs_m2 * 0.75)
+        die("margin-1 snapshot (%.2f s) did not accelerate vs margin-2 (%.2f s)", secs_m1, secs_m2);
+
+    /* Bring R4b back and close pvol4 client before creating pvol3 for Phase 3. */
+    penv[R4a] = NULL;
+    start(R4b);
+    mports[R4b] = th_mport;
+    tsdbc_close(c4);
+
+    /* Phase 3: pvol3 (3 replicas), both non-leader replicas stopped -> nisr=1 -> margin 0 (unlimited). */
+    rc = vol_add(L4, "pvol3", 3, &v3);
+    if (rc != 0)
+        die("volume add pvol3: %s", cluster_strerror(rc));
+    struct meta_volume mv3;
+    if (!vol_rec(L4, "pvol3", &mv3))
+        die("missing pvol3 record");
+    int L3 = server_of(mv3.leader), R3a = -1, R3b = -1;
+    for (uint32_t k = 0; k < mv3.nrep; k++) {
+        int srv = server_of(mv3.rep[k].node);
+        await_open_gen(L4, "pvol3", srv, 1, 0);
+        if (srv != L3) {
+            if (R3a < 0)
+                R3a = srv;
+            else if (R3b < 0)
+                R3b = srv;
+        }
+    }
+    tsdbc *c3 = client(L3);
+    tsdb_sid id3 = rep_series(c3, "pace.s3", "pvol3", 30000);
+    int64_t t3 = 1000;
+    snap_rows(c3, id3, &t3, 2000000);
+    await_isr(L3, "pvol3", 3, 20000, "pvol3 all 3 in ISR");
+
+    stop(R3a, SIGKILL);
+    stop(R3b, SIGKILL);
+    await_isr(L3, "pvol3", 1, 15000, "pvol3 R3a+R3b stopped (margin 0)");
+    for (int r = 0; r < 5; r++) {
+        snap_rows(c3, id3, &t3, 100);
+        if ((rc = tsdbc_flush(c3)) != 0)
+            die("flush pvol3: %s", ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    snap_rows(c3, id3, &t3, 1);
+
+    penv[R3a] = "TSDB_REPLD_TEST=snaphold";
+    start(R3a);
+    mports[R3a] = th_mport;
+    await_log(R3a, "(snaphold)", 60000, "Phase 3 (margin 0) snapshot never arrived");
+    uint64_t bytes3 = snap_verify_held(R3a, v3, &nf);
+    log_line(R3a, "snapshot received from node", line, sizeof line);
+    in = strstr(line, " bytes in ");
+    double secs_m0 = in ? strtod(in + 10, NULL) : 0.0;
+    uint64_t m0_send = pace_metric_u64(mports[L3], "\ntsdb_pace_bytes_total{dir=\"send\",class=\"margin0\"} ");
+    uint64_t m0_recv = pace_metric_u64(mports[R3a], "\ntsdb_pace_bytes_total{dir=\"recv\",class=\"margin0\"} ");
+    if (m0_send < bytes3 || m0_recv < bytes3)
+        die("margin-0 pace bytes: send=%" PRIu64 " recv=%" PRIu64 " want >= %" PRIu64, m0_send, m0_recv, bytes3);
+    double cap_m0 = (double)bytes3 / (double)(2ull << 20);
+    if (secs_m0 >= cap_m0 * 0.75)
+        die("margin-0 snapshot (%" PRIu64 " bytes) took %.2f s (should beat 2 MiB/s cap %.2f s)", bytes3, secs_m0,
+            cap_m0);
+
+    tsdbc_close(c3);
+    for (int i = 0; i < 5; i++) {
+        xargs[i] = NULL;
+        penv[i] = NULL;
+    }
+    stop_all();
+    printf("  pace: margin-2 (%" PRIu64 " B) in %.2f s, margin-1 in %.2f s, margin-0 (%" PRIu64 " B) in %.2f s; "
+           "send/recv pace metrics verified\n",
+           bytes4, secs_m2, secs_m1, bytes3, secs_m0);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -21802,7 +21992,7 @@ int main(int argc, char **argv)
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast},
                {"outtimer", scen_outtimer}, {"outback", scen_outback}, {"outguard", scen_outguard},
                {"outhold", scen_outhold}, {"outopening", scen_outopening}, {"outfailstop", scen_outfailstop},
-               {"replfault", scen_replfault}};
+               {"replfault", scen_replfault}, {"pace", scen_pace}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

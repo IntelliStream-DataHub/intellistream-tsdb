@@ -1526,6 +1526,13 @@ static void wal_writer_leave(eng *db)
     pthread_mutex_unlock(&db->wal_sync_lock);
 }
 
+_Atomic eng_wal_sync_fn eng_wal_sync_obs;
+
+void eng_set_wal_sync_observer(void (*fn)(int64_t ns))
+{
+    atomic_store_explicit(&eng_wal_sync_obs, fn, memory_order_release);
+}
+
 /* Writes a record of the rows in buf (WAL_HDR spare bytes first) to fd and
  * syncs it. On failure the engine is failed (eng_fail) before it returns:
  * the caller holds the writer role and has not woken anyone yet. */
@@ -1558,10 +1565,14 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
     if (sh)
         sh(db);
     if (db->opt.fsync) {
+        eng_wal_sync_fn obs = atomic_load_explicit(&eng_wal_sync_obs, memory_order_acquire);
+        int64_t t0 = obs ? eng_mono_ns() : 0;
         if (tsdb_fdatasync(fd) != 0) {
             eng_fail(db, "WAL fdatasync", errno);
             return TSDB_ERR_IO;
         }
+        if (obs)
+            obs(eng_mono_ns() - t0);
         atomic_fetch_add_explicit(&db->st_wal_syncs, 1, memory_order_relaxed);
     }
     if (bytes && eng_test_mutant == MUT_LEADER_BYTES_AFTER_SYNC) /* planted: shipped only after the sync */
