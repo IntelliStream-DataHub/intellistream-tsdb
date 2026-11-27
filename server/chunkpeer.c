@@ -2286,3 +2286,123 @@ int chunkpeer_notify_reopen(struct chunksrv *cs, uint32_t self, uint32_t node, u
     free(body);
     return rc ? rc : arc;
 }
+
+int chunkpeer_list_page(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume,
+                        bool has_cursor, const uint8_t cursor_oid[16], uint16_t cursor_pos, uint32_t max_entries,
+                        int timeout_ms, chunk_listed **items_out, uint32_t *n_out, bool *more_out)
+{
+    *items_out = NULL;
+    *n_out = 0;
+    *more_out = false;
+    if (!cs || node == 0 || max_entries == 0 || max_entries > CS_LIST_MAX)
+        return TSDB_ERR_INVALID;
+    struct cs_req r;
+    req_init(&r, CS_OP_LIST, volume, 0, NULL, has_cursor ? cursor_oid : NULL, has_cursor ? cursor_pos : 0);
+    r.has_cursor = has_cursor;
+    r.len = max_entries;
+    int32_t arc = 0;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int rc = (self && node == self)
+                 ? chunkpeer_local_call(cs, self, &r, &arc, &body, &bl)
+                 : chunksrv_call_kind(cs, node, PL_KIND_CHUNK, &r, timeout_ms, &arc, &body, &bl);
+    if (rc == 0 && arc != 0)
+        rc = arc;
+    if (rc == 0) {
+        if (bl < 5) {
+            rc = TSDB_ERR_CORRUPT;
+        } else {
+            uint32_t n = get32(body);
+            bool more = body[4] != 0;
+            if (n > CS_LIST_MAX || bl != 5 + CS_LIST_ENTRY * (size_t)n) {
+                rc = TSDB_ERR_CORRUPT;
+            } else {
+                chunk_listed *out = n ? calloc(n, sizeof *out) : NULL;
+                if (n && !out) {
+                    rc = TSDB_ERR_NOMEM;
+                } else {
+                    for (uint32_t i = 0; i < n; i++) {
+                        const uint8_t *e = body + 5 + CS_LIST_ENTRY * i;
+                        memcpy(out[i].oid, e, 16);
+                        out[i].pos = get16(e + 16);
+                        out[i].size = get64(e + 18);
+                        out[i].epoch = get64(e + 26);
+                        memcpy(out[i].vuuid, e + 34, 16);
+                        out[i].status = e[50];
+                        out[i].store = e[51];
+                    }
+                    *items_out = out;
+                    *n_out = n;
+                    *more_out = more;
+                }
+            }
+        }
+    }
+    free(body);
+    return rc;
+}
+
+int chunkpeer_gcpending(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume, int timeout_ms,
+                        uint8_t (**oids_out)[16], uint32_t *n_out, bool *truncated_out)
+{
+    *oids_out = NULL;
+    *n_out = 0;
+    if (truncated_out)
+        *truncated_out = false;
+    if (!cs || node == 0)
+        return TSDB_ERR_INVALID;
+    struct cs_req r;
+    req_init(&r, CS_OP_GCPENDING, volume, 0, NULL, NULL, 0);
+    int32_t arc = 0;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int rc = (self && node == self)
+                 ? chunkpeer_local_call(cs, self, &r, &arc, &body, &bl)
+                 : chunksrv_call_kind(cs, node, PL_KIND_CHUNK, &r, timeout_ms, &arc, &body, &bl);
+    if (rc == 0 && arc != 0)
+        rc = arc;
+    if (rc == 0) {
+        if (bl < 5 || body[4] > 1) {
+            rc = TSDB_ERR_CORRUPT;
+        } else {
+            uint32_t n = get32(body);
+            bool trunc = body[4] != 0;
+            if (n > CS_GCPENDING_MAX || bl != 5 + 16 * (size_t)n) {
+                rc = TSDB_ERR_CORRUPT;
+            } else {
+                if (truncated_out)
+                    *truncated_out = trunc;
+                if (n > 0) {
+                    uint8_t (*out)[16] = malloc(16 * (size_t)n);
+                    if (!out) {
+                        rc = TSDB_ERR_NOMEM;
+                    } else {
+                        memcpy(out, body + 5, 16 * (size_t)n);
+                        *oids_out = out;
+                        *n_out = n;
+                    }
+                }
+            }
+        }
+    }
+    free(body);
+    return rc;
+}
+
+int chunkpeer_notify_reconcile(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume, uint32_t pos,
+                               uint64_t stripe_version, int timeout_ms)
+{
+    if (!cs || node == 0 || pos >= CHUNK_POS_MAX)
+        return TSDB_ERR_INVALID;
+    struct cs_req r;
+    req_init(&r, CS_OP_RECONCILE, volume, 0, NULL, NULL, pos);
+    r.off = stripe_version;
+    int32_t arc = 0;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int rc = (self && node == self)
+                 ? chunkpeer_local_call(cs, self, &r, &arc, &body, &bl)
+                 : chunksrv_call_kind(cs, node, PL_KIND_CHUNK, &r, timeout_ms, &arc, &body, &bl);
+    free(body);
+    return rc ? rc : arc;
+}

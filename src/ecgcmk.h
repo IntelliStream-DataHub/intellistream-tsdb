@@ -45,6 +45,7 @@ int ecgcmk_queue_orphan(struct eng *db, const uint8_t oid[16]);
 void ecgcmk_test_opt(const char *tok);
 size_t ecgcmk_pending_count(const struct eng *db);
 bool ecgcmk_pending_has(const struct eng *db, const uint8_t oid[16]);
+int ecgcmk_pending_list(const struct eng *db, uint8_t (**oids_out)[16], size_t *n_out);
 bool ecgcmk_is_fenced(const struct eng *db);
 
 #endif

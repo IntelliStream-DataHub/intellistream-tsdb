@@ -30,6 +30,7 @@
  *                                                 TSDBD_IO: epoll or uring, passed as --io)
  */
 #define _GNU_SOURCE
+#include "chunk.h"
 #include "cluster.h"
 #include "crashpt.h"
 #include "creport.h"
@@ -27224,6 +27225,647 @@ static void scen_posmove(void)
            ecnum, old_holder, ids[S]);
 }
 
+/* ---- r9-reconcile: CHUNK_LIST both ways on start and return (ecback, ecbackempty, ecbackgc) */
+#ifdef TSDB_EC
+struct rec_chunk_ino {
+    char name[128];
+    ino_t ino;
+    uint64_t cell_bytes;
+};
+
+static int rec_scan_chunks(const char *sdir, uint32_t vol, struct rec_chunk_ino *out, int cap, bool verify_all)
+{
+    char vdir[PATH_MAX + 128];
+    snprintf(vdir, sizeof vdir, "%s/s%" PRIu32, sdir, vol);
+    DIR *d = opendir(vdir);
+    if (!d)
+        return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && n < cap) {
+        size_t nl = strlen(de->d_name);
+        if (de->d_name[0] != 'o' || nl < 8 || strcmp(de->d_name + nl - 6, ".chunk") != 0)
+            continue;
+        char fp[PATH_MAX + 256];
+        snprintf(fp, sizeof fp, "%s/%s", vdir, de->d_name);
+        struct stat st;
+        if (stat(fp, &st) != 0 || st.st_size <= 0)
+            continue;
+        uint64_t cell_bytes = 0;
+        if (verify_all) {
+            int fd = open(fp, O_RDONLY);
+            if (fd < 0)
+                die("rec_scan_chunks: open %s: %s", fp, strerror(errno));
+            uint8_t *buf = malloc((size_t)st.st_size);
+            if (!buf)
+                die("rec_scan_chunks: out of memory");
+            size_t got = 0;
+            while (got < (size_t)st.st_size) {
+                ssize_t r = read(fd, buf + got, (size_t)st.st_size - got);
+                if (r <= 0)
+                    break;
+                got += (size_t)r;
+            }
+            close(fd);
+            chunk_hdr h;
+            const uint8_t *cells = NULL, *sums_le = NULL;
+            if (got != (size_t)st.st_size || chunk_image_parse(buf, got, true, &h, &cells, &sums_le) != 0)
+                die("rec_scan_chunks: chunk %s failed full cell checksum verification", fp);
+            cell_bytes = h.chunk_len;
+            free(buf);
+        }
+        snprintf(out[n].name, sizeof out[n].name, "%s", de->d_name);
+        out[n].ino = st.st_ino;
+        out[n].cell_bytes = cell_bytes;
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static int rec_parse_log_filled(int srv, uint32_t vol, uint32_t pos, uint64_t *filled_out, uint64_t *bytes_out,
+                                int *lines_out)
+{
+    char lp[PATH_MAX + 128];
+    snprintf(lp, sizeof lp, "%s/n%d.log", base, srv);
+    FILE *f = fopen(lp, "r");
+    if (!f)
+        return -1;
+    uint64_t tot_filled = 0, tot_bytes = 0;
+    int lines = 0;
+    char line[1024];
+    char prefix[96];
+    snprintf(prefix, sizeof prefix, "tsdbd: reconcile: volume %" PRIu32 " pos %" PRIu32 " version ", vol, pos);
+    while (fgets(line, sizeof line, f)) {
+        const char *p = strstr(line, prefix);
+        if (!p)
+            continue;
+        unsigned long long ver = 0, done = 0, total = 0, bytes = 0;
+        if (sscanf(p + strlen(prefix), "%llu: complete (%llu/%llu missing filled, %llu bytes", &ver, &done, &total,
+                   &bytes) == 4) {
+            tot_filled += done;
+            tot_bytes += bytes;
+            lines++;
+        }
+    }
+    fclose(f);
+    if (filled_out)
+        *filled_out = tot_filled;
+    if (bytes_out)
+        *bytes_out = tot_bytes;
+    if (lines_out)
+        *lines_out = lines;
+    return 0;
+}
+#endif
+
+/* ecback (r9-reconcile): 4+2 on 7 nodes. Settle day 0 with all 6 holders UP, then SIGSTOP one stripe holder H past
+ * ec.settle_wait_max_s = 5 s so day 2 settles degraded (5 positions, H missing). SIGCONT H before rebuild_after_s:
+ * ONLY day 2's missing chunk is filled (day 0's chunk keeps its exact inode, counted bytes equal one chunk).
+ * Kills planted mutants `backfullcopy` and `backskipmissing`. */
+static void scen_ecback(void)
+{
+    scenario("ecback");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    epoll_after_two = 1;
+    init_rebuild_after_s = 600;
+    for (int i = 0; i < 7; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want_v = 5;
+    await_view(0, p_voters, &want_v, "five voters of seven members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    int voter_srv[7] = {0};
+    for (int i = 0; i < 7; i++)
+        voter_srv[i] = is_voter(&v, ids[i]) != 0;
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    static char sdirs[7][PATH_MAX + 96];
+    for (int i = 0; i < 7; i++) {
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
+        chunk_store_make(sdirs[i], uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i],
+                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --ec-settle-wait-max-s 5 "
+                 "--merge-idle-s 1 --flush-interval-ms 200 --ec-cache-mb 16",
+                 sdirs[i]);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with chunk stores");
+
+    uint32_t num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ecback: vol_add_ec 4+2: %s (%s)", cluster_strerror(rc), text);
+
+    struct meta_volume e;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecback: e42 has no leader");
+    int L = server_of(e.leader);
+    if (L < 0)
+        die("ecback: bad leader %d", L);
+    await_isr(L, "e42", 3, 30000, "e42 full ISR before day 0");
+
+    /* Phase 1: Write and settle day 0 while all 6 stripe holders are UP. */
+    const int64_t day0 = 1704067200000LL;
+    tsdbc *c = client(L);
+    tsdb_sid ide[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecb.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+    }
+    ecb_write_day(c, ide, day0);
+    int n0 = 0;
+    for (uint64_t t0 = now_ms(); (n0 = ecb_ec_parts(L, num)) < 1; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecback: day 0 did not settle within 90 s");
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecback: live .part files left after day 0: %s", live);
+    n0 = ecb_ec_parts(L, num);
+
+    /* Pick a non-leader, non-Raft-leader, preferably non-rep/non-voter stripe holder H. */
+    int ml = leader_of(L);
+    int H = -1;
+    uint32_t hpos = UINT32_MAX;
+    for (int pass = 0; pass < 4 && H < 0; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && H < 0; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == L || s == ml)
+                continue;
+            bool rep = ecb_is_rep(&e, s);
+            bool vot = voter_srv[s] != 0;
+            bool match = (pass == 0 && !rep && !vot) || (pass == 1 && !rep && vot) ||
+                         (pass == 2 && rep && !vot) || (pass == 3 && rep && vot);
+            if (match) {
+                H = s;
+                hpos = p;
+            }
+        }
+    }
+    if (H < 0)
+        die("ecback: could not pick stripe holder H");
+
+    struct rec_chunk_ino before[32];
+    int nbef = rec_scan_chunks(sdirs[H], num, before, 32, false);
+    if (nbef != n0)
+        die("ecback: holder H (srv %d, pos %" PRIu32 ") has %d chunk(s) before SIGSTOP, want %d", H, hpos, nbef, n0);
+
+    /* Phase 2: SIGSTOP H -> wait for META_DOWN -> write day 2 -> settles degraded past settle_wait_max_s = 5 s. */
+    pause_server(H, 1);
+    struct state_want down_w = {ids[H], META_DOWN, 0};
+    await_view(L, p_member_state, &down_w, "holder H marked META_DOWN after SIGSTOP");
+
+    ecb_write_day(c, ide, day0 + 2 * 86400000LL);
+    int ntot = 0;
+    for (uint64_t t0 = now_ms(); (ntot = ecb_ec_parts(L, num)) <= n0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecback: day 2 did not settle degraded within 90 s (ec parts=%d)", ntot);
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecback: live .part files left after degraded settle: %s", live);
+    ntot = ecb_ec_parts(L, num);
+    int ndeg = ntot - n0;
+    if (ndeg < 1)
+        die("ecback: expected >= 1 degraded object, got %d", ndeg);
+    if (ecd_chunks_of(H, num) != n0)
+        die("ecback: paused holder H has %d chunks (expected %d)", ecd_chunks_of(H, num), n0);
+    if (!log_has(L, "reconcile noted missing position"))
+        die("ecback: leader %d did not log sreconcile_note_missing", L);
+
+    /* Record reconcile log baseline before SIGCONT. */
+    uint64_t filled_before = 0, bytes_before = 0;
+    int lines_before = 0;
+    rec_parse_log_filled(H, num, hpos, &filled_before, &bytes_before, &lines_before);
+
+    /* Phase 3: SIGCONT H before rebuild_after_s -> H reconciles ONLY the degraded object's missing chunk! */
+    pause_server(H, 0);
+    struct state_want up_w = {ids[H], META_UP, 0};
+    await_view(L, p_member_state, &up_w, "holder H back META_UP after SIGCONT");
+
+    for (uint64_t t0 = now_ms();; usleep(150000)) {
+        int hch = ecd_chunks_of(H, num);
+        uint64_t fn = 0, bn = 0;
+        int ln = 0;
+        rec_parse_log_filled(H, num, hpos, &fn, &bn, &ln);
+        if (hch == ntot && ln > lines_before && fn > filled_before)
+            break;
+        if (now_ms() - t0 > 45000)
+            die("ecback: holder H did not reconcile missing chunk within 45 s (chunks %d/%d, log lines %d->%d, filled %" PRIu64 ")",
+                hch, ntot, lines_before, ln, fn - filled_before);
+    }
+
+    /* Verify:
+     *   1. Every chunk on H parses and passes full cell checksum verification.
+     *   2. Pre-existing day-0 chunks kept their EXACT original inodes (never rewritten -> kills backfullcopy).
+     *   3. Newly filled chunk(s)' cell bytes equal EXACTLY the reconcile bytes counted in H's log (kills backfullcopy). */
+    struct rec_chunk_ino after[32];
+    int naft = rec_scan_chunks(sdirs[H], num, after, 32, true);
+    if (naft != ntot)
+        die("ecback: holder H has %d chunk(s) after reconcile, want %d", naft, ntot);
+
+    uint64_t want_new_bytes = 0;
+    int new_found = 0;
+    for (int i = 0; i < naft; i++) {
+        int old_idx = -1;
+        for (int j = 0; j < nbef; j++) {
+            if (strcmp(after[i].name, before[j].name) == 0) {
+                old_idx = j;
+                break;
+            }
+        }
+        if (old_idx >= 0) {
+            if (after[i].ino != before[old_idx].ino)
+                die("ecback: pre-existing chunk %s on H was rewritten (inode changed %" PRIu64 " -> %" PRIu64 "; backfullcopy!)",
+                    after[i].name, (uint64_t)before[old_idx].ino, (uint64_t)after[i].ino);
+        } else {
+            want_new_bytes += after[i].cell_bytes;
+            new_found++;
+        }
+    }
+    if (new_found != ndeg)
+        die("ecback: found %d new chunk(s) on H, expected %d", new_found, ndeg);
+
+    uint64_t filled_after = 0, bytes_after = 0;
+    int lines_after = 0;
+    rec_parse_log_filled(H, num, hpos, &filled_after, &bytes_after, &lines_after);
+    uint64_t delta_filled = filled_after - filled_before;
+    uint64_t delta_bytes = bytes_after - bytes_before;
+    if (delta_filled != (uint64_t)ndeg || delta_bytes != want_new_bytes)
+        die("ecback: counted reconcile work %" PRIu64 " chunk(s) / %" PRIu64 " bytes != expected %d chunk(s) / %" PRIu64
+            " bytes (backfullcopy!)",
+            delta_filled, delta_bytes, ndeg, want_new_bytes);
+    int total_ch = ecb_chunks_n(num, 7);
+    if (total_ch != ntot * 6)
+        die("ecback: total chunks %d != %d * 6", total_ch, ntot);
+
+    tsdbc_close(c);
+    epoll_after_two = 0;
+    stop_all();
+    printf("  ecback: 4+2 on 7 nodes -> H (srv %d, pos %" PRIu32 ") SIGSTOPped past wait_max_s, %d degraded obj(s) settled, "
+           "SIGCONT -> ONLY %" PRIu64 " missing chunk(s) filled (%" PRIu64 " bytes == exact chunk), %d existing chunk(s) untouched\n",
+           H, hpos, ndeg, delta_filled, delta_bytes, nbef);
+#endif
+}
+
+/* ecbackempty (r9-reconcile): 4+2 on 7 nodes. Settle >= 2 days, stop stripe holder H, wipe & re-initialize H's
+ * store directory (empty with a new store id), restart H before rebuild_after_s: H logs the store id change with
+ * path and both ids, refills every chunk, and reads with two OTHER stripe holders stopped return exact oracle data. */
+static void scen_ecbackempty(void)
+{
+    scenario("ecbackempty");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    epoll_after_two = 1;
+    init_rebuild_after_s = 600;
+    for (int i = 0; i < 7; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want_v = 5;
+    await_view(0, p_voters, &want_v, "five voters of seven members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    int voter_srv[7] = {0};
+    for (int i = 0; i < 7; i++)
+        voter_srv[i] = is_voter(&v, ids[i]) != 0;
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    static char sdirs[7][PATH_MAX + 96];
+    for (int i = 0; i < 7; i++) {
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
+        chunk_store_make(sdirs[i], uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i],
+                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-cache-mb 16",
+                 sdirs[i]);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with chunk stores");
+
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ecbackempty: vol_add_ec 4+2: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("ecbackempty: twin t42: %s", cluster_strerror(rc));
+
+    struct meta_volume e, tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackempty: e42 has no leader");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackempty: t42 has no leader");
+    int L = server_of(e.leader), Lt = server_of(tv.leader);
+    if (L < 0 || Lt < 0)
+        die("ecbackempty: bad leaders L=%d Lt=%d", L, Lt);
+    await_isr(L, "e42", 3, 30000, "e42 full ISR before writes");
+
+    const int64_t day0 = 1704067200000LL;
+    tsdbc *c = client(L), *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecbe.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+    ecb_write_day(c, ide, day0);
+    ecb_write_day(ct, idt, day0);
+    ecb_write_day(c, ide, day0 + 2 * 86400000LL);
+    ecb_write_day(ct, idt, day0 + 2 * 86400000LL);
+
+    int nec = 0;
+    for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) < 2; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("ecbackempty: only %d .ec part(s) settled within 120 s", nec);
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("ecbackempty: live .part files remain: %s", live);
+    nec = ecb_ec_parts(L, num);
+
+    struct ecb_sum twin[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++)
+        if ((rc = ecb_read(ct, idt[s], &twin[s])) != 0 || twin[s].n != 4 * ECB_ROWS)
+            die("ecbackempty: twin read series %d: %s (%" PRIu64 " rows)", s, ers(rc), twin[s].n);
+    tsdbc_close(ct);
+
+    /* Pick stripe holder H (not L, not ml) and record its original store id. */
+    int ml = leader_of(L);
+    int H = -1;
+    uint32_t hpos = UINT32_MAX;
+    for (int pass = 0; pass < 4 && H < 0; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && H < 0; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == L || s == ml)
+                continue;
+            bool rep = ecb_is_rep(&e, s);
+            bool vot = voter_srv[s] != 0;
+            bool match = (pass == 0 && !rep && !vot) || (pass == 1 && !rep && vot) ||
+                         (pass == 2 && rep && !vot) || (pass == 3 && rep && vot);
+            if (match) {
+                H = s;
+                hpos = p;
+            }
+        }
+    }
+    if (H < 0)
+        die("ecbackempty: could not pick holder H");
+
+    uint8_t old_sid[16], new_sid[16];
+    if (chunk_store_meta_read(sdirs[H], old_sid, NULL) != 0)
+        die("ecbackempty: could not read original store id of %s", sdirs[H]);
+    char old_hex[33], new_hex[33];
+    chunk_oid_hex(old_sid, old_hex);
+
+    /* Stop H, empty its store directory completely and re-init fresh empty store (new store id), then restart H! */
+    stop(H, SIGKILL);
+    struct state_want down_w = {ids[H], META_DOWN, 0};
+    await_view(L, p_member_state, &down_w, "holder H marked META_DOWN after stop");
+
+    if (nftw(sdirs[H], rm_one, 16, FTW_DEPTH | FTW_PHYS) != 0)
+        die("ecbackempty: failed to empty %s: %s", sdirs[H], strerror(errno));
+    chunk_store_make(sdirs[H], uuid, ids[H]);
+    if (chunk_store_meta_read(sdirs[H], new_sid, NULL) != 0)
+        die("ecbackempty: could not read new store id of %s", sdirs[H]);
+    chunk_oid_hex(new_sid, new_hex);
+
+    start(H);
+    struct state_want up_w = {ids[H], META_UP, 0};
+    await_view(L, p_member_state, &up_w, "holder H back META_UP with empty store");
+
+    /* Wait until every chunk is refilled onto H! */
+    for (uint64_t t0 = now_ms(); ecd_chunks_of(H, num) < nec; usleep(150000))
+        if (now_ms() - t0 > 60000)
+            die("ecbackempty: holder H refilled only %d/%d chunks within 60 s", ecd_chunks_of(H, num), nec);
+
+    /* Verify store-id mismatch was logged with store path and both ids. */
+    char want_log[PATH_MAX + 160];
+    snprintf(want_log, sizeof want_log, "reconcile: store %s answered with another store id (expected %s, got %s)",
+             sdirs[H], old_hex, new_hex);
+    if (!log_has(H, want_log))
+        die("ecbackempty: holder H log missing store-id mismatch line '%s'", want_log);
+
+    /* Verify all refilled chunks on H pass full cell checksum verification. */
+    struct rec_chunk_ino refilled[32];
+    int nref = rec_scan_chunks(sdirs[H], num, refilled, 32, true);
+    if (nref != nec)
+        die("ecbackempty: holder H has %d verified chunks, want %d", nref, nec);
+
+    /* Stop TWO other stripe holders W1, W2 (keeping Raft quorum >= 3 of 5 voters and keeping L and H UP):
+     * with 2 of 6 stripe holders down, ONLY 4 remain UP (H + 3 others = k = 4), proving reads MUST use H! */
+    ml = leader_of(L);
+    int W[2] = {-1, -1};
+    int nw = 0;
+    int vdown = 0;
+    for (int pass = 0; pass < 2 && nw < 2; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && nw < 2; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == L || s == ml || s == H)
+                continue;
+            if (nw == 1 && s == W[0])
+                continue;
+            if (pass == 0 && voter_srv[s])
+                continue;
+            if (vdown + voter_srv[s] > 2)
+                continue;
+            W[nw++] = s;
+            vdown += voter_srv[s];
+        }
+    }
+    if (nw < 2)
+        die("ecbackempty: could not pick 2 other stripe holders to stop (found %d)", nw);
+    stop(W[0], SIGKILL);
+    stop(W[1], SIGKILL);
+
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0)
+            die("ecbackempty: post-refill read series %d failed: %s", s, ers(rc));
+        if (a.n != twin[s].n || a.h != twin[s].h)
+            die("ecbackempty: post-refill series %d mismatch: %" PRIu64 " (%" PRIx64 ") vs %" PRIu64 " (%" PRIx64 ")",
+                s, a.n, a.h, twin[s].n, twin[s].h);
+    }
+
+    tsdbc_close(c);
+    epoll_after_two = 0;
+    stop_all();
+    printf("  ecbackempty: holder H (srv %d, pos %" PRIu32 ") store wiped (%s -> %s), %d/%d chunks refilled & verified, "
+           "reads whole == oracle with 2 other holders stopped\n",
+           H, hpos, old_hex, new_hex, nref, nec);
+#endif
+}
+
+/* ecbackgc (r9-reconcile): 4+2 on 7 nodes. Settle day 0, SIGSTOP non-replica stripe holder H, expire day 0 by
+ * retention while H is away so MK_GC commits and deletes chunks on the 5 UP holders while staying pending in GCMK
+ * for H. SIGCONT H before rebuild_after_s: MK_GC is applied on return (H's chunks deleted via r8k's pending list,
+ * never falsely reported as orphans). */
+static void scen_ecbackgc(void)
+{
+    scenario("ecbackgc");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    epoll_after_two = 1;
+    init_rebuild_after_s = 600;
+    for (int i = 0; i < 7; i++) {
+        penv[i] = "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want_v = 5;
+    await_view(0, p_voters, &want_v, "five voters of seven members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    int voter_srv[7] = {0};
+    for (int i = 0; i < 7; i++)
+        voter_srv[i] = is_voter(&v, ids[i]) != 0;
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    static char sdirs[7][PATH_MAX + 96];
+    for (int i = 0; i < 7; i++) {
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/ecs%d", base, i);
+        chunk_store_make(sdirs[i], uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i],
+                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-cache-mb 16",
+                 sdirs[i]);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with chunk stores");
+
+    uint32_t num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ecbackgc: vol_add_ec 4+2: %s (%s)", cluster_strerror(rc), text);
+
+    struct meta_volume e;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackgc: e42 has no leader");
+    int L = server_of(e.leader);
+    if (L < 0)
+        die("ecbackgc: bad leader %d", L);
+    await_isr(L, "e42", 3, 30000, "e42 full ISR before writes");
+
+    const int64_t day0 = 1704067200000LL;
+    tsdbc *c = client(L);
+    tsdb_sid ide[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecbgc.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+    }
+    ecb_write_day(c, ide, day0);
+
+    int nec = 0;
+    for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) < 1; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecbackgc: day 0 did not settle within 90 s");
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecbackgc: live .part files remain: %s", live);
+    nec = ecb_ec_parts(L, num);
+
+    /* Pick a non-replica stripe holder H (so all 3 log replicas stay UP and commit MK_GC immediately while H is down). */
+    int ml = leader_of(L);
+    int H = -1;
+    uint32_t hpos = UINT32_MAX;
+    for (int pass = 0; pass < 2 && H < 0; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && H < 0; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == L || s == ml || ecb_is_rep(&e, s))
+                continue;
+            if ((pass == 0 && !voter_srv[s]) || pass == 1) {
+                H = s;
+                hpos = p;
+            }
+        }
+    }
+    if (H < 0)
+        die("ecbackgc: could not pick non-replica stripe holder H");
+    if (ecd_chunks_of(H, num) != nec)
+        die("ecbackgc: holder H has %d chunks before pause, want %d", ecd_chunks_of(H, num), nec);
+
+    /* Pause H -> wait for META_DOWN -> expire day 0 by retention while H is away -> MK_GC commits! */
+    pause_server(H, 1);
+    struct state_want down_w = {ids[H], META_DOWN, 0};
+    await_view(L, p_member_state, &down_w, "holder H marked META_DOWN before MK_GC");
+
+    for (int s = 0; s < ECB_SERIES; s++)
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_set_retention(c, ide[s], 86400000LL)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("ecbackgc: set retention on series %d: %s", s, ers(rc));
+
+    /* Wait until MK_GC retired day 0 on L and deleted chunks on the 5 UP holders while H still holds its chunks. */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int tot = ecb_chunks_n(num, 7);
+        int hch = ecd_chunks_of(H, num);
+        if (ecb_ec_parts(L, num) == 0 && tot == hch && hch == nec)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("ecbackgc: MK_GC did not delete UP holders' chunks while H away (ec=%d tot=%d hch=%d want=%d)",
+                ecb_ec_parts(L, num), tot, hch, nec);
+    }
+
+    /* Resume H -> MK_GC pending deletes apply on H's return (0 chunks left, 0 false orphan reports). */
+    pause_server(H, 0);
+    struct state_want up_w = {ids[H], META_UP, 0};
+    await_view(L, p_member_state, &up_w, "holder H back META_UP after MK_GC");
+
+    for (uint64_t t0 = now_ms(); ecd_chunks_of(H, num) != 0 || ecb_chunks_n(num, 7) != 0; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("ecbackgc: H's chunks not deleted on return within 60 s (hch=%d tot=%d)", ecd_chunks_of(H, num),
+                ecb_chunks_n(num, 7));
+
+    if (log_has(H, ": orphan chunk "))
+        die("ecbackgc: holder H falsely reported committed MK_GC chunk as an orphan");
+
+    tsdbc_close(c);
+    epoll_after_two = 0;
+    stop_all();
+    printf("  ecbackgc: holder H (srv %d, pos %" PRIu32 ") paused while MK_GC committed (%d chunks deleted on 5 UP holders); "
+           "on return MK_GC applied cleanly (0 chunks left, 0 false orphans)\n",
+           H, hpos, nec * 5);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -27279,7 +27921,8 @@ int main(int argc, char **argv)
                {"full", scen_full}, {"fullnonisr", scen_fullnonisr}, {"ecrebuild", scen_ecrebuild},
                {"nodehold", scen_nodehold}, {"nodeout", scen_nodeout}, {"nodedrain", scen_nodedrain},
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
-               {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal}};
+               {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
+               {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

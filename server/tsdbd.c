@@ -8294,7 +8294,7 @@ int main(int argc, char **argv)
             scrubd_stop();
             return 1;
         }
-        if (!witness && sfill_cluster_start(db) != 0) {
+        if (!witness && sfill_cluster_start(db, state_dir) != 0) {
             fprintf(stderr, "tsdbd: cannot start the stripe fill worker\n");
             return 1;
         }

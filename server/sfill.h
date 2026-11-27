@@ -135,6 +135,17 @@ int sfill_start(struct sfill *sf, const struct sfill_job_cfg *cfg);
 /* Stop and remove any fill job running for (volume, pos). Safe if none is running. */
 void sfill_stop(struct sfill *sf, uint32_t volume, uint32_t pos);
 
+/* Enqueue one specific missing object onto sfill's priority worker pool (server/sreconcile.c, D15).
+ * Runs the checked copy/decode + read-back + notify_reopen pipeline at `margin`'s priority without creating a
+ * FILLING job or touching sfill's whole-barrier state. Takes ownership of `obj->sums` (setting it to NULL) on 0.
+ * If `force_write` is true, bypasses the local_chunk_intact shortcut. Optional `cancel_cb(done_arg)` is polled
+ * without holding sf->mu before and during execution so a stopped reconcile job aborts queued/in-flight work.
+ * Calls `done_cb(done_arg, rc)` on completion, cancellation, or shutdown drop (rc == 0 on verified durable write,
+ * non-zero otherwise). Returns 0 on success, -1 on error. */
+int sfill_enqueue_obj(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t prev_node, int margin,
+                      uint32_t concurrency, const uint8_t vuuid[16], struct sfill_obj *obj, bool force_write,
+                      bool (*cancel_cb)(void *arg), void (*done_cb)(void *arg, int rc), void *done_arg);
+
 /* Collect up to `cap` current fill reports into `out` (non-blocking, called on the cluster heartbeat path).
  * Returns the number of entries written. */
 uint32_t sfill_report(struct sfill *sf, struct sfill_report *out, uint32_t cap);

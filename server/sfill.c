@@ -144,13 +144,17 @@ struct sfill_job {
 
 struct sfill_task {
     struct sfill_task *next;
-    struct sfill_job *job;
+    struct sfill_job *job; /* NULL for ad-hoc reconcile tasks enqueued via sfill_enqueue_obj */
     uint64_t gen;
     uint32_t volume;
     uint32_t pos;
     uint32_t prev_node;
     int margin;
     bool first_pass;
+    bool force_write;
+    bool (*cancel_cb)(void *arg);
+    void (*done_cb)(void *arg, int rc);
+    void *done_arg;
     uint8_t vuuid[16];
     uint64_t obj_bytes;
     struct sfill_obj obj; /* owns obj.sums */
@@ -207,9 +211,16 @@ static void task_free(struct sfill_task *t)
 static bool job_cancelled(struct sfill *sf, struct sfill_job *j, uint64_t gen)
 {
     pthread_mutex_lock(&sf->mu);
-    bool cancel = sf->stopping || j->removed || j->gen != gen;
+    bool cancel = sf->stopping || (j && (j->removed || j->gen != gen));
     pthread_mutex_unlock(&sf->mu);
     return cancel;
+}
+
+static bool task_cancelled(struct sfill *sf, const struct sfill_task *t)
+{
+    if (job_cancelled(sf, t->job, t->gen))
+        return true;
+    return t->cancel_cb && t->cancel_cb(t->done_arg);
 }
 
 static void publish_reports(struct sfill *sf)
@@ -350,7 +361,7 @@ static int try_copy_from_prev(struct sfill *sf, struct sfill_task *t, chunk_back
     int res = SFILL_OBJ_OK;
     uint64_t total_written = 0;
     for (uint64_t c = 0; c < ncells; c++) {
-        if (job_cancelled(sf, t->job, t->gen)) {
+        if (task_cancelled(sf, t)) {
             res = SFILL_OBJ_CANCELLED;
             break;
         }
@@ -456,7 +467,7 @@ static int decode_from_survivors(struct sfill *sf, struct sfill_task *t, chunk_b
     uint64_t total_written = 0;
 
     for (uint64_t s = 0; s < target_cells; s++) {
-        if (job_cancelled(sf, t->job, t->gen)) {
+        if (task_cancelled(sf, t)) {
             res = SFILL_OBJ_CANCELLED;
             break;
         }
@@ -602,7 +613,7 @@ static int decode_from_survivors(struct sfill *sf, struct sfill_task *t, chunk_b
 /* Execute one object fill task. */
 static int run_object_task(struct sfill *sf, struct sfill_task *t)
 {
-    if (job_cancelled(sf, t->job, t->gen))
+    if (task_cancelled(sf, t))
         return SFILL_OBJ_CANCELLED;
 
     const struct sfill_obj *obj = &t->obj;
@@ -630,7 +641,7 @@ static int run_object_task(struct sfill *sf, struct sfill_task *t)
 
     /* Fast path (and crash-resume path after CP_FILL_WRITTEN): already durably held and sum-verified locally.
      * Notify log replicas on pass 0 only (covers crash-resume after CP_FILL_WRITTEN without spamming retries). */
-    if (local_chunk_intact(be, &id, obj)) {
+    if (!t->force_write && local_chunk_intact(be, &id, obj)) {
         sf->ops.local_be_release(sf->ops.arg, be);
         SF_STAT(sf, already_held);
         if (t->first_pass && sf->ops.notify_reopen) {
@@ -718,25 +729,34 @@ static struct sfill_task *pop_task_locked(struct sfill *sf)
     return NULL;
 }
 
-/* Drop all unstarted queued tasks matching `job` (or all removed jobs if job == NULL; sf->mu held). */
-static void drop_tasks_locked(struct sfill *sf, struct sfill_job *job, bool drop_all)
+/* Drop all unstarted queued tasks matching `job` (or all removed jobs if job == NULL; sf->mu held).
+ * Ad-hoc tasks dropped on shutdown (`drop_all`) are appended to `*dropped_adhoc` so callers invoke done_cb outside mu. */
+static void drop_tasks_locked(struct sfill *sf, struct sfill_job *job, bool drop_all,
+                              struct sfill_task **dropped_adhoc)
 {
     for (unsigned b = 0; b < SFILL_BUCKETS; b++) {
         struct sfill_task *prev = NULL;
         struct sfill_task *cur = sf->q_head[b];
         while (cur) {
             struct sfill_task *nx = cur->next;
-            bool match = drop_all || (job ? cur->job == job : cur->job->removed);
+            bool match = drop_all || (cur->job && (job ? cur->job == job : cur->job->removed));
             if (match) {
                 if (prev)
                     prev->next = nx;
                 else
                     sf->q_head[b] = nx;
-                if (cur->job->inflight > 0)
-                    cur->job->inflight--;
-                if (cur->job->round_pending > 0)
-                    cur->job->round_pending--;
-                task_free(cur);
+                if (cur->job) {
+                    if (cur->job->inflight > 0)
+                        cur->job->inflight--;
+                    if (cur->job->round_pending > 0)
+                        cur->job->round_pending--;
+                    task_free(cur);
+                } else if (dropped_adhoc) {
+                    cur->next = *dropped_adhoc;
+                    *dropped_adhoc = cur;
+                } else {
+                    task_free(cur);
+                }
             } else {
                 prev = cur;
             }
@@ -828,6 +848,14 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&sf->mu);
 
         int rc = run_object_task(sf, t);
+
+        if (!t->job) {
+            if (t->done_cb)
+                t->done_cb(t->done_arg, rc == SFILL_OBJ_OK ? 0 : -1);
+            task_free(t);
+            pthread_mutex_lock(&sf->mu);
+            continue;
+        }
 
         bool should_publish = false;
         pthread_mutex_lock(&sf->mu);
@@ -1109,12 +1137,20 @@ void sfill_free(struct sfill *sf)
     pthread_mutex_lock(&sf->mu);
     sf->stopping = true;
     /* Drop any queued (not yet started) tasks so workers exit promptly. */
-    drop_tasks_locked(sf, NULL, true);
+    struct sfill_task *dropped = NULL;
+    drop_tasks_locked(sf, NULL, true, &dropped);
     pthread_cond_broadcast(&sf->coord_cv);
     pthread_cond_broadcast(&sf->work_cv);
     uint32_t nw = sf->nworkers;
     bool cs = sf->coord_started;
     pthread_mutex_unlock(&sf->mu);
+
+    for (struct sfill_task *t = dropped, *nx; t; t = nx) {
+        nx = t->next;
+        if (t->done_cb)
+            t->done_cb(t->done_arg, -1);
+        task_free(t);
+    }
 
     if (cs)
         pthread_join(sf->coord_thr, NULL);
@@ -1178,7 +1214,7 @@ int sfill_start(struct sfill *sf, const struct sfill_job_cfg *cfg)
                 found->pace_id = 0;
             }
             /* Drop unstarted queued tasks from the old stripe_version; in-flight workers still drain via inflight. */
-            drop_tasks_locked(sf, found, false);
+            drop_tasks_locked(sf, found, false, NULL);
             changed = true;
         } else {
             found->cfg.leader = cfg->leader;
@@ -1234,7 +1270,7 @@ void sfill_stop(struct sfill *sf, uint32_t volume, uint32_t pos)
     }
     if (removed_any) {
         /* Drop any queued (unstarted) tasks for removed jobs. */
-        drop_tasks_locked(sf, NULL, false);
+        drop_tasks_locked(sf, NULL, false, NULL);
         gc_removed_jobs_locked(sf);
         pthread_cond_signal(&sf->coord_cv);
     }
@@ -1242,6 +1278,46 @@ void sfill_stop(struct sfill *sf, uint32_t volume, uint32_t pos)
 
     if (removed_any)
         publish_reports(sf);
+}
+
+int sfill_enqueue_obj(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t prev_node, int margin,
+                      uint32_t concurrency, const uint8_t vuuid[16], struct sfill_obj *obj, bool force_write,
+                      bool (*cancel_cb)(void *arg), void (*done_cb)(void *arg, int rc), void *done_arg)
+{
+    if (!sf || !sf->has_ops || !vuuid || !obj || pos >= CHUNK_POS_MAX)
+        return -1;
+    uint32_t conc = concurrency ? concurrency : SFILL_DEFAULT_CONCURRENCY;
+    if (conc > SFILL_MAX_WORKERS)
+        conc = SFILL_MAX_WORKERS;
+    struct sfill_task *t = calloc(1, sizeof *t);
+    if (!t)
+        return -1;
+    t->volume = volume;
+    t->pos = pos;
+    t->prev_node = prev_node;
+    t->margin = margin;
+    t->first_pass = true;
+    t->force_write = force_write;
+    t->cancel_cb = cancel_cb;
+    t->done_cb = done_cb;
+    t->done_arg = done_arg;
+    memcpy(t->vuuid, vuuid, 16);
+    t->obj = *obj;
+
+    pthread_mutex_lock(&sf->mu);
+    if (sf->stopping) {
+        pthread_mutex_unlock(&sf->mu);
+        free(t);
+        return -1;
+    }
+    if (conc > sf->want_workers)
+        sf->want_workers = conc;
+    ensure_workers_locked(sf);
+    obj->sums = NULL; /* transferred ownership */
+    push_task_locked(sf, t);
+    pthread_cond_signal(&sf->work_cv);
+    pthread_mutex_unlock(&sf->mu);
+    return 0;
 }
 
 uint32_t sfill_report(struct sfill *sf, struct sfill_report *out, uint32_t cap)

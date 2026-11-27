@@ -457,6 +457,28 @@ bool ecgcmk_pending_has(const eng *db, const uint8_t oid[16])
     return has;
 }
 
+int ecgcmk_pending_list(const eng *db, uint8_t (**oids_out)[16], size_t *n_out)
+{
+    *oids_out = NULL;
+    *n_out = 0;
+    struct ecgcmk *g = db ? db->gcmk : NULL;
+    if (!g)
+        return 0;
+    pthread_mutex_lock(&g->mu);
+    size_t n = g->nents;
+    uint8_t (*out)[16] = n ? malloc(n * 16) : NULL;
+    if (n && !out) {
+        pthread_mutex_unlock(&g->mu);
+        return TSDB_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < n; i++)
+        memcpy(out[i], g->ents[i].oid, 16);
+    pthread_mutex_unlock(&g->mu);
+    *oids_out = out;
+    *n_out = n;
+    return 0;
+}
+
 bool ecgcmk_is_fenced(const eng *db) { return db && db->gcmk && atomic_load(&db->gcmk->fenced); }
 
 int ecgcmk_queue_orphan(eng *db, const uint8_t oid[16])

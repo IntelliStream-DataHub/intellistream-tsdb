@@ -904,6 +904,22 @@ cgroup, so `nice` does not keep your work out of its way.
     is UP in the current epoch right before `MK_COLD` (`TSDB_ECCOLD_TEST=pause_pre_marker=PATH` test hook), and notifies
     `sreconcile_note_missing` after `lw_leave`. `tests/test_eccold.c` (mutants
     `cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge degtwo degnoupcheck degnopositions`), `test_cluster ecdegraded`, `make degsettle-mutants`.
+  - **Startup and return chunk reconciliation** (R9, r9-reconcile; `server/sreconcile.[ch]`, `server/sfill.[ch]`,
+    `server/chunksrv.[ch]` `CS_OP_GCPENDING` (op 9) / `CS_OP_RECONCILE` (op 10), `server/chunkpeer_cluster.c`;
+    design-cluster-data.md §5.2, E10, E14, E27, E28; D14, D15): on every member start and return (`DOWN -> UP`,
+    `OUT -> UP`, or lease-lapse reconnect), hands work off the fill watch thread to `reconcile_main`, checks local
+    chunk store ids against `<state-dir>/chunk_stores` (protected by an `XXH64` trailer; read/format/checksum errors
+    log loudly and refuse to overwrite; a writable store answering with another store id is logged once with path and
+    both ids, refilled completely, and its new id persisted only after affected positions reconcile cleanly; a
+    non-writable DOWN or live-vs-disk diverged store is logged once and waits for store recovery/restart without
+    re-streaming `OBJLIST`), streams the leader's full `OBJLIST` (`max_version = 0`) page-by-page against local
+    `CHUNK_LIST` (re-checking `vol_view` per page), enqueues missing/damaged/replaced-store chunks onto `sfill` at the
+    volume's margin priority (`sfill_enqueue_obj` with a cancellation predicate when a position moves away, progress
+    merged into `HBS_FILL` at the current `stripe_version`), checks extra local chunks against `CS_OP_GCPENDING`
+    (wire-flagged truncation; leaving committed `MK_GC` oids to r8k and reporting confirmed orphans without deleting),
+    and drains `sreconcile_note_missing` off the watch thread via `CS_OP_RECONCILE`. Like r9-fill's `OBJLIST`/`REOPEN`,
+    chunk ops 9 and 10 are added without a `PL_CL_VERSION` bump. `tests/test_sreconcile.c`,
+    `test_cluster ecback ecbackempty ecbackgc`, `make reconcile-mutants` (`backfullcopy backskipmissing`).
   - **A replica applies a committed MK_COLD** (R8, r8h; `src/ecapply.c`, design-cluster-data.md 2.3 step 6): it checks the
     marker (every object record names its oid, the key and the marker's Z; one `.ec` file per object; each Y's header
     check), stages the files, numbers the `.ec` parts in the leader's block order with Y above them (never the marker's

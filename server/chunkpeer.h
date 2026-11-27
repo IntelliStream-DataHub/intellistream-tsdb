@@ -105,16 +105,26 @@ int chunkpeer_read_rebuild(struct chunksrv *cs, uint32_t self, uint32_t node, ui
                            size_t len, int timeout_ms);
 int chunkpeer_notify_reopen(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume,
                             const uint8_t oid[16], int timeout_ms);
+/* R9 (D15): reconcile helpers over PL_KIND_CHUNK: paged local CHUNK_LIST, leader committed MK_GC pending list,
+ * and remote reconcile nudge for degraded settles. */
+int chunkpeer_list_page(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume,
+                        bool has_cursor, const uint8_t cursor_oid[16], uint16_t cursor_pos, uint32_t max_entries,
+                        int timeout_ms, chunk_listed **items_out, uint32_t *n_out, bool *more_out);
+int chunkpeer_gcpending(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume, int timeout_ms,
+                        uint8_t (**oids_out)[16], uint32_t *n_out, bool *truncated_out);
+int chunkpeer_notify_reconcile(struct chunksrv *cs, uint32_t self, uint32_t node, uint32_t volume, uint32_t pos,
+                               uint64_t stripe_version, int timeout_ms);
 
 /* tsdbd's instance (chunkpeer_cluster.c): over chunksrv_cluster() and the metadata copy; installs chunksrv's epoch
  * source and tier.c's cluster attach hook. Before tsdb_open. */
 int chunkpeer_cluster_start(const char *stage_dir);
 void chunkpeer_cluster_stop(void); /* the epoch source's installer, if it still waits; after chunksrv_cluster_stop */
 struct chunkpeer *chunkpeer_cluster(void);
-/* R9 (r9-fill): tsdbd's checked stripe fill worker and OBJLIST/REOPEN server handlers (chunkpeer_cluster.c). */
+/* R9 (r9-fill, r9-reconcile): tsdbd's checked stripe fill worker, reconciler, and OBJLIST/REOPEN/GCPENDING/RECONCILE
+ * server handlers (chunkpeer_cluster.c). */
 struct tsdb;
 struct sfill_progress;
-int sfill_cluster_start(struct tsdb *db);
+int sfill_cluster_start(struct tsdb *db, const char *state_dir);
 void sfill_cluster_stop(void);
 uint32_t sfill_cluster_progress(struct sfill_progress *out, uint32_t cap);
 /* cvol.c, before a cluster volume's engine opens (writer or replica): an ec volume in the copy gets requires=tier,ec in

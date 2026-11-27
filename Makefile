@@ -666,11 +666,11 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs opening fa
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild \
-    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal
+    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal ecback ecbackempty ecbackgc
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
-test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margins $(B)/test_pout $(B)/test_pace $(B)/test_place $(B)/test_sfill $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb
+test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margins $(B)/test_pout $(B)/test_pace $(B)/test_place $(B)/test_sfill $(B)/test_sreconcile $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb
 	./$(B)/test_peerlink $(SCRATCH)
 	for c in header full; do ./$(B)/test_peerlink $(SCRATCH) --quick --check $$c --only $(PL_KINDS_TESTS) || exit 1; done # every link kind at the other check levels
 	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall donestatus statusneg updownleak noidcheck" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
@@ -684,6 +684,8 @@ test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margin
 	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier" -- ./$(B)/test_place --mutant @M@ # each planted bug must fail it
 	./$(B)/test_sfill $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_sfill --list "fillnocheck fillfewerk fillsurvivortrust" -- ./$(B)/test_sfill --mutant @M@ @D@) # each planted bug must fail it
+	./$(B)/test_sreconcile $(SCRATCH)
+	$(if $(EC_OBJ),$(MUT) --name test_sreconcile --list "backfullcopy backskipmissing" -- ./$(B)/test_sreconcile --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_plrdma $(SCRATCH)
 	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte settleready noauth keepqueue seqbump nobackoff noipoib cmnoauth cmnofallback" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_replwire
@@ -1072,7 +1074,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants reconcile-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1172,7 +1174,7 @@ $(B)/balance.o: server/balance.c $(R9_PLACE_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/sfill.o: server/sfill.c server/sfill.h server/pace.h server/crashpt.h src/chunk.h src/chunk_priv.h src/compat.h src/internal.h $(EC_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -c -o $@ $<
-$(B)/sreconcile.o: server/sreconcile.c server/sfill.h src/chunk.h | $(B)
+$(B)/sreconcile.o: server/sreconcile.c server/sreconcile.h server/sfill.h server/chunksrv.h server/pace.h src/chunk.h src/compat.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/pace.o: server/pace.c server/pace.h src/compat.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
@@ -1201,6 +1203,14 @@ $(B)/test_sfill: tests/test_sfill.c server/sfill.h server/pace.h src/chunk.h src
 sfill-mutants: $(B)/test_sfill
 	@$(if $(EC_OBJ),true,echo "sfill-mutants: this build has no erasure codec (NO_EC=1): test_sfill skips, nothing to plant"; false)
 	$(MUT) --name test_sfill --list "fillnocheck fillfewerk fillsurvivortrust" -- ./$(B)/test_sfill --mutant @M@ @D@
+# R9 startup/return reconciler unit tests and planted mutants (server/sreconcile.c, tests/test_sreconcile.c, test_cluster ecback; track r9-reconcile)
+$(B)/test_sreconcile: tests/test_sreconcile.c server/sreconcile.h server/sfill.h server/chunksrv.h server/pace.h src/chunk.h src/chunk_priv.h $(B)/sreconcile.o $(B)/sfill.o $(B)/pace.o $(B)/crashpt.o $(LIB) | $(B)
+	$(CC) $(CFLAGS) -Iinclude -Iserver -Isrc -o $@ tests/test_sreconcile.c $(B)/sreconcile.o $(B)/sfill.o $(B)/pace.o $(B)/crashpt.o $(LIB) $(LDLIBS)
+reconcile-mutants: $(B)/test_sreconcile $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	@$(if $(EC_OBJ),true,echo "reconcile-mutants: this build has no erasure codec (NO_EC=1): ecback skips, nothing to plant"; false)
+	$(MUT) --name test_sreconcile --list "backfullcopy backskipmissing" -- ./$(B)/test_sreconcile --mutant @M@ @D@
+	$(MUT) --name ecback --list "backfullcopy backskipmissing" -- env TSDB_SRECONCILE_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecback
 # R9 placement unit tests (server/place.c, track r9-plan)
 $(B)/test_place: tests/test_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/test_place.c $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
@@ -1360,7 +1370,7 @@ R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h ser
           server/margins.h server/pace.h
 # r8f: the peer cold ops and their cluster instance (server/chunkpeer.h), compiled with tsdbd (g_ec_cfg is tsdbd.c's)
 CP_SRC := server/chunkpeer.c server/chunkpeer_cluster.c
-TSDBD_SRC := $(CP_SRC) server/chunkpeer.h $(R4_SRC) $(R4_HDR) server/scrubd.h server/creport.h server/fwd.h server/fwdreq.h server/plrdma.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/stbuf.h server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
+TSDBD_SRC := $(CP_SRC) server/chunkpeer.h server/sfill.h server/sreconcile.h $(R4_SRC) $(R4_HDR) server/scrubd.h server/creport.h server/fwd.h server/fwdreq.h server/plrdma.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/stbuf.h server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h src/tiers.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/scrubd.o $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) \

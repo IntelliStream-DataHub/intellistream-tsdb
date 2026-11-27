@@ -114,6 +114,8 @@ static size_t req_body_len(uint8_t op)
     case CS_OP_EPOCH: return 0;
     case CS_OP_OBJLIST: return 8 + 1 + 16 + 4;
     case CS_OP_REOPEN: return 16;
+    case CS_OP_GCPENDING: return 0;
+    case CS_OP_RECONCILE: return 2 + 8;
     default: return (size_t)-1;
     }
 }
@@ -148,6 +150,9 @@ size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap)
         put32(b + 25, r->len);
     } else if (r->op == CS_OP_REOPEN) {
         memcpy(b, r->oid, 16);
+    } else if (r->op == CS_OP_RECONCILE) {
+        put16(b, r->pos);
+        put64(b + 2, r->off);
     }
     put64(out + REQ_HDR + bl, xh(out, REQ_HDR + bl));
     return REQ_HDR + bl + CS_CHECK_LEN;
@@ -201,6 +206,11 @@ int cs_req_decode(const uint8_t *p, size_t n, struct cs_req *r)
             return -1;
     } else if (r->op == CS_OP_REOPEN) {
         memcpy(r->oid, b, 16);
+    } else if (r->op == CS_OP_RECONCILE) {
+        r->pos = get16(b);
+        r->off = get64(b + 2);
+        if (r->pos >= CHUNK_POS_MAX)
+            return -1;
     }
     return 0;
 }
@@ -295,7 +305,7 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     r->body_len = n - RESP_HDR;
     if (get64(p + 13) != resp_check(p, n) && chunksrv_mutant != CS_MUT_NORESPCHECK)
         return -1;
-    if (r->op < CS_OP_READ || r->op > CS_OP_REOPEN || r->rc > 0)
+    if (r->op < CS_OP_READ || r->op > CS_OP_RECONCILE || r->rc > 0)
         return -1;
     if (r->rc != 0)
         return r->body_len == 0 ? 0 : -1;
@@ -312,6 +322,9 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     case CS_OP_PUT: return bl == 8 ? 0 : -1;
     case CS_OP_OBJLIST: return objlist_body_valid(b, bl);
     case CS_OP_REOPEN: return bl == 0 ? 0 : -1;
+    case CS_OP_GCPENDING:
+        return bl >= 5 && b[4] <= 1 && get32(b) <= CS_GCPENDING_MAX && bl == 5 + 16 * (size_t)get32(b) ? 0 : -1;
+    case CS_OP_RECONCILE: return bl == 0 ? 0 : -1;
     }
     return -1;
 }
@@ -500,6 +513,10 @@ struct chunksrv {
     _Atomic(void *) objlist_arg;
     _Atomic(chunksrv_reopen_fn) reopen;
     _Atomic(void *) reopen_arg;
+    _Atomic(chunksrv_gcpending_fn) gcpending;
+    _Atomic(void *) gcpending_arg;
+    _Atomic(chunksrv_reconcile_fn) reconcile;
+    _Atomic(void *) reconcile_arg;
     _Atomic(chunksrv_read_pace_fn) read_pace;
     _Atomic(void *) read_pace_arg;
     struct chunksrv_stats st;
@@ -650,6 +667,26 @@ int chunksrv_stores(struct chunksrv *cs, int *up, bool log)
     return cs->n;
 }
 
+int chunksrv_store_info(struct chunksrv *cs, int idx, char *path_out, size_t path_cap, int *state_out,
+                        uint8_t id_out[16])
+{
+    if (!cs || !cs->be || idx < 0 || idx >= cs->n)
+        return -1;
+    if (path_out && path_cap > 0)
+        snprintf(path_out, path_cap, "%s", cs->paths && cs->paths[idx] ? cs->paths[idx] : "");
+    int st = chunk_be_store_state(cs->be, idx);
+    if (state_out)
+        *state_out = st;
+    if (id_out) {
+        chunk_store *s = chunk_be_store(cs->be, idx);
+        if (s && st == CHUNK_STORE_UP)
+            memcpy(id_out, chunk_store_id(s), 16);
+        else
+            memset(id_out, 0, 16);
+    }
+    return 0;
+}
+
 void chunksrv_epoch_source(struct chunksrv *cs, chunksrv_epoch_fn fn, void *arg)
 {
     atomic_store(&cs->src_arg, arg);
@@ -666,6 +703,18 @@ void chunksrv_set_reopen(struct chunksrv *cs, chunksrv_reopen_fn fn, void *arg)
 {
     atomic_store(&cs->reopen_arg, arg);
     atomic_store(&cs->reopen, fn);
+}
+
+void chunksrv_set_gcpending(struct chunksrv *cs, chunksrv_gcpending_fn fn, void *arg)
+{
+    atomic_store(&cs->gcpending_arg, arg);
+    atomic_store(&cs->gcpending, fn);
+}
+
+void chunksrv_set_reconcile(struct chunksrv *cs, chunksrv_reconcile_fn fn, void *arg)
+{
+    atomic_store(&cs->reconcile_arg, arg);
+    atomic_store(&cs->reconcile, fn);
 }
 
 void chunksrv_set_read_pacer(struct chunksrv *cs, chunksrv_read_pace_fn fn, void *arg)
@@ -1025,6 +1074,50 @@ static void do_reopen(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn r
     reply_rc(reply, arg, r->rid, CS_OP_REOPEN, 0, NULL, 0);
 }
 
+static void do_gcpending(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn reply, void *arg)
+{
+    chunksrv_gcpending_fn fn = atomic_load(&cs->gcpending);
+    if (!fn) {
+        reply_rc(reply, arg, r->rid, CS_OP_GCPENDING, TSDB_ERR_UNAVAILABLE, NULL, 0);
+        return;
+    }
+    uint8_t (*oids)[16] = NULL;
+    uint32_t n = 0;
+    bool truncated = false;
+    int rc = fn(atomic_load(&cs->gcpending_arg), r->volume, &oids, &n, &truncated);
+    if (rc != 0) {
+        free(oids);
+        reply_rc(reply, arg, r->rid, CS_OP_GCPENDING, rc, NULL, 0);
+        return;
+    }
+    if (n > CS_GCPENDING_MAX) {
+        n = CS_GCPENDING_MAX;
+        truncated = true;
+    }
+    size_t bl = 5 + 16 * (size_t)n;
+    uint8_t *b = malloc(bl);
+    if (!b) {
+        free(oids);
+        reply_rc(reply, arg, r->rid, CS_OP_GCPENDING, TSDB_ERR_NOMEM, NULL, 0);
+        return;
+    }
+    put32(b, n);
+    b[4] = truncated ? 1 : 0;
+    if (n > 0)
+        memcpy(b + 5, oids, 16 * (size_t)n);
+    free(oids);
+    reply_rc(reply, arg, r->rid, CS_OP_GCPENDING, 0, b, bl);
+    free(b);
+}
+
+static void do_reconcile(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn reply, void *arg)
+{
+    chunksrv_reconcile_fn fn = atomic_load(&cs->reconcile);
+    if (fn)
+        fn(atomic_load(&cs->reconcile_arg), r->volume, r->pos, r->off);
+    reply_rc(reply, arg, r->rid, CS_OP_RECONCILE, 0, NULL, 0);
+}
+
 static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, const struct cs_req *r, cs_reply_fn reply,
                                void *arg)
 {
@@ -1036,6 +1129,14 @@ static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, con
     }
     if (r->op == CS_OP_REOPEN) {
         do_reopen(cs, r, reply, arg);
+        return 0;
+    }
+    if (r->op == CS_OP_GCPENDING) {
+        do_gcpending(cs, r, reply, arg);
+        return 0;
+    }
+    if (r->op == CS_OP_RECONCILE) {
+        do_reconcile(cs, r, reply, arg);
         return 0;
     }
     if (!cs->be) {

@@ -53,14 +53,17 @@ enum {
     CS_OP_DEL = 4,
     CS_OP_EPOCH = 5,
     CS_OP_PUT = 6,     /* answers only */
-    CS_OP_OBJLIST = 7, /* R9 (D11): paged list of committed .ec object records with stripe_version < max_version */
-    CS_OP_REOPEN = 8,  /* R9 (D11): notify a log replica to eccache_reopen(volume, oid) after a chunk fill */
+    CS_OP_OBJLIST = 7,   /* R9 (D11): paged list of committed .ec object records with stripe_version < max_version */
+    CS_OP_REOPEN = 8,    /* R9 (D11): notify a log replica to eccache_reopen(volume, oid) after a chunk fill */
+    CS_OP_GCPENDING = 9, /* R9 (D15): list oids on leader's committed MK_GC pending-delete list (and kick GC) */
+    CS_OP_RECONCILE = 10,/* R9 (D15): nudge a stripe holder to run reconcile for (volume, pos, stripe_version) */
 };
 
 #define CS_READ_MAX (4u << 20)        /* bytes of one CS_OP_READ */
 #define CS_SUMS_MAX 65536u            /* sums of one CS_OP_SUMS */
 #define CS_LIST_MAX 4096u             /* entries of one CS_OP_LIST */
 #define CS_LIST_ENTRY 52u             /* oid 16, pos 2, size 8, epoch 8, vuuid 16, status 1, store 1 */
+#define CS_GCPENDING_MAX 4096u        /* entries of one CS_OP_GCPENDING */
 #define CS_OBJLIST_MAX 1024u          /* entries of one CS_OP_OBJLIST */
 #define CS_OBJLIST_BYTES_MAX (4u << 20) /* payload byte budget of one CS_OP_OBJLIST page */
 #define CS_OBJLIST_HDR 21u            /* vuuid 16, u32 n, u8 more */
@@ -143,6 +146,9 @@ void chunksrv_close(struct chunksrv *cs); /* after chunksrv_unlisten */
 int chunksrv_check_owner(struct chunksrv *cs, const uint8_t cluster[16], uint32_t node, char *err, size_t errlen);
 /* Stores by state: up (open and not failed) and n. Logs each store's state when `log`. */
 int chunksrv_stores(struct chunksrv *cs, int *up, bool log);
+/* Store path, CHUNK_STORE_* state, and live 16-byte store_id (zeroed when not UP) for index `idx`. 0 or -1. */
+int chunksrv_store_info(struct chunksrv *cs, int idx, char *path_out, size_t path_cap, int *state_out,
+                        uint8_t id_out[16]);
 chunk_backend *chunksrv_backend(struct chunksrv *cs);
 
 /* One committed .ec object record returned by CS_OP_OBJLIST (R9 D11). */
@@ -172,6 +178,13 @@ void chunksrv_set_objlist(struct chunksrv *cs, chunksrv_objlist_fn fn, void *arg
 /* R9 (D11): server-side handler for CS_OP_REOPEN (calls eccache_reopen(tier, volume, oid) on log replicas). */
 typedef void (*chunksrv_reopen_fn)(void *arg, uint32_t volume, const uint8_t oid[16]);
 void chunksrv_set_reopen(struct chunksrv *cs, chunksrv_reopen_fn fn, void *arg);
+/* R9 (D15): server-side handler for CS_OP_GCPENDING (returns leader's committed MK_GC pending oids and kicks GC). */
+typedef int (*chunksrv_gcpending_fn)(void *arg, uint32_t volume, uint8_t (**oids_out)[16], uint32_t *n_out,
+                                     bool *truncated_out);
+void chunksrv_set_gcpending(struct chunksrv *cs, chunksrv_gcpending_fn fn, void *arg);
+/* R9 (D15): server-side handler for CS_OP_RECONCILE (triggers reconciliation of (volume, pos, stripe_version)). */
+typedef void (*chunksrv_reconcile_fn)(void *arg, uint32_t volume, uint32_t pos, uint64_t stripe_version);
+void chunksrv_set_reconcile(struct chunksrv *cs, chunksrv_reconcile_fn fn, void *arg);
 /* R9 (D18): optional send-side byte pacer for CS_OP_READ responses served over PL_KIND_CHUNKR (kind 8). */
 typedef void (*chunksrv_read_pace_fn)(void *arg, uint32_t volume, size_t bytes);
 void chunksrv_set_read_pacer(struct chunksrv *cs, chunksrv_read_pace_fn fn, void *arg);
