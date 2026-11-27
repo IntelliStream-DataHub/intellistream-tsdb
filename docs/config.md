@@ -97,10 +97,10 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
   keys are then left out (tsdbd prints one line that names them), where they would otherwise be refused (cluster
   settings without the cluster). A cluster option on the command line next to `--cluster=false` is an error, as is a
   file that sets `cluster.*` keys and `cluster.enabled = false`: the message names the settings and where they are.
-- **Reserved keys:** `storage.disks` and `storage.tiers` are named for the device classes
-  (`docs/design-cluster-data.md`) and not built. They are rows in the table with no option: a file that sets one is
+- **Reserved keys:** `storage.disks` is named for the device classes
+  (`docs/design-cluster-data.md`) and not built. It is a row in the table with no option: a file that sets it is
   refused (`reserved and not implemented yet`), so a file written for a later version is never read as if the key did
-  nothing. Nothing else in the `storage.` group may take those names.
+  nothing. Nothing else in the `storage.` group may take that name.
 
 ## tsdbd keys
 
@@ -117,6 +117,8 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `storage.partition` | `--partition-ms` | duration (plain: ms) | 1d | Length of a base partition. Used only when the database is created. |
 | `storage.partition.classes` | `--partition-classes` | integer | 1 | 1: series of different rates go to partitions of 1, 7, 28 or 364 days; 0: all to base partitions. Used only when the database is created. |
 | `storage.granule.rows` | `--granule-rows` | integer | 8192 | Rows per granule. Used only when the database is created. |
+| `storage.tiers` | `--tier` | list | unset | The stores of the single-server tier, PATH[:CLASS] each: checked against TIERS at start (never adds a store; a mismatch refuses to start). |
+| `storage.tier.cache` | `--tier-cache-mb` | size (plain: MiB) | unset | Memory of the single-server tier's decoded granule cache. Default: a tenth of the RAM. |
 | `server.listen` | `--listen` | string | 127.0.0.1 | The address clients connect to (there is no TLS: a trusted interface). |
 | `server.port` | `--port` | integer | 7070 | The client port; 0 lets the kernel choose (see server.port.file). |
 | `server.port.file` | `--port-file` | string | unset | A file that tsdbd writes, once it serves, with "PORT PID" (and the metrics port), for a launcher to read. |
@@ -196,7 +198,6 @@ Reserved keys (named for a design that is not built; a file that sets one is ref
 | Key | Why |
 |---|---|
 | `storage.disks` | the disks of a device-class server, PATH[:CLASS] each (docs/design-cluster-data.md, section 15) |
-| `storage.tiers` | the stores of the single-server tier, PATH[:CLASS] each, as `tier add` makes them (docs/design-cluster-data.md) |
 <!-- keys:tsdbd:end -->
 
 ## The tsdb command line tool

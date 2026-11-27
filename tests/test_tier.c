@@ -34,6 +34,7 @@
 #include "ecgc.h"
 #include "feed.h"
 #include "tier.h"
+#include "tiers.h"
 #include "tsdb.h"
 
 #include <dirent.h>
@@ -250,6 +251,28 @@ static void t_noec(void)
     /* without TSDB_EC: no build of that kind reads such a volume; with it: no tier is configured. Refused either way. */
     CHECK(open_db(dir, &db, 0) != 0);
     CHECK(strstr(slurp(meta), "requires=tier\n") != NULL); /* a refused open leaves META as it was */
+#ifndef TSDB_EC
+    /* A database whose TIERS lists stores must also be refused on a NO_EC=1 build naming requires=tier and the codec. */
+    char tdir[PATH_MAX + 32];
+    snprintf(tdir, sizeof tdir, "%s/noec-tiers", S);
+    fresh(tdir);
+    CHECK(open_db(tdir, &db, 0) == 0);
+    tsdb_close(db);
+    int dfd = open(tdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd >= 0);
+    if (dfd >= 0) {
+        uint8_t dbid[16], sid[16];
+        memset(sid, 0x33, sizeof sid);
+        CHECK(tiers_db_id_ensure(dfd, true, dbid) == 0);
+        CHECK(tiers_append_store(dfd, true, sid, TSDB_TIER_CLASS_HDD, false, "/noec-dummy-store") == 0);
+        close(dfd);
+    }
+    cap_begin();
+    int rct = open_db(tdir, &db, 0);
+    const char *terr = cap_end();
+    CHECK(rct == TSDB_ERR_INVALID && !db);
+    CHECK(strstr(terr, "requires=tier") != NULL && strstr(terr, "not built with the erasure codec") != NULL);
+#endif
     printf("  noec: requires=tier is refused by a build without the codec and by an open without a tier\n");
 }
 
@@ -1045,6 +1068,440 @@ static void t_eio(void)
     printf("  eio: an I/O error at each of %d steps of store 0 (%d failed the store): the tier halts with one line "
            "then, reads go on\n", faults, halts);
 }
+
+/* --------------------------------------------------------------------------------------------------- R15: TIERS */
+
+static int put_obj_km(direct *d, const uint8_t oid[16], unsigned k, unsigned m)
+{
+    chunk_geom g;
+    int rc = chunk_geom_make(&g, k, m, 512, sizeof OBJ);
+    return rc ? rc : chunk_be_put_object(tier_backend(d->t), d->db->tier_vol, tier_vuuid(d->db), oid, &g, 1, OBJ, ~0u,
+                                         NULL);
+}
+
+static void init_empty_db(const char *dir)
+{
+    tsdb *db = NULL;
+    CHECK(open_db(dir, &db, 0) == 0 && db != NULL);
+    if (db)
+        tsdb_close(db);
+}
+
+/* R15 r15-open: open from TIERS with strict store_id & db_id checks, LOST store handling, REPLACED_BY, and min_up.
+ * Kills planted mutants `dbidskip` (foreign db_id / missing db= binding with matching store_id) and `lostopen`
+ * (LOST store opened as UP instead of NULL / DOWN_MISSING). */
+static void t_tiers_open(void)
+{
+    char base[PATH_MAX + 32], db1[PATH_MAX + 48], db2[PATH_MAX + 48];
+    char st[3][PATH_MAX + 64], s1_bak[PATH_MAX + 80], s1_rep[PATH_MAX + 80], db2_st[PATH_MAX + 64];
+    snprintf(base, sizeof base, "%s/r15open", S);
+    fresh(base);
+    snprintf(db1, sizeof db1, "%s/db1", base);
+    snprintf(db2, sizeof db2, "%s/db2", base);
+    snprintf(db2_st, sizeof db2_st, "%s/db2_s0", base);
+    for (int i = 0; i < 3; i++)
+        snprintf(st[i], sizeof st[i], "%s/st%d", base, i);
+    snprintf(s1_bak, sizeof s1_bak, "%s/st1.bak", base);
+    snprintf(s1_rep, sizeof s1_rep, "%s/st1.rep", base);
+
+    no_tier_env();
+    init_empty_db(db1);
+    init_empty_db(db2);
+    for (int i = 0; i < 3; i++)
+        CHECK(tsdb_tier_add_dir(db1, st[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+    CHECK(tsdb_tier_add_dir(db2, db2_st, "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+
+    int dfd1 = open(db1, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int dfd2 = open(db2, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd1 >= 0 && dfd2 >= 0);
+    tiers_view tv1;
+    uint8_t db1_id[16], db2_id[16];
+    bool has1 = false, has2 = false;
+    CHECK(tiers_load(dfd1, false, false, &tv1) == 0 && tv1.nstores == 3);
+    CHECK(tiers_db_id_read(dfd1, &has1, db1_id) == 0 && has1);
+    CHECK(tiers_db_id_read(dfd2, &has2, db2_id) == 0 && has2);
+    CHECK(memcmp(db1_id, db2_id, 16) != 0);
+    close(dfd2);
+    uint8_t s1_id[16], s2_id[16];
+    memcpy(s1_id, tv1.stores[1].id, 16);
+    memcpy(s2_id, tv1.stores[2].id, 16);
+    tiers_view_free(&tv1);
+
+    /* Normal open from TIERS: 3 stores -> default 2+1, all UP, put & read succeed. */
+    direct d;
+    CHECK(direct_open(db1, 0, &d) == 0 && d.t && d.db);
+    if (!d.db) {
+        close(dfd1);
+        return;
+    }
+    CHECK(tier_config(d.t)->k == 2 && tier_config(d.t)->m == 1);
+    CHECK(tier_writable(d.t));
+    CHECK(put_obj_km(&d, OID, 2, 1) == 0 && get_obj(&d, OID) == 0);
+    direct_close(&d);
+
+    /* 1. Missing store is strictly refused (naming the store), and NOT re-created. */
+    CHECK(rename(st[1], s1_bak) == 0);
+    cap_begin();
+    int rc = direct_open(db1, 0, &d);
+    const char *err = cap_end();
+    CHECK(rc == TSDB_ERR_NOTFOUND && !d.t);
+    CHECK(strstr(err, st[1]) != NULL);
+    CHECK(access(st[1], F_OK) != 0);
+    if (d.t)
+        direct_close(&d);
+
+    /* 2. Wrong store_id (same db_id, freshly minted store_id) is refused naming the store. */
+    chunk_store_owner ow1;
+    memset(&ow1, 0, sizeof ow1);
+    ow1.db_set = true;
+    memcpy(ow1.db_id, db1_id, 16);
+    CHECK(chunk_store_init2(st[1], NULL, &ow1, NULL) == 0);
+    cap_begin();
+    rc = direct_open(db1, 0, &d);
+    err = cap_end();
+    CHECK(rc == TSDB_ERR_INVALID && !d.t);
+    CHECK(strstr(err, st[1]) != NULL);
+    if (d.t)
+        direct_close(&d);
+    sh("rm -rf '%s'", st[1]);
+
+    /* 3. Foreign db_id WITH matching store_id -> refused naming store and BOTH db_ids (kills `dbidskip`). */
+    chunk_store_owner ow2;
+    memset(&ow2, 0, sizeof ow2);
+    ow2.db_set = true;
+    memcpy(ow2.db_id, db2_id, 16);
+    CHECK(chunk_store_init2(st[1], s1_id, &ow2, NULL) == 0);
+    char hex1[33], hex2[33];
+    chunk_oid_hex(db1_id, hex1);
+    chunk_oid_hex(db2_id, hex2);
+    cap_begin();
+    rc = direct_open(db1, 0, &d);
+    err = cap_end();
+    CHECK(rc == TSDB_ERR_INVALID && !d.t);
+    CHECK(strstr(err, st[1]) != NULL && strstr(err, hex1) != NULL && strstr(err, hex2) != NULL);
+    if (d.t)
+        direct_close(&d);
+    sh("rm -rf '%s'", st[1]);
+
+    /* 4. Unbound store (no db= line) WITH matching store_id -> refused naming store and expected db_id (kills `dbidskip`). */
+    CHECK(chunk_store_init(st[1], s1_id, NULL) == 0);
+    cap_begin();
+    rc = direct_open(db1, 0, &d);
+    err = cap_end();
+    CHECK(rc == TSDB_ERR_INVALID && !d.t);
+    CHECK(strstr(err, st[1]) != NULL && strstr(err, "no db= binding") != NULL && strstr(err, hex1) != NULL);
+    if (d.t)
+        direct_close(&d);
+    sh("rm -rf '%s'", st[1]);
+
+    /* Restore original st[1] -> opens cleanly again. */
+    CHECK(rename(s1_bak, st[1]) == 0);
+    CHECK(direct_open(db1, 0, &d) == 0 && d.t && tier_writable(d.t) && get_obj(&d, OID) == 0);
+    direct_close(&d);
+
+    /* 5. LOST store: mark st[1] LOST in TIERS.
+     *    (a) Even while st[1] still sits on disk, it MUST open as DOWN_MISSING (NULL), NOT UP (kills `lostopen`),
+     *        reads decode around it, and settles wait (!tier_writable). */
+    CHECK(tiers_append_state(dfd1, true, s1_id, TIERS_STATE_LOST, 0, false, NULL, NULL) == 0);
+    CHECK(direct_open(db1, 0, &d) == 0 && d.t && d.db);
+    if (d.t) {
+        CHECK(chunk_be_store_state(tier_backend(d.t), 1) == CHUNK_STORE_DOWN_MISSING);
+        CHECK(chunk_be_store(tier_backend(d.t), 1) == NULL);
+        CHECK(!tier_writable(d.t)); /* settles wait */
+        CHECK(get_obj(&d, OID) == 0); /* reads decode around the LOST store */
+        direct_close(&d);
+    }
+
+    /*    (b) With st[1] removed from disk, open MUST still succeed (also kills `lostopen`). */
+    CHECK(rename(st[1], s1_bak) == 0);
+    CHECK(direct_open(db1, 0, &d) == 0 && d.t && d.db);
+    if (d.t) {
+        CHECK(chunk_be_store_state(tier_backend(d.t), 1) == CHUNK_STORE_DOWN_MISSING);
+        CHECK(!tier_writable(d.t));
+        CHECK(get_obj(&d, OID) == 0);
+        direct_close(&d);
+    }
+
+    /* 6. REPLACED_BY: create replacement store bound to db1_id, record REPLACED_BY -> opens UP with new id. */
+    uint8_t rep_id[16];
+    CHECK(chunk_store_init2(s1_rep, NULL, &ow1, rep_id) == 0);
+    CHECK(tiers_append_state(dfd1, true, s1_id, TIERS_STATE_REPLACED_BY, TSDB_TIER_CLASS_HDD, false, rep_id, s1_rep) == 0);
+    CHECK(direct_open(db1, 0, &d) == 0 && d.t && d.db);
+    if (d.t) {
+        CHECK(chunk_be_store_state(tier_backend(d.t), 1) == CHUNK_STORE_UP);
+        chunk_store *rs = chunk_be_store(tier_backend(d.t), 1);
+        CHECK(rs != NULL && memcmp(chunk_store_id(rs), rep_id, 16) == 0);
+        CHECK(tier_writable(d.t));
+        CHECK(get_obj(&d, OID) == 0);
+        direct_close(&d);
+    }
+
+    /* 7. Too many LOST stores (2 of 3 LOST for 2+1 -> 1 < min_up=2): open fails with TSDB_ERR_UNAVAILABLE. */
+    CHECK(tiers_append_state(dfd1, true, rep_id, TIERS_STATE_LOST, 0, false, NULL, NULL) == 0);
+    CHECK(tiers_append_state(dfd1, true, s2_id, TIERS_STATE_LOST, 0, false, NULL, NULL) == 0);
+    cap_begin();
+    rc = direct_open(db1, 0, &d);
+    err = cap_end();
+    CHECK(rc == TSDB_ERR_UNAVAILABLE && !d.t);
+    CHECK(strstr(err, "1 of 3") != NULL && strstr(err, "2 are needed") != NULL);
+    if (d.t)
+        direct_close(&d);
+
+    close(dfd1);
+    printf("  tiers_open: missing, wrong store_id, foreign/unbound db_id, LOST, REPLACED_BY, min_up\n");
+}
+
+/* R15 r15-open: D4 defaults for 2, 3, 4, 5, 6, 8 stores, 1 non-single-copy store, and single-copy m = 0. */
+static void t_tiers_defaults(void)
+{
+    no_tier_env();
+    static const struct {
+        int n, k, m;
+    } cases[] = {{2, 1, 1}, {3, 2, 1}, {4, 3, 1}, {5, 4, 1}, {6, 4, 2}, {8, 4, 2}};
+    for (size_t ci = 0; ci < sizeof cases / sizeof cases[0]; ci++) {
+        char base[PATH_MAX + 32], dbdir[PATH_MAX + 48], stdir[PATH_MAX + 64];
+        snprintf(base, sizeof base, "%s/r15def_%d", S, cases[ci].n);
+        fresh(base);
+        snprintf(dbdir, sizeof dbdir, "%s/db", base);
+        init_empty_db(dbdir);
+        for (int i = 0; i < cases[ci].n; i++) {
+            snprintf(stdir, sizeof stdir, "%s/st%d", base, i);
+            CHECK(tsdb_tier_add_dir(dbdir, stdir, "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        }
+        direct d;
+        CHECK(direct_open(dbdir, 0, &d) == 0 && d.t && d.db);
+        if (d.t && d.db) {
+            const tier_settings *ts = tier_eng_settings(d.db);
+            CHECK(tier_config(d.t)->k == cases[ci].k && tier_config(d.t)->m == cases[ci].m);
+            CHECK(ts && ts->from_tiers && ts->k == cases[ci].k && ts->m == cases[ci].m);
+            CHECK(ts->tier_after_s == TIERS_AFTER_S_DEFAULT && ts->grace_s == (int64_t)TIERS_AFTER_S_DEFAULT);
+            CHECK(ts->tier_high_pct == TIERS_HIGH_PCT_DEFAULT && ts->young_high_pct == TIERS_YOUNG_HIGH_PCT_DEFAULT);
+            CHECK(ts->rebuild_mb_s == TIERS_REBUILD_MB_S_DEFAULT && ts->scrub_mb_s == TIERS_SCRUB_MB_S_DEFAULT &&
+                  ts->scrub_days == TIERS_SCRUB_DAYS_DEFAULT);
+            CHECK(put_obj_km(&d, OID, (unsigned)cases[ci].k, (unsigned)cases[ci].m) == 0 && get_obj(&d, OID) == 0);
+            direct_close(&d);
+        }
+    }
+
+    /* 1 non-single-copy store: opens cleanly with no active tier yet (waits for 2nd store). */
+    {
+        char base[PATH_MAX + 32], dbdir[PATH_MAX + 48], st0[PATH_MAX + 64];
+        snprintf(base, sizeof base, "%s/r15one_plain", S);
+        fresh(base);
+        snprintf(dbdir, sizeof dbdir, "%s/db", base);
+        snprintf(st0, sizeof st0, "%s/st0", base);
+        init_empty_db(dbdir);
+        CHECK(tsdb_tier_add_dir(dbdir, st0, "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        tsdb_options o;
+        tsdb_options_init(&o);
+        tier *t = (tier *)0x1;
+        CHECK(tier_open(dbdir, &o, &t) == 0 && t == NULL);
+    }
+
+    /* Single-copy (m = 0): 1 store and 2 stores, all --single-copy -> 1+0, min_up = all stores. */
+    for (int n = 1; n <= 2; n++) {
+        char base[PATH_MAX + 32], dbdir[PATH_MAX + 48], stdir[PATH_MAX + 64];
+        snprintf(base, sizeof base, "%s/r15sc_%d", S, n);
+        fresh(base);
+        snprintf(dbdir, sizeof dbdir, "%s/db", base);
+        init_empty_db(dbdir);
+        for (int i = 0; i < n; i++) {
+            snprintf(stdir, sizeof stdir, "%s/st%d", base, i);
+            CHECK(tsdb_tier_add_dir(dbdir, stdir, "hdd", TSDB_TIER_SINGLE_COPY | TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        }
+        direct d;
+        CHECK(direct_open(dbdir, 0, &d) == 0 && d.t && d.db);
+        if (d.t && d.db) {
+            CHECK(tier_config(d.t)->k == 1 && tier_config(d.t)->m == 0);
+            CHECK(tier_eng_settings(d.db)->k == 1 && tier_eng_settings(d.db)->m == 0);
+            CHECK(put_obj_km(&d, OID, 1, 0) == 0 && get_obj(&d, OID) == 0);
+            direct_close(&d);
+        }
+        /* Marking 1 store LOST violates min_up = n (all stores for m = 0) -> open fails with UNAVAILABLE. */
+        int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        tiers_view tv;
+        CHECK(dfd >= 0 && tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == (size_t)n);
+        CHECK(tiers_append_state(dfd, true, tv.stores[0].id, TIERS_STATE_LOST, 0, false, NULL, NULL) == 0);
+        tiers_view_free(&tv);
+        close(dfd);
+        CHECK(direct_open(dbdir, 0, &d) == TSDB_ERR_UNAVAILABLE && !d.t);
+    }
+
+    /* Mixed single-copy + non-single-copy (2 stores): default 1+1; SETTINGS requesting m = 0 is refused. */
+    {
+        char base[PATH_MAX + 32], dbdir[PATH_MAX + 48], st0[PATH_MAX + 64], st1[PATH_MAX + 64];
+        snprintf(base, sizeof base, "%s/r15mix", S);
+        fresh(base);
+        snprintf(dbdir, sizeof dbdir, "%s/db", base);
+        snprintf(st0, sizeof st0, "%s/st0", base);
+        snprintf(st1, sizeof st1, "%s/st1", base);
+        init_empty_db(dbdir);
+        CHECK(tsdb_tier_add_dir(dbdir, st0, "hdd", TSDB_TIER_SINGLE_COPY | TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        CHECK(tsdb_tier_add_dir(dbdir, st1, "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        direct d;
+        CHECK(direct_open(dbdir, 0, &d) == 0 && d.t && tier_config(d.t)->k == 1 && tier_config(d.t)->m == 1);
+        if (d.t)
+            direct_close(&d);
+        int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        tiers_settings s;
+        memset(&s, 0, sizeof s);
+        s.set_mask = TSDB_TIER_SET_REDUNDANCY;
+        s.k = 1;
+        s.m = 0;
+        CHECK(dfd >= 0 && tiers_append_settings(dfd, true, TIERS_VOL_ALL, &s) == 0);
+        close(dfd);
+        cap_begin();
+        int rc = direct_open(dbdir, 0, &d);
+        const char *err = cap_end();
+        CHECK(rc == TSDB_ERR_INVALID && !d.t && strstr(err, "single-copy") != NULL);
+    }
+    printf("  tiers_defaults: D4 defaults (2,3,4,5,6,8), 1-store wait, single-copy m=0 and mixed refusal\n");
+}
+
+/* R15 r15-open: per-volume SETTINGS override, cache_bytes option, TSDB_TEST_TIER beside TIERS, and refusals. */
+static void t_tiers_settings(void)
+{
+    char base[PATH_MAX + 32], dbdir[PATH_MAX + 48], vol1[PATH_MAX + 48], stdir[PATH_MAX + 64];
+    snprintf(base, sizeof base, "%s/r15set", S);
+    fresh(base);
+    snprintf(dbdir, sizeof dbdir, "%s/db", base);
+    snprintf(vol1, sizeof vol1, "%s/v1", base);
+    no_tier_env();
+    init_empty_db(dbdir);
+    for (int i = 0; i < 6; i++) {
+        snprintf(stdir, sizeof stdir, "%s/st%d", base, i);
+        CHECK(tsdb_tier_add_dir(dbdir, stdir, "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+    }
+
+    int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd >= 0);
+    tiers_settings gs, vs1;
+    memset(&gs, 0, sizeof gs);
+    gs.set_mask = TSDB_TIER_SET_REDUNDANCY | TSDB_TIER_SET_AFTER | TSDB_TIER_SET_HIGH_PCT |
+                  TSDB_TIER_SET_YOUNG_HIGH_PCT | TSDB_TIER_SET_REBUILD_MB_S | TSDB_TIER_SET_SCRUB_MB_S |
+                  TSDB_TIER_SET_SCRUB_DAYS;
+    gs.k = 3;
+    gs.m = 2;
+    gs.tier_after_s = 1000;
+    gs.tier_high_pct = 75;
+    gs.young_high_pct = 88;
+    gs.rebuild_mb_s = 150;
+    gs.scrub_mb_s = 40;
+    gs.scrub_days = 7;
+    CHECK(tiers_append_settings(dfd, true, TIERS_VOL_ALL, &gs) == 0);
+
+    memset(&vs1, 0, sizeof vs1);
+    vs1.set_mask = TSDB_TIER_SET_REDUNDANCY | TSDB_TIER_SET_AFTER | TSDB_TIER_SET_HIGH_PCT;
+    vs1.k = 4;
+    vs1.m = 1;
+    vs1.tier_after_s = 300;
+    vs1.tier_high_pct = 65;
+    CHECK(tiers_append_settings(dfd, true, 1, &vs1) == 0);
+    close(dfd);
+
+    /* Per-process cache size option + per-volume SETTINGS override. */
+    tsdb_tier_set_cache_bytes(32u << 20);
+    direct d;
+    CHECK(direct_open(dbdir, 0, &d) == 0 && d.t && d.db);
+    if (d.t && d.db) {
+        const tier_settings *s0 = tier_eng_settings(d.db);
+        CHECK(tier_config(d.t)->cache_mb == 32);
+        CHECK(s0 && s0->from_tiers && s0->k == 3 && s0->m == 2 && s0->tier_after_s == 1000 && s0->grace_s == 1000 &&
+              s0->tier_high_pct == 75 && s0->young_high_pct == 88 && s0->rebuild_mb_s == 150 && s0->scrub_mb_s == 40 &&
+              s0->scrub_days == 7 && s0->cache_mb == 32);
+        tsdb_options o;
+        tsdb_options_init(&o);
+        eng *e1 = NULL;
+        tier_want(d.t, 1);
+        CHECK(eng_open(vol1, &o, &e1) == 0 && e1 != NULL);
+        tier_want(NULL, 0);
+        if (e1) {
+            const tier_settings *s1 = tier_eng_settings(e1);
+            CHECK(s1 && s1->from_tiers && s1->k == 4 && s1->m == 1 && s1->tier_after_s == 300 && s1->grace_s == 300 &&
+                  s1->tier_high_pct == 65 && s1->young_high_pct == 88 && s1->rebuild_mb_s == 150 &&
+                  s1->scrub_mb_s == 40 && s1->scrub_days == 7);
+            eng_close(e1);
+        }
+        direct_close(&d);
+    }
+    tsdb_tier_set_cache_bytes(0);
+
+    /* TSDB_TEST_TIER beside TIERS: dirs= refused (with or without I_KNOW), timing keys need I_KNOW=1. */
+    setenv("TSDB_TEST_TIER", "k=2,m=1,dirs=/a:/b:/c", 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+    cap_begin();
+    int rc = direct_open(dbdir, 0, &d);
+    const char *err = cap_end();
+    CHECK(rc == TSDB_ERR_INVALID && !d.t && strstr(err, "dirs=") != NULL);
+
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+    setenv("TSDB_TEST_TIER", "dirs=/a:/b:/c", 1);
+    cap_begin();
+    rc = direct_open(dbdir, 0, &d);
+    err = cap_end();
+    CHECK(rc == TSDB_ERR_INVALID && !d.t && strstr(err, "dirs=") != NULL);
+
+    setenv("TSDB_TEST_TIER", "grace_s=5,keep_s=10,eager=1", 1);
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+    cap_begin();
+    rc = direct_open(dbdir, 0, &d);
+    err = cap_end();
+    CHECK(rc == TSDB_ERR_INVALID && !d.t && strstr(err, "TSDB_TEST_TIER_I_KNOW=1") != NULL);
+
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+    CHECK(direct_open(dbdir, 0, &d) == 0 && d.t && d.db);
+    if (d.t && d.db) {
+        const tier_settings *s0 = tier_eng_settings(d.db);
+        CHECK(s0 && s0->k == 3 && s0->m == 2 && s0->grace_s == 5 && s0->tier_after_s == 5 && s0->keep_s == 10 &&
+              s0->eager);
+        direct_close(&d);
+    }
+    no_tier_env();
+
+    /* Read-only / follower open on a tiered DB (root META has requires=tier) is refused. */
+    tsdb *db = NULL;
+    CHECK(open_db(dbdir, &db, 1) == TSDB_ERR_INVALID && !db);
+    tsdb_options fo;
+    tsdb_options_init(&fo);
+    fo.follow = 1;
+    CHECK(tsdb_open(dbdir, &fo, &db) == TSDB_ERR_INVALID && !db);
+
+    printf("  tiers_settings: per-volume SETTINGS, cache_bytes, TSDB_TEST_TIER rules, ro/follow refusal\n");
+}
+
+/* Helper for tests/test_config.sh: --mk-tier-db DBDIR STORE[:CLASS]... (creates DB and adds stores to TIERS). */
+static int mk_tier_db(int argc, char **argv)
+{
+    if (argc < 4)
+        return 2;
+    const char *dbdir = argv[2];
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.stats = -1;
+    o.latest_cache = 0;
+    tsdb *db = NULL;
+    if (tsdb_open(dbdir, &o, &db) != 0)
+        return 1;
+    tsdb_close(db);
+    for (int i = 3; i < argc; i++) {
+        char path[PATH_MAX];
+        const char *spec = argv[i], *slash = strrchr(spec, '/'), *colon = strrchr(spec, ':');
+        const char *cls = NULL;
+        size_t plen = strlen(spec);
+        if (colon && (!slash || colon > slash)) {
+            plen = (size_t)(colon - spec);
+            cls = colon + 1;
+        }
+        if (plen >= sizeof path)
+            return 2;
+        memcpy(path, spec, plen);
+        path[plen] = '\0';
+        if (tsdb_tier_add_dir(dbdir, path, cls, TSDB_TIER_ALLOW_SHARED_DEV) != 0)
+            return 1;
+    }
+    return 0;
+}
 #endif
 
 /* ---------------------------------------------------------------------------------------------------------- follow */
@@ -1134,6 +1591,11 @@ int main(int argc, char **argv)
 #ifdef TSDB_EC
     if (argc > 1 && strcmp(argv[1], "--child") == 0)
         return child(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "--mk-tier-db") == 0)
+        return mk_tier_db(argc, argv);
+#else
+    if (argc > 1 && strcmp(argv[1], "--mk-tier-db") == 0)
+        return 77;
 #endif
     const char *mutant = NULL;
     int ai = 1;
@@ -1156,6 +1618,10 @@ int main(int argc, char **argv)
             tier_mutant = TIER_MUT_FENCE;
         else if (strcmp(mutant, "selfepoch") == 0)
             tier_mutant = TIER_MUT_SELFEPOCH;
+        else if (strcmp(mutant, "dbidskip") == 0)
+            tier_mutant = TIER_MUT_DBIDSKIP;
+        else if (strcmp(mutant, "lostopen") == 0)
+            tier_mutant = TIER_MUT_LOSTOPEN;
         else {
             fprintf(stderr, "unknown mutant %s\n", mutant);
             return 2;
@@ -1182,8 +1648,12 @@ int main(int argc, char **argv)
     t_power(false);
     t_power(true);
     t_eio();
+    t_tiers_open();
+    t_tiers_defaults();
+    t_tiers_settings();
 #else
-    printf("  volumes, down, lost, fence, unsure, ops, refuse, reval, power, eio: skipped (no TSDB_EC in this build)\n");
+    printf("  volumes, down, lost, fence, unsure, ops, refuse, reval, power, eio, tiers_open, tiers_defaults, "
+           "tiers_settings: skipped (no TSDB_EC in this build)\n");
 #endif
     t_follow();
     if (!fails)

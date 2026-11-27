@@ -7,9 +7,9 @@
  * why.
  *
  * Reserved for the device classes (docs/design-cluster-data.md, not built): storage.disks (the --disk of that design,
- * PATH[:CLASS] per element) and storage.tiers (the stores of the single-server tier, as `tier add`). They are rows
- * with no option (CK_X): a file that sets one is refused with a message, so a file written for a later version is
- * never read as if the key did nothing. When the design is built the row becomes a list with its option.
+ * PATH[:CLASS] per element). It is a row with no option (CK_X): a file that sets it is refused with a message, so a
+ * file written for a later version is never read as if the key did nothing. When the design is built the row becomes
+ * a list with its option.
  */
 #ifndef TSDBD_KEYS_H
 #define TSDBD_KEYS_H
@@ -46,8 +46,11 @@ static const struct cfg_key tsdbd_keys[] = {
        "when the database is created."),
     CK_I("storage.granule.rows", "granule-rows", "8192", "Rows per granule. Used only when the database is created."),
     CK_X("storage.disks", "the disks of a device-class server, PATH[:CLASS] each (docs/design-cluster-data.md, section 15)"),
-    CK_X("storage.tiers", "the stores of the single-server tier, PATH[:CLASS] each, as `tier add` makes them "
-                          "(docs/design-cluster-data.md)"),
+    CK_L("storage.tiers", "tier", "",
+         "The stores of the single-server tier, PATH[:CLASS] each: checked against TIERS at start (never adds a "
+         "store; a mismatch refuses to start)."),
+    CK_Z("storage.tier.cache", "tier-cache-mb", "MB", "",
+         "Memory of the single-server tier's decoded granule cache. Default: a tenth of the RAM."),
     /* server */
     CK_S("server.listen", "listen", "127.0.0.1", "The address clients connect to (there is no TLS: a trusted interface)."),
     CK_I("server.port", "port", "7070", "The client port; 0 lets the kernel choose (see server.port.file)."),

@@ -332,6 +332,10 @@ int tsdb_tier_salvage(tsdb *db, int64_t partition, int all_partitions, int force
 int tsdb_tier_status(tsdb *db, tsdb_tier_info *out);
 void tsdb_tier_info_free(tsdb_tier_info *info);
 
+/* Per-process memory budget (bytes) for the local settled tier's decoded granule cache (R15 D16;
+ * 0 restores the default of 10% of RAM). Set before tsdb_open. */
+void tsdb_tier_set_cache_bytes(size_t bytes);
+
 /* Carries a database of the previous disk format (8) over to this release's (9) in place, without opening it:
  * every volume and the root, volumes first. Refuses (TSDB_ERR_INVALID, with a message on stderr) unless each
  * directory was closed cleanly by the release that wrote it (no WAL segment, intent file or tmp part) and refuses

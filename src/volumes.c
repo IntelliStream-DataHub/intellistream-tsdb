@@ -1048,7 +1048,7 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     if (mfd >= 0)
         close(mfd);
     if (rc == 0)
-        rc = tier_open(dir, &t->opt, &t->tier); /* R7: TSDB_TEST_TIER, before any engine opens */
+        rc = tier_open(dir, &t->opt, &t->tier); /* R7/R15: TIERS or TSDB_TEST_TIER, before any engine opens */
     if (rc) {
         tsdb_close(t);
         return rc;

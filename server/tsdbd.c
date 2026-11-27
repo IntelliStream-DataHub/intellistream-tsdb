@@ -123,6 +123,7 @@
 #include "cluster.h"
 #include "chunksrv.h"
 #include "chunkpeer.h"
+#include "../src/tiers.h"
 #include "fwd.h"
 #include "peerlink.h" /* --peer-check, --peer-rdma, --peer-allow-ipoib */
 #include "plrdma.h"
@@ -6429,6 +6430,120 @@ static void fs_warn(tsdb *t, int verify)
     }
 }
 
+struct tier_cfg_entry {
+    char path[PATH_MAX];
+    uint8_t cls;
+};
+
+static int parse_tier_spec(const char *spec, struct tier_cfg_entry *out)
+{
+    if (!spec || !*spec)
+        return -1;
+    const char *slash = strrchr(spec, '/');
+    const char *colon = strrchr(spec, ':');
+    size_t plen;
+    uint8_t cls = TSDB_TIER_CLASS_UNKNOWN;
+    if (colon && (!slash || colon > slash)) {
+        if (!colon[1] || tiers_class_parse(colon + 1, &cls) != 0)
+            return -1;
+        plen = (size_t)(colon - spec);
+    } else {
+        plen = strlen(spec);
+    }
+    if (plen == 0 || plen >= sizeof out->path)
+        return -1;
+    memcpy(out->path, spec, plen);
+    out->path[plen] = '\0';
+    while (plen > 1 && out->path[plen - 1] == '/')
+        out->path[--plen] = '\0';
+    if (tiers_path_valid(out->path) != 0)
+        return -1;
+    out->cls = cls;
+    return 0;
+}
+
+/* R15 D17: storage.tiers checks against TIERS's non-lost stores (path and class) and never adds a store. */
+static int check_storage_tiers(const char *dir, const struct tier_cfg_entry *entries, int nentries)
+{
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        fprintf(stderr, "tsdbd: %s: storage.tiers lists %d store(s), but cannot open directory %s (%s; "
+                        "storage.tiers checks against %s and never adds stores)\n",
+                dir, nentries, dir, strerror(errno), TIERS_FILE);
+        return -1;
+    }
+    tiers_view tv;
+    int rc = tiers_load(dfd, false, false, &tv);
+    close(dfd);
+    if (rc != 0) {
+        fprintf(stderr, "tsdbd: %s: cannot load %s to verify storage.tiers (%s)\n", dir, TIERS_FILE,
+                tsdb_strerror(rc));
+        tiers_view_free(&tv);
+        return -1;
+    }
+    if (!tv.exists || tv.nstores == 0) {
+        fprintf(stderr, "tsdbd: %s: storage.tiers lists %d store(s) (first: %s), but %s has no stores recorded in %s "
+                        "(storage.tiers never adds stores; run 'tsdb %s tier add' first)\n",
+                dir, nentries, entries[0].path, dir, TIERS_FILE, dir);
+        tiers_view_free(&tv);
+        return -1;
+    }
+    bool matched[TIERS_STORES_MAX] = {false};
+    char (*canons)[PATH_MAX] = calloc((size_t)nentries, sizeof *canons);
+    if (!canons) {
+        tiers_view_free(&tv);
+        return -1;
+    }
+    int err = 0;
+    for (int i = 0; i < nentries && !err; i++) {
+        if (!realpath(entries[i].path, canons[i]))
+            snprintf(canons[i], sizeof canons[i], "%s", entries[i].path);
+        for (int k = 0; k < i; k++) {
+            if (strcmp(canons[k], canons[i]) == 0) {
+                fprintf(stderr, "tsdbd: %s: storage.tiers lists %s twice\n", dir, entries[i].path);
+                err = -1;
+                break;
+            }
+        }
+        if (err)
+            break;
+        size_t found = tv.nstores;
+        for (size_t j = 0; j < tv.nstores; j++) {
+            if (strcmp(tv.stores[j].path, canons[i]) == 0) {
+                found = j;
+                if (tv.stores[j].state != TIERS_STATE_LOST)
+                    break;
+            }
+        }
+        if (found == tv.nstores) {
+            fprintf(stderr, "tsdbd: %s: storage.tiers lists %s, which is not in %s (storage.tiers never adds stores)\n",
+                    dir, entries[i].path, TIERS_FILE);
+            err = -1;
+        } else if (tv.stores[found].state == TIERS_STATE_LOST) {
+            fprintf(stderr, "tsdbd: %s: storage.tiers lists %s, which is marked LOST in %s\n", dir, entries[i].path,
+                    TIERS_FILE);
+            err = -1;
+        } else if (tv.stores[found].cls != entries[i].cls) {
+            fprintf(stderr, "tsdbd: %s: storage.tiers mismatch for %s: %s records class %s, storage.tiers gives %s\n",
+                    dir, entries[i].path, TIERS_FILE, tiers_class_name(tv.stores[found].cls),
+                    tiers_class_name(entries[i].cls));
+            err = -1;
+        } else {
+            matched[found] = true;
+        }
+    }
+    for (size_t j = 0; j < tv.nstores && !err; j++) {
+        if (tv.stores[j].state != TIERS_STATE_LOST && !matched[j]) {
+            fprintf(stderr, "tsdbd: %s: storage.tiers is missing store %s (%s) recorded in %s\n", dir,
+                    tv.stores[j].path, tiers_class_name(tv.stores[j].cls), TIERS_FILE);
+            err = -1;
+        }
+    }
+    free(canons);
+    tiers_view_free(&tv);
+    return err;
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = NULL, *addr = "127.0.0.1", *port_file = NULL;
@@ -6499,6 +6614,8 @@ int main(int argc, char **argv)
                                    {"ec-settle-force-s", required_argument, 0, 0x119},
                                    {"ec-settle-wait-max-s", required_argument, 0, 0x11a},
                                    {"ec-cache-mb", required_argument, 0, 0x11b},
+                                   {"tier", required_argument, 0, 0x127},
+                                   {"tier-cache-mb", required_argument, 0, 0x128},
                                    {"rack", required_argument, 0, 'k'},
                                    {"cluster-secret-file", required_argument, 0, 'S'},
                                    {"state-dir", required_argument, 0, 0x102},
@@ -6527,6 +6644,9 @@ int main(int argc, char **argv)
     int nhealth = 0;
     const char *chunk_dirs[CHUNKSRV_DIRS_MAX];
     int nchunk = 0;
+    struct tier_cfg_entry *tier_cfg_entries = NULL;
+    int ntier_cfg = 0;
+    uint64_t tier_cache_mb = 0;
     uint64_t chunk_rate = 0; /* bytes/s; 0: the peerlink's default */
     const char *peer_addr = NULL, *advertise = NULL, *peer_advertise = NULL, *rack = "", *secret_file = NULL;
     const char *state_dir = NULL, *power_feed = "", *bmc = "";
@@ -6786,6 +6906,32 @@ int main(int argc, char **argv)
         case 0x119: g_ec_cfg.settle_force_s = (uint32_t)num_arg("ec-settle-force-s", optarg, 0, 86400 * 365); break;
         case 0x11a: g_ec_cfg.settle_wait_max_s = (uint32_t)num_arg("ec-settle-wait-max-s", optarg, 0, 86400 * 365); break;
         case 0x11b: g_ec_cfg.cache_bytes = (uint64_t)num_arg("ec-cache-mb", optarg, 0, 1ll << 30) << 20; break;
+        case 0x127: {
+            if (ntier_cfg >= TIERS_STORES_MAX) {
+                fprintf(stderr, "tsdbd: at most %d --tier entries\n", TIERS_STORES_MAX);
+                free(tier_cfg_entries);
+                return 2;
+            }
+            if (!tier_cfg_entries && !(tier_cfg_entries = calloc(TIERS_STORES_MAX, sizeof *tier_cfg_entries))) {
+                fprintf(stderr, "tsdbd: out of memory\n");
+                return 1;
+            }
+            if (parse_tier_spec(optarg, &tier_cfg_entries[ntier_cfg]) != 0) {
+                fprintf(stderr, "tsdbd: --tier '%s': expected absolute PATH[:nvme|ssd|hdd|unknown]\n", optarg);
+                free(tier_cfg_entries);
+                return 2;
+            }
+            for (int ti = 0; ti < ntier_cfg; ti++) {
+                if (strcmp(tier_cfg_entries[ti].path, tier_cfg_entries[ntier_cfg].path) == 0) {
+                    fprintf(stderr, "tsdbd: --tier '%s': duplicate store path\n", optarg);
+                    free(tier_cfg_entries);
+                    return 2;
+                }
+            }
+            ntier_cfg++;
+            break;
+        }
+        case 0x128: tier_cache_mb = (uint64_t)num_arg("tier-cache-mb", optarg, 0, 1ll << 30); break;
         case 'k': rack = optarg; cluster_opts = 1; break;
         case 'S': secret_file = optarg; cluster_opts = 1; break;
         case 0x102: state_dir = optarg; cluster_opts = 1; break;
@@ -6876,9 +7022,15 @@ int main(int argc, char **argv)
                         "%d\n", o.wal_sync_ms);
         return 2;
     }
-    if (witness && (!cluster_on || dir || nchunk)) {
+    if (witness && (!cluster_on || dir || nchunk || ntier_cfg)) {
         fprintf(stderr, "tsdbd: --witness is a cluster member without volumes: it needs --cluster, and takes no "
-                        "--dir and no --chunk-dir\n");
+                        "--dir, no --chunk-dir and no --tier\n");
+        free(tier_cfg_entries);
+        return 2;
+    }
+    if (cluster_on && ntier_cfg) {
+        fprintf(stderr, "tsdbd: --tier (storage.tiers) is for a single-server tier, not --cluster\n");
+        free(tier_cfg_entries);
         return 2;
     }
     if ((!dir && !witness) || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
@@ -6914,15 +7066,18 @@ int main(int argc, char **argv)
                         "              [--chunk-dir PATH]... [--chunk-rate-mb-s 256]]\n"
                         "             [--ec-settle-grace-s 3600] [--ec-settle-keep-s 86400] [--ec-settle-force-s 3600]\n"
                         "             [--ec-settle-wait-max-s 7200] [--ec-cache-mb MB]\n"
+                        "             [--tier PATH[:CLASS]]... [--tier-cache-mb MB]\n"
                         "       tsdbd --witness --cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
                         "             [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
                         "             [--power-feed NAME] [--bmc ADDR] [--peer-check none|header|full]\n"
                         "             [--port-file FILE] [--exit-with-parent[=PID]]\n",
                 TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1, TSDB_DEFAULT_PORT + 1);
+        free(tier_cfg_entries);
         return 2;
     }
     if (check_config) { /* the file and the command line are well-formed: what tsdbd would run with */
         cfg_print_effective(stdout, g_cfg.path ? &g_cfg : NULL, tsdbd_keys, TSDBD_NKEYS, orig_argc, orig_argv);
+        free(tier_cfg_entries);
         return 0;
     }
 #ifdef TSDB_TEST_HOOKS
@@ -7071,6 +7226,21 @@ int main(int argc, char **argv)
         return 1;
     o.tenants = (const char *const *)tn_list;
     o.ntenants = tn_n;
+    /* R15 D17: when storage.tiers (--tier) is given, verify it matches TIERS's non-lost stores before opening. */
+    if (ntier_cfg > 0) {
+        int trc = check_storage_tiers(dir, tier_cfg_entries, ntier_cfg);
+        free(tier_cfg_entries);
+        tier_cfg_entries = NULL;
+        if (trc != 0) {
+            tn_free_list(tn_list, tn_n);
+            return 1;
+        }
+    } else {
+        free(tier_cfg_entries);
+        tier_cfg_entries = NULL;
+    }
+    if (tier_cache_mb > 0)
+        tsdb_tier_set_cache_bytes((size_t)(tier_cache_mb << 20));
     /* r8f: the cluster ec volumes' cold side (server/chunkpeer.h), before tsdb_open opens the tier it hooks into */
     if (cluster_on && !witness && chunkpeer_cluster_start(dir) != 0) {
         fprintf(stderr, "tsdbd: the peer cold ops do not start\n");

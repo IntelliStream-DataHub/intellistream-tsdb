@@ -340,7 +340,7 @@ refused "--peer-port with no cluster" 'cluster settings are given (--peer-port)'
 out=$("$B/tsdbd" --no-config --dir /x --cluster=false --check-config 2>&1) || fail "--cluster=false alone: $out"
 
 # the keys that the device classes will take are reserved: in the table, refused when a file sets one
-for k in storage.disks storage.tiers; do
+for k in storage.disks; do
     "$B/tsdbd" --config-keys | grep -q "^| \`$k\` | " || fail "--config-keys does not list the reserved key $k"
     cfg res.properties 'storage.dir = /x' "$k = /nvme0:nvme, /hdd1:hdd"
     refused "reserved key $k" "res.properties:2: $k is reserved and not implemented yet" \
@@ -349,6 +349,80 @@ for k in storage.disks storage.tiers; do
         "$B/tsdbd" --config "$dir/res.properties" --dir /y --check-config
 done
 "$B/tsdbd" --no-config --dir /x --check-config 2>&1 | grep -q '^storage.disks' && fail "--check-config prints a reserved key"
+
+# storage.tiers and storage.tier.cache (R15 D16, D17)
+cfg tiercfg.properties 'storage.dir = /x' 'storage.tiers = /mnt/t0:hdd, /mnt/t1:ssd' 'storage.tier.cache = 128M'
+out=$("$B/tsdbd" --config "$dir/tiercfg.properties" --check-config 2>&1) || fail "storage.tiers/tier.cache refused: $out"
+check "storage.tiers effective" "$(echo "$out" | grep '^storage.tiers = ')" "storage.tiers = /mnt/t0:hdd, /mnt/t1:ssd"
+check "storage.tier.cache effective" "$(echo "$out" | grep '^storage.tier.cache = ')" "storage.tier.cache = 128M"
+refused "bad --tier relative path" "absolute PATH" "$B/tsdbd" --no-config --dir /x --tier relative/path --check-config
+refused "bad --tier class" "expected absolute PATH" "$B/tsdbd" --no-config --dir /x --tier /mnt/a:tape --check-config
+refused "duplicate --tier" "duplicate store path" "$B/tsdbd" --no-config --dir /x --tier /mnt/a:hdd --tier /mnt/a:ssd --check-config
+refused "--tier with --cluster" "not --cluster" "$B/tsdbd" --no-config --dir /x --cluster --cluster-secret-file /s --state-dir /st --tier /mnt/a:hdd --check-config
+
+# storage.tiers mismatch at start: DB with no TIERS refuses and NEVER adds a store
+mkdir -p "$dir/tier-none"
+cfg tiernone.properties "storage.dir = $dir/tier-none" 'server.listen = 127.0.0.1' 'server.port = 0' \
+    "server.port.file = $dir/tier-none.port" 'auth.enabled = false' 'server.io = epoll' \
+    "storage.tiers = $dir/tier-ghost:hdd"
+"$B/tsdbd" --config "$dir/tiernone.properties" --exit-with-parent=$me > "$dir/tier-none.log" 2>&1 &
+pt=$!
+wait_exit "$pt" 10 || fail "storage.tiers with no TIERS: tsdbd did not refuse to start"
+check "storage.tiers with no TIERS exit" "$WRC" 1
+grep -q "tier-ghost" "$dir/tier-none.log" || fail "storage.tiers with no TIERS did not name store: $(cat "$dir/tier-none.log")"
+[ ! -e "$dir/tier-ghost" ] || fail "storage.tiers created store directory $dir/tier-ghost"
+[ ! -e "$dir/tier-none/TIERS" ] || fail "storage.tiers created TIERS"
+
+# storage.tiers against a real TIERS file (exit 77 from --mk-tier-db means NO_EC=1 build)
+if [ -x "$B/test_tier" ]; then
+    "$B/test_tier" --mk-tier-db "$dir/tdb" "$dir/ts0:hdd" "$dir/ts1:ssd"
+    mkrc=$?
+    if [ $mkrc = 77 ]; then
+        echo "test_config: storage.tiers TIERS-match checks skipped (no TSDB_EC)"
+    elif [ $mkrc != 0 ]; then
+        fail "test_tier --mk-tier-db failed (rc $mkrc)"
+    else
+        # Exact match starts cleanly
+        cfg tierok.properties "storage.dir = $dir/tdb" 'server.listen = 127.0.0.1' 'server.port = 0' \
+            "server.port.file = $dir/tdb.port" 'auth.enabled = false' 'server.io = epoll' \
+            "storage.tiers = $dir/ts1:ssd, $dir/ts0:hdd" 'storage.tier.cache = 16M'
+        "$B/tsdbd" --config "$dir/tierok.properties" --exit-with-parent=$me > "$dir/tierok.log" 2>&1 &
+        pt=$!
+        for _ in $(seq 1 100); do [ -s "$dir/tdb.port" ] && break; alive "$pt" || break; sleep 0.1; done
+        [ -s "$dir/tdb.port" ] || fail "storage.tiers matching TIERS did not start: $(tail -5 "$dir/tierok.log")"
+        stop_srv "$pt"
+        # Class mismatch refuses naming store and classes
+        cfg tiercls.properties "storage.dir = $dir/tdb" 'server.listen = 127.0.0.1' 'server.port = 0' \
+            "server.port.file = $dir/tdb.port" 'auth.enabled = false' 'server.io = epoll' \
+            "storage.tiers = $dir/ts0:nvme, $dir/ts1:ssd"
+        "$B/tsdbd" --config "$dir/tiercls.properties" --exit-with-parent=$me > "$dir/tiercls.log" 2>&1 &
+        pt=$!
+        wait_exit "$pt" 10 || fail "storage.tiers class mismatch did not refuse"
+        check "storage.tiers class mismatch exit" "$WRC" 1
+        grep -q "records class hdd, storage.tiers gives nvme" "$dir/tiercls.log" && grep -q "ts0" "$dir/tiercls.log" \
+            || fail "storage.tiers class mismatch log: $(cat "$dir/tiercls.log")"
+        # Missing store refuses naming missing store
+        cfg tiermiss.properties "storage.dir = $dir/tdb" 'server.listen = 127.0.0.1' 'server.port = 0' \
+            "server.port.file = $dir/tdb.port" 'auth.enabled = false' 'server.io = epoll' \
+            "storage.tiers = $dir/ts0:hdd"
+        "$B/tsdbd" --config "$dir/tiermiss.properties" --exit-with-parent=$me > "$dir/tiermiss.log" 2>&1 &
+        pt=$!
+        wait_exit "$pt" 10 || fail "storage.tiers missing store did not refuse"
+        check "storage.tiers missing store exit" "$WRC" 1
+        grep -q "missing store" "$dir/tiermiss.log" && grep -q "ts1" "$dir/tiermiss.log" \
+            || fail "storage.tiers missing store log: $(cat "$dir/tiermiss.log")"
+        # Extra store refuses naming extra store and never creates it
+        cfg tierext.properties "storage.dir = $dir/tdb" 'server.listen = 127.0.0.1' 'server.port = 0' \
+            "server.port.file = $dir/tdb.port" 'auth.enabled = false' 'server.io = epoll' \
+            "storage.tiers = $dir/ts0:hdd, $dir/ts1:ssd, $dir/ts2:hdd"
+        "$B/tsdbd" --config "$dir/tierext.properties" --exit-with-parent=$me > "$dir/tierext.log" 2>&1 &
+        pt=$!
+        wait_exit "$pt" 10 || fail "storage.tiers extra store did not refuse"
+        check "storage.tiers extra store exit" "$WRC" 1
+        grep -q "ts2" "$dir/tierext.log" || fail "storage.tiers extra store log: $(cat "$dir/tierext.log")"
+        [ ! -e "$dir/ts2" ] || fail "storage.tiers created extra store $dir/ts2"
+    fi
+fi
 
 # a harness's server that skips an existing default file says so, once, with the way to use it
 cfg hdef.properties 'server.port = 7123'

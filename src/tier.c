@@ -31,6 +31,58 @@
 
 int r7_mutant;
 int tier_mutant;
+static _Atomic uint64_t tier_cache_mb_opt;
+
+static inline int tier_mut(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    return tier_mutant;
+#else
+    return 0;
+#endif
+}
+
+void tsdb_tier_set_cache_bytes(size_t bytes)
+{
+    uint64_t mb = 0;
+    if (bytes > 0) {
+        mb = bytes < (1u << 20) ? 1u : (uint64_t)(bytes >> 20);
+        if (mb > TIER_CACHE_MB_MAX)
+            mb = TIER_CACHE_MB_MAX;
+    }
+    atomic_store_explicit(&tier_cache_mb_opt, mb, memory_order_relaxed);
+}
+
+bool tier_default_geom(int nstores, bool all_single_copy, int *k_out, int *m_out)
+{
+    if (nstores <= 0)
+        return false;
+    if (all_single_copy) {
+        if (k_out)
+            *k_out = 1;
+        if (m_out)
+            *m_out = 0;
+        return true;
+    }
+    if (nstores < 2)
+        return false;
+    int k, m;
+    if (nstores == 2) {
+        k = 1;
+        m = 1;
+    } else if (nstores <= 5) {
+        k = nstores - 1;
+        m = 1;
+    } else {
+        k = 4;
+        m = 2;
+    }
+    if (k_out)
+        *k_out = k;
+    if (m_out)
+        *m_out = m;
+    return true;
+}
 
 
 void tier_cfg_free(tier_cfg *c)
@@ -199,6 +251,132 @@ out:
     return 0;
 }
 
+#if defined(TSDB_EC) && defined(TSDB_TEST_HOOKS)
+/* Timing-only overrides from TSDB_TEST_TIER beside a TIERS file that names stores (R15 D16). */
+typedef struct tier_env_override {
+    bool any;
+    bool has_grace, has_keep, has_coarse, has_cache, has_eager;
+    int64_t grace_s, keep_s, coarse_s;
+    uint64_t cache_mb;
+    bool eager;
+} tier_env_override;
+
+static int tier_env_override_parse(const char *dir, const char *spec, const char *iknow, tier_env_override *ov)
+{
+    memset(ov, 0, sizeof *ov);
+    if (!spec || !*spec)
+        return 0;
+    const char *sep = dir ? ": " : "";
+    dir = dir ? dir : "";
+    enum { K_GRACE, K_KEEP, K_COARSE, K_CACHE, K_EAGER, K_N };
+    static const char *const keys[K_N] = {"grace_s", "keep_s", "coarse_s", "cache_mb", "eager"};
+    bool seen[K_N] = {false};
+    /* First scan: validate key=value framing and always refuse dirs= (and k=/m=) beside TIERS, even without I_KNOW=1. */
+    char bad_geom = '\0';
+    for (const char *p = spec;;) {
+        const char *end = strchr(p, ',');
+        if (!end)
+            end = p + strlen(p);
+        const char *eq = memchr(p, '=', (size_t)(end - p));
+        if (!eq) {
+            fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: '%.*s' is not key=value: the open fails\n", dir, sep,
+                    (int)(end - p), p);
+            return TSDB_ERR_INVALID;
+        }
+        size_t kl = (size_t)(eq - p);
+        if (kl == 4 && memcmp(p, "dirs", 4) == 0) {
+            fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER names dirs= beside %s: stores come from %s, not "
+                            "TSDB_TEST_TIER: the open fails\n", dir, sep, TIERS_FILE, TIERS_FILE);
+            return TSDB_ERR_INVALID;
+        }
+        if (kl == 1 && (p[0] == 'k' || p[0] == 'm') && !bad_geom)
+            bad_geom = p[0];
+        if (!*end)
+            break;
+        p = end + 1;
+        if (!*p) {
+            fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: the setting ends with ',': the open fails\n", dir, sep);
+            return TSDB_ERR_INVALID;
+        }
+    }
+    if (bad_geom) {
+        fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER names %c= beside %s: geometry comes from %s, not "
+                        "TSDB_TEST_TIER: the open fails\n", dir, sep, bad_geom, TIERS_FILE, TIERS_FILE);
+        return TSDB_ERR_INVALID;
+    }
+    if ((!iknow || strcmp(iknow, "1") != 0) && r7_mutant != R7_MUT_TIERLOOSE) {
+        fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER is set beside %s without TSDB_TEST_TIER_I_KNOW=1: timing "
+                        "overrides apply only with TSDB_TEST_TIER_I_KNOW=1: the open fails\n", dir, sep, TIERS_FILE);
+        return TSDB_ERR_INVALID;
+    }
+    for (const char *p = spec;;) {
+        const char *end = strchr(p, ',');
+        if (!end)
+            end = p + strlen(p);
+        const char *eq = memchr(p, '=', (size_t)(end - p));
+        size_t kl = (size_t)(eq - p);
+        int k = 0;
+        while (k < K_N && !(strlen(keys[k]) == kl && memcmp(keys[k], p, kl) == 0))
+            k++;
+        if (k == K_N) {
+            fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: unknown key '%.*s' beside %s: the open fails\n", dir, sep,
+                    (int)kl, p, TIERS_FILE);
+            return TSDB_ERR_INVALID;
+        }
+        if (seen[k]) {
+            fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: %s is given twice: the open fails\n", dir, sep, keys[k]);
+            return TSDB_ERR_INVALID;
+        }
+        seen[k] = true;
+        const char *v = eq + 1;
+        uint64_t n = 0;
+        switch (k) {
+        case K_GRACE:
+        case K_KEEP:
+        case K_COARSE:
+            if (!tier_num(v, end, 0, TIER_SECONDS_MAX, &n)) {
+                fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: %s must be 0 .. %lld seconds: the open fails\n", dir, sep,
+                        keys[k], (long long)TIER_SECONDS_MAX);
+                return TSDB_ERR_INVALID;
+            }
+            if (k == K_GRACE) {
+                ov->has_grace = true;
+                ov->grace_s = (int64_t)n;
+            } else if (k == K_KEEP) {
+                ov->has_keep = true;
+                ov->keep_s = (int64_t)n;
+            } else {
+                ov->has_coarse = true;
+                ov->coarse_s = (int64_t)n;
+            }
+            break;
+        case K_CACHE:
+            if (!tier_num(v, end, 0, TIER_CACHE_MB_MAX, &n)) {
+                fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: cache_mb must be 0 .. %llu: the open fails\n", dir, sep,
+                        (unsigned long long)TIER_CACHE_MB_MAX);
+                return TSDB_ERR_INVALID;
+            }
+            ov->has_cache = true;
+            ov->cache_mb = n;
+            break;
+        case K_EAGER:
+            if (!tier_num(v, end, 0, 1, &n)) {
+                fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: eager must be 0 or 1: the open fails\n", dir, sep);
+                return TSDB_ERR_INVALID;
+            }
+            ov->has_eager = true;
+            ov->eager = n == 1;
+            break;
+        }
+        if (!*end)
+            break;
+        p = end + 1;
+    }
+    ov->any = true;
+    return 0;
+}
+#endif
+
 #ifdef TSDB_TEST_HOOKS
 /* tier_from_strings, its lines naming the database (dir; NULL: none) */
 static int tier_decide(const char *dir, const char *spec, const char *iknow, tier_cfg *c)
@@ -332,6 +510,109 @@ static int tier_be_open(tier *t, const char *dir)
 }
 #endif
 
+#ifdef TSDB_EC
+/* Open the directory chunk backend strictly from TIERS (R15 r15-open, design-cluster-data.md §15.7, D3, D4, D9):
+ * - At open, every non-LOST store in TIERS must exist with its recorded store_id and db_id (strict chunk_be_open +
+ *   owner db_id check; an unrecorded missing/down store fails open naming it until declared LOST).
+ * - LOST stores are passed as NULL (CHUNK_STORE_DOWN_MISSING), REPLACED_BY stores by their replacement path & id.
+ * - Fewer than min_up active stores fails the open (TSDB_ERR_UNAVAILABLE). */
+static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up)
+{
+    int n = (int)t->tview.nstores;
+    if (n <= 0 || n > TIERS_STORES_MAX)
+        return TSDB_ERR_INVALID;
+    const char *paths[TIERS_STORES_MAX];
+    uint8_t ids[TIERS_STORES_MAX * 16];
+    int active = 0;
+    for (int i = 0; i < n; i++) {
+        const tiers_store *st = &t->tview.stores[i];
+        if (st->state == TIERS_STATE_LOST) {
+            if (tier_mut() == TIER_MUT_LOSTOPEN) {
+                /* Planted mutant: opens a LOST store as UP instead of passing NULL (DOWN_MISSING). */
+                paths[i] = st->path;
+                memcpy(ids + 16 * i, st->id, 16);
+                active++;
+            } else {
+                paths[i] = NULL;
+                memset(ids + 16 * i, 0, 16);
+            }
+        } else if (st->state == TIERS_STATE_REPLACED_BY) {
+            paths[i] = st->path;
+            memcpy(ids + 16 * i, st->replaced_by, 16);
+            active++;
+        } else {
+            paths[i] = st->path;
+            memcpy(ids + 16 * i, st->id, 16);
+            active++;
+        }
+    }
+    if (active < min_up) {
+        fprintf(stderr, "tsdb: %s: %d of %d tier stores in %s are active, %d are needed: the open fails\n", dir,
+                active, n, TIERS_FILE, min_up);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    int rc = chunk_be_open(&t->be, paths, n, ids);
+    if (rc) {
+        t->be = NULL;
+        int mapped = rc == CHUNK_ERR_BUSY ? TSDB_ERR_LOCKED : rc == CHUNK_ERR_STORE_ID ? TSDB_ERR_INVALID : rc;
+        fprintf(stderr, "tsdb: %s: tier stores from %s failed to open (%s): the open fails\n", dir, TIERS_FILE,
+                rc == CHUNK_ERR_STORE_ID ? "store id mismatch"
+                                         : rc == CHUNK_ERR_BUSY ? "store is locked by another process"
+                                                                : tsdb_strerror(mapped));
+        return mapped;
+    }
+    if (tier_mut() != TIER_MUT_DBIDSKIP) {
+        for (int i = 0; i < n; i++) {
+            chunk_store *st = chunk_be_store(t->be, i);
+            if (!st)
+                continue; /* LOST store (DOWN_MISSING) */
+            chunk_store_owner ow;
+            chunk_store_get_owner(st, &ow);
+            if (!ow.db_set) {
+                char want_hex[33];
+                chunk_oid_hex(t->db_id, want_hex);
+                fprintf(stderr, "tsdb: %s: tier store %d (%s) META has no db= binding, expected database %s: "
+                                "the open fails\n", dir, i, paths[i], want_hex);
+                chunk_be_close(t->be);
+                t->be = NULL;
+                return TSDB_ERR_INVALID;
+            }
+            if (memcmp(ow.db_id, t->db_id, 16) != 0) {
+                char have_hex[33], want_hex[33];
+                chunk_oid_hex(ow.db_id, have_hex);
+                chunk_oid_hex(t->db_id, want_hex);
+                fprintf(stderr, "tsdb: %s: tier store %d (%s) belongs to database %s, not %s: the open fails\n", dir,
+                        i, paths[i], have_hex, want_hex);
+                chunk_be_close(t->be);
+                t->be = NULL;
+                return TSDB_ERR_INVALID;
+            }
+        }
+    }
+    return 0;
+}
+
+static int validate_tiers_redundancy(const char *dir, const tiers_settings *s, int nstores, bool all_single_copy)
+{
+    if (!(s->set_mask & TSDB_TIER_SET_REDUNDANCY))
+        return 0;
+    if (s->m == 0) {
+        if (s->k != 1 || !all_single_copy) {
+            fprintf(stderr, "tsdb: %s: %s requests %u+0 redundancy, but m = 0 requires k = 1 and every store "
+                            "to be single-copy: the open fails\n", dir, TIERS_FILE, (unsigned)s->k);
+            return TSDB_ERR_INVALID;
+        }
+        return 0;
+    }
+    if (s->k < 1 || s->k > CHUNK_K_MAX || s->m > CHUNK_M_MAX || (int)s->k + (int)s->m > nstores) {
+        fprintf(stderr, "tsdb: %s: %s requests %u+%u redundancy, but only %d store(s) are recorded: the open fails\n",
+                dir, TIERS_FILE, (unsigned)s->k, (unsigned)s->m, nstores);
+        return TSDB_ERR_INVALID;
+    }
+    return 0;
+}
+#endif
+
 static tier_cluster_fn cluster_fn; /* set once before any tsdb_open (tier_set_cluster), read-only after */
 static void *cluster_arg;
 static uint64_t cluster_cache_mb;
@@ -346,6 +627,173 @@ void tier_set_cluster(tier_cluster_fn fn, void *arg, uint64_t cache_mb)
 int tier_open(const char *dir, const tsdb_options *opt, tier **out)
 {
     *out = NULL;
+    tiers_view tv;
+    tiers_view_init(&tv);
+    bool has_db_id = false;
+    uint8_t db_id[16];
+    memset(db_id, 0, sizeof db_id);
+    if (dir && *dir) {
+        int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dirfd >= 0) {
+            /* Read-only parse here (before the root/VOLUMES lock); tsdb_open cuts any torn tail under the VOLUMES OFD
+             * write lock once the root engine is open. */
+            int trc = tiers_load(dirfd, false, false, &tv);
+            if (trc) {
+                close(dirfd);
+                tiers_view_free(&tv);
+                return trc;
+            }
+            if (tv.nstores > 0) {
+                int drc = tiers_db_id_read(dirfd, &has_db_id, db_id);
+                if (drc != 0 && drc != TSDB_ERR_NOTFOUND) {
+                    close(dirfd);
+                    tiers_view_free(&tv);
+                    return drc;
+                }
+                if (!has_db_id) {
+                    fprintf(stderr, "tsdb: %s: %s lists %zu store(s) but root META has no db_id=: the open fails\n",
+                            dir, TIERS_FILE, tv.nstores);
+                    close(dirfd);
+                    tiers_view_free(&tv);
+                    return TSDB_ERR_CORRUPT;
+                }
+            }
+            close(dirfd);
+        }
+    }
+
+    if (tv.nstores > 0) {
+#ifndef TSDB_EC
+        (void)opt;
+        fprintf(stderr, "tsdb: %s: %s lists %zu store(s) (requires=tier), but this build was not built with the "
+                        "erasure codec (TSDB_EC): the open fails\n", dir, TIERS_FILE, tv.nstores);
+        tiers_view_free(&tv);
+        return TSDB_ERR_INVALID;
+#else
+        if (cluster_fn) {
+            fprintf(stderr, "tsdb: %s: %s lists %zu store(s), but a cluster server cannot open a single-server tier: "
+                            "the open fails\n", dir, TIERS_FILE, tv.nstores);
+            tiers_view_free(&tv);
+            return TSDB_ERR_INVALID;
+        }
+#ifdef TSDB_TEST_HOOKS
+        tier_env_override ov;
+        int orc = tier_env_override_parse(dir, getenv("TSDB_TEST_TIER"), getenv("TSDB_TEST_TIER_I_KNOW"), &ov);
+        if (orc) {
+            tiers_view_free(&tv);
+            return orc;
+        }
+#endif
+        if (opt && (opt->read_only || opt->follow)) {
+#ifdef TSDB_TEST_HOOKS
+            if (ov.any) {
+                fprintf(stderr, "tsdb: %s: TSDB_TEST_TIER is set on a read-only open or a follower: only a writer "
+                                "opens a tier: the open fails\n", dir);
+                tiers_view_free(&tv);
+                return TSDB_ERR_INVALID;
+            }
+#endif
+            /* Read-only / follower opens do not acquire store flocks; if META already carries requires=tier,
+             * tier_engine_attach refuses the open with its requires=tier message (until r15-follow). */
+            tiers_view_free(&tv);
+            return 0;
+        }
+        int n = (int)tv.nstores;
+        bool all_single_copy = true;
+        for (int i = 0; i < n; i++)
+            if (!tv.stores[i].single_copy)
+                all_single_copy = false;
+        int vrc = validate_tiers_redundancy(dir, &tv.global, n, all_single_copy);
+        for (size_t i = 0; i < tv.nvols && vrc == 0; i++)
+            vrc = validate_tiers_redundancy(dir, &tv.vols[i].s, n, all_single_copy);
+        if (vrc) {
+            tiers_view_free(&tv);
+            return vrc;
+        }
+        int k = 0, m = 0;
+        if (tv.global.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+            k = (int)tv.global.k;
+            m = (int)tv.global.m;
+        } else if (!tier_default_geom(n, all_single_copy, &k, &m)) {
+            /* One non-single-copy store added so far: no active tier yet until a second store is added. */
+#ifdef TSDB_TEST_HOOKS
+            if (ov.any)
+                fprintf(stderr, "tsdb: %s: %s has only %d non-single-copy store (tier not active yet); "
+                                "TSDB_TEST_TIER timing overrides ignored\n", dir, TIERS_FILE, n);
+#endif
+            tiers_view_free(&tv);
+            return 0;
+        }
+        int min_m = m;
+        for (size_t i = 0; i < tv.nvols; i++)
+            if ((tv.vols[i].s.set_mask & TSDB_TIER_SET_REDUNDANCY) && (int)tv.vols[i].s.m < min_m)
+                min_m = (int)tv.vols[i].s.m;
+        int min_up = n - min_m;
+
+        tier_cfg c = {0};
+        c.set = true;
+        c.k = k;
+        c.m = m;
+        c.ndirs = n;
+        c.dirs = calloc((size_t)n, sizeof *c.dirs);
+        if (!c.dirs) {
+            tiers_view_free(&tv);
+            return TSDB_ERR_NOMEM;
+        }
+        for (int i = 0; i < n; i++) {
+            c.dirs[i] = strdup(tv.stores[i].path);
+            if (!c.dirs[i]) {
+                tier_cfg_free(&c);
+                tiers_view_free(&tv);
+                return TSDB_ERR_NOMEM;
+            }
+        }
+        c.grace_s = (int64_t)tv.global.tier_after_s;
+        c.keep_s = TIER_KEEP_S_DEFAULT;
+        c.coarse_s = TIER_COARSE_S_DEFAULT;
+        c.cache_mb = atomic_load_explicit(&tier_cache_mb_opt, memory_order_relaxed);
+        c.eager = false;
+#ifdef TSDB_TEST_HOOKS
+        if (ov.has_grace)
+            c.grace_s = ov.grace_s;
+        if (ov.has_keep)
+            c.keep_s = ov.keep_s;
+        if (ov.has_coarse)
+            c.coarse_s = ov.coarse_s;
+        if (ov.has_cache)
+            c.cache_mb = ov.cache_mb;
+        if (ov.has_eager)
+            c.eager = ov.eager;
+#endif
+        tier *t = calloc(1, sizeof *t);
+        if (!t) {
+            tier_cfg_free(&c);
+            tiers_view_free(&tv);
+            return TSDB_ERR_NOMEM;
+        }
+        atomic_init(&t->refs, 1);
+        atomic_init(&t->halted, false);
+        pthread_mutex_init(&t->cmu, NULL);
+        t->cfg = c;
+        t->from_tiers = true;
+        memcpy(t->db_id, db_id, 16);
+        t->tview = tv; /* ownership transferred; tier_put frees it */
+#ifdef TSDB_TEST_HOOKS
+        t->ov_grace = ov.has_grace;
+#endif
+        int open_rc = tier_be_open_from_tiers(t, dir, min_up);
+        if (open_rc != 0 || (open_rc = eccache_tier_open(t)) != 0 || (open_rc = ecgc_tier_open(t)) != 0 ||
+            (open_rc = ecsettle_tier_open(t)) != 0) {
+            tier_put(t);
+            return open_rc;
+        }
+        eccache_set_backend(t, t->be);
+        *out = t;
+        return 0;
+#endif
+    }
+    tiers_view_free(&tv);
+
     tier_cfg c = {0};
 #ifdef TSDB_TEST_HOOKS
     int rc = tier_decide(dir, getenv("TSDB_TEST_TIER"), getenv("TSDB_TEST_TIER_I_KNOW"), &c);
@@ -384,6 +832,8 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
         return TSDB_ERR_INVALID;
     }
 #endif
+    if (c.set && c.cache_mb == 0)
+        c.cache_mb = atomic_load_explicit(&tier_cache_mb_opt, memory_order_relaxed);
     tier *t = calloc(1, sizeof *t);
     if (!t) {
         tier_cfg_free(&c);
@@ -436,6 +886,7 @@ void tier_put(tier *t)
     if (t->be)
         chunk_be_close(t->be);
 #endif
+    tiers_view_free(&t->tview);
     tier_cfg_free(&t->cfg);
     free(t);
 }
@@ -737,6 +1188,10 @@ int tier_engine_attach(eng *db)
             }
             at.settings = &cset;
         }
+    } else if (t->from_tiers && tier_is_cluster_volume(db)) {
+        fprintf(stderr, "tsdb: %s: cluster volume cannot attach to a single-server tier (%s): the open fails\n",
+                db->dir, TIERS_FILE);
+        return TSDB_ERR_INVALID;
     } else if (tier_is_cluster_volume(db) && !eccold_may_attach(db)) { /* eccold.h: asked for cluster volumes only */
         fprintf(stderr, "tsdb: %s: cluster volume has no cold-tier hooks attached (!eccold_may_attach): the open "
                         "fails\n", db->dir);
@@ -762,10 +1217,27 @@ int tier_engine_attach(eng *db)
     cv->epoch_fn = at.epoch;
     cv->epoch_arg = at.epoch_arg;
     atomic_init(&cv->lead_epoch, (at.lead_epoch && db->leader_open) ? at.lead_epoch : 0);
-    if (at.settings)
+    if (at.settings) {
         cv->set = *at.settings;
-    else
+    } else if (t->from_tiers) {
+        tiers_settings vs;
+        tiers_view_settings_for(&t->tview, vol, &vs);
         tier_settings_from_cfg(&t->cfg, &cv->set);
+        cv->set.from_tiers = true;
+        if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+            cv->set.k = (int)vs.k;
+            cv->set.m = (int)vs.m;
+        }
+        cv->set.tier_after_s = t->ov_grace ? (uint64_t)t->cfg.grace_s : vs.tier_after_s;
+        cv->set.grace_s = t->ov_grace ? t->cfg.grace_s : (int64_t)vs.tier_after_s;
+        cv->set.tier_high_pct = vs.tier_high_pct;
+        cv->set.young_high_pct = vs.young_high_pct;
+        cv->set.rebuild_mb_s = vs.rebuild_mb_s;
+        cv->set.scrub_mb_s = vs.scrub_mb_s;
+        cv->set.scrub_days = vs.scrub_days;
+    } else {
+        tier_settings_from_cfg(&t->cfg, &cv->set);
+    }
     if ((rc = tier_meta_write(db, txt, es->vuuid)) != 0)
         return rc; /* the open fails; its eng_close detaches */
     db->tier_req = true; /* the one place it is set: META says requires=tier now, also at the first attach (E55) */

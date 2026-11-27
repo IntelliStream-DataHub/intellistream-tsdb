@@ -26,6 +26,7 @@
 #define TSDB_TIER_H
 
 #include "internal.h"
+#include "tiers.h"
 
 #define TIER_DIRS_MAX 64
 #define TIER_SECONDS_MAX 315360000LL /* ten years: every *_s stays far from overflow in ms */
@@ -79,7 +80,16 @@ typedef struct tier {
     pthread_mutex_t cmu;
     struct coldvol **cvs;
     size_t ncvs;
+    /* R15 (r15-open): loaded TIERS view & db_id when opened from TIERS, plus TSDB_TEST_TIER grace override flag */
+    bool from_tiers;
+    uint8_t db_id[16];
+    tiers_view tview;
+    bool ov_grace;
 } tier;
+
+/* Default geometry by store count (R15 D4, D5): all_single_copy -> 1+0; else 2 -> 1+1, 3..5 -> (n-1)+1, 6+ -> 4+2.
+ * Returns false when nstores is too small (<= 0, or 1 non-single-copy store). */
+bool tier_default_geom(int nstores, bool all_single_copy, int *k_out, int *m_out);
 
 /* tsdb_open's: *out NULL when no tier is configured, else a tier holding the caller's reference. A configuration the
  * build cannot serve (no TSDB_EC) is refused with a line. dir: the database, for messages. */
@@ -113,8 +123,10 @@ int tier_follower_ec(eng *db, const char *name);
  * every store UP holds the volume's epoch after the raise (one that could not store it stays UP, unfenced). */
 enum { TIER_MUT_NONE = 0, TIER_MUT_PERENGINE, TIER_MUT_UNSURE, TIER_MUT_NOEC, TIER_MUT_STRICT, TIER_MUT_FRESH,
        TIER_MUT_FENCE,
-       TIER_MUT_SELFEPOCH /* selfepoch: the epoch provider is bypassed at attach: the stores' own fence (the writer's
-                           * epoch) is given as the authoritative one, so an unsure store is raised by it */ };
+       TIER_MUT_SELFEPOCH, /* selfepoch: the epoch provider is bypassed at attach: the stores' own fence (the writer's
+                            * epoch) is given as the authoritative one, so an unsure store is raised by it */
+       TIER_MUT_DBIDSKIP,  /* dbidskip: skips db_id verification when opening stores from TIERS */
+       TIER_MUT_LOSTOPEN   /* lostopen: opens a LOST store as UP instead of passing NULL (DOWN_MISSING) */ };
 extern int tier_mutant;
 
 /* r8b-coldops (E22). A volume's settings: the tier's configuration on a single server (tier_settings_from_cfg); r8f
@@ -130,6 +142,14 @@ typedef struct tier_settings {
      * how long a settle waits for every position to be UP under the stripe version it put by. 0: the defaults
      * (ECCOLD_FORCE_S_DEFAULT, ECCOLD_WAIT_MAX_S_DEFAULT). */
     int64_t force_s, wait_max_s;
+    /* R15 (r15-open, D6, D7, D12, D16, D20): settings from TIERS (from_tiers false when not opened from TIERS). */
+    bool from_tiers;
+    uint64_t tier_after_s;
+    uint32_t tier_high_pct;
+    uint32_t young_high_pct;
+    uint32_t rebuild_mb_s;
+    uint32_t scrub_mb_s;
+    uint32_t scrub_days;
 } tier_settings;
 void tier_settings_from_cfg(const tier_cfg *c, tier_settings *s);
 
