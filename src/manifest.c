@@ -404,6 +404,12 @@ static int tail_segment_fd(eng *db, wal_tail *t, int fd, const char *name)
         wal_col_rows cr = {0};
         if (wr.kind == WAL_KIND_COL) {
             rc = wal_col_decode(wr.payload, wr.n, NULL, &cr);
+            if (rc == TSDB_ERR_CORRUPT && !t->reported) { /* its checks hold: a writer bug or damage, never a tail */
+                fprintf(stderr, "tsdb: follower: WAL segment %s: the columnar record at offset %" PRIu64
+                                " does not decode: the log is damaged; its later rows are not shown\n",
+                        name, t->off + pos);
+                t->reported = true;
+            }
             if (rc != 0)
                 break;
         }

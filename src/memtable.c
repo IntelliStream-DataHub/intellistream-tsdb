@@ -3110,6 +3110,9 @@ int wal_open(eng *db, int (*before_replay)(eng *))
             bool is_col = wr.kind == WAL_KIND_COL;
             if (is_col) {
                 rc = wal_col_decode(wr.payload, wr.n, NULL, &cr);
+                if (rc == TSDB_ERR_CORRUPT) /* a writer's open said so in wal_check_segment; a read-only one did not */
+                    fprintf(stderr, "tsdb: WAL segment %s: the columnar record at offset %zu does not decode: the log "
+                                    "is damaged\n", segs[k].name, pos);
                 if (rc != 0)
                     break;
             }

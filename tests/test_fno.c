@@ -1168,6 +1168,45 @@ static void check_series_bits(eng *db, uint32_t sid, size_t w, const int64_t *ex
     free(gv);
 }
 
+/* Runs f(arg) with stderr going to a file and gives back what it printed (the caller frees it). */
+static char *stderr_of(int (*f)(void *), void *arg, int *rc)
+{
+    char path[] = "/var/tmp/test_fno_stderr_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        *rc = f(arg);
+        return NULL;
+    }
+    unlink(path);
+    fflush(stderr);
+    int saved = dup(2);
+    dup2(fd, 2);
+    *rc = f(arg);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    off_t n = lseek(fd, 0, SEEK_END);
+    char *out = malloc((size_t)n + 1);
+    if (out && pread(fd, out, (size_t)n, 0) == (ssize_t)n)
+        out[n] = 0;
+    else if (out)
+        out[0] = 0;
+    close(fd);
+    return out;
+}
+
+struct ro_open_arg {
+    const char *dir;
+    bool follow;
+    eng *db;
+};
+static int ro_open_call(void *a)
+{
+    struct ro_open_arg *o = a;
+    return open_eng(o->dir, true, o->follow, &o->db);
+}
+static int refresh_call(void *a) { return eng_refresh(a); }
+
 /* Compressed columnar WAL_KIND_COL: single-series float32, multi-series float64, 64-bit timestamp jumps,
  * incompressible random payload (!ZSTD), bool/state/nulls, interleaved ROWS+COL+MARKER, crash replay,
  * read-only follower query verification, and corrupt rejection (direct + via eng_open). */
@@ -1457,9 +1496,67 @@ static void test_wal_col(void)
         CHECK(wfd >= 0);
         CHECK(write(wfd, wrec, WAL_HDR + plen) == (ssize_t)(WAL_HDR + plen));
         close(wfd);
+        if (mode == 0) {
+            /* a read-only open skips wal_check_segment, so the replay itself must say why it refuses */
+            struct ro_open_arg oa = {cdir, false, NULL};
+            int orc = 0;
+            char *msg = stderr_of(ro_open_call, &oa, &orc);
+            CHECK(orc == TSDB_ERR_CORRUPT && oa.db == NULL);
+            CHECK(msg && strstr(msg, "columnar record at offset 0 does not decode"));
+            if (!(msg && strstr(msg, "columnar record at offset 0 does not decode")))
+                fprintf(stderr, "  read-only open printed: %s\n", msg ? msg : "(nothing)");
+            free(msg);
+        }
         cdb = NULL;
         CHECK(open_eng(cdir, false, false, &cdb) == TSDB_ERR_CORRUPT);
         CHECK(cdb == NULL);
+    }
+
+    /* A follower tailing a segment meets such a record after its open: it says so, once */
+    {
+        char fdir[PATH_MAX + 32];
+        fresh("wal-col-follow", fdir, sizeof fdir);
+        eng *w = NULL;
+        CHECK(open_eng(fdir, false, false, &w) == 0);
+        uint32_t sid0 = 0;
+        CHECK(w && eng_series(w, "s0", TSDB_FLOAT32, &sid0) == 0);
+        /* the writer stays open: its active segment (the one MANIFEST names) is where the follower tails */
+        uint64_t aseq = w ? w->wal_seq : 0;
+        struct ro_open_arg oa = {fdir, true, NULL};
+        CHECK(open_eng(fdir, true, true, &oa.db) == 0);
+        char seg[PATH_MAX + 128], segname[64];
+        snprintf(segname, sizeof segname, "wal_%016" PRIx64 ".log", aseq);
+        snprintf(seg, sizeof seg, "%s/%s", fdir, segname);
+        uint8_t wrec[WAL_HDR + WAL_COL_HDR + 4];
+        memset(wrec, 0, sizeof wrec);
+        store32(wrec, (uint32_t)(WAL_COL_HDR + 4) | ((uint32_t)WAL_KIND_COL << 28));
+        uint64_t f1 = 1;
+        memcpy(wrec + 16, &f1, 8);
+        uint8_t *ch = wrec + WAL_HDR;
+        store32(ch, 1);
+        ch[4] = WAL_COL_SINGLE | WAL_COL_VAL4 | WAL_COL_ZSTD;
+        store32(ch + 12, 12);
+        ch[WAL_COL_HDR] = 0xff; /* invalid ZSTD magic */
+        wal_reseal(wrec, aseq, 0);
+        int wfd = open(seg, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        CHECK(wfd >= 0 && write(wfd, wrec, sizeof wrec) == (ssize_t)sizeof wrec);
+        if (wfd >= 0)
+            close(wfd);
+        int r1 = 0, r2 = 0;
+        char *m1 = oa.db ? stderr_of(refresh_call, oa.db, &r1) : NULL;
+        char *m2 = oa.db ? stderr_of(refresh_call, oa.db, &r2) : NULL;
+        char want[160];
+        snprintf(want, sizeof want, "follower: WAL segment %s: the columnar record at offset 0", segname);
+        CHECK(m1 && strstr(m1, want));
+        CHECK(m2 && !strstr(m2, "columnar record")); /* once */
+        if (!(m1 && strstr(m1, "columnar record")))
+            fprintf(stderr, "  follower refresh printed: %s (rc %d)\n", m1 ? m1 : "(nothing)", r1);
+        free(m1);
+        free(m2);
+        if (oa.db)
+            eng_close(oa.db);
+        if (w)
+            eng_close(w); /* whatever it makes of the planted record: the follower's line is what is checked */
     }
 
     printf("  compressed columnar WAL_KIND_COL: single/multi-series, 64-bit ts, !ZSTD fallback, bool/state/nulls, "
