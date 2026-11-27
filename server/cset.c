@@ -131,8 +131,8 @@ void cset_setop_file(const char *path)
         char t[320] = "";
         int rc = 0;
         uint64_t rid = 0;
-        if (!strcmp(op, "hold") || !strcmp(op, "out")) {
-            /* R9 test hook (until r9-ops): "hold NODE FOR_S" (0 releases) or "out NODE" */
+        if (!strcmp(op, "hold")) {
+            /* R9 test hook (until r9-ops): "hold NODE FOR_S" (0 releases) */
             uint32_t nid = vol;
             const struct meta_member *mb = meta_member(cl_meta(), nid);
             if (!mb) {
@@ -146,44 +146,56 @@ void cset_setop_file(const char *path)
                     wms = 1;
                 struct meta_entry e;
                 meta_entry_init(&e);
-                if (!strcmp(op, "hold")) {
-                    uint64_t for_s = k >= 3 ? (uint64_t)node : 0;
-                    meta_op_node_hold(&e, nid, for_s ? wms + for_s * 1000ull : 0, wms);
+                uint64_t for_s = k >= 3 ? (uint64_t)node : 0;
+                meta_op_node_hold(&e, nid, for_s ? wms + for_s * 1000ull : 0, wms);
+                rc = cl_propose(&e);
+            }
+            if (o)
+                fprintf(o, "hold %u %u: %s %s\n", vol, k >= 3 ? node : 0u, rc ? "refused" : "proposed", t);
+            cl_say("setop hold %u %u: %s %s", vol, k >= 3 ? node : 0u, rc ? "refused" : "proposed", t);
+            continue;
+        }
+        if (!strcmp(op, "out")) {
+            /* R9 test hook (until r9-ops): "out NODE" or "out 0 NODE" */
+            uint32_t target = k >= 3 ? node : vol;
+            const struct meta_member *mb = meta_member(cl_meta(), target);
+            if (!mb) {
+                rc = META_ERR_NOTFOUND;
+                snprintf(t, sizeof t, "no member %" PRIu32, target);
+            } else {
+                struct timespec ts;
+                uint64_t wms = clock_gettime(CLOCK_REALTIME, &ts) == 0
+                                   ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
+                                   : 0;
+                if (!wms)
+                    wms = 1;
+                struct meta_entry e;
+                meta_entry_init(&e);
+                meta_op_member_state(&e, target, META_OUT, mb->incarnation, META_DOWN_NONE, 0, wms);
+                rc = cl_propose(&e);
+            }
+            vol = 0;
+            node = target;
+        } else {
+            if (k < 3)
+                continue;
+            const struct meta_volume *v = meta_volume(cl_meta(), vol);
+            if (!strcmp(op, "reset")) {
+                rc = reset_propose(vol, node, &rid, t, sizeof t);
+            } else if (!v) {
+                rc = META_ERR_NOTFOUND;
+                snprintf(t, sizeof t, "no volume %u", vol);
+            } else {
+                struct meta_entry e;
+                meta_entry_init(&e);
+                if (!strcmp(op, "add")) {
+                    rid = fresh_rid(v);
+                    meta_op_replica_add(&e, vol, v->epoch, node, rid, k >= 4 ? repl : 0);
                 } else {
-                    meta_op_member_state(&e, nid, META_OUT, mb->incarnation, META_DOWN_NONE, 0, wms);
+                    meta_op_replica_remove(&e, vol, v->epoch, node);
                 }
                 rc = cl_propose(&e);
             }
-            if (o) {
-                if (!strcmp(op, "hold"))
-                    fprintf(o, "hold %u %u: %s %s\n", vol, k >= 3 ? node : 0u, rc ? "refused" : "proposed", t);
-                else
-                    fprintf(o, "out %u: %s %s\n", vol, rc ? "refused" : "proposed", t);
-            }
-            if (!strcmp(op, "hold"))
-                cl_say("setop hold %u %u: %s %s", vol, k >= 3 ? node : 0u, rc ? "refused" : "proposed", t);
-            else
-                cl_say("setop out %u: %s %s", vol, rc ? "refused" : "proposed", t);
-            continue;
-        }
-        if (k < 3)
-            continue;
-        const struct meta_volume *v = meta_volume(cl_meta(), vol);
-        if (!strcmp(op, "reset")) {
-            rc = reset_propose(vol, node, &rid, t, sizeof t);
-        } else if (!v) {
-            rc = META_ERR_NOTFOUND;
-            snprintf(t, sizeof t, "no volume %u", vol);
-        } else {
-            struct meta_entry e;
-            meta_entry_init(&e);
-            if (!strcmp(op, "add")) {
-                rid = fresh_rid(v);
-                meta_op_replica_add(&e, vol, v->epoch, node, rid, k >= 4 ? repl : 0);
-            } else {
-                meta_op_replica_remove(&e, vol, v->epoch, node);
-            }
-            rc = cl_propose(&e);
         }
         if (o)
             fprintf(o, "%s %u %u: %s %016" PRIx64 " %s\n", op, vol, node, rc ? "refused" : "proposed", rid, t);

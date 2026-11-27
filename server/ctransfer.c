@@ -154,6 +154,14 @@ static int member_up(uint32_t node, uint64_t now)
     return m && m->state == META_UP && cl_heard_fresh(node, now);
 }
 
+/* Source of a planned transfer: UP, or a live DRAINING/OUT server being evacuated by cmove. */
+static int leader_reachable(uint32_t node, uint64_t now)
+{
+    const struct meta_member *m = meta_member(cl_meta(), node);
+    return m && (m->state == META_UP || m->state == META_DRAINING || m->state == META_OUT) &&
+           cl_heard_fresh(node, now);
+}
+
 static void tr_reply(struct ctr *t, int32_t rc, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static void tr_reply(struct ctr *t, int32_t rc, const char *fmt, ...)
 {
@@ -225,7 +233,7 @@ static const char *tr_check(const struct meta_volume *v, uint32_t node, uint64_t
         return "the node is not in its ISR";
     if (!member_up(node, now) && m != CTM_ADMINUP)
         return "the node is not up";
-    if (!member_up(v->leader, now))
+    if (!leader_reachable(v->leader, now))
         return "its leader is not up";
     if (tr_find(v->number) && m != CTM_ADMINBUSY)
         return "a transfer of it is under way";

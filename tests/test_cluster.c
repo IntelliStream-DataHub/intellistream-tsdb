@@ -22168,9 +22168,11 @@ static void scen_replfault(void)
     init_rebuild_after_s = 60;
     init_failstop_out_s = 2;
     init_out_guard_pct = 25;
-    /* Server 2 (member id 3) reports CL_HEALTH_LOCAL_FAULT (1) on volume 1. */
+    /* Server 2 (member id 3) reports CL_HEALTH_LOCAL_FAULT (1) on volume 1. Add 3 nodes first so rfault is placed on
+     * {1, 2, 3}, then add node 4 as the healthy replacement target so pout_plan -> place_plan -> cmove replaces node 3
+     * while server 2 remains META_UP. */
     envs[2] = "vol=1/2/1/1/fault";
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 4; i++)
         start(i);
     init_cluster(0, 600);
     node_add(0, 1);
@@ -22182,12 +22184,33 @@ static void scen_replfault(void)
     int rc = vol_add(0, "rfault", 3, &vnum);
     if (rc != 0 || vnum != 1)
         die("replfault: volume add failed: %s (vnum=%" PRIu32 ")", cluster_strerror(rc), vnum);
+    await_isr(0, "rfault", 3, 20000, "rfault 3-replica ISR before adding spare");
+    node_add(0, 3);
+    struct state_want w4 = {ids[3], META_UP, 1};
+    await_view(0, p_member_state, &w4, "spare node 4 up");
 
-    await_log(0, "place: REPLICA_ADD for vol 1 replaces 3", 12000,
-              "replace-replica request for faulted replica on node 3");
+    uint64_t t0 = now_ms();
+    for (;;) {
+        struct meta_volume v;
+        if (vol_rec(0, "rfault", &v) && v.nrep == 3 && v.nisr == 3) {
+            int has3 = 0, has4 = 0;
+            for (uint32_t k = 0; k < v.nrep; k++) {
+                if (v.rep[k].node == ids[2])
+                    has3 = 1;
+                if (v.rep[k].node == ids[3])
+                    has4 = 1;
+            }
+            if (!has3 && has4)
+                break;
+        }
+        if (now_ms() - t0 > 30000)
+            die("replfault: faulted replica on node %" PRIu32 " was not replaced by node %" PRIu32 " within 30 s",
+                ids[2], ids[3]);
+        usleep(100000);
+    }
     if (member_state_of(0, ids[2], NULL, NULL) != META_UP)
         die("replfault: server 2 should remain META_UP on a per-replica fault");
-    printf("  replfault: continuous LOCAL_FAULT on vol 1 node 3 emitted replace-replica request while server stayed UP\n");
+    printf("  replfault: continuous LOCAL_FAULT on vol 1 node 3 auto-replaced onto node 4 while server stayed UP\n");
 }
 
 /* pace (R9 D18, E13, §8.4, r9-pace): margin-based rebuild pacing on both send and receive sides and Prometheus pace
@@ -22746,6 +22769,278 @@ static void scen_holdkeep(void)
            nwl_held, nwo_held, nw_before_out, nw_after_out, O, nwo_after_out);
 }
 
+/* outmove (r9-plan): replicas=3 on 5 nodes under 4 writers; mark a live member OUT via setop_file (`out NODE`).
+ * The pure planner (server/place.c) detects the OUT replica and routes a tracked move through cmove (cmove_start_auto),
+ * moving every volume off the OUT member without ever shrinking ISR below 3 (verified by R4's move_watch), leaving
+ * every volume with 3 in-sync replicas, zero lost writes, and the OUT member's v1 directory removed. */
+static void scen_outmove(void)
+{
+    scenario("outmove");
+    move_env(0);
+    struct meta_volume v, v2;
+    int L = set_setup(5, &v, 0);
+    set_cenv = NULL;
+    uint32_t num2 = 0;
+    int rc = vol_add(0, "plant2", 3, &num2);
+    if (rc != 0 || num2 != 2)
+        die("volume add plant2: %s, number %" PRIu32, cluster_strerror(rc), num2);
+    if (!vol_rec(0, "plant2", &v2))
+        die("no record of plant2");
+    for (uint32_t k = 0; k < v2.nrep; k++)
+        await_open_gen(0, "plant2", server_of(v2.rep[k].node), 1, 0);
+    await_isr(0, "plant", 3, 15000, "plant ISR of 3 before outmove");
+    await_isr(0, "plant2", 3, 15000, "plant2 ISR of 3 before outmove");
+
+    /* Also create a replicas=1 volume led by a non-leader replica of plant (deterministic live OUT leader with ISR=1:
+     * exercises cmove + planned transfer off a live OUT sole-ISR leader without any fence loop). */
+    uint32_t solo_num = 0;
+    struct meta_volume vsolo = {0};
+    int A = -1, R = leader_of(0);
+    char solo_name[32] = "";
+    for (int sidx = 1; sidx <= 5 && A < 0; sidx++) {
+        snprintf(solo_name, sizeof solo_name, "solo%d", sidx);
+        if ((rc = vol_add(0, solo_name, 1, &solo_num)) != 0)
+            die("volume add %s: %s", solo_name, cluster_strerror(rc));
+        if (!vol_rec(0, solo_name, &vsolo))
+            die("no record of %s", solo_name);
+        await_open_gen(0, solo_name, server_of(vsolo.leader), 1, 0);
+        await_isr(0, solo_name, 1, 15000, "solo ISR of 1 before outmove");
+        int ls = server_of(vsolo.leader);
+        if (ls >= 0 && ls != L && ls != R && rep_index(&v, ls) >= 0)
+            A = ls;
+    }
+    if (A < 0)
+        die("outmove: could not place a replicas=1 volume led by a non-leader replica of plant");
+
+    struct mv_run r;
+    move_writers(&r, L, L, 0);
+
+    /* Mark server A META_OUT via setop_file (r9-out / r9-ops are parallel tracks). */
+    char op[64], res[512];
+    snprintf(op, sizeof op, "out %" PRIu32, ids[A]);
+    set_op(5, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("outmove: setop %s: %s", op, res);
+    struct state_want out_w = {ids[A], META_OUT, 1};
+    await_view(L, p_member_state, &out_w, "node A marked META_OUT");
+
+    /* Restart the Raft leader R while live OUT node A leads solo (replicas=1): the newly elected Raft leader starts
+     * with an empty heard table and must NOT prematurely fence/wedge live OUT leader A before settling. */
+    if (R >= 0 && R != L && R != A) {
+        stop(R, SIGTERM);
+        start(R);
+    }
+
+    /* Wait for place_plan + cmove to automatically move plant, plant2, and solo (ISR=1 live OUT leader!) off A. */
+    struct meta_volume fv = {0}, fv2 = {0}, fsolo = {0};
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int ok1 = vol_rec(L, "plant", &fv) && fv.nrep == 3 && fv.nisr == 3 && rep_index(&fv, A) < 0 &&
+                  !fv.rep[0].learner && !fv.rep[1].learner && !fv.rep[2].learner;
+        int ok2 = vol_rec(L, "plant2", &fv2) && fv2.nrep == 3 && fv2.nisr == 3 && rep_index(&fv2, A) < 0 &&
+                  !fv2.rep[0].learner && !fv2.rep[1].learner && !fv2.rep[2].learner;
+        int ok3 = vol_rec(L, solo_name, &fsolo) && fsolo.nrep == 1 && fsolo.nisr == 1 && rep_index(&fsolo, A) < 0 &&
+                  !fsolo.rep[0].learner && fsolo.leader != ids[A] && fsolo.leader != 0;
+        if (ok1 && ok2 && ok3)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("outmove: volumes did not evacuate node %" PRIu32 " in 90 s "
+                "(plant nrep=%u nisr=%u hasA=%d; plant2 nrep=%u nisr=%u hasA=%d; %s nrep=%u nisr=%u leader=%u hasA=%d)",
+                ids[A], fv.nrep, fv.nisr, rep_index(&fv, A) >= 0, fv2.nrep, fv2.nisr, rep_index(&fv2, A) >= 0,
+                solo_name, fsolo.nrep, fsolo.nisr, fsolo.leader, rep_index(&fsolo, A) >= 0);
+    }
+
+    /* Verify the evacuated replicas=1 volume is led and writable on its new owner. */
+    {
+        int sL = server_of(fsolo.leader);
+        if (sL < 0 || sL == A)
+            die("outmove: %s has invalid new leader %" PRIu32, solo_name, fsolo.leader);
+        tsdbc *sc = client(sL);
+        tsdb_sid sid = write_read(sc, solo_name, 2000);
+        if (rows_of(sc, sid) != 3)
+            die("outmove: %s write/read on new leader %d failed", solo_name, sL);
+        tsdbc_close(sc);
+    }
+
+    /* Identify the target node B chosen by place_plan for plant. */
+    int B = -1;
+    for (uint32_t k = 0; k < fv.nrep; k++) {
+        int s = server_of(fv.rep[k].node);
+        if (s >= 0 && rep_index(&v, s) < 0) {
+            B = s;
+            break;
+        }
+    }
+    if (B < 0)
+        die("outmove: could not identify replacement target B for plant");
+
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_move(L, &x, 0, 30000, "outmove");
+    move_dir_gone(A);
+
+    /* Unracked cluster STATUS must report "rack loss survivable: no". */
+    char pL[META_ADDR_MAX], args[PATH_MAX * 2 + 256], sout[16384];
+    peer_of(L, pL, sizeof pL);
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", pL, secret_path);
+    if (cli_run(args, NULL, sout, sizeof sout) != 0 || !strstr(sout, "rack loss survivable: no"))
+        die("outmove: cluster status missing 'rack loss survivable: no':\n%s", sout);
+
+    for (int k = 0; k < REP_NAMES; k++)
+        await_batches(&r.w[k], 10, 20000);
+    move_writers_stop(&r);
+    stop_all();
+    move_watch(L, &x);
+    move_rows(&x.last, &r, "after outmove");
+    printf("  outmove: node %" PRIu32 " OUT under 4 writers -> plant auto-moved to node %" PRIu32
+           " (ISR never below %" PRIu32 ", %" PRIu32 " records), plant2 also back to 3 ISR, 0 lost writes\n",
+           ids[A], ids[B], x.min, x.lines);
+}
+
+/* ecout (r9-plan): ec=4+2 on 7 racked nodes across 3 racks (r1={0,1,2}, r2={3,4}, r3={5,6}). Verifies initial E9
+ * rack-spread placement and STATUS "rack loss survivable: yes", then marks a stripe holder on r1 OUT via setop_file
+ * and verifies place_plan automatically moves its stripe position to the 7th node as META_STRIPE_FILLING with prev
+ * set to the OUT node (and keeps rack loss survivable: yes). */
+static void scen_ecout(void)
+{
+    scenario("ecout");
+    static const char *const racks7[7] = {"r1", "r1", "r1", "r2", "r2", "r3", "r3"};
+    epoll_after_two = 1;
+    static char init_xa[7][64];
+    for (int i = 0; i < 7; i++) {
+        envs[i] = "setop_file=1";
+        snprintf(init_xa[i], sizeof init_xa[i], "--rack %s", racks7[i]);
+        xargs[i] = init_xa[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of seven members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    view_free(&v);
+    static char xa[7][PATH_MAX + 160];
+    for (int i = 0; i < 7; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--rack %s --chunk-dir %s", racks7[i], sd);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(0, p_n_placeable, &seven, "seven racked members UP");
+
+    uint32_t num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ecout: ec=4+2 add on 7 stores: %s (%s)", cluster_strerror(rc), text);
+
+    struct meta_volume e;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e); usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecout: no record of e42");
+    if (e.redundancy != META_RED_EC || e.ec_k != 4 || e.ec_m != 2 || e.nstripe != 6 || e.stripe_version != 1)
+        die("ecout: unexpected e42 record (nstripe %u ver %" PRIu64 ")", e.nstripe, e.stripe_version);
+    for (uint32_t k = 0; k < e.nrep; k++)
+        await_open_gen(0, "e42", server_of(e.rep[k].node), 1, 0);
+    await_isr(0, "e42", 3, 15000, "e42 ISR of 3 before ecout");
+
+    /* Verify STATUS shows "rack loss survivable: yes" on the 3-rack 4+2 placement. */
+    char p0[META_ADDR_MAX], args[PATH_MAX * 2 + 256], sout[16384];
+    peer_of(0, p0, sizeof p0);
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, sout, sizeof sout) != 0 || !strstr(sout, "rack loss survivable: yes"))
+        die("ecout: cluster status missing 'rack loss survivable: yes':\n%s", sout);
+
+    /* Find the 7th server S not in e.stripe[], and pick a stripe holder H on the same rack (r1) that is not the
+     * Raft leader (and preferably not the volume leader). */
+    int S = -1;
+    for (int i = 0; i < 7; i++) {
+        int in_s = 0;
+        for (uint32_t p = 0; p < e.nstripe; p++)
+            in_s |= (e.stripe[p] == ids[i]);
+        if (!in_s) {
+            S = i;
+            break;
+        }
+    }
+    if (S < 0)
+        die("ecout: every server already in 4+2 stripe");
+    int R = leader_of(0), H = -1;
+    uint32_t hpos = UINT32_MAX;
+    for (uint32_t p = 0; p < e.nstripe; p++) {
+        int s = server_of(e.stripe[p]);
+        if (s >= 0 && !strcmp(racks7[s], racks7[S]) && s != R) {
+            H = s;
+            hpos = p;
+            break;
+        }
+    }
+    if (H < 0) {
+        for (uint32_t p = 0; p < e.nstripe; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s >= 0 && s != R) {
+                H = s;
+                hpos = p;
+                break;
+            }
+        }
+    }
+    if (H < 0)
+        die("ecout: could not pick a stripe holder to mark OUT");
+
+    char op[64], res[512];
+    snprintf(op, sizeof op, "out %" PRIu32, ids[H]);
+    set_op(7, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("ecout: setop %s: %s", op, res);
+    struct state_want out_w = {ids[H], META_OUT, 1};
+    await_view(S, p_member_state, &out_w, "stripe holder H marked META_OUT");
+
+    /* Wait for place_plan to move stripe position `hpos` onto the 7th server S as FILLING with prev = H. */
+    struct meta_volume e2 = {0};
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(S, "e42", &e2) && e2.stripe[hpos] == ids[S] &&
+            e2.stripe_pos[hpos].state == META_STRIPE_FILLING && e2.stripe_pos[hpos].prev == ids[H] &&
+            e2.stripe_version >= 2)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("ecout: pos %" PRIu32 " did not move from node %" PRIu32 " to node %" PRIu32
+                " as FILLING within 30 s (cur holder %" PRIu32 " state %u prev %" PRIu32 " ver %" PRIu64 ")",
+                hpos, ids[H], ids[S], e2.stripe[hpos], e2.stripe_pos[hpos].state, e2.stripe_pos[hpos].prev,
+                e2.stripe_version);
+    }
+    /* Verify all 6 stripe positions remain distinct and rack-loss survivable stays yes. */
+    for (uint32_t a = 0; a < e2.nstripe; a++)
+        for (uint32_t b = a + 1; b < e2.nstripe; b++)
+            if (e2.stripe[a] == e2.stripe[b])
+                die("ecout: duplicate node %" PRIu32 " in stripe after replacement", e2.stripe[a]);
+    /* If H also held a log replica of e42, wait for it to move off H too so STATUS stays rack-loss survivable. */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(S, "e42", &e2) && e2.nrep == 3 && e2.nisr == 3 && rep_index(&e2, H) < 0 &&
+            !e2.rep[0].learner && !e2.rep[1].learner && !e2.rep[2].learner)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("ecout: e42 log replicas did not move off OUT node %" PRIu32 " (nrep=%u nisr=%u)", ids[H], e2.nrep,
+                e2.nisr);
+    }
+    char pS[META_ADDR_MAX];
+    peer_of(S, pS, sizeof pS);
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", pS, secret_path);
+    if (cli_run(args, NULL, sout, sizeof sout) != 0 || !strstr(sout, "rack loss survivable: yes"))
+        die("ecout: cluster status after replacement missing 'rack loss survivable: yes':\n%s", sout);
+
+    epoll_after_two = 0;
+    stop_all();
+    printf("  ecout: 4+2 on 7 racked nodes -> OUT node %" PRIu32 " (pos %" PRIu32 ") auto-moved to node %" PRIu32
+           " (FILLING, prev=%" PRIu32 ", stripe_version=%" PRIu64 "), rack loss survivable: yes\n",
+           ids[H], hpos, ids[S], e2.stripe_pos[hpos].prev, e2.stripe_version);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -22796,7 +23091,8 @@ int main(int argc, char **argv)
                {"outtimer", scen_outtimer}, {"outback", scen_outback}, {"outguard", scen_outguard},
                {"outhold", scen_outhold}, {"outopening", scen_outopening}, {"outfailstop", scen_outfailstop},
                {"replfault", scen_replfault}, {"pace", scen_pace},
-               {"downkeep", scen_downkeep}, {"downbudget", scen_downbudget}, {"holdkeep", scen_holdkeep}};
+               {"downkeep", scen_downkeep}, {"downbudget", scen_downbudget}, {"holdkeep", scen_holdkeep},
+               {"outmove", scen_outmove}, {"ecout", scen_ecout}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

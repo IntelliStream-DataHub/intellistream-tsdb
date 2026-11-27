@@ -4438,122 +4438,115 @@ static int text_ok_cl(const char *s)
     return 1;
 }
 
-/* A member a new volume may be placed on: up, taking volumes, and heard within node_timeout (the leader: itself). */
-static int placeable(const struct meta_member *mb, uint64_t now)
+/* Build a place_member (and optional place_fill) snapshot of the Raft leader's heartbeat view, shared by
+ * cl_place_volume, cl_place_stripe, and place_duty so all three see identical member liveness and store counts. */
+static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, struct place_fill **pf_out,
+                                                uint32_t *nf_out)
 {
-    if (mb->state != META_UP || !(mb->flags & META_MF_VOLUMES_OK))
-        return 0;
-    if (mb->id == C.id)
-        return 1;
-    const struct heard *h = heard_get(mb->id);
-    return h && h->ns && now - h->ns < (uint64_t)C.sm.set.node_timeout_ms * MS;
-}
-
-/* §3.2 rules 1-2, a deterministic greedy pass: the preferred leader (nodes[0]) is the live member that leads the
- * fewest volumes (then holds the fewest, then the lowest id); each further replica the one that holds the fewest,
- * on a rack not used yet while one is left (racks count only when every candidate has one and there are at least
- * `n` of them). Returns 0 or -1 (fewer live members than n). */
-static int place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
-{
-    uint32_t cand[META_REPLICAS_MAX * 64], nc = 0, leads[META_REPLICAS_MAX * 64], holds[META_REPLICAS_MAX * 64];
-    for (uint32_t i = 0; i < C.sm.nmembers && nc < sizeof cand / sizeof cand[0]; i++) {
-        const struct meta_member *mb = &C.sm.members[i];
-        if (!placeable(mb, now))
-            continue;
-        leads[nc] = holds[nc] = 0;
-        for (uint32_t v = 0; v < C.sm.nvolumes; v++)
-            for (uint32_t k = 0; k < C.sm.volumes[v].nrep; k++)
-                if (C.sm.volumes[v].rep[k].node == mb->id) {
-                    holds[nc]++;
-                    leads[nc] += k == 0;
+    uint32_t nm = C.sm.nmembers;
+    *nm_out = nm;
+    if (pf_out)
+        *pf_out = NULL;
+    if (nf_out)
+        *nf_out = 0;
+    uint32_t total_fills = 0, nf = 0;
+    struct place_fill *pf = NULL;
+    if (pf_out && nf_out) {
+        for (size_t i = 0; i < C.nheard; i++)
+            total_fills += C.heard[i].nfills;
+        if (total_fills) {
+            pf = calloc(total_fills, sizeof *pf);
+            if (!pf)
+                oom();
+        }
+    }
+    struct place_member *pm = nm ? calloc(nm, sizeof *pm) : NULL;
+    if (nm && !pm)
+        oom();
+    for (uint32_t i = 0; i < nm; i++) {
+        uint32_t id = C.sm.members[i].id;
+        struct heard *h = heard_get(id);
+        pm[i].id = id;
+        pm[i].fill_pct = 0xff; /* unknown unless reported in HBS_NODE */
+        uint64_t last = heard_ns(id, now);
+        pm[i].heard_age_ms = last ? since(now, last) / MS : UINT64_MAX;
+        if (id == C.id) {
+            pm[i].opening = (uint8_t)(atomic_load_explicit(&g_hb_opening, memory_order_relaxed) != 0);
+            pm[i].failstop = (uint8_t)(atomic_load_explicit(&g_hb_failstop, memory_order_relaxed) != 0);
+            pm[i].fill_pct = atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed);
+            pm[i].chunk_stores = atomic_load_explicit(&g_chunk_stores, memory_order_relaxed);
+            pm[i].heard_age_ms = 0;
+        }
+        if (h) {
+            pm[i].opening = h->opening;
+            pm[i].failstop = h->failstop;
+            pm[i].fill_pct = h->fill_pct;
+            if (id != C.id)
+                pm[i].chunk_stores = h->have_stores ? h->chunk_stores : 0;
+            if (pf_out) {
+                for (uint32_t j = 0; j < h->nvols && pm[i].nfaults < PLACE_FAULTS_MAX; j++) {
+                    if (h->vols[j].v.health == CL_HEALTH_LOCAL_FAULT && h->vols[j].fault_ns) {
+                        pm[i].faults[pm[i].nfaults].volume = h->vols[j].v.volume;
+                        pm[i].faults[pm[i].nfaults].fault_s = since(now, h->vols[j].fault_ns) / (1000 * MS);
+                        pm[i].nfaults++;
+                    }
                 }
-        cand[nc++] = i;
-    }
-    if (nc < n)
-        return -1;
-    int racks = 1;
-    uint32_t distinct = 0;
-    for (uint32_t i = 0; i < nc; i++) {
-        const char *ri = C.sm.members[cand[i]].rack;
-        if (!ri[0])
-            racks = 0;
-        int seen = 0;
-        for (uint32_t j = 0; j < i; j++)
-            seen |= !strcmp(C.sm.members[cand[j]].rack, ri);
-        distinct += !seen;
-    }
-    racks = racks && distinct >= n;
-    uint8_t used[META_REPLICAS_MAX * 64] = {0};
-    for (uint32_t k = 0; k < n; k++) {
-        int best = -1;
-        for (uint32_t i = 0; i < nc; i++) {
-            if (used[i])
-                continue;
-            if (racks) {
-                int clash = 0;
-                for (uint32_t j = 0; j < k; j++)
-                    clash |= !strcmp(C.sm.members[cand[i]].rack, meta_member(&C.sm, nodes[j])->rack);
-                if (clash)
-                    continue;
+                for (uint32_t j = 0; j < h->nfills && nf < total_fills; j++) {
+                    pf[nf].node = id;
+                    pf[nf].volume = h->fills[j].volume;
+                    pf[nf].pos = h->fills[j].pos;
+                    pf[nf].stripe_version = h->fills[j].version;
+                    pf[nf].done = h->fills[j].done;
+                    pf[nf].total = h->fills[j].total;
+                    pf[nf].whole = h->fills[j].whole;
+                    nf++;
+                }
             }
-            if (best < 0)
-                best = (int)i;
-            else if (k == 0 ? (leads[i] < leads[best] || (leads[i] == leads[best] && holds[i] < holds[best]))
-                            : holds[i] < holds[best])
-                best = (int)i;
         }
-        if (best < 0)
-            return -1;
-        used[best] = 1;
-        nodes[k] = C.sm.members[cand[best]].id;
     }
-    return 0;
+    if (pf_out)
+        *pf_out = pf;
+    if (nf_out)
+        *nf_out = nf;
+    return pm;
 }
 
-/* An erasure-coded volume's stripe group (R8, E9): ns distinct live members that take volumes and report a chunk
- * store UP (HBS_STORES; this server: what chunksrv_cluster.c set), the proposer's pick, never apply's (heartbeats are
- * not replicated state). Each position goes to the candidate on the rack used least so far, then holding the fewest
- * positions of other EC volumes, then the lowest id. *qualify: how many members qualify. */
-static int place_stripe(uint32_t ns, uint64_t now, uint32_t *stripe, uint32_t *qualify)
+/* Initial log-replica placement for VOLUME_ADD: delegates to pure server/place.c (r9-plan). */
+static int cl_place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
 {
-    uint32_t cand[META_STRIPE_MAX * 16], nc = 0, holds[META_STRIPE_MAX * 16];
-    for (uint32_t i = 0; i < C.sm.nmembers && nc < sizeof cand / sizeof cand[0]; i++) {
-        const struct meta_member *mb = &C.sm.members[i];
-        if (!placeable(mb, now))
-            continue;
-        const struct heard *h = heard_get(mb->id);
-        uint32_t up = mb->id == C.id ? atomic_load_explicit(&g_chunk_stores, memory_order_relaxed)
-                                     : (h && h->have_stores ? h->chunk_stores : 0);
-        if (!up)
-            continue;
-        holds[nc] = 0;
-        for (uint32_t v = 0; v < C.sm.nvolumes; v++)
-            for (uint32_t k = 0; k < C.sm.volumes[v].nstripe; k++)
-                holds[nc] += C.sm.volumes[v].stripe[k] == mb->id;
-        cand[nc++] = i;
-    }
-    *qualify = nc;
-    if (nc < ns)
-        return -1;
-    uint8_t used[META_STRIPE_MAX * 16] = {0};
-    for (uint32_t k = 0; k < ns; k++) {
-        int best = -1;
-        uint32_t best_rack = 0;
-        for (uint32_t i = 0; i < nc; i++) {
-            if (used[i])
-                continue;
-            uint32_t rack = 0; /* positions already on this candidate's rack */
-            for (uint32_t j = 0; j < k; j++)
-                rack += !strcmp(C.sm.members[cand[i]].rack, meta_member(&C.sm, stripe[j])->rack);
-            if (best < 0 || rack < best_rack || (rack == best_rack && holds[i] < holds[best])) {
-                best = (int)i;
-                best_rack = rack;
-            }
-        }
-        used[best] = 1;
-        stripe[k] = C.sm.members[cand[best]].id;
-    }
-    return 0;
+    uint32_t nm = 0;
+    struct place_member *pm = build_place_members(now, &nm, NULL, NULL);
+    struct place_in in = {
+        .sm = &C.sm,
+        .members = pm,
+        .nmembers = nm,
+        .mono_ms = now / MS,
+        .self_id = C.id,
+        .mutant = place_mutant_env(),
+    };
+    place_settings_default(&in.set);
+    int rc = place_volume(&in, n, nodes);
+    free(pm);
+    return rc;
+}
+
+/* Initial EC stripe-group placement for VOLUME_ADD_EC: delegates to pure server/place.c (r9-plan, E9, D20). */
+static int cl_place_stripe(uint32_t ns, uint64_t now, uint32_t *stripe, uint32_t *qualify)
+{
+    uint32_t nm = 0;
+    struct place_member *pm = build_place_members(now, &nm, NULL, NULL);
+    struct place_in in = {
+        .sm = &C.sm,
+        .members = pm,
+        .nmembers = nm,
+        .mono_ms = now / MS,
+        .self_id = C.id,
+        .mutant = place_mutant_env(),
+    };
+    place_settings_default(&in.set);
+    int rc = place_stripe(&in, ns, stripe, qualify);
+    free(pm);
+    return rc;
 }
 
 static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r, int ec)
@@ -4611,14 +4604,14 @@ static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r, int e
         admin_reply(c->serial, reqid, META_ERR_RANGE, NULL, 0);
         return;
     }
-    if (place_volume(n, iso_now_ns(), a.nodes) != 0) {
+    if (cl_place_volume(n, iso_now_ns(), a.nodes) != 0) {
         say("volume add %s: fewer than %" PRIu32 " live members take volumes", a.name, n);
         admin_reply(c->serial, reqid, CLUSTER_ERR_FEW, NULL, 0);
         return;
     }
     if (ek) {
         uint32_t qualify = 0;
-        if (place_stripe((uint32_t)ek + em, iso_now_ns(), a.stripe, &qualify) != 0) {
+        if (cl_place_stripe((uint32_t)ek + em, iso_now_ns(), a.stripe, &qualify) != 0) {
             char msg[160];
             int ml = snprintf(msg, sizeof msg,
                               "%" PRIu32 " members qualify for an ec=%u+%u stripe group of %u (live, taking volumes, a "
@@ -7246,10 +7239,10 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
             old_ok = 1;
     }
     const struct meta_member *om = meta_member(&C.sm, p->old);
-    int fs_down = om && ((om->state == META_DOWN && om->down_reason == META_DOWN_FAILSTOP) || om->state == META_OUT) &&
+    int fs_down = om && om->state == META_DOWN && om->down_reason == META_DOWN_FAILSTOP &&
                   cl_mutant() != CLM_FAILSTOPPROMO;
-    if (!old_ok && (!om || (om->state != META_UP && !fs_down) || now >= promote_safe_ns(p->old) ||
-                    cl_mutant() == CLM_OLDPASS))
+    if (!old_ok && (!om || om->state == META_DESTROYED || (om->state == META_DOWN && !fs_down) ||
+                    now >= promote_safe_ns(p->old) || cl_mutant() == CLM_OLDPASS))
         old_ok = 1;
     if (!nrep) {
         if (!p->said && since(now, p->t0) >= PROMO_WAIT_NS && p->reason != META_GR_PLANNED) {
@@ -7275,10 +7268,16 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
     g.target = p->target;
     g.min_end = p->min_end;
     /* not the failed or the cut-off one; a planned transfer (target) passes every reply, the drained old leader's
-     * included, so that no member is left `unanswered` (ctr_reply_passes, D14) */
+     * included, so that no member is left `unanswered` (ctr_reply_passes, D14). For an OUT/DESTROYED leader, prefer
+     * another ISR member if one replied, else fall back to the old leader so a sole-ISR volume never wedges. */
+    int other_replied = 0;
+    for (uint32_t i = 0; i < p->nfenced; i++)
+        if (p->replied[i] && p->fenced[i] != p->old)
+            other_replied = 1;
     for (uint32_t i = 0; i < p->nfenced; i++)
         if (p->replied[i] && (p->target ? ctr_reply_passes(p->target, p->fenced[i])
-                                        : !((p->reason == META_GR_FENCED || p->reason == META_GR_PLANNED) &&
+                                        : !((p->reason == META_GR_FENCED || p->reason == META_GR_PLANNED ||
+                                             (om && om->state >= META_OUT && other_replied)) &&
                                             p->fenced[i] == p->old))) {
             g.reply[g.nreplies++] = p->reply[i];
             if (p->reply[i].durable > best)
@@ -7474,6 +7473,10 @@ static void promote_duty(uint64_t now)
         }
     }
     g_npromo = k;
+    const struct meta_settings *ps = settings();
+    uint64_t pto = (uint64_t)ps->node_timeout_ms * MS;
+    uint64_t pwait = cluster_lease_safe(0, ps->lease_ms, ps->drift_ppm);
+    int psettled = since(now, C.leader_since) >= (pwait > pto ? pwait : pto);
     for (uint32_t i = 0; i < C.sm.nvolumes; i++) {
         const struct meta_volume *v = &C.sm.volumes[i];
         if (v->kind != META_VOL_REPLICATED || !v->nhist || !v->leader)
@@ -7484,6 +7487,9 @@ static void promote_duty(uint64_t now)
             uint8_t reason = 0;
             if (m && m->state == META_DOWN)
                 reason = META_GR_UNHEARD;
+            else if (m && m->state >= META_OUT && psettled && !heard_fresh(v->leader, now) &&
+                     (cl_mutant() == CLM_NOPROMOTEWAIT || now >= promote_safe_ns(v->leader)))
+                reason = META_GR_UNHEARD;
             else if (vol_reports_fault(v->leader, v))
                 reason = META_GR_FENCED;
             struct vstate *vs = nres ? vs_find(v->number) : NULL;
@@ -7492,7 +7498,8 @@ static void promote_duty(uint64_t now)
                     reason = META_GR_RESIGNED;
                 vs->resigned = 0;
             }
-            if (!reason && m && m->state == META_UP && leader_deposed(v, now, &own, &have_own)) {
+            if (!reason && m && (m->state == META_UP || m->state == META_DRAINING || m->state == META_OUT) &&
+                heard_fresh(v->leader, now) && leader_deposed(v, now, &own, &have_own)) {
                 say("volume %" PRIu32 ": leader %" PRIu32 " of epoch %" PRIu64 " is up but has not led it for %llu ms "
                     "(deposed by a fence no promotion followed); taken as its resignation", v->number, v->leader,
                     v->epoch, (unsigned long long)(DEPOSED_HOLD_NS / MS));
@@ -7551,53 +7558,9 @@ static void place_duty(uint64_t now)
     uint64_t wall_ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
                            ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
                            : now / MS;
-    uint32_t nm = C.sm.nmembers;
-    struct place_member *pm = nm ? calloc(nm, sizeof *pm) : NULL;
-    if (nm && !pm)
-        oom();
-    uint32_t total_fills = 0;
-    for (size_t i = 0; i < C.nheard; i++)
-        total_fills += C.heard[i].nfills;
-    struct place_fill *pf = total_fills ? calloc(total_fills, sizeof *pf) : NULL;
-    if (total_fills && !pf)
-        oom();
-    uint32_t nf = 0;
-    for (uint32_t i = 0; i < nm; i++) {
-        uint32_t id = C.sm.members[i].id;
-        struct heard *h = heard_get(id);
-        pm[i].id = id;
-        pm[i].fill_pct = 0xff; /* unknown unless reported in HBS_NODE */
-        uint64_t last = heard_ns(id, now);
-        pm[i].heard_age_ms = last ? since(now, last) / MS : UINT64_MAX;
-        if (h) {
-            pm[i].opening = h->opening;
-            pm[i].failstop = h->failstop;
-            pm[i].fill_pct = h->fill_pct;
-            pm[i].chunk_stores = h->have_stores ? h->chunk_stores : 0;
-            for (uint32_t j = 0; j < h->nvols && pm[i].nfaults < PLACE_FAULTS_MAX; j++) {
-                if (h->vols[j].v.health == CL_HEALTH_LOCAL_FAULT && h->vols[j].fault_ns) {
-                    pm[i].faults[pm[i].nfaults].volume = h->vols[j].v.volume;
-                    pm[i].faults[pm[i].nfaults].fault_s = since(now, h->vols[j].fault_ns) / (1000 * MS);
-                    pm[i].nfaults++;
-                }
-            }
-            for (uint32_t j = 0; j < h->nfills && nf < total_fills; j++) {
-                pf[nf].node = id;
-                pf[nf].volume = h->fills[j].volume;
-                pf[nf].pos = h->fills[j].pos;
-                pf[nf].stripe_version = h->fills[j].version;
-                pf[nf].done = h->fills[j].done;
-                pf[nf].total = h->fills[j].total;
-                pf[nf].whole = h->fills[j].whole;
-                nf++;
-            }
-        } else if (id == C.id) {
-            pm[i].opening = (uint8_t)(atomic_load_explicit(&g_hb_opening, memory_order_relaxed) != 0);
-            pm[i].failstop = (uint8_t)(atomic_load_explicit(&g_hb_failstop, memory_order_relaxed) != 0);
-            pm[i].fill_pct = atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed);
-            pm[i].chunk_stores = atomic_load_explicit(&g_chunk_stores, memory_order_relaxed);
-        }
-    }
+    uint32_t nm = 0, nf = 0;
+    struct place_fill *pf = NULL;
+    struct place_member *pm = build_place_members(now, &nm, &pf, &nf);
     struct place_in in = {
         .sm = &C.sm,
         .members = pm,
@@ -7607,6 +7570,7 @@ static void place_duty(uint64_t now)
         .now_ms = wall_ms,
         .mono_ms = now / MS,
         .self_id = C.id,
+        .mutant = place_mutant_env(),
     };
     place_settings_default(&in.set);
     in.set.rebuild_after_s = C.sm.set.rebuild_after_s;
@@ -7628,6 +7592,15 @@ static void place_duty(uint64_t now)
             atomic_fetch_add_explicit(&g_out_guard_passed, 1, memory_order_relaxed);
         say("%s", out.logs[i].msg);
     }
+    /* Deduplicate repeated deferral log lines per volume (pruned each tick so resolved deferrals don't linger). */
+    struct defer_entry {
+        uint32_t vol;
+        const char *why;
+    };
+    static struct defer_entry defer_last[64];
+    static uint32_t ndefer_last;
+    struct defer_entry defer_next[64];
+    uint32_t ndefer_next = 0;
     for (uint32_t i = 0; i < out.nprops && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
         const struct place_prop *p = &out.props[i];
         if (p->kind == PLACE_PROP_MEMBER_STATE) {
@@ -7653,16 +7626,31 @@ static void place_duty(uint64_t now)
                 say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", p->node,
                     meta_member_state_name(p->state), p->version);
         } else if (p->kind == PLACE_PROP_REPLICA_ADD) {
-            /* TODO(r9-plan): route automatic log moves through cmove so g_mv tracks the move (progress,
-             * min_isr, status, and cancel). Do not propose a bare REPLICA_ADD directly. */
-            say("place: REPLICA_ADD for vol %" PRIu32 " replaces %" PRIu32
-                " skipped (awaiting cmove wiring in r9-plan)",
-                p->volume, p->other_node);
-            continue;
+            const char *why = cmove_start_auto(p->volume, p->other_node, p->node, now);
+            if (why && why != cmove_err_already_proposed) {
+                int same = 0;
+                for (uint32_t di = 0; di < ndefer_last; di++)
+                    if (defer_last[di].vol == p->volume && defer_last[di].why == why)
+                        same = 1;
+                if (!same)
+                    say("place: move of volume %" PRIu32 " from node %" PRIu32 " to node %" PRIu32 " deferred: %s",
+                        p->volume, p->other_node, p->node, why);
+                if (ndefer_next < sizeof defer_next / sizeof defer_next[0])
+                    defer_next[ndefer_next++] = (struct defer_entry){.vol = p->volume, .why = why};
+            }
+        } else if (p->kind == PLACE_PROP_REPLICA_REMOVE) {
+#ifdef TSDB_TEST_HOOKS
+            if (in.mutant == PLACE_MUT_MOVE_SHRINKS) {
+                struct meta_entry e;
+                meta_entry_init(&e);
+                meta_op_replica_remove(&e, p->volume, p->epoch, p->node);
+                (void)propose(&e, 0, 0, 0);
+            }
+#endif
         } else if (p->kind == PLACE_PROP_STRIPE_SET) {
             struct meta_entry e;
             meta_entry_init(&e);
-            meta_op_stripe_set(&e, p->volume, p->pos, p->node, p->version, p->reason, p->other_node);
+            meta_op_stripe_set(&e, p->volume, p->pos, p->node, p->reason, p->other_node, p->version);
             (void)propose(&e, 0, 0, 0);
         } else if (p->kind == PLACE_PROP_STRIPE_WHOLE) {
             struct meta_entry e;
@@ -7674,6 +7662,8 @@ static void place_duty(uint64_t now)
         }
         /* TODO(r9-whole, r9-return): wire PLACE_PROP_GC_RELEASE and PLACE_PROP_MOVE_CANCEL once handlers land. */
     }
+    memcpy(defer_last, defer_next, ndefer_next * sizeof defer_last[0]);
+    ndefer_last = ndefer_next;
     place_out_free(&out);
     free(pf);
     free(pm);

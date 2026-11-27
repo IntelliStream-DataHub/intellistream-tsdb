@@ -13,6 +13,7 @@
  */
 #include "cluster.h"
 #include "meta.h"
+#include "place.h"
 #include "raft/raft.h"
 
 #include <inttypes.h>
@@ -324,7 +325,7 @@ static void print_status(const struct cluster_status *st)
         } else {
             printf(" redundancy replicas=%" PRIu32, v->nrep);
         }
-        printf("\n");
+        printf(" rack loss survivable: %s\n", place_rack_survivable(&m, v) ? "yes" : "no");
         for (uint32_t k = 0; k < v->nrep; k++) {
             printf("replica volume %" PRIu32 " node %" PRIu32 " rid %016" PRIx64 " open_gen %" PRIu64, v->number,
                    v->rep[k].node, v->rep[k].rid, v->rep[k].open_gen);

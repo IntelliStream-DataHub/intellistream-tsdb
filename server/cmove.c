@@ -351,6 +351,53 @@ static void reply(uint64_t conn, uint32_t reqid, int32_t rc, const char *fmt, ..
     cl_admin_reply(conn, reqid, rc, b, l < 0 ? 0 : (size_t)l < sizeof b ? (size_t)l : sizeof b - 1);
 }
 
+const char cmove_err_already_proposed[] = "a move of the volume is already proposed";
+
+/* Shared validation and proposal path for operator (`cmove_admin`) and planner (`cmove_start_auto`) log moves.
+ * Returns NULL on success (with *rid_out set), or an error string (and *rc_out set to META_ERR_* / CLUSTER_ERR_*). */
+static const char *mv_propose_add(const struct meta_volume *v, uint32_t from, uint32_t to, uint64_t now, int dedup_pend,
+                                  int *rc_out, uint64_t *rid_out)
+{
+    const struct meta_replica *in = moving_in(v);
+    struct mv *prev = mv_find(v->number);
+    if (dedup_pend && prev && !prev->seen && since(now, prev->t0) < ADD_WAIT_NS) {
+        *rc_out = CLUSTER_ERR_RETRY;
+        return cmove_err_already_proposed;
+    }
+    const struct meta_member *mb = meta_member(cl_meta(), to);
+    const char *no = in                                         ? "a move of the volume is running"
+                     : !meta_replica(v, from)                   ? "the old node is not a member of the volume"
+                     : meta_replica(v, to)                      ? "the new node is a member already"
+                     : !mb || !(mb->flags & META_MF_VOLUMES_OK) ? "the new node may not hold volumes"
+                     : !member_up(to, now)                      ? "the new node is not up"
+                     : v->nrep >= META_REPLICAS_MAX             ? "the volume has as many replicas as it may"
+                     : g_nmv == sizeof g_mv / sizeof g_mv[0]    ? "too many moves under way"
+                                                                : NULL;
+    if (no) {
+        *rc_out = META_ERR_INVALID;
+        return no;
+    }
+    uint64_t rid = fresh_rid(v);
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_replica_add(&e, v->number, v->epoch, to, rid, from);
+    if (cl_propose(&e) != 0) { /* frees e */
+        *rc_out = CLUSTER_ERR_RETRY;
+        return "not proposed (try again)";
+    }
+    if (prev) /* an entry of a move whose end this leader has not seen yet */
+        *prev = g_mv[--g_nmv];
+    struct mv *m = mv_new(v->number, from, to, rid, now);
+    if (m) {
+        m->mine = 1;
+        m->min_isr = v->nisr;
+        m->have_min = 1;
+    }
+    atomic_fetch_add_explicit(&n_started, 1, memory_order_relaxed);
+    *rid_out = rid;
+    return NULL;
+}
+
 void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
 {
     uint32_t vol, from, to, flags;
@@ -378,16 +425,6 @@ void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
             no = "no such move is running";
         else if (!meta_volume_in_isr(v, from) && meta_volume_in_isr(v, to))
             no = "too late: the old member has left the ISR (the move finishes)";
-    } else if (!no) {
-        const struct meta_member *mb = meta_member(cl_meta(), to);
-        no = in                                         ? "a move of the volume is running"
-             : !meta_replica(v, from)                   ? "the old node is not a member of the volume"
-             : meta_replica(v, to)                      ? "the new node is a member already"
-             : !mb || !(mb->flags & META_MF_VOLUMES_OK) ? "the new node may not hold volumes"
-             : !member_up(to, now)                      ? "the new node is not up"
-             : v->nrep >= META_REPLICAS_MAX             ? "the volume has as many replicas as it may"
-             : g_nmv == sizeof g_mv / sizeof g_mv[0]    ? "too many moves under way"
-                                                        : NULL;
     }
     if (no) {
         reply(conn, reqid, META_ERR_INVALID, "%s: %s", what, no);
@@ -405,22 +442,13 @@ void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
               from);
         return;
     }
-    uint64_t rid = fresh_rid(v);
-    struct meta_entry e;
-    meta_entry_init(&e);
-    meta_op_replica_add(&e, vol, v->epoch, to, rid, from);
-    if (cl_propose(&e) != 0) { /* frees e */
-        reply(conn, reqid, CLUSTER_ERR_RETRY, "%s: not proposed (try again)", what);
+    int rc = META_OK;
+    uint64_t rid = 0;
+    no = mv_propose_add(v, from, to, now, 0, &rc, &rid);
+    if (no) {
+        reply(conn, reqid, rc, "%s: %s", what, no);
         return;
     }
-    struct mv *m = mv_find(vol);
-    if (m) /* an entry of a move whose end this leader has not seen yet */
-        *m = g_mv[--g_nmv];
-    if ((m = mv_new(vol, from, to, rid, now))) {
-        m->mine = 1;
-        m->min_isr = v->nisr, m->have_min = 1;
-    }
-    atomic_fetch_add_explicit(&n_started, 1, memory_order_relaxed);
     cl_say("volume %" PRIu32 ": %s proposed (replica %016" PRIx64 ", ISR of %" PRIu32 ")", vol, what, rid, v->nisr);
     test_read();
     if (T.duty_at_propose) /* the round that falls before the ADD applies, every time */
@@ -428,6 +456,31 @@ void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
     reply(conn, reqid, META_OK,
           "%s: proposed (replica %016" PRIx64 "); it runs in the background: learner, join, shrink, remove\n", what,
           rid);
+}
+
+const char *cmove_start_auto(uint32_t vol, uint32_t from, uint32_t to, uint64_t now)
+{
+    if (!cl_leading())
+        return "not the Raft leader";
+    if (cl_term() != g_term) {
+        g_nmv = 0;
+        g_term = cl_term();
+    }
+    const struct meta_volume *v = meta_volume(cl_meta(), vol);
+    if (!v)
+        return "no such volume";
+    if (v->kind != META_VOL_REPLICATED || !v->nhist)
+        return "not a replicated volume";
+    if (from == to)
+        return "the same node twice";
+    int rc = META_OK;
+    uint64_t rid = 0;
+    const char *no = mv_propose_add(v, from, to, now, 1, &rc, &rid);
+    if (no)
+        return no;
+    cl_say("volume %" PRIu32 ": automatic move from node %" PRIu32 " to node %" PRIu32
+           " proposed (replica %016" PRIx64 ", ISR of %" PRIu32 ")", vol, from, to, rid, v->nisr);
+    return NULL;
 }
 
 size_t cmove_status(char *out, size_t n, uint64_t now)

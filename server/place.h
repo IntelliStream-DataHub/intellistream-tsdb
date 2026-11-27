@@ -98,6 +98,18 @@ enum place_mutant {
     PLACE_MUT_BALANCE_UNBOUNDED = 12,
 };
 
+/* Active `node replace OLD NEW` intent (r9-ops records; place_plan sends each of OLD's positions to NEW). */
+struct place_replace {
+    uint32_t old_node;
+    uint32_t new_node;
+};
+
+/* Optional per-volume byte size from heartbeats for E13 tie-breaking (0/absent: tie-break by volume number). */
+struct place_vol_size {
+    uint32_t volume;
+    uint64_t bytes;
+};
+
 /* Complete read-only input to pout_plan / place_plan / balance_plan (D7). */
 struct place_in {
     const struct meta_state *sm; /* applied metadata state (never mutated) */
@@ -110,6 +122,10 @@ struct place_in {
     uint32_t self_id;  /* this Raft leader's member id */
     struct place_settings set;
     int mutant;        /* enum place_mutant (0 in production) */
+    const struct place_replace *replaces; /* optional active node-replace intents (NULL/0: none) */
+    uint32_t nreplaces;
+    const struct place_vol_size *vol_sizes; /* optional per-volume bytes (NULL/0: none) */
+    uint32_t nvol_sizes;
 };
 
 /* Kinds of proposals a planner may emit. */
@@ -121,6 +137,7 @@ enum place_prop_kind {
     PLACE_PROP_GC_RELEASE = 5,      /* MK_GC release request(volume, pos, node, stripe_version) */
     PLACE_PROP_MOVE_CANCEL = 6,     /* cancel an in-flight log move(volume, from_node, to_node) */
     PLACE_PROP_VOLUME_TRANSFER = 7, /* planned leader transfer(volume, node) for balancer */
+    PLACE_PROP_REPLICA_REMOVE = 8,  /* REPLICA_REMOVE(volume, epoch, node) — mutant moveshrinks only */
 };
 
 struct place_prop {
@@ -157,5 +174,18 @@ int place_out_log(struct place_out *out, const char *fmt, ...) __attribute__((fo
 void pout_plan(const struct place_in *in, struct place_out *out);
 void place_plan(const struct place_in *in, struct place_out *out);
 void balance_plan(const struct place_in *in, struct place_out *out);
+
+/* Initial placement for VOLUME_ADD / VOLUME_ADD_EC (pure; moved from cluster.c by r9-plan; §3.2 rules 1-4, E9, D20).
+ * Returns 0 on success, -1 if fewer than n (or ns) eligible members qualify. */
+int place_volume(const struct place_in *in, uint32_t n, uint32_t *nodes);
+int place_stripe(const struct place_in *in, uint32_t ns, uint32_t *stripe, uint32_t *qualify);
+
+/* Returns 1 if losing any single rack leaves volume `v` survivable in both log and EC tiers (E9, D20), else 0. */
+int place_rack_survivable(const struct meta_state *sm, const struct meta_volume *v);
+
+/* Parse a mutant name (NULL or "" -> PLACE_MUT_NONE; unknown -> -1). */
+int place_mutant_parse(const char *name);
+/* Read TSDB_PLACE_MUTANT once (tests only, outside pure planners; 0 in production builds). */
+int place_mutant_env(void);
 
 #endif
