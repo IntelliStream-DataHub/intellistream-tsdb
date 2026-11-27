@@ -219,7 +219,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; `MK_COLD` = 11, `MK_GC` = 12, `MK_DIGEST` = 13, `MK_UNSETTLE` = 14 = `MK_TYPE_LAST`, `MK_EC_LATER_LO..HI` = 15..15 reserved
   for R10 (`MK_DROP_OBJ`) and admitted nowhere; `mk_type_admitted` gates both writer and replay on `requires=ec|tier`; `test_marker`
-  mutants `mkcoldbounds mkadmitall ecpposloose mkwriteany mkretired`; `jr_intent`/`jr_commit` and `jr_cold`/
+  mutants `mkcoldbounds mkadmitall ecpposloose mkwriteany`; `jr_intent`/`jr_commit` and `jr_cold`/
   `jr_markers_append`/`jr_markers_wait` in `src/replica.c` carry them).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
   per-partition vectors, the HyperLogLogs of active series, the hot lists (reads, writes, bytes per row) and the
@@ -1066,8 +1066,20 @@ cgroup, so `nice` does not keep your work out of its way.
     configured (including a read-only or follower open without `TIERS`) and every build without
     `TSDB_EC` fails. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says
     `requires=tier` is then refused at open.
-  - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); on a single
-    server `eng_reencode` / `ecpolicy_pick_reencode` (R10) combines them (`> ecpolicy_objects_max` or `> 10%` tombstones).
+  - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); `eng_reencode` /
+    `ecpolicy_pick_reencode` (R10) combines them (`> ecpolicy_objects_max` or `> 10%` tombstones) on both single-server
+    tiers and cluster EC leaders (`r10-crepl`, D24). On a cluster EC leader (`eccold_reencode`), re-encode enforces the
+    suffix LWW invariant (no `.ec` above `I`, no young part below `I`), merges/verifies pre-put, puts to the stripe group,
+    gates and cuts at `Z`, appends `MK_COLD` naming both the new object (or empty `.part` as `Y`) and the retired oids
+    (`nretired`/`retired`), swaps via `ec_swap_reencode` with `ecapply_swap_pre/post` and `need_digest` GC gating, verifies
+    the post-swap read-back logical digest (`ecdigest_leader_reencode`), commits `MK_DIGEST`, and only then releases retired
+    objects to `MK_GC` (`need_applied = digest_pos`) and young sources to `eckeep`. Replicas apply `MK_COLD` in `ecapply.c`
+    (retiring named `.ec` parts as `retired_*.ec` and own non-`.ec` parts `<= Z` as `settled_*` under intent v5, diverging
+    on parts `> Z`, with `ecapply_cold_decide_ex` handling empty-output recovery) and verify `MK_DIGEST` synchronously on
+    jobs with `retired_*.ec` before advancing `applied` (with bounded transient-`UNAVAILABLE` retry, never acknowledging on
+    read failure or mismatch). Test hooks `TSDB_REENCODE_HOLD`, `TSDB_ECCOLD_TEST=pause_before_digest=<path>`,
+    `TSDB_ECCOLD_MUTANT=retiredunnamed`, `TSDB_ECGC_MUTANT=gcbeforedigest`; tests `test_ecapply --case reencode`,
+    `test_cluster reencode` (in `CLUSTER_SCEN_3`), and `make reencode-mutants` (`retiredunnamed`, `gcbeforedigest`).
     Cluster unsettle (`r10-unsettle`, `MK_UNSETTLE = 14`, §6.4, D14, D27) converts settled keys back to plain `.part`
     files on all log replicas: `eng_ec_keys` lists settled keys, `eng_unsettle_key` prepares local `.part` files unlocked
     (Source 1 `settled_` or Source 2 cluster chunk decode with sum/digest/granule checks), takes `jr_serial`, arms

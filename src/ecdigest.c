@@ -4,9 +4,12 @@
  * (the comparison runs on eckeep's thread, src/eckeep.c).
  */
 #include "internal.h"
+#include "ecapply.h"
 #include "ecdigest.h"
 #include "ecdiverge.h"
+#include "ecgc.h"
 #include "eckeep.h"
+#include "ecpart.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -18,9 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 int ecdigest_mutant;
 atomic_bool ecdigest_test_alter;
+_Atomic int64_t ecdigest_test_retry_ms = -1;
 static _Thread_local bool alter_next; /* the job check of this thread changes the value of the next row it hashes */
 
 int ecdigest_mutant_parse(const char *name)
@@ -312,8 +317,11 @@ int ecd_freeze(eng *db, part **set, size_t n, int64_t key, int64_t now_ms, ecd_c
 
 /* ------------------------------------------------------------ the leader */
 
-int ecdigest_leader(eng *db, int64_t key, uint64_t z, part **set, size_t n, const uint8_t *oids, size_t noids)
+static int leader_digest_ex(eng *db, int64_t key, uint64_t z, part **set, size_t n, part **out_set, size_t nout,
+                            const uint8_t *oids, size_t noids, uint64_t *pos_out)
 {
+    if (pos_out)
+        *pos_out = 0;
     if (noids > MK_FILES_MAX)
         return TSDB_ERR_INVALID;
     /* The clock, the cutoffs and the tombstone decision are taken under ret_lock, the rows are read without it, and the
@@ -325,6 +333,8 @@ int ecdigest_leader(eng *db, int64_t key, uint64_t z, part **set, size_t n, cons
     const char *what = "a settle's DIGEST marker was appended but its commit point did not come";
     uint64_t last = 0;
     int rc;
+    bool mismatch = false;
+    ec_ldigest d_in = {0}, d_out = {0};
     for (int tries = 0;; tries++) {
         bool under = tries >= 3;
         pthread_mutex_lock(&db->ret_lock);
@@ -336,9 +346,10 @@ int ecdigest_leader(eng *db, int64_t key, uint64_t z, part **set, size_t n, cons
         rc = ecd_freeze(db, set, n, key, now, &cuts, &nc);
         if (!under)
             pthread_mutex_unlock(&db->ret_lock);
-        ec_ldigest d;
         if (rc == 0)
-            rc = ec_logical_digest_frozen(db, set, n, key, cuts, nc, tombs, &d);
+            rc = ec_logical_digest_frozen(db, set, n, key, cuts, nc, tombs, &d_in);
+        if (rc == 0 && out_set)
+            rc = ec_logical_digest_frozen(db, out_set, nout, key, cuts, nc, tombs, &d_out);
         free(cuts);
         if (!under)
             pthread_mutex_lock(&db->ret_lock);
@@ -346,25 +357,53 @@ int ecdigest_leader(eng *db, int64_t key, uint64_t z, part **set, size_t n, cons
             pthread_mutex_unlock(&db->ret_lock);
             continue;
         }
+        if (rc == 0 && out_set &&
+            (d_in.rows != d_out.rows || d_in.series != d_out.series || d_in.xxh64 != d_out.xxh64)) {
+            mismatch = true;
+            rc = TSDB_ERR_CORRUPT;
+            pthread_mutex_unlock(&db->ret_lock);
+            break;
+        }
         if (rc == 0) {
             mk m;
             memset(&m, 0, sizeof m);
             m.type = MK_DIGEST;
             m.span = 1;
             m.flags = tombs ? MKD_TOMBS : 0;
-            m.u.digest = (mk_digest){.key = key, .z = z, .rows = d.rows, .series = d.series, .xxh64 = d.xxh64,
-                                     .now_ms = now, .noids = (uint32_t)noids, .oids = oids};
+            m.u.digest = (mk_digest){.key = key, .z = z, .rows = d_in.rows, .series = d_in.series,
+                                     .xxh64 = d_in.xxh64, .now_ms = now, .noids = (uint32_t)noids, .oids = oids};
             rc = jr_markers_append(db, &m, 1, what, &last);
         }
         pthread_mutex_unlock(&db->ret_lock);
         break;
     }
+    if (mismatch) {
+        fprintf(stderr, "tsdb: %s: re-encode: key %" PRId64 ": leader logical digest mismatch (retired %" PRIu64
+                " rows/%" PRIu64 " series/%016" PRIx64 ", output %" PRIu64 "/%" PRIu64 "/%016" PRIx64
+                "): volume is DIVERGED, retired objects kept\n",
+                db->dir, key, d_in.rows, d_in.series, d_in.xxh64, d_out.rows, d_out.series, d_out.xxh64);
+        ec_diverge(db, key, noids ? oids : NULL, EC_DIV_DIGEST);
+        return TSDB_ERR_CORRUPT;
+    }
     if (rc == 0)
         rc = jr_markers_wait(db, last, what);
+    if (rc == 0 && pos_out)
+        *pos_out = last;
     if (rc && rc != TSDB_ERR_INDETERMINATE)
         fprintf(stderr, "tsdb: %s: settle: key %" PRId64 ": the DIGEST marker was not appended (%d)\n", db->dir, key,
                 rc);
     return rc;
+}
+
+int ecdigest_leader(eng *db, int64_t key, uint64_t z, part **set, size_t n, const uint8_t *oids, size_t noids)
+{
+    return leader_digest_ex(db, key, z, set, n, NULL, 0, oids, noids, NULL);
+}
+
+int ecdigest_leader_reencode(eng *db, int64_t key, uint64_t z, part **in_set, size_t nin, part **out_set, size_t nout,
+                             const uint8_t *oids, size_t noids, uint64_t *pos_out)
+{
+    return leader_digest_ex(db, key, z, in_set, nin, out_set, nout, oids, noids, pos_out);
 }
 
 /* ------------------------------------------------------------ a replica's jobs */
@@ -503,7 +542,7 @@ static int job_read(eng *db, const char *file, ecd_job *j)
                     memcpy(j->names[i], b + off, l);
                     j->names[i][l] = 0;
                     off += l;
-                    if (!settled_part_name(j->names[i]) || strchr(j->names[i], '/'))
+                    if ((!settled_part_name(j->names[i]) && !ec_retired_name(j->names[i])) || strchr(j->names[i], '/'))
                         rc = TSDB_ERR_CORRUPT;
                 }
                 j->nnames = nn;
@@ -537,7 +576,10 @@ static int open_set(eng *db, char (*names)[256], size_t n, part ***out, size_t *
     int rc = 0;
     size_t m = 0;
     for (size_t i = 0; i < n && rc == 0; i++) {
-        rc = part_open_as(db->dirfd, names[i], names[i] + 8, false, false, &set[m]);
+        if (ec_retired_name(names[i]))
+            rc = part_open_ec(db, names[i], names[i] + 8, &set[m]);
+        else
+            rc = part_open_as(db->dirfd, names[i], names[i] + 8, false, false, &set[m]);
         if (rc == 0)
             set[m++]->verify = true; /* a copy's granule that fails its checksum is rot (D25), never hashed */
         else if (rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_CORRUPT) {
@@ -585,12 +627,14 @@ static void bind_job(eng *db, int64_t key, uint64_t z, char (*names)[256], size_
     ecd_job_free(&j);
 }
 
-void ecdigest_cold_bind(eng *db, int64_t key, uint64_t z, part *const *own, size_t nown)
+void ecdigest_cold_bind_ex(eng *db, int64_t key, uint64_t z, part *const *own, size_t nown, part *const *ret_ec,
+                           size_t nret_ec)
 {
-    if (!eckeep_active(db) || nown == 0)
+    size_t total = nown + nret_ec;
+    if (!eckeep_active(db) || total == 0)
         return;
     eckeep_jobs_load(db);
-    char (*names)[256] = malloc(nown * sizeof *names);
+    char (*names)[256] = malloc(total * sizeof *names);
     if (!names) {
         fprintf(stderr, "tsdb: %s: the retired copies of the COLD at Z %" PRIu64 " (key %" PRId64 ") have no job file "
                         "(out of memory): a restart holds them unbound\n", db->dir, z, key);
@@ -598,10 +642,17 @@ void ecdigest_cold_bind(eng *db, int64_t key, uint64_t z, part *const *own, size
     }
     for (size_t i = 0; i < nown; i++)
         snprintf(names[i], 256, "settled_%s", own[i]->name);
-    bind_job(db, key, z, names, nown);
+    for (size_t i = 0; i < nret_ec; i++)
+        snprintf(names[nown + i], 256, "retired_%s", ret_ec[i]->name);
+    bind_job(db, key, z, names, total);
 }
 
-void ecdigest_cold_rebind(eng *db, int64_t key, uint64_t z)
+void ecdigest_cold_bind(eng *db, int64_t key, uint64_t z, part *const *own, size_t nown)
+{
+    ecdigest_cold_bind_ex(db, key, z, own, nown, NULL, 0);
+}
+
+void ecdigest_cold_rebind_ex(eng *db, int64_t key, uint64_t z, const uint8_t *retired, uint32_t nretired)
 {
     if (!eckeep_active(db))
         return;
@@ -613,8 +664,34 @@ void ecdigest_cold_rebind(eng *db, int64_t key, uint64_t z)
         free(names); /* bound already (or armed) */
         return;
     }
-    if ((n = eckeep_unbound(db, key, &names)) != 0)
-        bind_job(db, key, z, names, n);
+    n = eckeep_unbound(db, key, &names);
+    char (*rnames)[256] = NULL;
+    size_t nr = 0;
+    if (nretired && retired)
+        (void)ecgc_find_retired_names(db, key, retired, nretired, &rnames, &nr);
+    if (n + nr == 0) {
+        free(names);
+        free(rnames);
+        return;
+    }
+    if (nr) {
+        char (*all)[256] = realloc(names, (n + nr) * sizeof *all);
+        if (!all) {
+            free(names);
+            free(rnames);
+            return;
+        }
+        memcpy(all + n, rnames, nr * sizeof *all);
+        names = all;
+        n += nr;
+        free(rnames);
+    }
+    bind_job(db, key, z, names, n);
+}
+
+void ecdigest_cold_rebind(eng *db, int64_t key, uint64_t z)
+{
+    ecdigest_cold_rebind_ex(db, key, z, NULL, 0);
 }
 
 int ecdigest_apply(eng *db, uint64_t pos, const mk *m)
@@ -646,13 +723,98 @@ int ecdigest_apply(eng *db, uint64_t pos, const mk *m)
         rc = ecd_freeze(db, set, got, d->key, d->now_ms, &j.cuts, &j.ncuts);
         close_set(set, got);
     }
-    if (rc == 0)
-        rc = ecdigest_job_write(db, &j);
-    if (rc) {
-        fprintf(stderr, "tsdb: %s: the DIGEST at %" PRIu64 " (key %" PRId64 "): no job (%d); its %zu retired files are "
-                        "held until an operator acts\n", db->dir, pos, d->key, rc, j.nnames);
-        ecd_job_free(&j);
-        return eng_check(db) ? eng_check(db) : 0; /* held, never released unchecked; a failed engine stops the apply */
+    /* R10 (r10-crepl): when the retired set includes retired_*.ec objects, verify the logical digest synchronously
+     * (dropping rp->mu) BEFORE writing ECDJ_ARMED and BEFORE acknowledging MK_DIGEST so the leader's
+     * lead_applied_floor gate keeps those objects' chunks alive on the stripe group until every log replica has
+     * actually verified them (never acknowledging past a store outage or read failure). */
+    bool has_ec = false;
+    for (size_t i = 0; i < j.nnames && !has_ec; i++)
+        has_ec = ec_retired_name(j.names[i]);
+    if (rc == 0 && has_ec && db->rp && !atomic_load(&eckeep_test_pause)) {
+        int64_t retry_ms = atomic_load(&ecdigest_test_retry_ms);
+        if (retry_ms < 0)
+            retry_ms = 30000;
+        int64_t t0 = eng_mono_ms();
+        bool logged_unavail = false;
+        ec_ldigest got_d = {0};
+        size_t bad = 0;
+        int chk = 0;
+        uint64_t gen = replica_mu_drop(db);
+        for (;;) {
+            memset(&got_d, 0, sizeof got_d);
+            bad = 0;
+            chk = ecdigest_job_check(db, &j, &got_d, &bad);
+            if (chk != TSDB_ERR_UNAVAILABLE || atomic_load_explicit(&db->stop, memory_order_acquire) ||
+                atomic_load_explicit(&db->replica_stop, memory_order_acquire) || eng_check(db) != 0 ||
+                eng_mono_ms() - t0 >= retry_ms)
+                break;
+            if (!logged_unavail) {
+                fprintf(stderr, "tsdb: %s: MK_DIGEST at %" PRIu64 " (key %" PRId64
+                                "): chunk stores unavailable during retired .ec digest; retrying\n",
+                        db->dir, pos, d->key);
+                logged_unavail = true;
+            }
+            struct timespec ts = {0, 200 * 1000000L};
+            nanosleep(&ts, NULL);
+            if (replica_mu_retake(db, gen)) {
+                ecd_job_free(&j);
+                return RP_AGAIN;
+            }
+            gen = replica_mu_drop(db);
+        }
+        bool match = chk == 0 &&
+                     ((got_d.rows == j.want.rows && got_d.series == j.want.series && got_d.xxh64 == j.want.xxh64) ||
+                      ecdigest_mutant == ECDIGEST_MUT_SKIP);
+        bool mismatched = (chk == 0 && !match) || chk == ECD_REFUSED;
+        if (match) {
+            j.flags |= ECDJ_MATCHED;
+            rc = ecdigest_job_write(db, &j);
+        } else if (mismatched) {
+            if (chk == ECD_REFUSED)
+                fprintf(stderr, "tsdb: volume %" PRIu32 " partition %" PRId64 ": the %zu retired copies of the COLD "
+                        "at Z %" PRIu64 " cannot be digested: the volume is DIVERGED and the copies are kept\n",
+                        db->tier_vol, j.key, j.nnames, j.z);
+            else
+                fprintf(stderr, "tsdb: volume %" PRIu32 " partition %" PRId64 ": the logical digest of the %zu retired "
+                        "copies of the COLD at Z %" PRIu64 " is %" PRIu64 " rows, %" PRIu64 " series, %016" PRIx64
+                        "; its DIGEST says %" PRIu64 ", %" PRIu64 ", %016" PRIx64 ": the volume is DIVERGED and the "
+                        "copies are kept\n", db->tier_vol, j.key, j.nnames, j.z, got_d.rows, got_d.series, got_d.xxh64,
+                        j.want.rows, j.want.series, j.want.xxh64);
+            ec_diverge(db, j.key, j.oid, EC_DIV_DIGEST);
+            (void)ecdigest_job_write(db, &j);
+        }
+        if (replica_mu_retake(db, gen)) {
+            ecd_job_free(&j);
+            return RP_AGAIN;
+        }
+        if (mismatched) {
+            (void)eckeep_add_job(db, &j);
+            return TSDB_ERR_CORRUPT;
+        }
+        if (chk != 0) {
+            /* Do NOT arm or acknowledge MK_DIGEST: keep applied < pos so lead_applied_floor holds MK_GC back until
+             * this replica reopens and verifies the retired set (or an operator intervenes). */
+            fprintf(stderr, "tsdb: %s: MK_DIGEST at %" PRIu64 " (key %" PRId64 "): synchronous digest of %zu retired "
+                            "copies failed (%d, %zu bad): not acknowledging so retired chunks stay held\n",
+                    db->dir, pos, d->key, j.nnames, chk, bad);
+            ecd_job_free(&j);
+            return chk;
+        }
+        if (rc) {
+            fprintf(stderr, "tsdb: %s: the DIGEST at %" PRIu64 " (key %" PRId64 "): no job (%d); its %zu retired "
+                            "files are held until an operator acts\n", db->dir, pos, d->key, rc, j.nnames);
+            ecd_job_free(&j);
+            return eng_check(db) ? eng_check(db) : rc;
+        }
+    } else {
+        if (rc == 0)
+            rc = ecdigest_job_write(db, &j);
+        if (rc) {
+            fprintf(stderr, "tsdb: %s: the DIGEST at %" PRIu64 " (key %" PRId64 "): no job (%d); its %zu retired "
+                            "files are held until an operator acts\n", db->dir, pos, d->key, rc, j.nnames);
+            ecd_job_free(&j);
+            return eng_check(db) ? eng_check(db) : 0; /* held, never released unchecked; a failed engine stops the apply */
+        }
     }
     rc = eckeep_add_job(db, &j); /* takes the job */
     eckeep_supersede(db, d->key, d->z);
@@ -667,8 +829,12 @@ int ecdigest_job_check(eng *db, const ecd_job *j, ec_ldigest *got, size_t *bad)
         return TSDB_ERR_NOMEM;
     int rc = 0;
     size_t missing = 0, rotted = 0;
+    bool has_ec = false;
     for (size_t i = 0; i < j->nnames && rc == 0; i++) {
-        int r = part_open_as(db->dirfd, j->names[i], j->names[i] + 8, false, false, &set[i]);
+        bool is_ec = ec_retired_name(j->names[i]);
+        has_ec |= is_ec;
+        int r = is_ec ? part_open_ec(db, j->names[i], j->names[i] + 8, &set[i])
+                      : part_open_as(db->dirfd, j->names[i], j->names[i] + 8, false, false, &set[i]);
         if (r == TSDB_ERR_NOTFOUND) {
             missing++;
             continue;
@@ -682,6 +848,8 @@ int ecdigest_job_check(eng *db, const ecd_job *j, ec_ldigest *got, size_t *bad)
             break;
         }
         set[i]->verify = true; /* a granule that fails its checksum while digesting is caught as well */
+        if (is_ec)
+            continue; /* .ec granules are checked via the chunk seam (granule_read + encode-time cell sums) */
         bool rot = false; /* the whole copy, every granule: the digest reads only rows the cutoff and the tombstones
                            * leave */
         for (uint32_t g = 0; g < set[i]->ng && !rot && ecdigest_mutant != ECDIGEST_MUT_NOCRCWALK; g++) {
@@ -705,8 +873,14 @@ int ecdigest_job_check(eng *db, const ecd_job *j, ec_ldigest *got, size_t *bad)
         rc = ec_logical_digest_frozen(db, set, j->nnames, j->key, j->cuts, j->ncuts, (j->flags & ECDJ_TOMBS) != 0,
                                       got);
         alter_next = false;
-        if (rc == TSDB_ERR_CORRUPT) /* every checksum held: what the digest refused is the rows themselves */
-            rc = ECD_REFUSED;
+        if (rc == TSDB_ERR_CORRUPT) {
+            if (!has_ec) /* every checksum held: what the digest refused is the rows themselves */
+                rc = ECD_REFUSED;
+            else
+                *bad = 1;
+        } else if (rc == TSDB_ERR_NOTFOUND) {
+            *bad = 1;
+        }
     }
     close_set(set, j->nnames);
     return rc;

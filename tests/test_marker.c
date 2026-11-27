@@ -9,7 +9,7 @@
  *  - record_valid: ppos or stripe_version != 0 refused on a single server's tier and accepted for a cluster ec volume,
  *    positions != 0 refused always (mutant ecpposloose);
  *  - every reserved byte of COLD (its fixed part, an object entry, a file entry) and of COMMIT's file entries is refused
- *    when set, and COLD's retired oids (R10's) at any count (mutant mkretired);
+ *    when set, and COLD's retired oids (R10) round-trip and are checked against MK_FILES_MAX;
  *  - E17's admission table: GC and DIGEST need requires=ec, COLD ec or tier, 14 and 15 are admitted nowhere; the writer
  *    of a volume refuses what it does not admit (mutant mkwriteany), and an open refuses a segment that holds one,
  *    written while META had the word (mutant mkadmitall); with the word it replays;
@@ -17,7 +17,7 @@
  *  - requires=tier alone (a single server's tier) admits COLD at the writer and the replay, GC still refused.
  *
  *   ./build/test_marker [scratch dir]                                  must pass
- *   ./build/test_marker --mutant mkcoldbounds|mkadmitall|ecpposloose|mkwriteany|mkretired [scratch dir]    must fail
+ *   ./build/test_marker --mutant mkcoldbounds|mkadmitall|ecpposloose|mkwriteany [scratch dir]    must fail
  */
 #define _GNU_SOURCE
 #include "internal.h"
@@ -68,8 +68,8 @@ static void truncations(const uint8_t *p, size_t n, const char *what)
 /* ---------------------------------------------------------------- COLD */
 static void test_cold(void)
 {
-    /* three objects of record lengths 1, 5 and 4096 (padding on two), two .ec files and a Y file; two retired oids are
-     * refused (R10's list: written empty in R8, and a decode refuses one) */
+    /* three objects of record lengths 1, 5 and 4096 (padding on two), two .ec files, a Y file, and two retired oids
+     * (R10 re-encode) */
     uint32_t rl[3] = {1, 5, 4096};
     size_t olen = 0;
     for (int i = 0; i < 3; i++)
@@ -103,17 +103,14 @@ static void test_cold(void)
                          .files_len = fl, .retired = retired};
     uint8_t *p;
     size_t n;
-    int erc = mk_encode(&m, &p, &n); /* the encoder's own decode refuses the list */
-    CHECK(erc == TSDB_ERR_INVALID);
-    if (erc == 0)
-        free(p);
-    m.u.cold.nretired = 0, m.u.cold.retired = NULL;
     CHECK(mk_encode(&m, &p, &n) == 0);
     CHECK(mk_decode(p, n, &d) == 0);
     CHECK(d.type == MK_COLD && d.span == 1 && strcmp(mk_type_name(MK_COLD), "COLD") == 0);
     const mk_cold *c = &d.u.cold;
     CHECK(c->z == 123456789 && c->flush_through == 41 && c->stripe_version == 7 && c->key == 4 * 19700 + 1);
-    CHECK(c->nobjs == 3 && c->nfiles == 3 && c->nretired == 0 && c->objs_len == olen && c->files_len == fl);
+    CHECK(c->nobjs == 3 && c->nfiles == 3 && c->nretired == 2 && c->objs_len == olen && c->files_len == fl);
+    CHECK(memcmp(mk_oid_at(c->retired, 0), retired, MK_OID) == 0 &&
+          memcmp(mk_oid_at(c->retired, 1), retired + MK_OID, MK_OID) == 0);
     size_t pos = 0;
     mk_cold_obj o;
     uint32_t no = 0;
@@ -134,16 +131,14 @@ static void test_cold(void)
         nf++;
     }
     CHECK(nf == 3 && pos == c->files_len);
-    truncations(p, n, "COLD");
+    truncations(p, n, "COLD-reencode");
+    free(p);
 
-    /* the same payload with two retired oids behind it and the count set: refused (with mkretired it decodes) */
-    uint8_t *q = malloc(n + sizeof retired);
-    memcpy(q, p, n);
-    memcpy(q + n, retired, sizeof retired);
-    uint32_t two = 2;
-    memcpy(q + MK_HDR + 40, &two, 4);
-    CHECK(mk_decode(q, n + sizeof retired, &d) == TSDB_ERR_CORRUPT);
-    free(q);
+    /* regular settle (nretired == 0) */
+    m.u.cold.nretired = 0, m.u.cold.retired = NULL;
+    CHECK(mk_encode(&m, &p, &n) == 0);
+    CHECK(mk_decode(p, n, &d) == 0 && d.u.cold.nretired == 0);
+    truncations(p, n, "COLD");
     /* every reserved byte the encoder writes as zero: the fixed part's u32 at 44, an object entry's u32 after rec_len,
      * a file entry's byte after the kind; one encoding per payload */
     size_t resv[3] = {MK_HDR + 44, MK_HDR + 48 + MK_OID + 4, MK_HDR + 48 + olen + 3};
@@ -350,10 +345,9 @@ static void test_bounds(void)
             const uint8_t *rest = list == 0 ? objs : list == 1 ? files : ids;
             size_t rlen = (size_t)cnt * (list == 0 ? osz : list == 1 ? fsz : MK_OID);
             int rc = decode_body(MK_COLD, fixed, 48, rest, rlen);
-            int w = list == 2 ? TSDB_ERR_CORRUPT : want; /* a retired oid is refused at any count (R10's) */
-            if (rc != w)
-                fprintf(stderr, "COLD list %d with %u entries: decode gives %d, not %d\n", list, cnt, rc, w);
-            CHECK(rc == w);
+            if (rc != want)
+                fprintf(stderr, "COLD list %d with %u entries: decode gives %d, not %d\n", list, cnt, rc, want);
+            CHECK(rc == want);
         }
         /* GC, DIGEST and UNSETTLE */
         uint32_t g[2] = {MK_GC_RETIRED, cnt};
@@ -756,7 +750,6 @@ int main(int argc, char **argv)
                          : strcmp(mu, "mkadmitall") == 0  ? MK_MUT_ADMIT_ALL
                          : strcmp(mu, "ecpposloose") == 0 ? MK_MUT_PPOS_LOOSE
                          : strcmp(mu, "mkwriteany") == 0  ? MK_MUT_WRITE_ANY
-                         : strcmp(mu, "mkretired") == 0   ? MK_MUT_RETIRED
                                                           : -1;
         if (mk_test_mutant < 0) {
             fprintf(stderr, "unknown mutant %s\n", mu);

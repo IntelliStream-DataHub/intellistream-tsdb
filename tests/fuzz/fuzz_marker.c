@@ -183,7 +183,10 @@ void fuzz_seeds(const char *dir)
     m.u.cold = (mk_cold){.z = 5000, .flush_through = 12, .stripe_version = 3, .key = 4 * 19700 + 1, .nobjs = 2,
                          .nfiles = 2, .nretired = 0, .objs = objs, .objs_len = ol, .files = files, .files_len = fl,
                          .retired = oids};
-    seed(dir, "seed-cold", &m); /* retired oids are R10's: a decode refuses them (the corpus keeps one such input) */
+    seed(dir, "seed-cold", &m);
+    m.u.cold.nretired = 2;
+    seed(dir, "seed-cold-reencode", &m);
+    m.u.cold.nretired = 0;
     m.u.cold.nfiles = 0, m.u.cold.files_len = 0;
     seed(dir, "seed-cold-objs", &m);
     memset(&m, 0, sizeof m);

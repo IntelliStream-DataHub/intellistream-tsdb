@@ -17108,6 +17108,580 @@ static void scen_unsettle(void)
 }
 
 #ifdef TSDB_EC
+/* Sum of (k + m) across every live .ec file in server `srv`'s v<num>: exact chunk count expected on the stores
+ * (small parts use effective k' < 4, e.g. 1+2 = 3 chunks). Returns -1 if a file disappears mid-scan. */
+static int reenc_expected_chunks(int srv, uint32_t num)
+{
+    char d[PATH_MAX + 80], dirp[PATH_MAX + 120];
+    server_dir(srv, d, sizeof d);
+    snprintf(dirp, sizeof dirp, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(dirp);
+    if (!dd)
+        return -1;
+    int total = 0;
+    for (struct dirent *de; (de = readdir(dd));) {
+        size_t l = strlen(de->d_name);
+        if (l <= 3 || strcmp(de->d_name + l - 3, ".ec") != 0 || strncmp(de->d_name, "retired_", 8) == 0)
+            continue;
+        char fp[PATH_MAX + 256];
+        snprintf(fp, sizeof fp, "%s/%s", dirp, de->d_name);
+        int fd = open(fp, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            closedir(dd);
+            return -1;
+        }
+        struct stat st;
+        uint8_t tr[64], rhdr[64];
+        bool ok = fstat(fd, &st) == 0 && st.st_size >= 64 + 216 && pread(fd, tr, 64, st.st_size - 64) == 64 &&
+                  memcmp(tr, "TSDB-EC\n", 8) == 0;
+        uint64_t roff = 0, rlen = 0;
+        if (ok) {
+            memcpy(&roff, tr + 16, 8);
+            memcpy(&rlen, tr + 24, 8);
+            ok = rlen >= 216 && roff + rlen + 64 == (uint64_t)st.st_size && pread(fd, rhdr, 64, (off_t)roff) == 64;
+        }
+        close(fd);
+        if (!ok) {
+            closedir(dd);
+            return -1;
+        }
+        uint16_t k = 0, m = 0;
+        memcpy(&k, rhdr + 52, 2);
+        memcpy(&m, rhdr + 54, 2);
+        total += (int)k + (int)m;
+    }
+    closedir(dd);
+    return total;
+}
+
+#define REENC_ROWS 5500 /* 5 rounds * 12000 s = 60000 s, leaving [60000, 86400) for late rows on the same day */
+
+/* Write one settled round (2 batches a flush apart) into day_ms at timestamp offset round_idx * 12000s to both
+ * e42 and oracle t42. Round 4 also overwrites 20 timestamps from round 0 on series 0 to exercise LWW across .ec. */
+static void reenc_write_round(tsdbc *c, tsdbc *ct, const tsdb_sid *ide, const tsdb_sid *idt, int64_t day_ms,
+                              int round_idx)
+{
+    for (int b = 0; b < 2; b++) {
+        for (int s = 0; s < ECB_SERIES; s++) {
+            static int64_t ts[REENC_ROWS];
+            static float val[REENC_ROWS];
+            int64_t base_s = (int64_t)round_idx * 12000;
+            for (int r = 0; r < REENC_ROWS; r++) {
+                ts[r] = day_ms + (base_s + (int64_t)(2 * r + b)) * 1000LL;
+                uint64_t z = ((uint64_t)round_idx << 48 | (uint64_t)s << 40 | (uint64_t)b << 32 | (uint64_t)r) +
+                             (uint64_t)day_ms * 0x2545f4914f6cdd1dull + 0x9e3779b97f4a7c15ull;
+                z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9ull;
+                z = (z ^ z >> 27) * 0x94d049bb133111ebull;
+                z ^= z >> 31;
+                uint32_t bits = (uint32_t)(z & 0x7fffffu) | (uint32_t)(127 + (z >> 61)) << 23;
+                memcpy(&val[r], &bits, 4);
+            }
+            if (round_idx == 4 && b == 1 && s == 0) {
+                for (int r = 0; r < 20 && r < REENC_ROWS; r++) {
+                    ts[r] = day_ms + (int64_t)(2 * r) * 1000LL; /* overwrite round 0 rows */
+                    val[r] = 500.0f + (float)r;
+                }
+            }
+            int rc;
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, REENC_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("reencode: insert round %d into e42: %s", round_idx, ers(rc));
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, REENC_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("reencode: insert round %d into t42: %s", round_idx, ers(rc));
+        }
+        usleep(450000); /* past --flush-interval-ms 200 */
+    }
+}
+
+struct reenc_writer {
+    int id;
+    int srv_e;
+    int srv_t;
+    tsdb_sid ide[2];
+    tsdb_sid idt[2];
+    int64_t day_ms;
+    _Atomic int *stop;
+    _Atomic int *batches;
+    pthread_mutex_t *oracle_mu;
+    tsdbc *ct;
+    int err;
+};
+
+static void *reenc_writer_fn(void *arg)
+{
+    struct reenc_writer *w = arg;
+    tsdbc *c = client(w->srv_e);
+    int seq = 0;
+    while (!atomic_load(w->stop) && seq < 400) {
+        int64_t ts[8];
+        float val[8];
+        int k = seq & 1;
+        for (int r = 0; r < 8; r++) {
+            ts[r] = w->day_ms + (60000LL + (int64_t)w->id * 6500LL + (int64_t)seq * 16LL + (int64_t)r) * 1000LL;
+            val[r] = 1000.0f + (float)w->id * 100.0f + (float)seq + 0.125f * (float)r;
+        }
+        int rc = tsdbc_insert_series(c, w->ide[k], ts, val, 8);
+        if (rc == 0) {
+            pthread_mutex_lock(w->oracle_mu);
+            int orc;
+            for (uint64_t t0 = now_ms(); (orc = tsdbc_insert_series(w->ct, w->idt[k], ts, val, 8)) != 0; usleep(20000))
+                if ((orc != TSDB_ERR_UNAVAILABLE && orc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    break;
+            pthread_mutex_unlock(w->oracle_mu);
+            if (orc != 0) {
+                w->err = orc;
+                break;
+            }
+            seq++;
+            atomic_fetch_add(w->batches, 1);
+        } else if (rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) {
+            w->err = rc;
+            break;
+        }
+        usleep(40000);
+    }
+    tsdbc_close(c);
+    return NULL;
+}
+#endif
+
+/* reencode (R10 r10-crepl, E6, D24): 3 log replicas, 4+2 stripe; a key with 5 objects and late rows re-encoded
+ * under 4 concurrent writers; rows equal on every member and against oracle; replica restarted mid-apply
+ * (cold-mid-intent) and leader killed between MK_COLD and its commit (cold-after-marker).
+ * Planted bugs: TSDB_ECCOLD_MUTANT=retiredunnamed and TSDB_ECGC_MUTANT=gcbeforedigest must fail this scenario. */
+static void scen_reencode(void)
+{
+    scenario("reencode");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    static char hold_path[PATH_MAX + 64], pause_dig[PATH_MAX + 64];
+    static char crash_mid[6][PATH_MAX + 64];
+    static char penv_buf[6][4 * PATH_MAX + 512];
+    snprintf(hold_path, sizeof hold_path, "%s/reenc_hold", base);
+    snprintf(pause_dig, sizeof pause_dig, "%s/reenc_pause_dig", base);
+    unlink(hold_path);
+    unlink(pause_dig);
+    touch_file(hold_path); /* hold re-encode until 5 objects are settled on day0 */
+
+    for (int i = 0; i < 6; i++) {
+        snprintf(crash_mid[i], sizeof crash_mid[i], "%s/crash_reenc_mid_%d", base, i);
+        unlink(crash_mid[i]);
+        snprintf(penv_buf[i], sizeof penv_buf[i],
+                 "TSDB_REENCODE_HOLD=%s TSDB_ECCOLD_TEST=pause_before_digest=%s "
+                 "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=0 TSDB_CRASH_AT=cold-mid-intent:1@%s",
+                 hold_path, pause_dig, crash_mid[i]);
+        penv[i] = penv_buf[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of six members");
+
+    static char xa[6][PATH_MAX + 256];
+    for (int i = 0; i < 6; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i],
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-settle-keep-s 1",
+                 sd);
+        restart_xargs(i, xa[i]);
+    }
+    await_view(5, p_six_placeable, NULL, "six members UP with their volumes open");
+
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("reencode: ec=4+2 add: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("reencode: twin t42 add: %s", cluster_strerror(rc));
+
+    struct meta_volume e, tv;
+    int L = ecgc_leader_of(num, 0, &e);
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("reencode: no leader for twin t42 in 30 s");
+    int Lt = server_of(tv.leader);
+    int reps[3], nreps = 0;
+    for (uint32_t k = 0; k < e.nrep && nreps < 3; k++)
+        reps[nreps++] = server_of(e.rep[k].node);
+    if (nreps != 3 || Lt < 0)
+        die("reencode: bad layout (nreps=%d Lt=%d)", nreps, Lt);
+    int R1 = -1, R2 = -1, nonrep = -1;
+    for (int k = 0; k < 3; k++)
+        if (reps[k] != L)
+            *(R1 < 0 ? &R1 : &R2) = reps[k];
+    for (int i = 0; i < 6; i++)
+        if (!ecb_is_rep(&e, i)) {
+            nonrep = i;
+            break;
+        }
+    printf("  e42 (vol %" PRIu32 ") led by %d, replicas %d,%d,%d (mid-apply target %d)\n", num, L, reps[0], reps[1],
+           reps[2], R2);
+
+    tsdbc *c = client(L), *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    const int64_t day0 = 1704067200000LL;
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "re.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+
+    /* Phase 1: settle at least 5 distinct objects on day0 while TSDB_REENCODE_HOLD is active. */
+    int ec_d0 = 0;
+    for (int r = 0; ec_d0 < 5; r++) {
+        reenc_write_round(c, ct, ide, idt, day0, r);
+        int min_ec = ec_d0 + 1;
+        for (uint64_t t0 = now_ms();; usleep(200000)) {
+            char live[512];
+            int nec = ecb_ec_parts(L, num);
+            int ech = reenc_expected_chunks(L, num);
+            int ok = nec >= min_ec && ech > 0 && ecb_chunks(num) == ech;
+            for (int k = 0; k < 3; k++)
+                if (ecb_ec_parts(reps[k], num) != nec || ecb_live_parts(reps[k], num, live, sizeof live) != 0)
+                    ok = 0;
+            if (ok) {
+                ec_d0 = nec;
+                break;
+            }
+            if (now_ms() - t0 > 90000)
+                die("reencode: round %d did not settle to >= %d .ec on all 3 replicas (ec=%d/%d/%d chunks=%d want=%d)",
+                    r, min_ec, ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num),
+                    ecb_chunks(num), ech);
+        }
+    }
+    int ch_d0 = ecb_chunks(num);
+    tsdbc_close(c);
+    c = NULL;
+    printf("  phase 1: %d .ec objects settled on day0 across all 3 replicas (%d chunks)\n", ec_d0, ch_d0);
+
+    /* Start 4 concurrent writers inserting late rows into day0; mirror every acknowledged batch to oracle t42. */
+    _Atomic int stop_w = 0, w_batches = 0;
+    pthread_mutex_t oracle_mu = PTHREAD_MUTEX_INITIALIZER;
+    struct reenc_writer ws[4];
+    pthread_t wt[4];
+    for (int w = 0; w < 4; w++) {
+        ws[w] = (struct reenc_writer){.id = w,
+                                      .srv_e = L,
+                                      .srv_t = Lt,
+                                      .ide = {ide[w], ide[w + 4]},
+                                      .idt = {idt[w], idt[w + 4]},
+                                      .day_ms = day0,
+                                      .stop = &stop_w,
+                                      .batches = &w_batches,
+                                      .oracle_mu = &oracle_mu,
+                                      .ct = ct,
+                                      .err = 0};
+        if (pthread_create(&wt[w], NULL, reenc_writer_fn, &ws[w]) != 0)
+            die("reencode: pthread_create writer %d failed", w);
+    }
+    for (uint64_t t0 = now_ms(); atomic_load(&w_batches) < 12; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("reencode: 4 writers produced only %d batches in 30 s", atomic_load(&w_batches));
+
+    /* Arm pause_before_digest on leader and cold-mid-intent on replica R2 ONLY, then release TSDB_REENCODE_HOLD. */
+    int pd0 = log_count(L, "pause_before_digest: paused");
+    touch_file(pause_dig);
+    touch_file(crash_mid[R2]);
+    unlink(hold_path);
+
+    for (uint64_t t0 = now_ms(); log_count(L, "pause_before_digest: paused") <= pd0; usleep(100000))
+        if (now_ms() - t0 > 90000)
+            die("reencode: leader %d did not reach pause_before_digest in 90 s (ec=%d)", L, ecb_ec_parts(L, num));
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int st = 0;
+        if (waitpid(pids[R2], &st, WNOHANG) == pids[R2]) {
+            pids[R2] = 0;
+            break;
+        }
+        if (now_ms() - t0 > 30000)
+            die("reencode: replica %d did not hit cold-mid-intent in 30 s", R2);
+    }
+    if (!log_has(R2, "cold-mid-intent"))
+        die("reencode: replica %d exited without hitting cold-mid-intent", R2);
+    unlink(crash_mid[R2]);
+
+    /* Verify R1 applied MK_COLD and retired the ec_d0 named .ec objects (kills retiredunnamed!). */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (ecb_retired_ec(R1, num) >= ec_d0 && ecb_ec_parts(R1, num) < ec_d0)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("reencode: replica %d did not retire %d .ec objects (ec=%d ret=%d; retiredunnamed?)", R1, ec_d0,
+                ecb_ec_parts(R1, num), ecb_retired_ec(R1, num));
+    }
+
+    /* Restart R2 (recovers cold-mid-intent v5 intent) and wait for ISR=3 so all 6 stripe members are UP while leader
+     * is STILL paused at pause_before_digest. Poll for 5 s across multiple GC poll_ms (200 ms) cycles: all retired
+     * objects' chunks and retired_*.ec files MUST stay alive before MK_DIGEST (kills gcbeforedigest!). */
+    start(R2);
+    await_isr(L, "e42", 3, 60000, "ISR=3 after R2 cold-mid-intent recovery");
+    int ch_before_dig = ecb_chunks(num);
+    for (int t = 0; t < 25; t++) {
+        usleep(200000);
+        ch_before_dig = ecb_chunks(num);
+        int lret = ecb_retired_ec(L, num);
+        if (ch_before_dig < ch_d0 + 3 || lret < ec_d0)
+            die("reencode: retired objects GC'd before MK_DIGEST (chunks=%d want >= %d, L ret=%d want >= %d; "
+                "gcbeforedigest?)",
+                ch_before_dig, ch_d0 + 3, lret, ec_d0);
+    }
+    printf("  phase 1 mid-reencode: R2 recovered mid-intent, R1 retired %d .ec (live %d), %d chunks held before DIGEST\n",
+           ecb_retired_ec(R1, num), ecb_ec_parts(R1, num), ch_before_dig);
+
+    /* Release pause_before_digest and stop writers. */
+    unlink(pause_dig);
+    atomic_store(&stop_w, 1);
+    for (int w = 0; w < 4; w++) {
+        pthread_join(wt[w], NULL);
+        if (ws[w].err != 0)
+            die("reencode: writer %d failed: %s", w, ers(ws[w].err));
+    }
+    printf("  phase 1 writers finished: %d concurrent late-row batches acknowledged\n", atomic_load(&w_batches));
+
+    /* Wait until MK_DIGEST + MK_GC clean up all retired_*.ec and chunks == expected live chunks on all 3 replicas. */
+    int ec_p1 = 0;
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char live[512];
+        int nec = ecb_ec_parts(L, num);
+        int nch = ecb_chunks(num);
+        int ech = reenc_expected_chunks(L, num);
+        int ok = nec >= 1 && nec < 5 && ech > 0 && nch == ech;
+        for (int k = 0; k < 3; k++) {
+            if (ecb_ec_parts(reps[k], num) != nec || ecb_retired_ec(reps[k], num) != 0 ||
+                ecb_live_parts(reps[k], num, live, sizeof live) != 0)
+                ok = 0;
+        }
+        if (ok) {
+            ec_p1 = nec;
+            break;
+        }
+        if (now_ms() - t0 > 90000)
+            die("reencode phase 1: post-reencode cleanup incomplete (ec=%d/%d/%d ret=%d/%d/%d chunks=%d want=%d)",
+                ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num),
+                ecb_retired_ec(reps[0], num), ecb_retired_ec(reps[1], num), ecb_retired_ec(reps[2], num), nch, ech);
+    }
+    for (int k = 0; k < 3; k++)
+        if (log_has(reps[k], "DIVERGED"))
+            die("reencode phase 1: replica %d logged DIVERGED", reps[k]);
+
+    /* Verify row-for-row equality against oracle t42 on EVERY log replica. */
+    struct ecb_sum oracle[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        if ((rc = ecb_read(ct, idt[s], &oracle[s])) != 0 || oracle[s].n == 0)
+            die("reencode phase 1: oracle read s=%d: %s", s, ers(rc));
+    }
+    int check_order[3] = {L, R1, R2};
+    for (int step = 0; step < 3; step++) {
+        int tgt = check_order[step];
+        if (step > 0) {
+            char why[256];
+            for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[tgt], why, sizeof why)) != 0; usleep(200000))
+                if (now_ms() - t0 > 30000)
+                    die("reencode phase 1: transfer to %d: %s (%s)", tgt, cluster_strerror(rc), why);
+            for (uint64_t t0 = now_ms();; usleep(100000)) {
+                struct meta_volume mv;
+                if (vol_rec(tgt, "e42", &mv) && mv.leader == ids[tgt])
+                    break;
+                if (now_ms() - t0 > 30000)
+                    die("reencode phase 1: replica %d did not become leader", tgt);
+            }
+        }
+        c = client(tgt);
+        for (int s = 0; s < ECB_SERIES; s++) {
+            struct ecb_sum got;
+            for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &got)) != 0; usleep(100000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("reencode phase 1: read on %d s=%d: %s", tgt, s, ers(rc));
+            if (got.n != oracle[s].n || got.h != oracle[s].h)
+                die("reencode phase 1: replica %d s=%d mismatch (n=%" PRIu64 " want %" PRIu64 ", h=%016" PRIx64
+                    " want %016" PRIx64 ")",
+                    tgt, s, got.n, oracle[s].n, got.h, oracle[s].h);
+        }
+        tsdbc_close(c);
+        c = NULL;
+    }
+    printf("  phase 1 ok: %d .ec/replica (%d chunks), oracle verified on all 3 replicas\n", ec_p1, ecb_chunks(num));
+
+    /* Phase 2: leader killed between MK_COLD append and commit (cold-after-marker); failover finishes or aborts cleanly.
+     * Hold re-encode, settle 5 objects on day1 (30 days later), arm cold-after-marker on R1, transfer leadership to R1,
+     * release hold -> R1 exits 99 right after MK_COLD append -> new leader promotes -> R1 restarts -> clean end state. */
+    touch_file(hold_path);
+    L = ecgc_leader_of(num, 0, &e);
+    c = client(L);
+    const int64_t day1 = day0 + 35 * 86400000LL;
+    int ec_d1_tot = ec_p1;
+    for (int r = 0; ec_d1_tot - ec_p1 < 5; r++) {
+        reenc_write_round(c, ct, ide, idt, day1, r);
+        int min_ec = ec_d1_tot + 1;
+        for (uint64_t t0 = now_ms();; usleep(200000)) {
+            char live[512];
+            int nec = ecb_ec_parts(L, num);
+            int ech = reenc_expected_chunks(L, num);
+            int ok = nec >= min_ec && ech > 0 && ecb_chunks(num) == ech;
+            for (int k = 0; k < 3; k++)
+                if (ecb_ec_parts(reps[k], num) != nec || ecb_live_parts(reps[k], num, live, sizeof live) != 0)
+                    ok = 0;
+            if (ok) {
+                ec_d1_tot = nec;
+                break;
+            }
+            if (now_ms() - t0 > 90000)
+                die("reencode phase 2: day1 round %d did not settle to >= %d .ec (ec=%d/%d/%d chunks=%d want=%d)", r,
+                    min_ec, ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num),
+                    ecb_chunks(num), ech);
+        }
+    }
+    tsdbc_close(c);
+    c = NULL;
+
+    /* Pick a follower F_lead != L, restart it with cold-after-marker, transfer leadership to F_lead. */
+    int F_lead = (L == R1) ? R2 : R1;
+    static char crash_after[PATH_MAX + 64], fpenv[4 * PATH_MAX + 512];
+    snprintf(crash_after, sizeof crash_after, "%s/crash_reenc_after", base);
+    unlink(crash_after);
+    snprintf(fpenv, sizeof fpenv,
+             "TSDB_REENCODE_HOLD=%s TSDB_ECGC_TEST=poll_ms=200,lifetime_s=0 "
+             "TSDB_CRASH_AT=cold-after-marker:1@%s",
+             hold_path, crash_after);
+    penv[F_lead] = fpenv;
+    restart_xargs(F_lead, xa[F_lead]);
+    await_isr(L, "e42", 3, 60000, "ISR=3 after restarting F_lead with cold-after-marker");
+    {
+        char why[256];
+        for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[F_lead], why, sizeof why)) != 0; usleep(200000))
+            if (now_ms() - t0 > 30000)
+                die("reencode phase 2: transfer to %d: %s (%s)", F_lead, cluster_strerror(rc), why);
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            struct meta_volume mv;
+            if (vol_rec(F_lead, "e42", &mv) && mv.leader == ids[F_lead])
+                break;
+            if (now_ms() - t0 > 30000)
+                die("reencode phase 2: F_lead %d did not become leader", F_lead);
+        }
+    }
+    /* Write a few late rows on day1 right before releasing re-encode hold. */
+    c = client(F_lead);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        int64_t ts[4];
+        float val[4];
+        for (int r = 0; r < 4; r++) {
+            ts[r] = day1 + (70000LL + (int64_t)r) * 1000LL;
+            val[r] = 777.0f + (float)s + 0.25f * (float)r;
+        }
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, 4)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("reencode phase 2: late write e42 s=%d: %s", s, ers(rc));
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, 4)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("reencode phase 2: late write t42 s=%d: %s", s, ers(rc));
+    }
+    tsdbc_close(c);
+    c = NULL;
+
+    touch_file(crash_after);
+    unlink(hold_path);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int st = 0;
+        if (waitpid(pids[F_lead], &st, WNOHANG) == pids[F_lead]) {
+            pids[F_lead] = 0;
+            break;
+        }
+        if (now_ms() - t0 > 90000)
+            die("reencode phase 2: leader %d did not hit cold-after-marker in 90 s", F_lead);
+    }
+    if (!log_has(F_lead, "cold-after-marker"))
+        die("reencode phase 2: leader %d exited without hitting cold-after-marker", F_lead);
+    unlink(crash_after);
+
+    /* Wait for failover onto new leader L2 != F_lead, restart F_lead, wait for clean re-encode completion. */
+    int L2 = ecgc_leader_of(num, nonrep, &e);
+    if (L2 == F_lead)
+        die("reencode phase 2: leader did not move off crashed %d", F_lead);
+    start(F_lead);
+    await_isr(L2, "e42", 3, 60000, "ISR=3 after F_lead restart");
+
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char live[512];
+        int nec = ecb_ec_parts(L2, num);
+        int nch = ecb_chunks(num);
+        int ech = reenc_expected_chunks(L2, num);
+        int ok = nec >= ec_p1 + 1 && nec < ec_d1_tot && ech > 0 && nch == ech;
+        for (int k = 0; k < 3; k++) {
+            if (ecb_ec_parts(reps[k], num) != nec || ecb_retired_ec(reps[k], num) != 0 ||
+                ecb_live_parts(reps[k], num, live, sizeof live) != 0)
+                ok = 0;
+        }
+        if (ok)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("reencode phase 2: failover cleanup incomplete (ec=%d/%d/%d ret=%d/%d/%d chunks=%d want=%d, ec < %d)",
+                ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num),
+                ecb_retired_ec(reps[0], num), ecb_retired_ec(reps[1], num), ecb_retired_ec(reps[2], num), nch, ech,
+                ec_d1_tot);
+    }
+    for (int k = 0; k < 3; k++)
+        if (log_has(reps[k], "DIVERGED"))
+            die("reencode phase 2: replica %d logged DIVERGED", reps[k]);
+
+    /* Final oracle verification across all 3 log replicas. */
+    for (int s = 0; s < ECB_SERIES; s++) {
+        if ((rc = ecb_read(ct, idt[s], &oracle[s])) != 0 || oracle[s].n == 0)
+            die("reencode phase 2: oracle read s=%d: %s", s, ers(rc));
+    }
+    tsdbc_close(ct);
+    ct = NULL;
+    int final_order[3], nf = 0;
+    final_order[nf++] = L2;
+    for (int k = 0; k < 3; k++)
+        if (reps[k] != L2)
+            final_order[nf++] = reps[k];
+    for (int step = 0; step < 3; step++) {
+        int tgt = final_order[step];
+        if (step > 0) {
+            char why[256];
+            for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[tgt], why, sizeof why)) != 0; usleep(200000))
+                if (now_ms() - t0 > 30000)
+                    die("reencode phase 2: transfer to %d: %s (%s)", tgt, cluster_strerror(rc), why);
+            for (uint64_t t0 = now_ms();; usleep(100000)) {
+                struct meta_volume mv;
+                if (vol_rec(tgt, "e42", &mv) && mv.leader == ids[tgt])
+                    break;
+                if (now_ms() - t0 > 30000)
+                    die("reencode phase 2: replica %d did not become leader", tgt);
+            }
+        }
+        c = client(tgt);
+        for (int s = 0; s < ECB_SERIES; s++) {
+            struct ecb_sum got;
+            for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &got)) != 0; usleep(100000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("reencode phase 2: read on %d s=%d: %s", tgt, s, ers(rc));
+            if (got.n != oracle[s].n || got.h != oracle[s].h)
+                die("reencode phase 2: replica %d s=%d mismatch (n=%" PRIu64 " want %" PRIu64 ", h=%016" PRIx64
+                    " want %016" PRIx64 ")",
+                    tgt, s, got.n, oracle[s].n, got.h, oracle[s].h);
+        }
+        tsdbc_close(c);
+        c = NULL;
+    }
+    printf("  phase 2 ok: leader %d killed at cold-after-marker, promoted leader %d converged to %d .ec (%d chunks), "
+           "oracle verified on all 3 replicas\n",
+           F_lead, L2, ecb_ec_parts(L2, num), ecb_chunks(num));
+#endif
+}
+
+#ifdef TSDB_EC
 static int ecd_chunks_of(int srv, uint32_t num)
 {
     char p[PATH_MAX + 80];
@@ -31064,7 +31638,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"snapmove", scen_snapmove}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"unsettle", scen_unsettle}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"opening", scen_opening}, {"failgasp", scen_failgasp}, {"faultreason", scen_faultreason}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"unsettle", scen_unsettle}, {"reencode", scen_reencode}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"opening", scen_opening}, {"failgasp", scen_failgasp}, {"faultreason", scen_faultreason}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast},

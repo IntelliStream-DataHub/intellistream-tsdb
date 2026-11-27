@@ -610,7 +610,7 @@ test-units-b6:
 	./$(B)/test_seam $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop prefetchnocheck prefetchevictpinned prefetchnodouble prefetchdupkey prefetchforgetlive prefetchnofallback" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_marker $(SCRATCH)
-	$(MUT) --name test_marker --list "mkcoldbounds mkadmitall ecpposloose mkwriteany mkretired" -- ./$(B)/test_marker --mutant @M@ @D@ # each planted bug must fail it
+	$(MUT) --name test_marker --list "mkcoldbounds mkadmitall ecpposloose mkwriteany" -- ./$(B)/test_marker --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_ecpart $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecpart --list "ecnohash ecnowalseq ecskipname ecnofno ecnolayout" -- ./$(B)/test_ecpart --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_keep $(SCRATCH)
@@ -665,7 +665,7 @@ CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail re
     fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
     snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
     reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
-CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle r4stubs r9stubs opening failgasp faultreason addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs r9stubs opening failgasp faultreason addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
     volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
@@ -1080,7 +1080,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants cvolfs-mutants placeclass-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants whole-mutants reconcile-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants cvolfs-mutants placeclass-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1383,6 +1383,13 @@ unsettle-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/test_ecapply
 	$(MUT) --name unsettle --list "unsettleleaderonly unsettlenogcgate unsettlenofloorclamp" -- env TSDB_ECUNSETTLE_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ unsettle
 	$(MUT) --name unsettle-snap --list "unsettlesnapnohold" -- env TSDB_ECUNSETTLE_MUTANT=@M@ ./$(B)/test_ecapply @D@ --case unsettle
+# r10-crepl: cluster re-encode planted bugs (TSDB_ECCOLD_MUTANT=retiredunnamed, TSDB_ECGC_MUTANT=gcbeforedigest), each must fail test_cluster reencode
+reencode-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	@$(if $(EC_OBJ),true,echo "reencode-mutants: this build has no erasure codec (NO_EC=1): reencode skips, nothing to plant"; false)
+	$(MUT) --name reencode-cold --list "retiredunnamed" -- env TSDB_ECCOLD_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ reencode
+	$(MUT) --name reencode-gc --list "gcbeforedigest" -- env TSDB_ECGC_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ reencode
 # the planned leader transfer's mutants (server/rtransfer.c, server/ctransfer.c; tests/transfer_mutants.sh)
 transfer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/transfer_mutants.sh $(SCRATCH)
@@ -1721,7 +1728,7 @@ $(B)/test_ecpart: tests/test_ecpart.c src/internal.h $(R7_HDR) src/chunk.h $(LIB
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # R8's marker bodies (COLD, GC, DIGEST: round trips, truncation, bounds), record_valid's cluster ec flag and the open's
-# refusal of GC and DIGEST without requires=ec; mutants mkcoldbounds mkadmitall ecpposloose mkwriteany mkretired must fail it
+# refusal of GC and DIGEST without requires=ec; mutants mkcoldbounds mkadmitall ecpposloose mkwriteany must fail it
 $(B)/test_marker: tests/test_marker.c src/internal.h src/marker.h src/ecpart.h src/chunk.h src/tier.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 

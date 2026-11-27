@@ -56,8 +56,10 @@
 #include "internal.h"
 #include "eccold.h"
 #include "coldops.h"
+#include "eccache.h"
 #include "ecdigest.h"
 #include "ecgc.h"
+#include "eckeep.h"
 #include "ecpart.h"
 #include "ecskip.h"
 #include "ecswap.h"
@@ -66,6 +68,7 @@
 #include "tier.h"
 
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,7 +88,7 @@ int eccold_mutant_parse(const char *name)
 {
     static const char *const names[] = {"",            "cutnogate",      "cutnowait",        "ttlsettling",
                                         "cutnorotate", "fencekeyonly",   "stripewaitfenced", "degtwo",
-                                        "degnoupcheck", "degnopositions"};
+                                        "degnoupcheck", "degnopositions", "retiredunnamed"};
     for (int i = 1; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
@@ -95,15 +98,30 @@ int eccold_mutant_parse(const char *name)
 #ifdef TSDB_TEST_HOOKS
 static pthread_once_t mut_once = PTHREAD_ONCE_INIT;
 static char pause_pre_marker_path[512];
+static char pause_before_digest_path[512];
 static void mut_env(void)
 {
     const char *m = getenv("TSDB_ECCOLD_MUTANT");
-    int v = m && *m ? eccold_mutant_parse(m) : -1;
-    if (v > 0)
+    if (m && *m) {
+        int v = eccold_mutant_parse(m);
+        if (v < 0) {
+            fprintf(stderr, "tsdb: TSDB_ECCOLD_MUTANT=%s names no mutant: exiting with status 2\n", m);
+            _exit(2);
+        }
         eccold_mutant = v;
+    }
     const char *th = getenv("TSDB_ECCOLD_TEST");
-    if (th && strncmp(th, "pause_pre_marker=", 17) == 0)
-        snprintf(pause_pre_marker_path, sizeof pause_pre_marker_path, "%s", th + 17);
+    if (th && *th) {
+        char buf[1024];
+        snprintf(buf, sizeof buf, "%s", th);
+        char *sp = NULL;
+        for (char *tok = strtok_r(buf, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+            if (strncmp(tok, "pause_pre_marker=", 17) == 0)
+                snprintf(pause_pre_marker_path, sizeof pause_pre_marker_path, "%s", tok + 17);
+            else if (strncmp(tok, "pause_before_digest=", 20) == 0)
+                snprintf(pause_before_digest_path, sizeof pause_before_digest_path, "%s", tok + 20);
+        }
+    }
 }
 
 static void pause_pre_marker_hook(void)
@@ -118,12 +136,25 @@ static void pause_pre_marker_hook(void)
     fprintf(stderr, "tsdb: test: pause_pre_marker: resumed before MK_COLD\n");
 }
 
+static void pause_before_digest_hook(void)
+{
+    if (!pause_before_digest_path[0] || access(pause_before_digest_path, F_OK) != 0)
+        return;
+    fprintf(stderr, "tsdb: test: pause_before_digest: paused before MK_DIGEST\n");
+    while (access(pause_before_digest_path, F_OK) == 0) {
+        struct timespec ts = {0, 50 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "tsdb: test: pause_before_digest: resumed before MK_DIGEST\n");
+}
+
 void eccold_mutant_init(void)
 {
     pthread_once(&mut_once, mut_env);
 }
 #else
 static void pause_pre_marker_hook(void) {}
+static void pause_before_digest_hook(void) {}
 void eccold_mutant_init(void) {}
 #endif
 
@@ -366,9 +397,10 @@ static void put_file(uint8_t *files, size_t *len, const char *name, uint64_t siz
 
 _Atomic int eccold_test_marker;
 
-/* MK_COLD for the .ec parts ec[0 .. np) (records recs) and the late parts y[0 .. ny), then jr_cold */
-static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, part **ec, size_t np, part **y,
-                       size_t ny, uint64_t *pos)
+/* MK_COLD for the .ec parts ec[0 .. np) (records recs), late parts y[0 .. ny), and retired oids[0 .. nretired),
+ * then jr_cold. */
+static int cold_marker_ex(eng *db, const eccold_cut *cut, const ec_record *recs, part **ec, size_t np, part **y,
+                          size_t ny, const uint8_t *retired, uint32_t nretired, uint64_t *pos)
 {
     size_t olen = 0, flen = 0, nf = np + ny, fcap = 0;
     int tm = atomic_load(&eccold_test_marker);
@@ -409,7 +441,7 @@ static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, pa
         size_t i = tm == ECCOLD_TM_REVERSE ? ny - 1 - j : j;
         put_file(files, &flen, y[i]->name, y[i]->map_len, xxh64(y[i]->map, y[i]->map_len, 0),
                  y[i]->index_hash ^ (tm == ECCOLD_TM_YHC), MK_FILE_Y);
-        src[np + j] = y[i]->name;
+        src[np + j] = y[i]->pending ? y[i]->pending : y[i]->name;
     }
     if (rc == 0) {
         mk m;
@@ -422,10 +454,12 @@ static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, pa
         m.u.cold.key = cut->key;
         m.u.cold.nobjs = (uint32_t)np;
         m.u.cold.nfiles = (uint32_t)nf;
+        m.u.cold.nretired = nretired;
         m.u.cold.objs = objs;
         m.u.cold.objs_len = off;
         m.u.cold.files = files;
         m.u.cold.files_len = flen;
+        m.u.cold.retired = nretired ? retired : NULL;
         appending = db; /* eccold_after_append: the crash point right after the append (r8l's midcommit) */
         rc = jr_cold(db, &m, src, nf, pos);
         appending = NULL;
@@ -434,6 +468,12 @@ static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, pa
     free(files);
     free(src);
     return rc;
+}
+
+static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, part **ec, size_t np, part **y,
+                       size_t ny, uint64_t *pos)
+{
+    return cold_marker_ex(db, cut, recs, ec, np, y, ny, NULL, 0, pos);
 }
 
 /* the .ec parts ec[0 .. n) that no marker names: their temporaries removed, their objects to r7-gc */
@@ -810,6 +850,420 @@ out:
     for (size_t i = 0; i < np; i++)
         ec_record_free(&recs[i]);
     free(recs);
+    cut.rc = rc;
+    pthread_mutex_lock(&last_mu);
+    last_cut = cut;
+    pthread_mutex_unlock(&last_mu);
+    return rc;
+}
+
+/* Under db->lock: verifies pin[0..np) is still contiguous and listed at `base`, satisfies the cluster suffix
+ * invariant (no non-.ec part of key below pin[0], no .ec part of key above pin[np-1]), and pins all trailing
+ * non-.ec parts of key into y[0..*ny). */
+static int take_reencode_y_locked(eng *db, int64_t key, part **pin, size_t np, part **y, size_t *ny)
+{
+    *ny = 0;
+    if (partition_dropping(db, key))
+        return TSDB_ERR_STOPPED;
+    size_t base = db->nparts;
+    for (size_t j = 0; j < db->nparts; j++)
+        if (db->parts[j] == pin[0]) {
+            base = j;
+            break;
+        }
+    if (base + np > db->nparts)
+        return TSDB_ERR_STOPPED;
+    for (size_t i = 0; i < np; i++)
+        if (db->parts[base + i] != pin[i] || pin[i]->dropped || pin[i]->merging)
+            return TSDB_ERR_STOPPED;
+    for (size_t i = 0; i < base; i++) {
+        part *p = db->parts[i];
+        if (p->partition == key && !p->dropped && !part_is_ec(p))
+            return TSDB_ERR_STOPPED; /* a non-.ec part below I cannot be placed in Y above new_EC */
+    }
+    size_t n = 0;
+    for (size_t i = base + np; i < db->nparts; i++) {
+        part *p = db->parts[i];
+        if (p->partition != key || p->dropped)
+            continue;
+        if (part_is_ec(p))
+            return TSDB_ERR_STOPPED; /* an .ec part above I would be out-of-order after replica renumbering */
+        if (p->merging || p->settling)
+            return TSDB_ERR_STOPPED;
+        y[n++] = p;
+    }
+    size_t max = atomic_load(&eccold_test_files_max);
+    if (1 + n > (max ? max : MK_FILES_MAX))
+        return TSDB_ERR_INVALID;
+    for (size_t i = 0; i < n; i++) {
+        y[i]->settling = true;
+        part_ref(y[i]);
+    }
+    *ny = n;
+    return 0;
+}
+
+int eccold_reencode(eng *db, int64_t key, part **pin, size_t np)
+{
+    eccold_mutant_init();
+    coldvol *cv = tier_cold(db);
+    if (!cv)
+        return TSDB_ERR_UNAVAILABLE;
+    if (!np || np > MK_FILES_MAX)
+        return TSDB_ERR_INVALID;
+    eccold_cut cut;
+    memset(&cut, 0, sizeof cut);
+    cut.key = key;
+    uint64_t epoch = 0, sv = stripe_of(cv);
+    cut.stripe_version = sv;
+    if (!stripe_ok(cv, coldvol_epoch(cv), sv))
+        return TSDB_ERR_UNAVAILABLE;
+
+    /* 1. Freeze cutoffs & below-listed decision, then merge I outside locks (no engine lock across chunk reads). */
+    ecd_cut *cuts = NULL;
+    size_t ncuts = 0;
+    bool tombs_below = false;
+    uint32_t merge_len_gen = 0;
+    int rc = 0;
+    pthread_mutex_lock(&db->ret_lock);
+    int64_t now = eng_now_ms(db);
+    merge_len_gen = atomic_load(&db->ret_len_gen);
+    rc = ecd_freeze(db, pin, np, key, now, &cuts, &ncuts);
+    if (rc == 0) {
+        uint64_t lo_block = pin[0]->min_block;
+        pthread_mutex_lock(&db->lock);
+        for (size_t i = 0; i < db->nparts && !tombs_below; i++) {
+            part *p = db->parts[i];
+            tombs_below = p->partition == key && !p->dropped && p->max_block < lo_block;
+        }
+        pthread_mutex_unlock(&db->lock);
+    }
+    pthread_mutex_unlock(&db->ret_lock);
+
+    part *merged = NULL, *out = NULL;
+    ec_record rec;
+    memset(&rec, 0, sizeof rec);
+    bool have_rec = false, put_unindexed = false;
+    part **y = NULL, **part_srcs = NULL;
+    size_t ny = 0, npart_srcs = 0, nret = 0;
+    uint8_t (*ret_oids)[16] = NULL;
+    char (*pin_names)[256] = NULL;
+    bool gated = false;
+    lw_fence f;
+    memset(&f, 0, sizeof f);
+    int64_t t_gate = 0;
+
+    if (rc == 0)
+        rc = merge_parts_reencode(db, pin, np, cuts, ncuts, tombs_below, &merged);
+    if (rc == 0 && merged) {
+        ec_ldigest d_in = {0}, d_m = {0};
+        rc = ec_logical_digest_frozen(db, pin, np, key, cuts, ncuts, tombs_below, &d_in);
+        if (rc == 0) {
+            part *one[1] = {merged};
+            rc = ec_logical_digest_frozen(db, one, 1, key, cuts, ncuts, tombs_below, &d_m);
+        }
+        if (rc == 0 && (d_in.rows != d_m.rows || d_in.series != d_m.series || d_in.xxh64 != d_m.xxh64)) {
+            fprintf(stderr, "tsdb: %s: cluster re-encode of key %lld aborted before put: logical digest mismatch\n",
+                    db->dir, (long long)key);
+            rc = TSDB_ERR_CORRUPT;
+        }
+    }
+    free(cuts);
+    cuts = NULL;
+    if (rc != 0 || !merged)
+        goto out;
+
+    /* 2. Put the combined object onto the stripe group outside every engine lock (full stripe group, no degraded). */
+    if (merged->ng > 0) {
+        rc = ecsettle_put(db, merged, &rec, &epoch);
+        if (rc != 0)
+            goto out;
+        have_rec = true;
+        put_unindexed = true;
+        step(db, ECCOLD_STEP_PUT);
+        if (eccold_mutant != ECCOLD_MUT_STRIPEWAITFENCED && (rc = stripe_wait(db, cv, epoch, sv, 0)) != 0)
+            goto out;
+    }
+
+    /* 3. Gate and cut at Z (identical to eccold_settle). */
+    int64_t plo, phi;
+    partition_range(db, key, &plo, &phi);
+    int64_t hi = phi == INT64_MAX ? INT64_MAX : phi - 1;
+    if ((rc = fence_make(&f, plo, hi, pin, np)) != 0)
+        goto out;
+    bool pending = true;
+    if (eccold_mutant != ECCOLD_MUT_CUTNOGATE) {
+        pending = lw_enter(db, &f);
+        gated = true;
+        t_gate = mono_us();
+    }
+    cut.gated = gated;
+    cut.l = log_end(db);
+    step(db, ECCOLD_STEP_GATED);
+    if (have_rec && eccold_mutant == ECCOLD_MUT_STRIPEWAITFENCED && (rc = stripe_wait(db, cv, epoch, sv, 0)) != 0)
+        goto out;
+    if (pending && mt_may_hold(db, plo, hi) && eccold_mutant != ECCOLD_MUT_CUTNOROTATE) {
+        if ((rc = mt_flush(db)) != 0)
+            goto out;
+        cut.flushed = true;
+    }
+    pthread_mutex_lock(&db->lock);
+    cut.f = db->wal_flushed;
+    pthread_mutex_unlock(&db->lock);
+    if (eccold_mutant != ECCOLD_MUT_CUTNOWAIT && (rc = eng_leader_wait(db, cut.l, false)) != 0)
+        goto out;
+    cut.z = log_end(db);
+    if (atomic_load(&db->ret_len_gen) != merge_len_gen) {
+        rc = TSDB_ERR_STOPPED; /* retention lengthened since merge_parts_reencode ran */
+        goto out;
+    }
+    uint64_t want_ep = have_rec ? epoch : coldvol_epoch(cv);
+    if (!stripe_ok(cv, want_ep, sv)) {
+        rc = TSDB_ERR_UNAVAILABLE;
+        goto out;
+    }
+
+    /* 4. Collect Y, retired oids, and post-swap filenames under db->lock. */
+    pin_names = calloc(np, sizeof *pin_names);
+    ret_oids = calloc(np, sizeof *ret_oids);
+    part_srcs = calloc(np, sizeof *part_srcs);
+    if (!pin_names || !ret_oids || !part_srcs) {
+        rc = TSDB_ERR_NOMEM;
+        goto out;
+    }
+    size_t ycap = 0;
+    for (;;) {
+        pthread_mutex_lock(&db->lock);
+        size_t need = 0;
+        for (size_t i = 0; i < db->nparts; i++)
+            need += db->parts[i]->partition == key;
+        if (need > ycap) {
+            pthread_mutex_unlock(&db->lock);
+            size_t nc = need + 16;
+            part **ny_buf = realloc(y, nc * sizeof *ny_buf);
+            if (!ny_buf) {
+                rc = TSDB_ERR_NOMEM;
+                goto out;
+            }
+            y = ny_buf;
+            ycap = nc;
+            continue;
+        }
+        rc = take_reencode_y_locked(db, key, pin, np, y, &ny);
+        if (rc == 0) {
+            for (size_t i = 0; i < np; i++) {
+                struct ecpart *ep = atomic_load(&pin[i]->ec);
+                if (ep && !ep->test_mark) {
+                    memcpy(ret_oids[nret++], ep->rec.oid, 16);
+                    snprintf(pin_names[i], 256, "retired_%s", pin[i]->name);
+                } else {
+                    snprintf(pin_names[i], 256, "settled_%s", pin[i]->name);
+                    part_ref(pin[i]);
+                    part_srcs[npart_srcs++] = pin[i];
+                }
+            }
+        }
+        pthread_mutex_unlock(&db->lock);
+        break;
+    }
+    cut.ny = ny;
+    for (size_t i = 0; i < ny && i < ECCOLD_TEST_Y_MAX; i++)
+        snprintf(cut.y[i], sizeof cut.y[i], "%.63s", y[i]->name);
+    if (rc)
+        goto out;
+    step(db, ECCOLD_STEP_CUT);
+
+    /* 5. Index the new .ec file with ppos = Z and stripe_version, then append/commit MK_COLD with retired oids. */
+    if (have_rec) {
+        rec.ppos = cut.z;
+        rec.stripe_version = sv;
+        rc = ecsettle_index(db, merged, &rec, &out);
+        put_unindexed = false; /* ecsettle_index queued GC on failure */
+        if (merged->pending)
+            unlinkat(db->dirfd, merged->pending, 0);
+        if (rc == 0 && out)
+            out->written = merged->written;
+        part_unref(merged);
+        merged = NULL;
+        if (rc)
+            goto out;
+    } else {
+        out = merged;
+        merged = NULL;
+    }
+    cut.nobjs = have_rec ? 1 : 0;
+    step(db, ECCOLD_STEP_PRE_MARKER);
+    pause_pre_marker_hook();
+    atomic_store_explicit(&db->cold_active_sv, sv, memory_order_seq_cst);
+    if (!stripe_ok(cv, want_ep, sv)) {
+        if (have_rec) {
+            drop_ec(db, &out, 1, true);
+        } else if (out) {
+            if (out->pending)
+                unlinkat(db->dirfd, out->pending, 0);
+            part_unref(out);
+            out = NULL;
+        }
+        rc = TSDB_ERR_UNAVAILABLE;
+        goto out;
+    }
+    uint64_t pos = 0;
+    uint32_t nret_mk = eccold_mutant == ECCOLD_MUT_RETIREDUNNAMED ? 0u : (uint32_t)nret;
+    if (have_rec) {
+        rc = cold_marker_ex(db, &cut, &rec, &out, 1, y, ny, (const uint8_t *)ret_oids, nret_mk, &pos);
+    } else {
+        part **ymk = malloc((1 + ny) * sizeof *ymk);
+        if (!ymk) {
+            rc = TSDB_ERR_NOMEM;
+        } else {
+            ymk[0] = out;
+            if (ny)
+                memcpy(ymk + 1, y, ny * sizeof *y);
+            rc = cold_marker_ex(db, &cut, NULL, NULL, 0, ymk, 1 + ny, (const uint8_t *)ret_oids, nret_mk, &pos);
+            free(ymk);
+        }
+    }
+    cut.pos = pos;
+    if (rc) {
+        bool discard = rc != TSDB_ERR_INDETERMINATE && !eng_check(db);
+        if (have_rec) {
+            drop_ec(db, &out, 1, discard);
+        } else if (out) {
+            if (discard && out->pending)
+                unlinkat(db->dirfd, out->pending, 0);
+            part_unref(out);
+            out = NULL;
+        }
+        goto out;
+    }
+    step(db, ECCOLD_STEP_MARKER);
+
+    /* 6. Leader swap (ec_swap_reencode records PPOS, RSTATE doing/done, and retires old .ec with need_digest). */
+    struct eccold cur = {.pos = pos, .z = cut.z, .key = key};
+    db->cold = &cur;
+    rc = ec_swap_reencode(db, pin, np, out);
+    db->cold = NULL;
+    if (rc) {
+        if (!eng_check(db))
+            eng_fail(db, "a re-encode's swap was refused after its COLD marker committed", rc);
+        part_unref(out);
+        out = NULL;
+        rc = TSDB_ERR_IO;
+        goto out;
+    }
+
+    /* Release gate and drop all in-memory references to pin[] BEFORE pause_before_digest and leader digest so no
+     * local ecgc_held() masks the need_digest GC gate (testing gcbeforedigest). */
+    atomic_store_explicit(&db->cold_active_sv, 0, memory_order_release);
+    if (gated) {
+        lw_leave(db, &f);
+        f.r = NULL;
+        gated = false;
+        cut.hold_us = mono_us() - t_gate;
+    }
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < np; i++) {
+        pin[i]->settling = false;
+        pin[i]->reencoding = false;
+    }
+    pthread_cond_broadcast(&db->merged_cv);
+    pthread_mutex_unlock(&db->lock);
+    for (size_t i = 0; i < np; i++) {
+        part_unref(pin[i]);
+        pin[i] = NULL;
+    }
+
+    /* 7. Verify leader logical digest (retired set + Y vs new output + Y read back from chunk stores), commit
+     *    MK_DIGEST, and ONLY THEN release the retired objects for MK_GC and hand young settled_ sources to eckeep.
+     *    Note: step 1 already verified exact logical equivalence before putting to the stripe group; if step 7 hits a
+     *    brief store blip we retry up to 3 times, and on prolonged outage or failover before MK_DIGEST the retired
+     *    objects stay held on this leader (reopen/promotion collects them via ecgc_load_retired once replicas pass
+     *    MK_COLD), while a genuine mismatch sets durable DIVERGED and keeps both chunks and young settled_ copies. */
+    pause_before_digest_hook();
+    {
+        part **in_set = calloc(np + ny, sizeof *in_set);
+        part **out_set = calloc(1 + ny, sizeof *out_set);
+        size_t n_opened = 0;
+        int drc = in_set && out_set ? 0 : TSDB_ERR_NOMEM;
+        for (size_t i = 0; drc == 0 && i < np; i++) {
+            if (ec_retired_name(pin_names[i]))
+                drc = part_open_ec(db, pin_names[i], pin_names[i] + 8, &in_set[n_opened]);
+            else
+                drc = part_open_as(db->dirfd, pin_names[i], pin_names[i] + 8, false, false, &in_set[n_opened]);
+            if (drc == 0) {
+                in_set[n_opened]->verify = true;
+                n_opened++;
+            }
+        }
+        if (drc == 0) {
+            for (size_t i = 0; i < ny; i++)
+                in_set[np + i] = y[i];
+            out_set[0] = out;
+            for (size_t i = 0; i < ny; i++)
+                out_set[1 + i] = y[i];
+            uint64_t digest_pos = 0;
+            for (int try_n = 0; try_n < 3; try_n++) {
+                if (have_rec)
+                    eccache_forget(db->tier, db->tier_vol, rec.oid); /* read output back through chunk stores */
+                drc = ecdigest_leader_reencode(db, key, cut.z, in_set, np + ny, out_set, 1 + ny,
+                                               have_rec ? rec.oid : NULL, have_rec ? 1 : 0, &digest_pos);
+                if (drc != TSDB_ERR_UNAVAILABLE || atomic_load(&db->stop) || !eccold_leader(db))
+                    break;
+                struct timespec ts = {0, 200 * 1000000L};
+                nanosleep(&ts, NULL);
+            }
+            for (size_t i = 0; i < n_opened; i++)
+                part_unref(in_set[i]);
+            n_opened = 0;
+            if (drc == 0) {
+                if (nret > 0)
+                    ecgc_digest_matched(db, ret_oids, nret, digest_pos);
+                if (npart_srcs)
+                    eckeep_swapped(db, part_srcs, npart_srcs);
+            }
+        } else {
+            fprintf(stderr, "tsdb: %s: re-encode: key %" PRId64 ": retired copy could not be reopened for digest (%d); "
+                            "retired objects and sources stay held\n", db->dir, key, drc);
+            for (size_t i = 0; i < n_opened; i++)
+                part_unref(in_set[i]);
+        }
+        free(in_set);
+        free(out_set);
+    }
+
+out:
+    atomic_store_explicit(&db->cold_active_sv, 0, memory_order_release);
+    if (gated) {
+        lw_leave(db, &f);
+        cut.hold_us = mono_us() - t_gate;
+    } else if (f.r) {
+        free(f.r);
+    }
+    if (ny) {
+        pthread_mutex_lock(&db->lock);
+        for (size_t i = 0; i < ny; i++)
+            y[i]->settling = false;
+        pthread_mutex_unlock(&db->lock);
+        for (size_t i = 0; i < ny; i++)
+            part_unref(y[i]);
+    }
+    free(y);
+    for (size_t i = 0; i < npart_srcs; i++)
+        part_unref(part_srcs[i]);
+    free(part_srcs);
+    free(pin_names);
+    free(ret_oids);
+    if (merged) {
+        if (merged->pending)
+            unlinkat(db->dirfd, merged->pending, 0);
+        part_unref(merged);
+    }
+    if (out)
+        part_unref(out);
+    if (put_unindexed)
+        ecsettle_gc_object(db, &rec);
+    if (have_rec)
+        ec_record_free(&rec);
     cut.rc = rc;
     pthread_mutex_lock(&last_mu);
     last_cut = cut;

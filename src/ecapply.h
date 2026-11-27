@@ -27,8 +27,11 @@ struct part;
 /* A committed MK_COLD at log position pos (m decoded): 0 when applied. */
 int ecapply_cold(struct eng *db, uint64_t pos, const mk *m);
 /* Recovery of a swap record of key `key` naming oids[0 .. n) (n x MK_OID bytes): 1 done (every oid's .ec listed),
- * 0 not (none), TSDB_ERR_CORRUPT for some. */
+ * 0 not (none), TSDB_ERR_CORRUPT for some. ecapply_cold_decide_ex also handles an empty-output re-encode (n == 0,
+ * nretired > 0) by checking whether all retired oids are still listed (0), none (1), or some (CORRUPT). */
 int ecapply_cold_decide(struct eng *db, int64_t key, const uint8_t *oids, uint32_t n);
+int ecapply_cold_decide_ex(struct eng *db, int64_t key, const uint8_t *oids, uint32_t n, const uint8_t *retired,
+                           uint32_t nretired);
 /* Around a settle's swap (src/ecswap.c, ec_swap_commit: the inputs `in`, their .ec parts `ec`, n of each). */
 /* ecapply_swap_pre sets *logged (first, also when it fails) when a committed COLD marker names the swap's objects (every
  * swap of a cluster ec volume, leader or replica): ec_swap_commit then never hands them to r7-gc or back to its caller;

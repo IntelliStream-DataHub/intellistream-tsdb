@@ -2533,6 +2533,383 @@ static void test_unsettle(void)
            "PPOS reopen + idempotent replay\n");
 }
 
+/* ------------------------------------------------------------ reencode: R10 cluster re-encode leader + replica */
+
+static void reenc_intent_exit(eng *db, int which)
+{
+    (void)db;
+    if (which == ECAPPLY_CRASH_MID_INTENT)
+        _exit(99);
+}
+
+static void test_reencode(void)
+{
+    /* Part A: 3 .ec objects + 1 young .part on KEY re-encoded on leader -> MK_COLD(nretired=3) + MK_DIGEST ->
+     * GC applied-floor gate -> replica applies (retires 3 .ec + young part, lists 1 .ec, verifies MK_DIGEST
+     * synchronously, serves exact rows including overwrite) -> idempotent reopen. */
+    {
+        lt L;
+        rt R;
+        rec_reset();
+        if (!start("reencode", &L))
+            return;
+        make_replica(&L, &R);
+        /* Build 3 settled .ec parts on KEY (with distinct ranges + an overwrite in batch 3). */
+        CHECK(rows(L.db, L.s[0], 0, 0, 200, 1.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        CHECK(rows(L.db, L.s[0], 0, 200, 200, 201.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        CHECK(rows(L.db, L.s[0], 0, 400, 100, 401.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        /* Add a late young .part on KEY that overwrites timestamps [10..29] and adds s1 rows. */
+        CHECK(rows(L.db, L.s[0], 0, 10, 20, 9000.0f) == 0);
+        CHECK(rows(L.db, L.s[1], 0, 0, 50, 500.0f) == 0);
+
+        part *ec[8], *plain[8], *sel[16];
+        size_t ne = parts_of(L.db, KEY, ec, 8, true);
+        size_t np = parts_of(L.db, KEY, plain, 8, false);
+        CHECK(ne == 3 && np >= 1);
+        size_t nsel = 0;
+        for (size_t i = 0; i < ne; i++)
+            sel[nsel++] = ec[i];
+        for (size_t i = 0; i < np; i++)
+            sel[nsel++] = plain[i];
+        size_t reenc = 0;
+        int rc = eng_reencode(L.db, KEY, sel, nsel, &reenc);
+        unref_all(ec, ne);
+        unref_all(plain, np);
+        CHECK(rc == 0 && reenc == nsel);
+
+        /* Verify MK_COLD carried nretired == 3 and nobjs == 1. */
+        uint64_t cold_pos = L.x.cold_fno;
+        uint64_t last = LAST;
+        CHECK(cold_pos > 0 && last > cold_pos); /* MK_DIGEST appended after MK_COLD */
+        mk dm;
+        CHECK(L.x.cold && mk_decode(L.x.cold, L.x.ncold, &dm) == 0 && dm.type == MK_COLD &&
+              dm.u.cold.nobjs == 1 && dm.u.cold.nretired == 3);
+
+        /* Leader lists 1 .ec part and 0 plain parts on KEY, and serves all rows including the overwrite. */
+        ne = parts_of(L.db, KEY, ec, 8, true);
+        np = parts_of(L.db, KEY, plain, 8, false);
+        CHECK(ne == 1 && np == 0);
+        unref_all(ec, ne);
+        unref_all(plain, np);
+        CHECK(holds(L.db, L.s[1], 0, 0, 50, 500.0f));
+        {
+            qctx *q = query(L.db, L.s[0], 0);
+            CHECK(q->n == 500);
+            for (int i = 0; q->n == 500 && i < 500; i++) {
+                float want = (i >= 10 && i < 30) ? 9000.0f + (float)(i - 10) : 1.0f + (float)i;
+                CHECK(q->ts[i] == DAY0 + 1000LL * i && q->v[i] == want);
+            }
+            free(q);
+        }
+
+        /* GC gate: retired oids stay held while lead_applied_floor < digest_pos, then release once floor >= last. */
+        eng_leader_applied_floor(L.db, cold_pos);
+        uint8_t (*due)[16] = NULL;
+        size_t ndue = 0;
+        CHECK(ecgc_take_due_retired(L.db, INT64_MAX, &due, &ndue) == 0 && ndue == 0);
+        free(due);
+        eng_leader_applied_floor(L.db, last);
+        due = NULL, ndue = 0;
+        CHECK(ecgc_take_due_retired(L.db, INT64_MAX, &due, &ndue) == 0 && ndue == 3);
+        free(due);
+
+        lstop(&L);
+
+        /* Replica replays the entire log (3 settles + late inserts + re-encode MK_COLD + MK_DIGEST). */
+        if (ropen(&L, &R, 0) != 0) {
+            CHECK(0);
+            lclose(&L);
+            return;
+        }
+        CHECK(feed(&R, last) == 0);
+        CHECK(!atomic_load(&R.db->diverged));
+        ne = parts_of(R.db, KEY, ec, 8, true);
+        np = parts_of(R.db, KEY, plain, 8, false);
+        CHECK(ne == 1 && np == 0);
+        unref_all(ec, ne);
+        unref_all(plain, np);
+        CHECK(count_names(R.dir, "retired_") >= 3);
+        CHECK(holds(R.db, L.s[1], 0, 0, 50, 500.0f));
+        {
+            qctx *q = query(R.db, L.s[0], 0);
+            CHECK(q->n == 500);
+            for (int i = 0; q->n == 500 && i < 500; i++) {
+                float want = (i >= 10 && i < 30) ? 9000.0f + (float)(i - 10) : 1.0f + (float)i;
+                CHECK(q->ts[i] == DAY0 + 1000LL * i && q->v[i] == want);
+            }
+            free(q);
+        }
+        CHECK(eng_check(R.db) == 0);
+        rstop(&R);
+        /* Clean reopen at last. */
+        if (ropen(&L, &R, last) == 0) {
+            ne = parts_of(R.db, KEY, ec, 8, true);
+            CHECK(ne == 1 && !atomic_load(&R.db->diverged));
+            unref_all(ec, ne);
+            CHECK(holds(R.db, L.s[1], 0, 0, 50, 500.0f));
+            rstop(&R);
+        } else {
+            CHECK(0);
+        }
+        lclose(&L);
+    }
+
+    /* Part B: a replica part on KEY with ppos > Z during re-encode MK_COLD triggers DIVERGED. */
+    {
+        lt L;
+        rt R;
+        rec_reset();
+        if (!start("reencode-above", &L))
+            return;
+        make_replica(&L, &R);
+        CHECK(rows(L.db, L.s[0], 0, 0, 200, 1.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        CHECK(rows(L.db, L.s[0], 0, 200, 200, 201.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        CHECK(rows(L.db, L.s[0], 0, 400, 50, 401.0f) == 0);
+        part *ec[8], *plain[8], *sel[16];
+        size_t ne = parts_of(L.db, KEY, ec, 8, true);
+        size_t np = parts_of(L.db, KEY, plain, 8, false);
+        CHECK(ne == 2 && np >= 1);
+        size_t nsel = 0;
+        for (size_t i = 0; i < ne; i++)
+            sel[nsel++] = ec[i];
+        for (size_t i = 0; i < np; i++)
+            sel[nsel++] = plain[i];
+        CHECK(eng_reencode(L.db, KEY, sel, nsel, NULL) == 0);
+        unref_all(ec, ne);
+        unref_all(plain, np);
+        eccold_cut c;
+        eccold_test_last(&c);
+        uint64_t cpos = L.x.cold_fno, last = LAST;
+        lstop(&L);
+
+        if (ropen(&L, &R, 0) == 0) {
+            CHECK(feed(&R, cpos - 1) == 0);
+            part *own[8];
+            size_t no = parts_of(R.db, KEY, own, 8, false);
+            CHECK(no >= 1);
+            if (no >= 1) {
+                const char *nm[1] = {own[0]->name};
+                pthread_mutex_lock(&R.db->publish_lock);
+                CHECK(ppos_record(R.db, nm, 1, c.z + 1) == 0);
+                pthread_mutex_unlock(&R.db->publish_lock);
+            }
+            unref_all(own, no);
+            CHECK(replica_apply(R.db, last) != 0);
+            CHECK(atomic_load(&R.db->diverged));
+            rstop(&R);
+        } else {
+            CHECK(0);
+        }
+        lclose(&L);
+    }
+
+    /* Part C: replica crashes mid-intent (ECAPPLY_STEP_INTENT) on re-encode MK_COLD -> v5 intent rolls forward. */
+    {
+        lt L;
+        rt R;
+        rec_reset();
+        if (!start("reencode-crash", &L))
+            return;
+        make_replica(&L, &R);
+        CHECK(rows(L.db, L.s[0], 0, 0, 200, 1.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        CHECK(rows(L.db, L.s[0], 0, 200, 200, 201.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        part *ec[8];
+        size_t ne = parts_of(L.db, KEY, ec, 8, true);
+        CHECK(ne == 2);
+        CHECK(eng_reencode(L.db, KEY, ec, ne, NULL) == 0);
+        unref_all(ec, ne);
+        uint64_t cpos = L.x.cold_fno, last = LAST;
+        lstop(&L);
+
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (ropen(&L, &R, 0) != 0)
+                _exit(2);
+            if (feed(&R, cpos - 1) != 0)
+                _exit(3);
+            atomic_store(&ecapply_crash_hook, reenc_intent_exit);
+            (void)replica_apply(R.db, last);
+            _exit(4);
+        }
+        CHECK(child_status(pid) == 99);
+        if (ropen(&L, &R, cpos - 1) == 0) {
+            CHECK(replica_apply(R.db, last) == 0);
+            CHECK(!atomic_load(&R.db->diverged));
+            ne = parts_of(R.db, KEY, ec, 8, true);
+            CHECK(ne == 1);
+            unref_all(ec, ne);
+            CHECK(holds(R.db, L.s[0], 0, 0, 400, 1.0f));
+            CHECK(eng_check(R.db) == 0);
+            rstop(&R);
+        } else {
+            CHECK(0);
+        }
+        lclose(&L);
+    }
+
+    /* Part D: empty-output re-encode (tombstones delete every row -> MK_COLD with nobjs=0, nretired=2, empty .part as
+     * MK_FILE_Y) + ecapply_cold_decide_ex (all/none/partial) + replica apply + mid-intent crash recovery. */
+    {
+        lt L;
+        rt R;
+        rec_reset();
+        if (!start("reencode-empty", &L))
+            return;
+        make_replica(&L, &R);
+        CHECK(rows(L.db, L.s[0], 0, 0, 200, 1.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        CHECK(rows(L.db, L.s[0], 0, 200, 200, 201.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        /* Delete every row of s0 on day 0 (produces a tombstone-only part above the 2 .ec parts). */
+        CHECK(eng_delete_range(L.db, L.s[0], DAY0, DAY0 + DAY_MS) == 0);
+        part *ec[8], *plain[8], *sel[16];
+        size_t ne = parts_of(L.db, KEY, ec, 8, true);
+        size_t np = parts_of(L.db, KEY, plain, 8, false);
+        CHECK(ne == 2 && np >= 1);
+        uint8_t ret_oids[2 * MK_OID];
+        for (size_t i = 0; i < 2 && i < ne; i++) {
+            struct ecpart *ep = atomic_load(&ec[i]->ec);
+            memcpy(ret_oids + i * MK_OID, ep->rec.oid, MK_OID);
+        }
+        /* Before re-encode: all 2 retired oids are still listed -> decide_ex answers 0 (not done); 1 real + 1 bogus
+         * oid -> partial -> TSDB_ERR_CORRUPT. */
+        CHECK(ecapply_cold_decide_ex(L.db, KEY, NULL, 0, ret_oids, 2) == 0);
+        {
+            uint8_t partial[2 * MK_OID];
+            memcpy(partial, ret_oids, MK_OID);
+            memset(partial + MK_OID, 0xee, MK_OID);
+            CHECK(ecapply_cold_decide_ex(L.db, KEY, NULL, 0, partial, 2) == TSDB_ERR_CORRUPT);
+        }
+        size_t nsel = 0;
+        for (size_t i = 0; i < ne; i++)
+            sel[nsel++] = ec[i];
+        for (size_t i = 0; i < np; i++)
+            sel[nsel++] = plain[i];
+        CHECK(eng_reencode(L.db, KEY, sel, nsel, NULL) == 0);
+        unref_all(ec, ne);
+        unref_all(plain, np);
+
+        mk dm;
+        CHECK(L.x.cold && mk_decode(L.x.cold, L.x.ncold, &dm) == 0 && dm.type == MK_COLD &&
+              dm.u.cold.nobjs == 0 && dm.u.cold.nretired == 2 && dm.u.cold.nfiles >= 1);
+        /* After re-encode: none of the 2 retired oids are listed -> decide_ex answers 1 (done). */
+        CHECK(ecapply_cold_decide_ex(L.db, KEY, NULL, 0, ret_oids, 2) == 1);
+        ne = parts_of(L.db, KEY, ec, 8, true);
+        CHECK(ne == 0);
+        unref_all(ec, ne);
+        {
+            qctx *q = query(L.db, L.s[0], 0);
+            CHECK(q->n == 0);
+            free(q);
+        }
+        uint64_t cpos = L.x.cold_fno, last = LAST;
+        lstop(&L);
+
+        /* Replica crashes mid-intent on empty-output MK_COLD, then recovers and finishes cleanly. */
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (ropen(&L, &R, 0) != 0)
+                _exit(2);
+            if (feed(&R, cpos - 1) != 0)
+                _exit(3);
+            atomic_store(&ecapply_crash_hook, reenc_intent_exit);
+            (void)replica_apply(R.db, last);
+            _exit(4);
+        }
+        CHECK(child_status(pid) == 99);
+        if (ropen(&L, &R, cpos - 1) == 0) {
+            CHECK(replica_apply(R.db, last) == 0);
+            CHECK(!atomic_load(&R.db->diverged));
+            ne = parts_of(R.db, KEY, ec, 8, true);
+            CHECK(ne == 0);
+            unref_all(ec, ne);
+            qctx *q = query(R.db, L.s[0], 0);
+            CHECK(q->n == 0);
+            free(q);
+            CHECK(eng_check(R.db) == 0);
+            rstop(&R);
+        } else {
+            CHECK(0);
+        }
+        lclose(&L);
+    }
+
+    /* Part E: transient store outage during replica synchronous MK_DIGEST on retired .ec MUST NOT acknowledge
+     * MK_DIGEST (keeps applied < digest_pos so MK_GC stays gated); reopening with stores UP completes it cleanly. */
+    {
+        lt L;
+        rt R;
+        rec_reset();
+        if (!start("reencode-digunavail", &L))
+            return;
+        make_replica(&L, &R);
+        CHECK(rows(L.db, L.s[0], 0, 0, 200, 1.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        CHECK(rows(L.db, L.s[0], 0, 200, 200, 201.0f) == 0);
+        CHECK(eng_optimize(L.db) == 0);
+        CHECK(settle_key(L.db, KEY) == 0);
+        part *ec[8];
+        size_t ne = parts_of(L.db, KEY, ec, 8, true);
+        CHECK(ne == 2);
+        CHECK(eng_reencode(L.db, KEY, ec, ne, NULL) == 0);
+        unref_all(ec, ne);
+        uint64_t cpos = L.x.cold_fno, last = LAST;
+        CHECK(cpos > 0 && last > cpos);
+        lstop(&L);
+
+        if (ropen(&L, &R, 0) == 0) {
+            CHECK(feed(&R, cpos) == 0);
+            CHECK(replica_applied_end(R.db) == cpos);
+            /* Mark all 3 stores down so retired .ec objects are unreadable (-> TSDB_ERR_UNAVAILABLE). */
+            tier_store_set_down(R.t, 0, CHUNK_STORE_DOWN_IOERR);
+            tier_store_set_down(R.t, 1, CHUNK_STORE_DOWN_IOERR);
+            tier_store_set_down(R.t, 2, CHUNK_STORE_DOWN_IOERR);
+            atomic_store(&ecdigest_test_retry_ms, 50);
+            int rc = replica_apply(R.db, last);
+            atomic_store(&ecdigest_test_retry_ms, -1);
+            CHECK(rc == TSDB_ERR_UNAVAILABLE);
+            CHECK(replica_applied_end(R.db) == cpos); /* MUST NOT advance applied past MK_DIGEST */
+            CHECK(!atomic_load(&R.db->diverged));
+            rstop(&R);
+        } else {
+            CHECK(0);
+        }
+        /* Reopen with all 3 stores UP: synchronous digest now succeeds and advances applied to last. */
+        if (ropen(&L, &R, cpos) == 0) {
+            CHECK(replica_apply(R.db, last) == 0);
+            CHECK(replica_applied_end(R.db) == last);
+            CHECK(!atomic_load(&R.db->diverged));
+            CHECK(holds(R.db, L.s[0], 0, 0, 400, 1.0f));
+            CHECK(eng_check(R.db) == 0);
+            rstop(&R);
+        } else {
+            CHECK(0);
+        }
+        lclose(&L);
+    }
+    printf("  reencode: leader MK_COLD(nretired) + MK_DIGEST + GC floor gate + replica apply + above-Z DIVERGED + "
+           "mid-intent crash + empty output + digest outage gate\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *only = NULL, *power_root = NULL, *lpower_root = NULL, *recover_root = NULL, *dpower_root = NULL;
@@ -2600,7 +2977,8 @@ int main(int argc, char **argv)
                  {"multi", test_multi}, {"twice", test_twice}, {"tamper", test_tamper}, {"leader", test_leader},
                  {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power},
                  {"recover", test_recover}, {"recpower", test_recpower}, {"digest", test_digest},
-                 {"digestpower", test_digestpower}, {"degraded", test_degraded}, {"unsettle", test_unsettle}};
+                 {"digestpower", test_digestpower}, {"degraded", test_degraded}, {"unsettle", test_unsettle},
+                 {"reencode", test_reencode}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();

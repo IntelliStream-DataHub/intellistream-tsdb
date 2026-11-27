@@ -726,6 +726,9 @@ static bool pick_tomb_window(part *const *parts, size_t len, size_t limit, uint6
 typedef struct {
     int64_t key;
     size_t off, len;
+    size_t min_hi;    /* cluster EC: exclusive upper bound must be >= min_hi (past last .ec in key); 0 on single server */
+    size_t max_lo;    /* cluster EC: inclusive lower bound must be <= max_lo (at/before first young part); SIZE_MAX else */
+    size_t tail_after;/* parts in key after this run (cluster EC: must fit 1 + tail <= MK_FILES_MAX) */
 } reenc_run;
 
 /* Whether a reencodeable run parts[r_lo .. r_hi) has any non-empty .ec part followed by a part with tombstones. */
@@ -745,15 +748,19 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
 {
     ecpolicy_state *ps = ecpolicy_of(db);
     const tier_settings *cfg = db->tier ? tier_eng_settings(db) : NULL;
-    if (!ps || !cfg || !cap || db->ec_cluster || db->cluster_req || db->replica_req || eng_jr(db) ||
-        atomic_load(&db->diverged))
+    bool cluster = db->ec_cluster;
+    if (!ps || !cfg || !cap || (!cluster && (db->cluster_req || db->replica_req || eng_jr(db))) ||
+        (cluster && !eccold_leader(db)) || atomic_load(&db->diverged))
         return 0;
     pthread_mutex_lock(&ps->pmu);
     ecpolicy_state snap = *ps;
     pthread_mutex_unlock(&ps->pmu);
-    if (cfg->eager && now - snap.eager_rwin_ms < 60000 && now >= snap.eager_rwin_ms &&
+    if (!cluster && cfg->eager && now - snap.eager_rwin_ms < 60000 && now >= snap.eager_rwin_ms &&
         snap.eager_rn >= ECPOLICY_EAGER_REENCODE_PER_MIN)
         return 0;
+    uint64_t cap_ms = atomic_load(&db->lead_cap_ms);
+    int64_t retain = cap_ms ? (int64_t)cap_ms : ECCOLD_RETAIN_S_DEFAULT * 1000LL;
+    int64_t margin = cfg->keep_s * 1000 + retain + 3600 * 1000LL;
     unsigned obj_max = atomic_load(&ecpolicy_objects_max);
     if (obj_max == 0)
         obj_max = ECPOLICY_OBJECTS_MAX_DEFAULT;
@@ -777,11 +784,19 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
         if (hi_i - lo_i < 2 || partition_dropping(db, k) || rfailed_recently(&snap, k, now) ||
             eckeep_key_pending(db, k))
             continue;
+        if (cluster && expires_within(db, lo_i, hi_i, now, margin))
+            continue;
         bool blocked = false, has_ec = false, has_tombs = false;
+        size_t first_young = hi_i, last_ec = lo_i;
         for (size_t i = lo_i; i < hi_i; i++) {
             const part *p = db->parts[i];
-            blocked |= p->settling || atomic_load(&p->damaged);
-            has_ec |= part_is_real_ec(p);
+            blocked |= p->settling || atomic_load(&p->damaged) || (cluster && p->merging);
+            if (part_is_real_ec(p)) {
+                has_ec = true;
+                last_ec = i;
+            } else if (first_young == hi_i) {
+                first_young = i;
+            }
             has_tombs |= p->nt > 0;
         }
         if (blocked || !has_ec)
@@ -811,7 +826,7 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
                 bool next_ok = next_ec != SIZE_MAX && span_fits(db->parts, i, next_ec, limit, max_bytes);
                 if (prev_ok || next_ok)
                     ncomb++;
-                if (pick_lo == SIZE_MAX && next_ok) {
+                if (!cluster && pick_lo == SIZE_MAX && next_ok) {
                     /* Greedily extend rightward across combinable .ec and young .part files within the budget. */
                     uint64_t sum = 0;
                     for (size_t j = i; j <= next_ec; j++)
@@ -838,7 +853,40 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
                 }
                 prev_ec = i;
             }
-            if (has_tombs && run_has_ec_tombs(db->parts, r_lo, r_hi)) {
+            if (cluster && r_lo <= last_ec && last_ec < r_hi && r_lo <= first_young) {
+                /* Cluster suffix pick (r10-crepl): window must cover through last_ec and start at or before
+                 * first_young so replicas can renumber new_EC and trailing Y strictly above remaining .ec parts. */
+                size_t end = last_ec + 1;
+                size_t start = last_ec;
+                uint64_t sum = part_data_bytes(db->parts[last_ec]);
+                if (sum <= max_bytes) {
+                    while (start > r_lo && end - start < limit) {
+                        uint64_t sz = part_data_bytes(db->parts[start - 1]);
+                        if (sz > max_bytes - sum)
+                            break;
+                        sum += sz;
+                        start--;
+                    }
+                    size_t ec_in = 0;
+                    for (size_t j = start; j < end; j++)
+                        ec_in += part_is_ec(db->parts[j]) ? 1 : 0;
+                    if (start <= first_young && ec_in >= 2) {
+                        while (end < r_hi && end - start < limit) {
+                            uint64_t sz = part_data_bytes(db->parts[end]);
+                            if (sz > max_bytes - sum)
+                                break;
+                            sum += sz;
+                            end++;
+                        }
+                        if (1 + (hi_i - end) <= MK_FILES_MAX) {
+                            pick_lo = start;
+                            pick_hi = end;
+                        }
+                    }
+                }
+            }
+            if (has_tombs && run_has_ec_tombs(db->parts, r_lo, r_hi) &&
+                (!cluster || (r_lo <= last_ec && last_ec < r_hi && r_lo <= first_young))) {
                 nruns++;
                 ncand += r_hi - r_lo;
             }
@@ -871,11 +919,19 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
                 if (hi_i - lo_i < 2 || partition_dropping(db, k) || rfailed_recently(&snap, k, now) ||
                     eckeep_key_pending(db, k))
                     continue;
+                if (cluster && expires_within(db, lo_i, hi_i, now, margin))
+                    continue;
                 bool blocked = false, has_ec = false, has_tombs = false;
+                size_t first_young = hi_i, last_ec = lo_i;
                 for (size_t i = lo_i; i < hi_i; i++) {
                     const part *p = db->parts[i];
-                    blocked |= p->settling || atomic_load(&p->damaged);
-                    has_ec |= part_is_real_ec(p);
+                    blocked |= p->settling || atomic_load(&p->damaged) || (cluster && p->merging);
+                    if (part_is_real_ec(p)) {
+                        has_ec = true;
+                        last_ec = i;
+                    } else if (first_young == hi_i) {
+                        first_young = i;
+                    }
                     has_tombs |= p->nt > 0;
                 }
                 if (blocked || !has_ec || !has_tombs)
@@ -888,8 +944,17 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
                         r++;
                     size_t r_hi = r;
                     size_t rlen = r_hi - r_lo;
-                    if (run_has_ec_tombs(db->parts, r_lo, r_hi) && got_parts + rlen <= ncand) {
-                        runs[got_runs++] = (reenc_run){.key = k, .off = got_parts, .len = rlen};
+                    if (run_has_ec_tombs(db->parts, r_lo, r_hi) &&
+                        (!cluster || (r_lo <= last_ec && last_ec < r_hi && r_lo <= first_young)) &&
+                        got_parts + rlen <= ncand) {
+                        runs[got_runs++] = (reenc_run){
+                            .key = k,
+                            .off = got_parts,
+                            .len = rlen,
+                            .min_hi = cluster ? (last_ec - r_lo + 1) : 0,
+                            .max_lo = cluster ? (first_young >= r_hi ? rlen : first_young - r_lo) : SIZE_MAX,
+                            .tail_after = hi_i - r_hi,
+                        };
                         for (size_t i = r_lo; i < r_hi; i++) {
                             part_ref(db->parts[i]);
                             cand_parts[got_parts++] = db->parts[i];
@@ -905,7 +970,17 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
     size_t picked = 0;
     for (size_t ri = 0; ri < got_runs; ri++) {
         size_t wlo = 0, whi = 0;
-        if (pick_tomb_window(cand_parts + runs[ri].off, runs[ri].len, limit, max_bytes, &wlo, &whi)) {
+        part *const *rp = cand_parts + runs[ri].off;
+        if (pick_tomb_window(rp, runs[ri].len, limit, max_bytes, &wlo, &whi)) {
+            if (cluster) {
+                if (wlo > runs[ri].max_lo)
+                    wlo = runs[ri].max_lo;
+                if (whi < runs[ri].min_hi)
+                    whi = runs[ri].min_hi;
+                if (!span_fits(rp, wlo, whi - 1, limit, max_bytes) ||
+                    1 + (runs[ri].len - whi) + runs[ri].tail_after > MK_FILES_MAX)
+                    continue;
+            }
             picked = whi - wlo;
             for (size_t i = 0; i < picked; i++) {
                 sel[i] = cand_parts[runs[ri].off + wlo + i];

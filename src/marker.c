@@ -17,7 +17,7 @@
  *   COLD    u64 z, u64 flush_through, u64 stripe_version, i64 key, u32 nobjs, u32 nfiles, u32 nretired, u32 0,
  *           objects: nobjs x (oid[16], u32 rec_len, u32 0, record, zeros to 4 bytes),
  *           files: nfiles x (as COMMIT's, with the kind in the byte after name_len: u16 name_len, u8 kind, u8 0, ...),
- *           retired: nretired x oid[16] (R10's; this build refuses nretired != 0)
+ *           retired: nretired x oid[16] (R10's re-encode: objects replaced by this COLD)
  *   GC      u32 reason, u32 noids, noids x oid[16] (RETIRED/ORPHAN/DONE);
  *           u32 reason, u32 0, u32 rel_vol, u32 rel_pos, u32 rel_node, u32 0, u64 rel_ver (RELEASE/RELEASE_DONE)
  *   DIGEST  i64 key, u64 z, u64 rows, u64 series, u64 xxh64, i64 now_ms, u32 noids, u32 0, noids x oid[16]; flags MKD_TOMBS
@@ -327,10 +327,6 @@ static int decode_cold(const uint8_t *b, size_t n, mk_cold *c)
     memcpy(&c->nfiles, b + 36, 4);
     memcpy(&c->nretired, b + 40, 4);
     if (!counts_ok(c->nobjs, c->nfiles, c->nretired))
-        return TSDB_ERR_CORRUPT;
-    /* retired oids are R10's re-encode, written empty in R8: a list says something this build cannot honour (the
-     * objects would stay referenced here while the leader dropped them), as a record's `positions` (ecpart.c) */
-    if (c->nretired != 0 && mk_test_mutant != MK_MUT_RETIRED)
         return TSDB_ERR_CORRUPT;
     size_t pos = COLD_FIXED, at = 0;
     c->objs = b + pos;

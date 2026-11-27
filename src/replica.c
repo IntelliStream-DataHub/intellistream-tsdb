@@ -2045,7 +2045,7 @@ static int apply_cold(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
         uint32_t n;
         if ((rc = cold_oids(&m->u.cold, &oids, &n)) != 0)
             return rc;
-        rc = ecapply_cold_decide(db, m->u.cold.key, oids, n);
+        rc = ecapply_cold_decide_ex(db, m->u.cold.key, oids, n, m->u.cold.retired, m->u.cold.nretired);
         free(oids);
         if (rc < 0) {
             fprintf(stderr, "tsdb: %s: the COLD at position %" PRIu64 " (key %" PRId64 ") was being carried out and what "
@@ -2053,7 +2053,7 @@ static int apply_cold(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
             return rc;
         }
         if (rc == 1) { /* it was: only the record is left to write */
-            ecdigest_cold_rebind(db, m->u.cold.key, m->u.cold.z); /* its copies' job, if the crash came first */
+            ecdigest_cold_rebind_ex(db, m->u.cold.key, m->u.cold.z, m->u.cold.retired, m->u.cold.nretired);
             rc = rs_cold_done(db, last);
             if (rc == 0 && ci < rp->ncm)
                 cm_remove(db, rp, ci, true);

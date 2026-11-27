@@ -665,15 +665,36 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         return TSDB_ERR_READONLY;
     if (!reencode_args_valid(in, nin, out))
         return TSDB_ERR_INVALID;
-    part **pin_parts = calloc(nin, sizeof *pin_parts);
-    if (!pin_parts)
-        return TSDB_ERR_NOMEM;
     char intent[64];
     snprintf(intent, sizeof intent, "txn_%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
 
     pthread_mutex_lock(&db->publish_lock);
     int rc = eng_check(db) ? TSDB_ERR_IO : 0;
     bool early = ecswap_mutant == SWAP_MUT_EARLY;
+    bool logged = false;
+    part *out1[1] = {out};
+    if (rc == 0) {
+        rc = ecapply_swap_pre(db, in, out1, 1, &logged);
+        logged = (logged || atomic_load(&ecswap_test_logged)) && ecswap_mutant != SWAP_MUT_LOGGEDGC;
+        if (rc && logged) {
+            pthread_mutex_unlock(&db->publish_lock);
+            return swap_refuse_logged(db, "its hook before the intent failed");
+        }
+        if (rc) {
+            pthread_mutex_unlock(&db->publish_lock);
+            if (rc != TSDB_ERR_NOMEM)
+                swap_discard_reencode(db, out);
+            return rc;
+        }
+    }
+    part **pin_parts = NULL;
+    if (rc == 0) {
+        pin_parts = calloc(nin, sizeof *pin_parts);
+        if (!pin_parts) {
+            pthread_mutex_unlock(&db->publish_lock);
+            return logged ? swap_refuse_logged(db, "out of memory") : TSDB_ERR_NOMEM;
+        }
+    }
     if (rc) {
         pthread_mutex_unlock(&db->publish_lock);
         free(pin_parts);
@@ -724,7 +745,10 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         lt_merge_marks(db, &lsec, in, nin);
         for (size_t i = 0; i < nin; i++) {
             if (atomic_load(&in[i]->ec)) {
-                ecgc_retire_locked(db, in[i]);
+                if (logged)
+                    ecgc_retire_locked_digest(db, in[i]);
+                else
+                    ecgc_retire_locked(db, in[i]);
                 if (db->opt.obsolete_part_lifetime_s <= 0) {
                     in[i]->retired = true;
                     atomic_store(&in[i]->obsolete, true);
@@ -759,6 +783,11 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
     pthread_mutex_unlock(&db->lock);
     lt_end(db, &lsec);
 
+    if (!ok && logged && eng_check(db) == 0) {
+        pthread_mutex_unlock(&db->publish_lock);
+        free(pin_parts);
+        return swap_refuse_logged(db, "a source was dropped, merged or unlisted before its renames");
+    }
     if (!ok) {
         rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
         swap_discard_reencode(db, out);
@@ -767,6 +796,11 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         return rc;
     }
     if (rc != 0) {
+        if (logged) {
+            pthread_mutex_unlock(&db->publish_lock);
+            free(pin_parts);
+            return swap_refuse_logged(db, "its intent could not be written");
+        }
         if (!wrote_intent && rc != TSDB_ERR_NOMEM)
             swap_discard_reencode(db, out);
         pthread_mutex_unlock(&db->publish_lock);
@@ -788,14 +822,15 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         free(pin_parts);
         return rc;
     }
+    ecapply_swap_post(db, in, out1, 1);
     settle_crash(SC_BEFORE_UNLINK);
     if (unlinkat(db->dirfd, intent, 0) != 0)
         fprintf(stderr, "tsdb: unlink of re-encode intent %s after its swap: %s (the next open rolls it forward)\n",
                 intent, strerror(errno));
     pthread_mutex_unlock(&db->publish_lock);
     /* Re-encoded .part sources have no same-stem .ec, so eckeep's digest thread marks them ECKEEP_ORPHAN and releases
-     * them after keep_s; eng_reencode already verified ec_logical_digest_frozen before swapping. */
-    if (npart_src)
+     * them after keep_s; for cluster re-encodes (logged), eccold_reencode hands them over after its leader digest. */
+    if (npart_src && !logged)
         eckeep_swapped(db, pin_parts, npart_src);
     free(pin_parts);
     int mrc = ec_swap_publish(db);
@@ -1498,8 +1533,15 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, bool *
             good = part_tmp_name(x->from) && part_file_name(x->to) && name_key(x->to, &k);
         else if (good && x->kind == 'R') {
             char want[sizeof x->to];
-            settled_of(x->from, want, sizeof want);
-            good = part_file_name(x->from) && strcmp(want, x->to) == 0 && name_key(x->from, &k);
+            if (part_file_name(x->from)) {
+                settled_of(x->from, want, sizeof want);
+                good = strcmp(want, x->to) == 0 && name_key(x->from, &k);
+            } else if (ec_file_name(x->from)) {
+                retired_of(x->from, want, sizeof want);
+                good = strcmp(want, x->to) == 0 && name_key(x->from, &k);
+            } else {
+                good = false;
+            }
         } else
             good = false; /* X (R15 salvage) is not written here */
         if (good && got == 0)

@@ -148,12 +148,12 @@ typedef struct mk_now {
     int64_t now_ms;
 } mk_now;
 
-/* COLD (R8, design-cluster-data.md 2.3 steps 4-6): the settle of partition key `key` cut at log position Z. The
- * leader's memtable held no row of the key above `flush_through` (F, as a COMMIT's: the leader's wal_flushed after
- * its rotate at the cut; a replica flushes through F only). The object records are opaque here (ec_record_encode's
- * bytes, decoded and checked by their consumer), each with its oid; the files are the .ec and Y files to list; the
- * retired oids are objects the settle replaces (R10's re-encode; written empty in R8, and a decode refuses a list). Iterate with mk_cold_obj_next,
- * mk_cold_file_next and mk_oid_at (the retired list). */
+/* COLD (R8/R10, design-cluster-data.md 2.3 steps 4-6, E6): the settle or re-encode of partition key `key` cut at log
+ * position Z. The leader's memtable held no row of the key above `flush_through` (F, as a COMMIT's: the leader's
+ * wal_flushed after its rotate at the cut; a replica flushes through F only). The object records are opaque here
+ * (ec_record_encode's bytes, decoded and checked by their consumer), each with its oid; the files are the .ec and Y
+ * files to list; the retired oids are objects a re-encode replaces (empty for a plain settle). Iterate with
+ * mk_cold_obj_next, mk_cold_file_next and mk_oid_at (the retired list). */
 typedef struct mk_cold {
     uint64_t z, flush_through, stripe_version;
     int64_t key;
@@ -277,8 +277,7 @@ const uint8_t *mk_oid_at(const uint8_t *oids, uint32_t i);
 enum { MK_MUT_NONE = 0, MK_MUT_COLD_BOUNDS /* mkcoldbounds: R8's counts unbounded */,
        MK_MUT_ADMIT_ALL /* mkadmitall: an open without requires=ec admits GC and DIGEST */,
        MK_MUT_PPOS_LOOSE /* ecpposloose: record_valid takes ppos and stripe_version on any volume */,
-       MK_MUT_WRITE_ANY /* mkwriteany: the WAL writer logs a marker its volume does not admit */,
-       MK_MUT_RETIRED /* mkretired: COLD's decoder takes retired oids, which R8 cannot honour */ };
+       MK_MUT_WRITE_ANY /* mkwriteany: the WAL writer logs a marker its volume does not admit */ };
 extern int mk_test_mutant;
 /* A bucket of a MK_KEYS_TABLE (MK_BUCKETS x 16 bytes, not aligned): read and written through these. */
 void mk_table_get(const uint8_t *table, uint32_t bucket, int64_t *lo, int64_t *hi);

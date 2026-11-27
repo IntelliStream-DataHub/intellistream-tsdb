@@ -40,6 +40,12 @@ bool eccold_leader(struct eng *db);
  * went out: nothing is cleaned up, the reopen as a replica decides); TSDB_ERR_IO (the engine failed: after the marker
  * committed, any refusal of the swap fails it); the errors of the puts, the flush and jr_cold before the marker. */
 int eccold_settle(struct eng *db, int64_t key, struct part **pin, size_t np, struct part **ec);
+/* eng_reencode's leader branch (R10 r10-crepl, E6, D24): combines contiguous suffix pin[0 .. np) of key `key`
+ * (containing >= 1 .ec part, pinned and referenced by the caller) into one object (or empty .part), gates, cuts at Z,
+ * appends/commits MK_COLD with the retired oids list, swaps via ec_swap_reencode, verifies logical digest of retired
+ * set vs output, commits MK_DIGEST, and releases the retired objects' GC gate. On rc == 0, clears settling/reencoding,
+ * unrefs pin[0..np), and sets pin[i] = NULL before the digest step so no in-memory hold masks GC gating. */
+int eccold_reencode(struct eng *db, int64_t key, struct part **pin, size_t np);
 /* The COLD being carried out by ec_swap_commit on this engine, for r8h's swap hooks (the same thread): its marker
  * position, key and cut. false when no settle of this engine is between its marker and the end of its swap. */
 bool eccold_swap_cur(struct eng *db, uint64_t *pos, int64_t *key, uint64_t *z);
@@ -94,7 +100,8 @@ extern void (*_Atomic eccold_test_hook)(struct eng *db, int step);
  * instead of k+m-1 on a degraded settle. */
 enum { ECCOLD_MUT_NONE = 0, ECCOLD_MUT_CUTNOGATE, ECCOLD_MUT_CUTNOWAIT, ECCOLD_MUT_TTLSETTLING,
        ECCOLD_MUT_CUTNOROTATE, ECCOLD_MUT_FENCEKEYONLY, ECCOLD_MUT_STRIPEWAITFENCED,
-       ECCOLD_MUT_DEGTWO, ECCOLD_MUT_DEGNOUPCHECK, ECCOLD_MUT_DEGNOPOSITIONS };
+       ECCOLD_MUT_DEGTWO, ECCOLD_MUT_DEGNOUPCHECK, ECCOLD_MUT_DEGNOPOSITIONS,
+       ECCOLD_MUT_RETIREDUNNAMED };
 extern int eccold_mutant;
 /* the number of files one marker may name in place of MK_FILES_MAX (0: MK_FILES_MAX), for test_eccold's toomany */
 extern _Atomic size_t eccold_test_files_max;

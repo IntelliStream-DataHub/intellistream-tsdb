@@ -22,6 +22,14 @@ void ecgc_retire_locked(eng *db, part *p);
  * position on a cluster EC leader; 0 for TTL/DROP retirement). Cluster MK_GC holds the retired object until
  * db->lead_applied_floor >= need_applied so every log replica has durably swapped .ec -> .part before chunks go. */
 void ecgc_retire_locked_at(eng *db, part *p, uint64_t need_applied);
+/* R10 (r10-crepl): ecgc_retire_locked for a cluster EC leader re-encode: holds the retired object from MK_GC until
+ * the leader's logical digest matches and MK_DIGEST commits (ecgc_digest_matched clears the gate and sets
+ * need_applied to the MK_DIGEST log position). */
+void ecgc_retire_locked_digest(eng *db, part *p);
+void ecgc_digest_matched(eng *db, const uint8_t (*oids)[16], size_t noids, uint64_t need_applied);
+/* Collects retired_<name>.ec filenames of `key` whose oid is in oids[0..noids) (for replica digest rebind). */
+int ecgc_find_retired_names(eng *db, int64_t key, const uint8_t *oids, size_t noids, char (**names_out)[256],
+                            size_t *n_out);
 /* graveyard_purge, for a GY_EC entry (db->lock held): true when the entry is done and leaves the list. On a single
  * server: once due and no part of the object is referenced (in any engine of the tier) the object goes to the tier's
  * delete queue; once the queue has deleted every chunk, the name is unlinked and only then does the entry leave. On a
@@ -129,6 +137,8 @@ enum {
     GC_MUT_RELEASE_NOMARK, /* releasenomark: deletes released holder's chunks without waiting for committed MK_GC */
     /* R15 (r15-follow) planted bug: */
     GC_MUT_FOLLOWDEL,      /* followdel: writer deletes retired chunks immediately ignoring obsolete_part_lifetime_s */
+    /* R10 (r10-crepl) planted bug: */
+    GC_MUT_BEFORE_DIGEST,  /* gcbeforedigest: emits MK_GC for re-encode retired objects before leader digest matches */
 };
 extern int ecgc_mutant;
 int ecgc_mutant_parse(const char *name); /* GC_MUT_* or -1 */

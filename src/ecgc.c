@@ -68,6 +68,7 @@ int ecgc_mutant_parse(const char *name)
         {"gcreplicanoop", GC_MUT_REPLICANOOP},
         {"releasenomark", GC_MUT_RELEASE_NOMARK},
         {"followdel", GC_MUT_FOLLOWDEL},
+        {"gcbeforedigest", GC_MUT_BEFORE_DIGEST},
     };
     if (!name)
         return -1;
@@ -205,9 +206,10 @@ typedef struct gc_rec {
     uint16_t npos;
     bool object;
     bool loaded_from_disk; /* loaded by ecgc_load_retired at open (checked in ecgc_eng_ready for unsettle gating) */
+    bool need_digest;      /* true: cluster MK_GC waits until leader re-encode digest matches & commits (r10-crepl) */
     int64_t partition;
     uint64_t min_block, max_block;
-    uint64_t need_applied; /* >0: cluster MK_GC waits until db->lead_applied_floor >= need_applied (R10 unsettle) */
+    uint64_t need_applied; /* >0: cluster MK_GC waits until db->lead_applied_floor >= need_applied (R10 unsettle/crepl) */
     int64_t deadline;      /* monotonic ms: when cluster MK_GC may collect this retired object */
     gc_ticket *tk;
 } gc_rec;
@@ -903,7 +905,7 @@ int ecgc_load_retired(eng *db, const char *name, bool read_only)
     return 0;
 }
 
-void ecgc_retire_locked_at(eng *db, part *p, uint64_t need_applied)
+static void retire_locked_ex(eng *db, part *p, uint64_t need_applied, bool need_digest)
 {
     EC_CALLED(EC_CALL_GC_RETIRE);
     struct ecgc_eng *e = eng_gc(db);
@@ -920,7 +922,11 @@ void ecgc_retire_locked_at(eng *db, part *p, uint64_t need_applied)
     /* out of memory: no record, and a GY_EC entry without one is kept (its name stays for the next open) */
     if (!r)
         return;
+    r->partition = p->partition;
+    r->min_block = p->min_block;
+    r->max_block = p->max_block;
     r->need_applied = need_applied;
+    r->need_digest = need_digest;
     /* Holds are taken in part_open_ec; holdatretire plants the old r7-gc F5 bug of taking them only here. */
     if (object && ecgc_mutant == GC_MUT_HOLDATRET && ecgc_hold(db->tier, p, db->tier_vol, ep->rec.oid) != 0) {
         rec_remove(e, r);
@@ -930,15 +936,85 @@ void ecgc_retire_locked_at(eng *db, part *p, uint64_t need_applied)
      * (ecgc_owns_name). Unrecorded (out of memory): the next open. */
     if (object && db->opt.obsolete_part_lifetime_s <= 0)
         (void)graveyard_add(db, retired, GY_EC, now);
-    if (object && db->ec_cluster && deadline <= now &&
+    bool digest_ok = !need_digest || ecgc_mutant == GC_MUT_BEFORE_DIGEST;
+    if (object && db->ec_cluster && deadline <= now && digest_ok &&
         (need_applied == 0 || ecunsettle_mut() == ECUNSETTLE_MUT_NOGCGATE ||
          atomic_load(&db->lead_applied_floor) >= need_applied))
         ecgc_kick_tier(db->tier);
 }
 
+void ecgc_retire_locked_at(eng *db, part *p, uint64_t need_applied)
+{
+    retire_locked_ex(db, p, need_applied, false);
+}
+
+void ecgc_retire_locked_digest(eng *db, part *p)
+{
+    retire_locked_ex(db, p, 0, true);
+}
+
 void ecgc_retire_locked(eng *db, part *p)
 {
-    ecgc_retire_locked_at(db, p, 0);
+    retire_locked_ex(db, p, 0, false);
+}
+
+void ecgc_digest_matched(eng *db, const uint8_t (*oids)[16], size_t noids, uint64_t need_applied)
+{
+    struct ecgc_eng *e = eng_gc(db);
+    if (!e || !oids || noids == 0)
+        return;
+    bool any = false;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < e->n; i++) {
+        if (!e->r[i].object)
+            continue;
+        bool hit = false;
+        for (size_t j = 0; j < noids && !hit; j++)
+            hit = memcmp(e->r[i].oid, oids[j], 16) == 0;
+        if (!hit)
+            continue;
+        e->r[i].need_digest = false;
+        if (need_applied > e->r[i].need_applied)
+            e->r[i].need_applied = need_applied;
+        any = true;
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (any && db->tier)
+        ecgc_kick_tier(db->tier);
+}
+
+int ecgc_find_retired_names(eng *db, int64_t key, const uint8_t *oids, size_t noids, char (**names_out)[256],
+                            size_t *n_out)
+{
+    *names_out = NULL;
+    *n_out = 0;
+    struct ecgc_eng *e = eng_gc(db);
+    if (!e || !oids || noids == 0)
+        return 0;
+    pthread_mutex_lock(&db->lock);
+    char (*names)[256] = malloc((e->n ? e->n : 1) * sizeof *names);
+    if (!names) {
+        pthread_mutex_unlock(&db->lock);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < e->n; i++) {
+        if (!e->r[i].object || e->r[i].partition != key)
+            continue;
+        bool hit = false;
+        for (size_t j = 0; j < noids && !hit; j++)
+            hit = memcmp(e->r[i].oid, oids + j * 16, 16) == 0;
+        if (hit)
+            snprintf(names[n++], 256, "%s", e->r[i].name);
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (n == 0) {
+        free(names);
+        names = NULL;
+    }
+    *names_out = names;
+    *n_out = n;
+    return 0;
 }
 
 bool ecgc_purge_entry(eng *db, const graveyard_entry *ge, bool all, int64_t now)
@@ -966,6 +1042,7 @@ bool ecgc_purge_entry(eng *db, const graveyard_entry *ge, bool all, int64_t now)
     /* Cluster EC volume (E14, D13): never directly delete chunks; retired objects go only via committed MK_GC. */
     if (db->ec_cluster) {
         if (!db->rp && r->deadline <= now &&
+            (!r->need_digest || ecgc_mutant == GC_MUT_BEFORE_DIGEST) &&
             (r->need_applied == 0 || ecunsettle_mut() == ECUNSETTLE_MUT_NOGCGATE ||
              atomic_load(&db->lead_applied_floor) >= r->need_applied) &&
             (ecgc_mutant == GC_MUT_NOHOLD || !ecgc_held(db->tier, db->tier_vol, r->oid)))
@@ -1059,6 +1136,8 @@ int ecgc_take_due_retired(eng *db, int64_t now, uint8_t (**oids_out)[16], size_t
     bool nogcgate = ecunsettle_mut() == ECUNSETTLE_MUT_NOGCGATE;
     for (size_t i = 0; i < e->n && n < MK_FILES_MAX; i++) {
         if (!e->r[i].object || e->r[i].deadline > now)
+            continue;
+        if (e->r[i].need_digest && ecgc_mutant != GC_MUT_BEFORE_DIGEST)
             continue;
         if (!nogcgate && e->r[i].need_applied > 0 && app_floor < e->r[i].need_applied)
             continue;

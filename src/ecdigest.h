@@ -80,10 +80,16 @@ int ec_logical_digest_frozen(struct eng *db, struct part **set, size_t n, int64_
 int ecd_freeze(struct eng *db, struct part **set, size_t n, int64_t key, int64_t now_ms, ecd_cut **cuts,
                size_t *ncuts);
 
-/* A leader after a settle's swap: the digest of set[0 .. n) (I and Y) and MK_NOW + MK_DIGEST {key, z, the oids}. 0,
+/* A leader after a settle's swap: the digest of set[0 .. n) (I and Y) and MK_DIGEST {key, z, the oids}. 0,
  * TSDB_ERR_INDETERMINATE (deposed), or another error (the engine failed, or nothing was appended). */
 int ecdigest_leader(struct eng *db, int64_t key, uint64_t z, struct part **set, size_t n, const uint8_t *oids,
                     size_t noids);
+/* A leader after a re-encode's swap (r10-crepl): computes the logical digest of in_set (retired .ec + young parts + Y)
+ * and compares it against out_set (new output + Y, read back through the chunk store). On mismatch sets durable
+ * DIVERGED without appending MK_DIGEST (retired chunks stay held); on match appends and commits MK_DIGEST (returning
+ * its log position in *pos_out when non-NULL). */
+int ecdigest_leader_reencode(struct eng *db, int64_t key, uint64_t z, struct part **in_set, size_t nin,
+                             struct part **out_set, size_t nout, const uint8_t *oids, size_t noids, uint64_t *pos_out);
 /* A committed MK_DIGEST at log position pos (m decoded): 0 once its comparison is queued (or done). */
 int ecdigest_apply(struct eng *db, uint64_t pos, const mk *m);
 
@@ -121,7 +127,10 @@ int ecdigest_job_write(struct eng *db, const ecd_job *j);
  * (ecapply_cold_decide) binds the copies of its key that no job names (a crash before the job was durable: earlier
  * COLDs' copies are named by theirs). */
 void ecdigest_cold_bind(struct eng *db, int64_t key, uint64_t z, struct part *const *own, size_t nown);
+void ecdigest_cold_bind_ex(struct eng *db, int64_t key, uint64_t z, struct part *const *own, size_t nown,
+                           struct part *const *ret_ec, size_t nret_ec);
 void ecdigest_cold_rebind(struct eng *db, int64_t key, uint64_t z);
+void ecdigest_cold_rebind_ex(struct eng *db, int64_t key, uint64_t z, const uint8_t *retired, uint32_t nretired);
 /* eckeep's thread at its start: every digest_* file of the directory to eckeep_add_job; a damaged one is logged and
  * kept (its files stay held) */
 void ecdigest_load_jobs(struct eng *db);
@@ -156,6 +165,9 @@ extern int ecdigest_mutant;
 /* test hook: the next replica job check hashes the value of its first row changed by one bit, as a retired copy whose
  * rows differ from the leader's with valid checksums would (test_ecapply digest, test_cluster ecdigest) */
 extern atomic_bool ecdigest_test_alter;
+/* test seam (tests/test_ecapply.c reencode): retry budget in ms for synchronous replica MK_DIGEST on retired .ec
+ * (< 0 uses the 30 s default). */
+extern _Atomic int64_t ecdigest_test_retry_ms;
 int ecdigest_mutant_parse(const char *name); /* -1 for an unknown name */
 
 #endif

@@ -28,6 +28,7 @@
 #include "ecapply.h"
 #include "ecdiverge.h"
 #include "ecdigest.h"
+#include "ecgc.h"
 #include "eckeep.h"
 #include "ecpart.h"
 #include "ecswap.h"
@@ -116,10 +117,13 @@ static int cold_check(struct eng *db, uint64_t pos, const mk_cold *c, cfile **ou
 {
     *out = NULL;
     *nout = 0;
-    if (c->nretired) {
-        fprintf(stderr, "tsdb: %s: the COLD at position %" PRIu64 " retires objects (R10's re-encode): not applied by "
-                        "this replica\n", db->dir, pos);
-        return TSDB_ERR_INVALID;
+    for (uint32_t i = 0; i < c->nretired; i++) {
+        const uint8_t *ri = mk_oid_at(c->retired, i);
+        for (uint32_t j = 0; j < i; j++)
+            if (memcmp(ri, mk_oid_at(c->retired, j), MK_OID) == 0) {
+                fprintf(stderr, "tsdb: %s: the COLD at position %" PRIu64 " names a retired oid twice\n", db->dir, pos);
+                return TSDB_ERR_CORRUPT;
+            }
     }
     size_t at = 0, nobj = 0;
     mk_cold_obj o;
@@ -132,6 +136,9 @@ static int cold_check(struct eng *db, uint64_t pos, const mk_cold *c, cfile **ou
         }
         bool good = memcmp(r.oid, o.oid, MK_OID) == 0 && r.key == c->key &&
                     (r.ppos == c->z || ecapply_mutant == ECAPPLY_MUT_CHECKZ);
+        for (uint32_t j = 0; good && j < c->nretired; j++)
+            if (memcmp(r.oid, mk_oid_at(c->retired, j), MK_OID) == 0)
+                good = false;
         ec_record_free(&r);
         if (!good) {
             fprintf(stderr, "tsdb: %s: an object record of the COLD at position %" PRIu64 " does not name its oid, key "
@@ -293,23 +300,29 @@ static inline void sn_add(size_t *len, size_t cap, int r)
         *len += (size_t)r < cap - *len ? (size_t)r : cap - *len - 1;
 }
 
-/* the intent v5 (src/ecswap.c): N and Y lines in listing order, then R; written and synced (db->lock held, as a drop's) */
-static int cold_intent(struct eng *db, const char *intent, cfile **ord, size_t n, part **own, size_t nown)
+/* the intent v5 (src/ecswap.c): N and Y lines in listing order, then R (settled_ for own .part, retired_ for .ec);
+ * written and synced (db->lock held, as a drop's) */
+static int cold_intent(struct eng *db, const char *intent, cfile **ord, size_t n, part **own, size_t nown,
+                       part **ret_ec, size_t nret_ec)
 {
     size_t cap = 64, len = 0;
     for (size_t i = 0; i < n; i++)
         cap += 8 + strlen(ord[i]->tmp) + strlen(ord[i]->fin);
     for (size_t i = 0; i < nown; i++)
         cap += 16 + 2 * strlen(own[i]->name);
+    for (size_t i = 0; i < nret_ec; i++)
+        cap += 16 + 2 * strlen(ret_ec[i]->name);
     char *buf = malloc(cap);
     if (!buf)
         return TSDB_ERR_NOMEM;
-    sn_add(&len, cap, snprintf(buf + len, cap - len, INTENT_V5_HEAD "%zu\n", n + nown));
+    sn_add(&len, cap, snprintf(buf + len, cap - len, INTENT_V5_HEAD "%zu\n", n + nown + nret_ec));
     for (size_t i = 0; i < n; i++)
         sn_add(&len, cap, snprintf(buf + len, cap - len, "%c %s %s\n", ord[i]->kind == MK_FILE_EC ? 'N' : 'Y',
                                    ord[i]->tmp, ord[i]->fin));
     for (size_t i = 0; i < nown; i++)
         sn_add(&len, cap, snprintf(buf + len, cap - len, "R %s settled_%s\n", own[i]->name, own[i]->name));
+    for (size_t i = 0; i < nret_ec; i++)
+        sn_add(&len, cap, snprintf(buf + len, cap - len, "R %s retired_%s\n", ret_ec[i]->name, ret_ec[i]->name));
     sn_add(&len, cap, snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0)));
     int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int rc = fd < 0 || write_full(fd, buf, len) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
@@ -319,6 +332,14 @@ static int cold_intent(struct eng *db, const char *intent, cfile **ord, size_t n
     if (rc)
         unlinkat(db->dirfd, intent, 0);
     return rc;
+}
+
+static bool oid_in_retired(const mk_cold *c, const uint8_t oid[MK_OID])
+{
+    for (uint32_t i = 0; i < c->nretired; i++)
+        if (memcmp(oid, mk_oid_at(c->retired, i), MK_OID) == 0)
+            return true;
+    return false;
 }
 
 enum { CS_APPLY, CS_DROPPED, CS_ABOVE };
@@ -407,8 +428,8 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
 
     char intent[64];
     snprintf(intent, sizeof intent, "txn_%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
-    part **own = NULL;
-    size_t nown = 0, above = 0;
+    part **own = NULL, **ret_ec = NULL;
+    size_t nown = 0, nret_ec = 0, above = 0;
     const char *above_name = NULL;
     int state = CS_APPLY;
     bool renamed = false, written = false;
@@ -421,13 +442,22 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
         listed += db->parts[i]->partition == c->key;
     if (rc == 0 && !listed)
         state = CS_DROPPED; /* this member's retention dropped the key before the hold */
-    if (rc == 0 && state == CS_APPLY && !(own = malloc(listed * sizeof *own)))
-        rc = TSDB_ERR_NOMEM;
+    if (rc == 0 && state == CS_APPLY) {
+        own = malloc(listed * sizeof *own);
+        ret_ec = c->nretired ? malloc(listed * sizeof *ret_ec) : NULL;
+        if (!own || (c->nretired && !ret_ec))
+            rc = TSDB_ERR_NOMEM;
+    }
     for (size_t i = 0; rc == 0 && state == CS_APPLY && i < db->nparts; i++) {
         part *p = db->parts[i];
         struct ecpart *e = atomic_load(&p->ec);
-        if (p->partition != c->key || (e && !e->test_mark))
+        if (p->partition != c->key)
             continue;
+        if (e && !e->test_mark) {
+            if (c->nretired && oid_in_retired(c, e->rec.oid))
+                ret_ec[nret_ec++] = p;
+            continue;
+        }
         /* no record (ppos_of then gives 0) is unknown, above every Z: retiring it as <= Z is what this check is for */
         uint64_t pp = PPOS_UNKNOWN;
         if (db->ppos && ppos_of(db, p->name, &pp) != 0 && ecapply_mutant != ECAPPLY_MUT_NOTFOUNDZERO)
@@ -444,15 +474,21 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
                         "of the key above Z (%s): nothing is retired, the volume is DIVERGED\n", db->dir, pos, c->key,
                 c->z, above, above_name);
         state = CS_ABOVE;
+    } else if (rc == 0 && state == CS_APPLY && c->nretired && nret_ec != c->nretired) {
+        fprintf(stderr, "tsdb: %s: the COLD at position %" PRIu64 " of key %" PRId64 " retires %" PRIu32 " objects, "
+                        "but %zu are listed here: nothing is retired, the volume is DIVERGED\n", db->dir, pos, c->key,
+                c->nretired, nret_ec);
+        state = CS_ABOVE;
     }
     if (rc == 0 && state == CS_APPLY) {
-        rc = cold_intent(db, intent, ord, n, own, nown);
+        size_t ntot = n + nown + nret_ec;
+        rc = cold_intent(db, intent, ord, n, own, nown, ret_ec, nret_ec);
         written = rc == 0;
         if (rc == 0 && ecapply_mutant != ECAPPLY_MUT_V5NODIRSYNC &&
             eng_sync_dir(db, "fsync of the directory after writing a cold apply's intent") != 0)
             rc = TSDB_ERR_IO; /* the engine failed; the intent's name is the commit: the next open decides */
         renamed = rc == 0;
-        for (size_t i = 0; renamed && i < n + nown; i++) {
+        for (size_t i = 0; renamed && i < ntot; i++) {
             if (i == nec)
                 crash_at(db, ECAPPLY_CRASH_MID_INTENT);
             const char *from, *to;
@@ -463,9 +499,13 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
                     snprintf(st, sizeof st, "settled_%s", ord[i]->fin);
                     to = st;
                 }
-            } else {
+            } else if (i < n + nown) {
                 from = own[i - n]->name;
                 snprintf(st, sizeof st, "settled_%s", from);
+                to = st;
+            } else {
+                from = ret_ec[i - n - nown]->name;
+                snprintf(st, sizeof st, "retired_%s", from);
                 to = st;
             }
             if (renameat(db->dirfd, from, db->dirfd, to) != 0) {
@@ -474,13 +514,33 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
                 rc = TSDB_ERR_IO;
             }
         }
-        if (renamed && nec == n + nown) /* nothing followed the .ec renames: the point is after them all the same */
+        if (renamed && nec == ntot) /* nothing followed the .ec renames: the point is after them all the same */
             crash_at(db, ECAPPLY_CRASH_MID_INTENT);
         if (renamed) {
+            if (nret_ec) {
+                lt_merge_marks(db, &lsec, ret_ec, nret_ec);
+                if (nown)
+                    lt_merge_marks(db, &lsec, own, nown);
+            }
             for (size_t i = 0; i < nown; i++) {
                 part_ref(own[i]);
                 own[i]->dropped = ecapply_mutant != ECAPPLY_MUT_MERGEKEPT; /* a merge of it in flight drops its output */
                 db_parts_remove_locked(db, own[i]);
+            }
+            for (size_t i = 0; i < nret_ec; i++) {
+                part_ref(ret_ec[i]);
+                ret_ec[i]->dropped = true;
+                ecgc_retire_locked(db, ret_ec[i]);
+                if (db->opt.obsolete_part_lifetime_s <= 0) {
+                    ret_ec[i]->retired = true;
+                    atomic_store(&ret_ec[i]->obsolete, true);
+                } else {
+                    char retired[sizeof ret_ec[i]->name + 16];
+                    snprintf(retired, sizeof retired, "retired_%s", ret_ec[i]->name);
+                    (void)graveyard_add(db, retired, GY_EC,
+                                        eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000);
+                }
+                db_parts_remove_locked(db, ret_ec[i]);
             }
             for (size_t i = 0; i < n; i++) {
                 part *p = ord[i]->p;
@@ -495,9 +555,11 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
             pthread_cond_signal(&db->merge_cv);
         } else {
             nown = 0;
+            nret_ec = 0;
         }
     } else {
         nown = 0;
+        nret_ec = 0;
     }
     pthread_mutex_unlock(&db->lock);
     lt_end(db, &lsec);
@@ -512,13 +574,16 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
     /* refused before an intent: the temporaries go; renamed: the listed parts were taken out of f; an intent and no
      * renames (the engine failed): everything stays for the next open */
     cf_free(db, f, n, written && !renamed);
-    if (renamed && nown) {
+    if (renamed && nown)
         eckeep_retired(db, own, nown, c->key, c->z); /* held until the MK_DIGEST of (key, Z) matched (r8j) */
-        ecdigest_cold_bind(db, c->key, c->z, own, nown); /* durable before RSTATE's done: a replay rebinds */
-    }
+    if (renamed && (nown || nret_ec))
+        ecdigest_cold_bind_ex(db, c->key, c->z, own, nown, ret_ec, nret_ec); /* durable before RSTATE's done */
     for (size_t i = 0; i < nown; i++)
         part_unref(own[i]);
+    for (size_t i = 0; i < nret_ec; i++)
+        part_unref(ret_ec[i]);
     free(own);
+    free(ret_ec);
     if (rc)
         return rc;
     if (state == CS_ABOVE) {
@@ -595,26 +660,63 @@ int ecapply_cold_decide(struct eng *db, int64_t key, const uint8_t *oids, uint32
     return listed == n ? 1 : 0;
 }
 
+int ecapply_cold_decide_ex(struct eng *db, int64_t key, const uint8_t *oids, uint32_t n, const uint8_t *retired,
+                           uint32_t nretired)
+{
+    if (n > 0)
+        return ecapply_cold_decide(db, key, oids, n);
+    if (nretired == 0 || !retired)
+        return 0;
+    uint32_t *seen = calloc(nretired, sizeof *seen);
+    if (!seen)
+        return TSDB_ERR_NOMEM;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++) {
+        const part *p = db->parts[i];
+        const struct ecpart *e = atomic_load(&((part *)p)->ec);
+        if (!e || e->test_mark || p->partition != key)
+            continue;
+        for (uint32_t k = 0; k < nretired; k++)
+            if (memcmp(e->rec.oid, retired + (size_t)k * MK_OID, MK_OID) == 0)
+                seen[k]++;
+    }
+    pthread_mutex_unlock(&db->lock);
+    uint32_t listed = 0;
+    for (uint32_t k = 0; k < nretired; k++)
+        listed += seen[k] > 0;
+    free(seen);
+    if (listed == 0)
+        return 1; /* every retired oid is gone (applied, or key dropped) */
+    if (listed < nretired && ecapply_mutant != ECAPPLY_MUT_DECIDESOME) {
+        fprintf(stderr, "tsdb: %s: of the %u retired objects of an empty-output COLD of key %" PRId64 ", %u are still "
+                        "listed: its swap was all or nothing\n", db->dir, nretired, key, listed);
+        return TSDB_ERR_CORRUPT;
+    }
+    return 0;
+}
+
 /* The .ec parts' PPOS records (src/ppos.h, design-cluster-data.md 2.3 "Part position"), each at its object record's
- * ppos (the settle's cut Z; 0, as in no cluster record, is recorded as unknown), one append and fdatasync per run of
- * equal positions. Not stub behaviour: r8h keeps it. They go out before the intent, so every state a power cut can
- * leave holds at the next open: no intent (the .ec never named; its record is dead and the compaction drops it), an
- * intent rolled back (the sources keep their own records), rolled forward or standing (the .ec names have theirs).
- * A failed write or sync failed the engine (ppos.c); nothing of the swap is visible. Nothing on other volumes. */
+ * ppos (the settle's cut Z; for an empty-part re-encode output without an .ec record, eccold_swap_cur's Z), one append
+ * and fdatasync per run of equal positions. Not stub behaviour: r8h keeps it. They go out before the intent, so every
+ * state a power cut can leave holds at the next open: no intent (the .ec never named; its record is dead and the
+ * compaction drops it), an intent rolled back (the sources keep their own records), rolled forward or standing (the
+ * .ec names have theirs). A failed write or sync failed the engine (ppos.c); nothing of the swap is visible. */
 static int swap_ppos(struct eng *db, struct part **ec, size_t n)
 {
     if (!db->ppos)
         return 0;
+    uint64_t cur_z = 0;
+    (void)eccold_swap_cur(db, NULL, NULL, &cur_z);
     const char **nm = malloc(n * sizeof *nm);
     if (!nm)
         return TSDB_ERR_NOMEM;
     int rc = 0;
     for (size_t i = 0, j; rc == 0 && i < n; i = j) {
         struct ecpart *e = atomic_load(&ec[i]->ec);
-        uint64_t z = e ? e->rec.ppos : 0;
+        uint64_t z = e ? e->rec.ppos : cur_z;
         for (j = i; j < n; j++) {
             struct ecpart *f = atomic_load(&ec[j]->ec);
-            if ((f ? f->rec.ppos : 0) != z)
+            if ((f ? f->rec.ppos : cur_z) != z)
                 break;
             nm[j - i] = ec[j]->name;
         }

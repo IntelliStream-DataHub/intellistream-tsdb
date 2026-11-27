@@ -476,7 +476,7 @@ static int digest(eng *db, struct eckeep_eng *k, const char *name, int64_t *dead
             break;
         }
     bool keyed = false;
-    if (!p && db->ppos) { /* a replica's retired file: held for its MK_DIGEST while its key is listed */
+    if (!p && db->ppos && db->rp) { /* a replica's retired file: held for its MK_DIGEST while its key is listed */
         int64_t key = strtoll(src + 1, NULL, 10);
         for (size_t i = 0; i < db->nparts && !keyed; i++)
             keyed = db->parts[i]->partition == key && !db->parts[i]->dropped;
@@ -939,16 +939,28 @@ int eckeep_job_names(eng *db, const char *file, int64_t key, char (**names)[256]
     size_t c = 0;
     if (x && (x->j.flags & ECDJ_ARMED))
         rc = ECD_ARMED;
+    if (rc == 0 && ecdigest_mutant != ECDIGEST_MUT_ANYZ) {
+        /* Use the job's own bound file list (settled_*.part and, for R10 re-encodes, retired_*.ec) so pure-.ec
+         * re-encodes and mixed re-encodes both arm their full retired set. */
+        if (!x || x->j.nnames == 0)
+            rc = TSDB_ERR_NOTFOUND;
+        else if (!(*names = malloc(x->j.nnames * sizeof **names)))
+            rc = TSDB_ERR_NOMEM;
+        else {
+            memcpy(*names, x->j.names, x->j.nnames * sizeof **names);
+            *n = x->j.nnames;
+        }
+        pthread_mutex_unlock(&k->mu);
+        return rc;
+    }
     for (size_t i = 0; rc == 0 && i < k->n; i++) /* the planted digestanyz: every unarmed copy of the key */
-        c += ecdigest_mutant == ECDIGEST_MUT_ANYZ ? anyz_take(k, &k->e[i], key) : x && strcmp(k->e[i].job, file) == 0;
+        c += anyz_take(k, &k->e[i], key);
     if (rc == 0 && c == 0)
         rc = TSDB_ERR_NOTFOUND;
     if (rc == 0 && !(*names = malloc(c * sizeof **names)))
         rc = TSDB_ERR_NOMEM;
     for (size_t i = 0; rc == 0 && i < k->n; i++) {
-        bool take = ecdigest_mutant == ECDIGEST_MUT_ANYZ ? anyz_take(k, &k->e[i], key)
-                                                         : x && strcmp(k->e[i].job, file) == 0;
-        if (take)
+        if (anyz_take(k, &k->e[i], key))
             memcpy((*names)[(*n)++], k->e[i].name, 256);
     }
     pthread_mutex_unlock(&k->mu);
@@ -1126,17 +1138,27 @@ bool eckeep_key_pending(eng *db, int64_t key)
     if (!k)
         return false;
     bool pending = false;
+    bool is_leader = !db->rp;
     pthread_mutex_lock(&k->mu);
     for (size_t i = 0; i < k->n && !pending; i++) {
         const kent *e = &k->e[i];
         int64_t ek;
-        if ((e->status == ECKEEP_PENDING || e->busy) && name_key(e->name, &ek) && ek == key)
+        if ((e->status == ECKEEP_PENDING || e->busy) && name_key(e->name, &ek) && ek == key) {
+            if (is_leader && e->bound) {
+                kjob *x = e->job[0] ? find_job(k, e->job) : NULL;
+                if (!x || !(x->j.flags & ECDJ_ARMED))
+                    continue; /* unarmed replica job inherited by a promoted leader: its DIGEST can never come */
+            }
             pending = true;
+        }
     }
     for (size_t i = 0; i < k->nj && !pending; i++) {
         const kjob *x = &k->jobs[i];
-        if (x->j.key == key && (x->status == ECKEEP_PENDING || x->busy))
+        if (x->j.key == key && (x->status == ECKEEP_PENDING || x->busy)) {
+            if (is_leader && !(x->j.flags & ECDJ_ARMED))
+                continue;
             pending = true;
+        }
     }
     pthread_mutex_unlock(&k->mu);
     return pending;

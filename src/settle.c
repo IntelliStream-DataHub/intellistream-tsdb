@@ -988,34 +988,48 @@ static int cmp_part_block(const void *a, const void *b)
     return x->min_block < y->min_block ? -1 : x->min_block > y->min_block;
 }
 
-int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reencoded)
+static int eng_reencode_ex(eng *db, int64_t partition, part **sel, size_t n, size_t *reencoded, bool take_refs)
 {
     mut_init();
     if (reencoded)
         *reencoded = 0;
-    if (!db->tier || !db->ecstate || !db->ecstate->settle || db->ec_cluster || db->replica_req || db->cluster_req ||
-        eng_jr(db))
-        return TSDB_ERR_INVALID;
-    if (db->opt.read_only || db->opt.follow)
-        return TSDB_ERR_READONLY;
-    if (eng_check(db))
-        return TSDB_ERR_IO;
-    if (eng_stopping(db))
-        return TSDB_ERR_STOPPED;
-    if (!sel || n == 0 || n > MAX_MERGE_PARTS)
-        return n == 0 ? TSDB_ERR_NOTFOUND : TSDB_ERR_INVALID;
-    if (!stores_ready_for_settle(db, NULL, NULL, NULL) || !tier_cold_writable(db)) {
+    int early = 0;
+    bool cold = eccold_leader(db);
+    if (!db->tier || !db->ecstate || !db->ecstate->settle ||
+        (!cold && (db->ec_cluster || db->replica_req || db->cluster_req || eng_jr(db))))
+        early = TSDB_ERR_INVALID;
+    else if (db->opt.read_only || db->opt.follow)
+        early = TSDB_ERR_READONLY;
+    else if (eng_check(db))
+        early = TSDB_ERR_IO;
+    else if (eng_stopping(db))
+        early = TSDB_ERR_STOPPED;
+    else if (!sel || n == 0 || n > MAX_MERGE_PARTS)
+        early = n == 0 ? TSDB_ERR_NOTFOUND : TSDB_ERR_INVALID;
+    else if ((!cold && !stores_ready_for_settle(db, NULL, NULL, NULL)) || !tier_cold_writable(db)) {
         if (settle_mut() == SETTLE_MUT_MARKUNAVAIL) {
             for (size_t i = 0; i < n; i++)
                 if (sel[i] && part_is_ec(sel[i]))
                     part_mark_payload(db, sel[i], "reencode");
         }
-        return TSDB_ERR_UNAVAILABLE;
+        early = TSDB_ERR_UNAVAILABLE;
+    }
+    if (early) {
+        if (take_refs && sel)
+            for (size_t i = 0; i < n; i++)
+                if (sel[i])
+                    part_unref(sel[i]);
+        return early;
     }
 
     part **pin = calloc(n, sizeof *pin);
-    if (!pin)
+    if (!pin) {
+        if (take_refs)
+            for (size_t i = 0; i < n; i++)
+                if (sel[i])
+                    part_unref(sel[i]);
         return TSDB_ERR_NOMEM;
+    }
     size_t np = 0;
     int rc = 0;
     pthread_mutex_lock(&db->lock);
@@ -1051,13 +1065,24 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
                 contig = db->parts[base + i] == pin[i];
                 has_ec |= part_is_ec(pin[i]);
             }
+            if (contig && cold) {
+                /* Cluster suffix invariant (r10-crepl): replicas renumber new_EC and Y above existing .ec parts,
+                 * so no non-.ec part of this key may lie below pin[0] and no .ec part may lie above pin[np-1]. */
+                for (size_t i = 0; i < base && contig; i++)
+                    if (db->parts[i]->partition == partition && !db->parts[i]->dropped && !part_is_ec(db->parts[i]))
+                        contig = false;
+                for (size_t i = base + np; i < db->nparts && contig; i++)
+                    if (db->parts[i]->partition == partition && !db->parts[i]->dropped && part_is_ec(db->parts[i]))
+                        contig = false;
+            }
             if (!contig || !has_ec) {
                 np = 0;
             } else {
                 for (size_t i = 0; i < np; i++) {
                     pin[i]->settling = true;
                     pin[i]->reencoding = true;
-                    part_ref(pin[i]);
+                    if (!take_refs)
+                        part_ref(pin[i]);
                 }
             }
         } else {
@@ -1066,8 +1091,17 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
     }
     pthread_mutex_unlock(&db->lock);
     if (np == 0) {
+        if (take_refs)
+            for (size_t i = 0; i < n; i++)
+                if (sel[i])
+                    part_unref(sel[i]);
         free(pin);
         return TSDB_ERR_NOTFOUND;
+    }
+    part *merged = NULL, *out = NULL;
+    if (cold) {
+        rc = eccold_reencode(db, partition, pin, np);
+        goto unpin;
     }
 
     /* Freeze retention cutoffs and whether any listed part of this key lies below the re-encode window so the merge
@@ -1090,7 +1124,6 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
     }
     pthread_mutex_unlock(&db->ret_lock);
 
-    part *merged = NULL, *out = NULL;
     if (rc == 0)
         rc = merge_parts_reencode(db, pin, np, cuts, ncuts, tombs_below, &merged);
     if (rc == 0 && merged) {
@@ -1159,8 +1192,11 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
         part_unref(merged);
     }
 
+unpin:
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < np; i++) {
+        if (!pin[i])
+            continue;
         pin[i]->settling = false;
         pin[i]->reencoding = false;
     }
@@ -1168,7 +1204,8 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
         pthread_cond_broadcast(&db->merged_cv); /* wake db_wait_merges if it waited on this re-encode */
     pthread_mutex_unlock(&db->lock);
     for (size_t i = 0; i < np; i++)
-        part_unref(pin[i]);
+        if (pin[i])
+            part_unref(pin[i]);
     if (out)
         part_unref(out);
     free(pin);
@@ -1184,6 +1221,11 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
         atomic_fetch_add(&reencode_failed, 1);
     }
     return rc;
+}
+
+int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reencoded)
+{
+    return eng_reencode_ex(db, partition, sel, n, reencoded, false);
 }
 
 /* ------------------------------------------------------------ the thread */
@@ -1260,6 +1302,20 @@ static bool settle_test_held(void)
 {
 #ifdef TSDB_TEST_HOOKS
     const char *h = getenv("TSDB_SETTLE_HOLD");
+    if (!h || !*h)
+        return false;
+    if (strcmp(h, "1") == 0)
+        return true;
+    return access(h, F_OK) == 0;
+#else
+    return false;
+#endif
+}
+
+static bool reencode_test_held(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    const char *h = getenv("TSDB_REENCODE_HOLD");
     if (!h || !*h)
         return false;
     if (strcmp(h, "1") == 0)
@@ -1383,21 +1439,25 @@ static bool settle_engine(eng *db)
             }
         }
     }
-    /* R10: check E6 re-encode triggers first on single-server tiered volumes (skip under settledegraded when a store
-     * is down so only eng_settle runs degraded). */
-    if (!db->ec_cluster && stores_ready && !atomic_load(&settle_reencode_pause)) {
+    /* R10: check E6 re-encode triggers first on tiered volumes and cluster EC leaders (skip under settledegraded when
+     * a store is down on a single server so only eng_settle runs degraded). */
+    if ((db->ec_cluster || stores_ready) && !atomic_load(&settle_reencode_pause) && !reencode_test_held()) {
         part *rsel[MAX_MERGE_PARTS];
         size_t rn = ecpolicy_pick_reencode(db, now, &key, rsel, MAX_MERGE_PARTS);
         if (rn) {
-            int rc = eng_reencode(db, key, rsel, rn, NULL);
-            for (size_t i = 0; i < rn; i++)
-                part_unref(rsel[i]);
+            int rc = eng_reencode_ex(db, key, rsel, rn, NULL, true);
             if (rc == 0)
                 ecpolicy_reencoded(db, now);
             else if (rc == CHUNK_ERR_FULL && settle_hit_store_cap(db))
                 settle_mark_store_full(db);
-            else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND)
+            else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND && rc != TSDB_ERR_INDETERMINATE)
                 ecpolicy_reencode_failed(db, key, now);
+            if (db->ec_cluster) {
+                uint32_t bk = 0;
+                uint64_t bo = 0;
+                ecpolicy_backlog(db, &bk, &bo);
+                cluster_backlog_set(db->tier_vol, bk, bo);
+            }
             return rc == 0;
         }
     }
