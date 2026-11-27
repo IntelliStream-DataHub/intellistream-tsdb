@@ -55,11 +55,13 @@
 #include "coldops.h"
 #include "tier.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #ifdef __linux__
 #include <sys/resource.h>
@@ -71,8 +73,18 @@ atomic_bool settle_reencode_pause;
 void (*_Atomic settle_fill_hook)(eng *db, const part *p, uint64_t stripe);
 atomic_uint_fast64_t settle_done, settle_failed, settle_abandoned, settle_rounds;
 atomic_uint_fast64_t reencode_done, reencode_failed, reencode_abandoned;
+atomic_uint_fast64_t ecpolicy_fill_samples;
 atomic_int settle_test_fail_at, settle_test_fail_skip;
 int settle_mutant;
+
+static inline int settle_mut(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    return settle_mutant;
+#else
+    return 0;
+#endif
+}
 
 int settle_mutant_parse(const char *name)
 {
@@ -80,12 +92,44 @@ int settle_mutant_parse(const char *name)
                                         "coarsewhole", "gcskipput", "gcskipindex", "gcskipopen", "gcskipelse",
                                         "gcskipswap", "gcskipdiscard", "gccommitted", "gcdouble", "gcearly",
                                         "nullnosync",  "syncfailgo",  "nohaltstop",
-                                        "reencodedroptomb", "reencoderankdown", "reencodemarkunavail"};
+                                        "reencodedroptomb", "reencoderankdown", "reencodemarkunavail",
+                                        "afterignored", "highnotoldest", "settledegraded"};
     for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
     return -1;
 }
+
+#ifdef TSDB_TEST_HOOKS
+static atomic_int ecpolicy_test_fill_pct = -1;
+static pthread_once_t fill_env_once = PTHREAD_ONCE_INIT;
+static void fill_env_init(void)
+{
+    const char *v = getenv("TSDB_TEST_FILL_PCT");
+    if (!v || !*v)
+        return;
+    char *end = NULL;
+    errno = 0;
+    long n = strtol(v, &end, 10);
+    if (errno == 0 && end != v && *end == '\0' && n >= 0 && n <= 100) {
+        int cur = -1;
+        atomic_compare_exchange_strong(&ecpolicy_test_fill_pct, &cur, (int)n);
+    }
+}
+void ecpolicy_set_test_fill_pct(int pct)
+{
+    pthread_once(&fill_env_once, fill_env_init);
+    atomic_store(&ecpolicy_test_fill_pct, pct < 0 ? -1 : pct > 100 ? 100 : pct);
+}
+static int fill_test_override(void)
+{
+    pthread_once(&fill_env_once, fill_env_init);
+    return atomic_load(&ecpolicy_test_fill_pct);
+}
+#else
+void ecpolicy_set_test_fill_pct(int pct) { (void)pct; }
+static inline int fill_test_override(void) { return -1; }
+#endif
 
 #ifdef TSDB_TEST_HOOKS
 static pthread_once_t mut_once = PTHREAD_ONCE_INIT;
@@ -220,12 +264,25 @@ struct ecsettle_tier {
     eng **engs;
     size_t neng, cap;
     eng *cur; /* the engine the thread works on (ecsettle_eng_stop waits for it to change) */
+    atomic_uint_fast64_t settles_waiting; /* R15 D6: due settles deferred while < k'+m / not all stores UP */
+};
+
+enum {
+    SETTLE_WAIT_NONE = 0,
+    SETTLE_WAIT_STORES = 1, /* fewer than k'+m (or not all) directory stores are UP */
+    SETTLE_WAIT_HALTED = 2, /* tier->halted latched until reopen */
+    SETTLE_WAIT_UNWRITABLE = 3, /* cold backend ops->writable() returned false */
 };
 
 struct ecsettle_eng {
     ecpolicy_state pol;
     eccold_deg_wait deg;  /* R9 (E10): degraded-settle wait tracking (single settle thread per tier) */
     atomic_bool stopping; /* ecsettle_eng_stop ran: a settle of this engine unwinds */
+    atomic_uint_fast32_t fill_pct;        /* R15 D6: last sampled volume fs used % (0..100) */
+    atomic_int_fast64_t fill_sample_ms;   /* R15 D6: eng_mono_ms() of last fstatvfs sample (0: none yet) */
+    atomic_uint_fast64_t settles_waiting; /* R15 D6: rounds with a due settle deferred (stores down or tier halted) */
+    atomic_bool is_waiting;               /* R15 D6: gauge flag, true while most recent round had a waiting settle */
+    int wait_state;                       /* SETTLE_WAIT_* (settle thread only: log once per transition) */
 };
 
 ecpolicy_state *ecpolicy_of(eng *db)
@@ -236,6 +293,102 @@ ecpolicy_state *ecpolicy_of(eng *db)
 eccold_deg_wait *ecsettle_deg_wait(eng *db)
 {
     return db->ecstate && db->ecstate->settle ? &db->ecstate->settle->deg : NULL;
+}
+
+uint32_t ecpolicy_sample_fill(eng *db)
+{
+    if (!db || !db->ecstate || !db->ecstate->settle)
+        return 0;
+    struct ecsettle_eng *se = db->ecstate->settle;
+    int ov = fill_test_override();
+    if (ov >= 0) {
+        uint32_t pct = (uint32_t)ov;
+        atomic_store_explicit(&se->fill_pct, pct, memory_order_relaxed);
+        return pct;
+    }
+    int64_t mono = eng_mono_ms();
+    int64_t last = atomic_load_explicit(&se->fill_sample_ms, memory_order_relaxed);
+    if (last != 0 && mono >= last && mono - last < ECPOLICY_FILL_SAMPLE_MS)
+        return atomic_load_explicit(&se->fill_pct, memory_order_relaxed);
+    uint32_t pct = atomic_load_explicit(&se->fill_pct, memory_order_relaxed);
+    struct statvfs sv;
+    /* Use f_bavail (unprivileged available blocks, matching src/feedclean.c:223) so root-reserved blocks count as
+     * unavailable to an unprivileged writer before ENOSPC. */
+    if (db->dirfd >= 0 && fstatvfs(db->dirfd, &sv) == 0 && sv.f_blocks > 0) {
+        uint64_t total = (uint64_t)sv.f_blocks;
+        uint64_t avail = (uint64_t)sv.f_bavail < total ? (uint64_t)sv.f_bavail : total;
+        uint64_t used = total - avail;
+        pct = used > UINT64_MAX / 100u ? (uint32_t)(used / (total / 100u)) : (uint32_t)((used * 100u) / total);
+        if (pct > 100u)
+            pct = 100u;
+        atomic_fetch_add_explicit(&ecpolicy_fill_samples, 1, memory_order_relaxed);
+    }
+    atomic_store_explicit(&se->fill_pct, pct, memory_order_relaxed);
+    atomic_store_explicit(&se->fill_sample_ms, mono ? mono : 1, memory_order_relaxed);
+    return pct;
+}
+
+uint32_t ecpolicy_fill_pct(const eng *db)
+{
+    int ov = fill_test_override();
+    if (ov >= 0)
+        return (uint32_t)ov;
+    if (!db || !db->ecstate || !db->ecstate->settle)
+        return 0;
+    return atomic_load_explicit(&db->ecstate->settle->fill_pct, memory_order_relaxed);
+}
+
+uint64_t eng_tier_settles_waiting(const eng *db)
+{
+    if (!db || !db->ecstate || !db->ecstate->settle)
+        return 0;
+    return atomic_load_explicit(&db->ecstate->settle->settles_waiting, memory_order_relaxed);
+}
+
+uint64_t ecsettle_tier_waiting(const struct tier *t)
+{
+    if (!t || !t->settle)
+        return 0;
+    return atomic_load_explicit(&t->settle->settles_waiting, memory_order_relaxed);
+}
+
+bool eng_tier_settle_is_waiting(const eng *db)
+{
+    if (!db || !db->ecstate || !db->ecstate->settle)
+        return false;
+    return atomic_load_explicit(&db->ecstate->settle->is_waiting, memory_order_relaxed);
+}
+
+/* Single-server directory tier store availability check (R15 D6, E55): requires every directory store (and at least
+ * k + m) to be CHUNK_STORE_UP (neither DOWN_* nor REPLACING). Returns true for non-directory backends (cluster EC). */
+static bool stores_ready_for_settle(const eng *db, int *up_out, int *total_out, int *need_out)
+{
+    if (up_out)
+        *up_out = 0;
+    if (total_out)
+        *total_out = 0;
+    if (need_out)
+        *need_out = 0;
+    if (!db || db->ec_cluster || !db->tier)
+        return true;
+    chunk_backend *be = tier_backend(db->tier);
+    if (!be)
+        return true;
+    const tier_settings *cfg = tier_eng_settings(db);
+    int n = chunk_be_nstores(be);
+    int km = cfg ? cfg->k + cfg->m : n;
+    int need = n > km ? n : km;
+    int up = 0;
+    for (int i = 0; i < n; i++)
+        if (chunk_be_store_state(be, i) == CHUNK_STORE_UP)
+            up++;
+    if (up_out)
+        *up_out = up;
+    if (total_out)
+        *total_out = n;
+    if (need_out)
+        *need_out = need;
+    return n > 0 && up >= need;
 }
 
 static bool eng_stopping(eng *db)
@@ -554,6 +707,21 @@ static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, ui
     unsigned npos = chunk_npos(&g);
     uint32_t full = npos < 32 ? ((1u << npos) - 1u) : ~0u;
     uint32_t written = full;
+#ifdef TSDB_TEST_HOOKS
+    if (!posmask && !db->ec_cluster && settle_mutant == SETTLE_MUT_SETTLEDEGRADED && db->tier) {
+        chunk_backend *be = tier_backend(db->tier);
+        if (be) {
+            uint32_t upmask = 0;
+            for (unsigned pos = 0; pos < npos; pos++) {
+                int st = chunk_be_store_state(be, chunk_be_place(be, r->oid, pos));
+                if (st == CHUNK_STORE_UP || st == CHUNK_STORE_REPLACING)
+                    upmask |= 1u << pos;
+            }
+            if (upmask != full)
+                posmask = upmask;
+        }
+    }
+#endif
     if (posmask && cv->ops->put_stream_pos)
         rc = cv->ops->put_stream_pos(cv->ctx, r->oid, &g, r->writer_epoch, &src, posmask, &written, r->sums);
     else if (posmask && (posmask & full) != full)
@@ -664,7 +832,9 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
         return TSDB_ERR_READONLY;
     if (eng_check(db))
         return TSDB_ERR_IO;
-    if (!tier_cold_writable(db))
+    if (!cold && !stores_ready_for_settle(db, NULL, NULL, NULL) && settle_mut() != SETTLE_MUT_SETTLEDEGRADED)
+        return TSDB_ERR_UNAVAILABLE;
+    if (!tier_cold_writable(db) && settle_mut() != SETTLE_MUT_SETTLEDEGRADED)
         return TSDB_ERR_UNAVAILABLE;
     if (eng_stopping(db))
         return TSDB_ERR_STOPPED;
@@ -781,8 +951,8 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
         return TSDB_ERR_STOPPED;
     if (!sel || n == 0 || n > MAX_MERGE_PARTS)
         return n == 0 ? TSDB_ERR_NOTFOUND : TSDB_ERR_INVALID;
-    if (!tier_cold_writable(db)) {
-        if (settle_mutant == SETTLE_MUT_MARKUNAVAIL) {
+    if (!stores_ready_for_settle(db, NULL, NULL, NULL) || !tier_cold_writable(db)) {
+        if (settle_mut() == SETTLE_MUT_MARKUNAVAIL) {
             for (size_t i = 0; i < n; i++)
                 if (sel[i] && part_is_ec(sel[i]))
                     part_mark_payload(db, sel[i], "reencode");
@@ -968,13 +1138,78 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
 /* one settle or re-encode of db, if the policy has one due: whether it completed one */
 static bool settle_engine(eng *db)
 {
-    if (eng_check(db) || eng_stopping(db) || !tier_cold_writable(db))
+    if (eng_check(db) || eng_stopping(db))
         return false;
     if (db->cluster_req && !eccold_leader(db)) /* a cluster volume settles only while this member leads it (D21) */
         return false;
     int64_t now = eng_now_ms(db), key = 0;
-    /* R10: check E6 re-encode triggers first on single-server tiered volumes (keeps eager jepsen partitions small). */
-    if (!db->ec_cluster && !atomic_load(&settle_reencode_pause)) {
+    bool stores_ready = true;
+    if (db->ec_cluster) {
+        /* Cluster EC leaders have their own stripe-position wait in eccold.c and use MK_FILES_MAX (4096) cap; never
+         * probe them with the single-server 64-part waiting check (which would mark >64-part keys failed for 1h). */
+        if (!tier_cold_writable(db))
+            return false;
+    } else {
+        /* R15 (D6): sample volume filesystem fill at most once per second on the settle thread (never on the append
+         * path), and only for single-server TIERS volumes with a tier_high_pct policy active (avoiding extra statvfs
+         * syscalls on NFS or non-TIERS engines). */
+        const tier_settings *cfg = db->tier ? tier_eng_settings(db) : NULL;
+        if (cfg && cfg->from_tiers && cfg->tier_high_pct > 0 && !cfg->eager)
+            (void)ecpolicy_sample_fill(db);
+        int n_up = 0, n_total = 0, n_need = 0;
+        stores_ready = stores_ready_for_settle(db, &n_up, &n_total, &n_need);
+        /* Only ask tier_cold_writable when stores_ready is true so a transient DOWN/REPLACING store does not cause
+         * tier_writable() to permanently latch tier->halted. If tier->halted was already set (e.g. store DOWN at open
+         * or tripped by ecgc), writable is false and we keep reporting the wait rather than claiming resume. */
+        bool writable = stores_ready ? tier_cold_writable(db) : false;
+        struct ecsettle_eng *se = db->ecstate ? db->ecstate->settle : NULL;
+        if ((!stores_ready || !writable) && settle_mut() != SETTLE_MUT_SETTLEDEGRADED) {
+            int want_state = !stores_ready
+                                 ? SETTLE_WAIT_STORES
+                                 : (db->tier && atomic_load(&db->tier->halted) ? SETTLE_WAIT_HALTED
+                                                                               : SETTLE_WAIT_UNWRITABLE);
+            part *sel64[64];
+            pthread_mutex_lock(&db->lock);
+            size_t n = ecpolicy_pick_locked(db, now, &key, sel64, 64);
+            pthread_mutex_unlock(&db->lock);
+            for (size_t i = 0; i < n; i++)
+                part_unref(sel64[i]);
+            if (n > 0) {
+                if (se) {
+                    if (se->wait_state != want_state) {
+                        se->wait_state = want_state;
+                        if (want_state == SETTLE_WAIT_STORES)
+                            fprintf(stderr, "tsdb: %s: settle waiting: %d of %d tier stores UP (need %d)\n", db->dir,
+                                    n_up, n_total, n_need);
+                        else if (want_state == SETTLE_WAIT_HALTED)
+                            fprintf(stderr, "tsdb: %s: settle waiting: tier halted until reopen\n", db->dir);
+                        else
+                            fprintf(stderr, "tsdb: %s: settle waiting: cold backend not writable\n", db->dir);
+                    }
+                    atomic_store_explicit(&se->is_waiting, true, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&se->settles_waiting, 1, memory_order_relaxed);
+                }
+                if (db->tier && db->tier->settle)
+                    atomic_fetch_add_explicit(&db->tier->settle->settles_waiting, 1, memory_order_relaxed);
+            } else if (se) {
+                atomic_store_explicit(&se->is_waiting, false, memory_order_relaxed);
+            }
+            return false;
+        }
+        if (se) {
+            atomic_store_explicit(&se->is_waiting, false, memory_order_relaxed);
+            if (se->wait_state != SETTLE_WAIT_NONE) {
+                se->wait_state = SETTLE_WAIT_NONE;
+                if (n_total > 0)
+                    fprintf(stderr, "tsdb: %s: settle resuming: %d of %d tier stores UP\n", db->dir, n_up, n_total);
+                else
+                    fprintf(stderr, "tsdb: %s: settle resuming: cold backend writable\n", db->dir);
+            }
+        }
+    }
+    /* R10: check E6 re-encode triggers first on single-server tiered volumes (skip under settledegraded when a store
+     * is down so only eng_settle runs degraded). */
+    if (!db->ec_cluster && stores_ready && !atomic_load(&settle_reencode_pause)) {
         part *rsel[MAX_MERGE_PARTS];
         size_t rn = ecpolicy_pick_reencode(db, now, &key, rsel, MAX_MERGE_PARTS);
         if (rn) {

@@ -586,6 +586,7 @@ test-units-b4:
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "gcskipput gcskipindex gcskipopen gcskipelse gcskipswap gcskipdiscard gccommitted gcdouble" -- ./$(B)/test_settle --quick --case gcpaths --mutant @M@ @D@) # each failure path's handoff (int-h)
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "gcearly nullnosync syncfailgo" -- ./$(B)/test_settle --quick --case gcpower --mutant @M@ @D@) # the handoff after the directory sync, never on a failed engine
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "nohaltstop" -- ./$(B)/test_settle --quick --case halt --mutant @M@ @D@) # a halt stops the settle
+	$(if $(EC_OBJ),$(MUT) --name test_settle --list "afterignored highnotoldest settledegraded" -- ./$(B)/test_settle --quick --case r15policy --mutant @M@ @D@) # R15 settle policy (tier_after_s, tier_high_pct, k'+m UP) must fail it
 test-units-b5:
 	./$(B)/test_eccold $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge degtwo degnoupcheck degnopositions" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
@@ -1063,7 +1064,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants margin-mutants lease-mutants hb-mutants report-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1261,6 +1262,10 @@ disk-mutants: $(B)/test_disks $(CRASHFS_SO) $(B)/tsdb
 # TIERS catalog, db_id binding, device isolation and crashfs mutants (src/tiers.c, src/volumes.c, tests/test_tiers.c)
 tiers-mutants: $(B)/test_tiers $(CRASHFS_SO)
 	$(if $(EC_OBJ),$(MUT) --name test_tiers --list "tiersnosync nodbid samedev" -- ./$(B)/test_tiers --mutant @M@ @D@)
+
+# R15 settle policy mutants (src/ecpolicy.c, src/settle.c, tests/test_settle.c)
+settle-policy-mutants: $(B)/test_settle
+	$(if $(EC_OBJ),$(MUT) --name test_settle --list "afterignored highnotoldest settledegraded" -- ./$(B)/test_settle --quick --case r15policy --mutant @M@ @D@)
 
 # the replica set change mutants (server/rset.c, cvolset*.c, cset.c; tests/rset_mutants.sh pins each to its FAIL line)
 rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb

@@ -36,6 +36,7 @@
  */
 #include "internal.h"
 #include "chunk.h"
+#include "chunk_priv.h"
 #include "coldops.h"
 #include "eccache.h"
 #include "ecdigest.h"
@@ -2091,6 +2092,7 @@ static void coldops_case(void)
     REC.name = "rec", REC.put_stream = r_put, REC.obj_open = r_open, REC.del = r_del, REC.list_names = r_list;
     REC.owner = r_owner, REC.see_epoch = r_see, REC.epoch = r_epoch, REC.writable = r_writable;
     REC.all_up = r_all_up, REC.ctx_free = r_free;
+    REC.put_stream_pos = NULL, REC.obj_open_pos = NULL, REC.chunk_info = NULL;
     static rec r0, r1;
     memset(&r0, 0, sizeof r0);
     memset(&r1, 0, sizeof r1);
@@ -3066,6 +3068,481 @@ static void zc_stripe_case(void)
     printf("  zc_stripe: in-stripe zero-copy and cross-stripe granule CRC + class-decode checks ok\n");
 }
 
+/* ------------------------------------------------------------ R15 settle policy (tier_after_s, tier_high_pct, k'+m UP) */
+
+static void r15_init_tiers_db(const where *w, const tiers_settings *gs, int classes)
+{
+    unsetenv("TSDB_TEST_TIER");
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_classes = classes;
+    o.stats = -1;
+    o.latest_cache = 0;
+    tsdb *db = NULL;
+    CHECK(tsdb_open(w->db, &o, &db) == 0 && db != NULL);
+    if (db)
+        CHECK(tsdb_close(db) == 0);
+    for (int i = 0; i < 3; i++)
+        CHECK(tsdb_tier_add_dir(w->db, w->st[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+    if (gs) {
+        int dfd = open(w->db, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        CHECK(dfd >= 0);
+        if (dfd >= 0) {
+            CHECK(tiers_append_settings(dfd, true, TIERS_VOL_ALL, gs) == 0);
+            close(dfd);
+        }
+    }
+}
+
+static atomic_int r15_drop_hook_hits;
+static void r15_high_fill_drop_hook(eng *db, const part *p, uint64_t stripe)
+{
+    (void)db;
+    (void)p;
+    if (stripe == SETTLE_HOOK_PREPARED) {
+        ecpolicy_set_test_fill_pct(50);
+        atomic_fetch_add(&r15_drop_hook_hits, 1);
+    }
+}
+
+static int r15_count_substr(const char *hay, const char *needle)
+{
+    int n = 0;
+    size_t len = strlen(needle);
+    for (const char *p = hay; (p = strstr(p, needle)) != NULL; p += len)
+        n++;
+    return n;
+}
+
+static void r15policy_case(void)
+{
+    unsetenv("TSDB_TEST_TIER");
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+
+    /* 1. Age-based settling from TIERS: default tier_after_s = 7 days (not grace_s = 3600s) for class 0 and coarse
+     *    class 1 (part by part, at most once per coarse_s). Kills `afterignored`. */
+    {
+        where w;
+        fresh("r15age", &w);
+        r15_init_tiers_db(&w, NULL, 1);
+        atomic_store(&NOW, 1000);
+        ecpolicy_set_test_fill_pct(10); /* isolate age trigger from host disk fill */
+        eopts e = {.merge_threads = 0, .classes = 1};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0 && d.db != NULL);
+        eng *o = o_open(&w, &e);
+        if (d.db && o) {
+            const tier_settings *ts = tier_eng_settings(d.db);
+            CHECK(ts && ts->from_tiers && ts->tier_after_s == TIERS_AFTER_S_DEFAULT &&
+                  ts->tier_high_pct == TIERS_HIGH_PCT_DEFAULT);
+            uint32_t s0 = 0, s1 = 0, os0 = 0, os1 = 0;
+            CHECK(eng_series(d.db, "s0", TSDB_FLOAT32, &s0) == 0 && eng_series(d.db, "s1", TSDB_FLOAT32, &s1) == 0);
+            CHECK(eng_series(o, "s0", TSDB_FLOAT32, &os0) == 0 && eng_series(o, "s1", TSDB_FLOAT32, &os1) == 0);
+            int64_t t0 = 0;
+            CHECK(eng_class_switch(d.db, s0, 0, &t0) == 0 && eng_class_switch(o, os0, 0, &t0) == 0);
+            CHECK(eng_class_switch(d.db, s1, 1, &t0) == 0 && eng_class_switch(o, os1, 1, &t0) == 0);
+            /* Class-0 day 0 key (k = 0): [0, DAY). */
+            write_rows(d.db, s0, 0, 5000, 2000, 0);
+            write_rows(o, os0, 0, 5000, 2000, 0);
+            /* Class-1 week 0 key (k = 1): part 1 on day 0, part 2 on day 5. */
+            write_rows(d.db, s1, 0, 2000, 10000, 1);
+            write_rows(o, os1, 0, 2000, 10000, 1);
+            CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+            write_rows(d.db, s1, 5 * DAY, 2000, 10000, 2);
+            write_rows(o, os1, 5 * DAY, 2000, 10000, 2);
+            CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+
+            size_t all, ec;
+            /* Past grace_s (3600s) after day 0 end, well before tier_after_s (7d): NOTHING settles! */
+            atomic_store(&NOW, DAY + HOUR + 1000);
+            wait_rounds(5);
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 1 && ec == 0);
+            key_count(d.db, 1, &all, &ec);
+            CHECK(all == 2 && ec == 0);
+
+            /* 6 days: still before tier_after_s for both day 0 and week 0 part 1. */
+            atomic_store(&NOW, 6 * DAY);
+            wait_rounds(5);
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 1 && ec == 0);
+            key_count(d.db, 1, &all, &ec);
+            CHECK(all == 2 && ec == 0);
+
+            /* 1 minute short of DAY + 7*DAY: day 0 still must NOT settle; week 0 part 1 (day 0) IS > 7d old so only
+             * part 1 settles, not part 2. */
+            atomic_store(&NOW, DAY + 7 * DAY - 60000);
+            for (int i = 0; i < 2000; i++) {
+                key_count(d.db, 1, &all, &ec);
+                if (ec)
+                    break;
+                sleep_ms(10);
+            }
+            wait_rounds(5);
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 1 && ec == 0);
+            key_count(d.db, 1, &all, &ec);
+            CHECK(all == 2 && ec == 1);
+
+            /* Past DAY + tier_after_s (7d): class-0 day 0 settles; week 0 part 2 still held by age & coarse_s. */
+            atomic_store(&NOW, DAY + 7 * DAY + 1000);
+            CHECK(wait_settled(d.db, 0, 20000));
+            wait_rounds(4);
+            key_count(d.db, 1, &all, &ec);
+            CHECK(all == 2 && ec == 1);
+
+            /* Past coarse_s (7d) after part 1's settle and tier_after_s after part 2: part 2 settles too. */
+            atomic_store(&NOW, 15 * DAY + 1000);
+            CHECK(wait_settled(d.db, 1, 20000));
+            CHECK(same(digest(d.db, "s0"), digest(o, "s0")));
+            CHECK(same(digest(d.db, "s1"), digest(o, "s1")));
+        }
+        t_close(&d);
+        if (o)
+            eng_close(o);
+    }
+
+    /* 1b. Custom TIERS SETTINGS tier_after_s = 2 days. */
+    {
+        where w;
+        fresh("r15age2d", &w);
+        tiers_settings gs;
+        memset(&gs, 0, sizeof gs);
+        gs.set_mask = TSDB_TIER_SET_AFTER;
+        gs.tier_after_s = 2 * 86400;
+        r15_init_tiers_db(&w, &gs, 0);
+        atomic_store(&NOW, 1000);
+        ecpolicy_set_test_fill_pct(10);
+        eopts e = {.merge_threads = 0, .classes = 0};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0 && d.db != NULL);
+        if (d.db) {
+            uint32_t s = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &s) == 0);
+            write_rows(d.db, s, 0, 4000, 2000, 0);
+            CHECK(eng_flush(d.db) == 0);
+            atomic_store(&NOW, DAY + 2 * DAY - 60000);
+            wait_rounds(5);
+            size_t all, ec;
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 1 && ec == 0);
+            atomic_store(&NOW, DAY + 2 * DAY + 1000);
+            CHECK(wait_settled(d.db, 0, 20000));
+        }
+        t_close(&d);
+    }
+
+    /* 2. Fill-pressure settling (tier_high_pct = 80): fill hook at 85% settles keys earlier, OLDEST KEY FIRST,
+     *    younger keys only after, while still respecting merge boundaries. Kills `highnotoldest`. */
+    {
+        where w;
+        fresh("r15fill", &w);
+        r15_init_tiers_db(&w, NULL, 0);
+        atomic_store(&NOW, 3 * DAY + 1000); /* days 0, 1, 2 all ended, all younger than tier_after_s (7d) */
+        ecpolicy_set_test_fill_pct(50);     /* below tier_high_pct = 80 */
+        eopts e = {.merge_threads = 0, .classes = 0};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0 && d.db != NULL);
+        eng *o = o_open(&w, &e);
+        if (d.db && o) {
+            uint32_t sd = 0, so = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0 && eng_series(o, "s", TSDB_FLOAT32, &so) == 0);
+            for (int k = 0; k < 4; k++) {
+                /* Keys 0..2 are finished (phi <= NOW); key 3 is the active day (phi > NOW) and must not churn. */
+                write_rows(d.db, sd, k * DAY, 4000, 2000, k);
+                write_rows(o, so, k * DAY, 4000, 2000, k);
+            }
+            CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+            /* At 50% fill and age < 7d: nothing settles. */
+            wait_rounds(5);
+            bool all_unsettled = true;
+            for (int k = 0; k < 4; k++) {
+                size_t all, ec;
+                key_count(d.db, k, &all, &ec);
+                CHECK(all == 1 && ec == 0);
+                if (ec != 0)
+                    all_unsettled = false;
+            }
+            /* Pulse 85% fill once per finished key; hook drops fill back to 50% as soon as one settle starts. */
+            if (all_unsettled) {
+                atomic_store(&r15_drop_hook_hits, 0);
+                atomic_store(&settle_fill_hook, r15_high_fill_drop_hook);
+                for (int want_k = 0; want_k < 3; want_k++) {
+                    uint64_t d0 = atomic_load(&settle_done);
+                    ecpolicy_set_test_fill_pct(85);
+                    for (int i = 0; i < 2000 && atomic_load(&settle_done) == d0; i++)
+                        sleep_ms(10);
+                    CHECK(atomic_load(&settle_done) == d0 + 1);
+                    wait_rounds(4);
+                    for (int k = 0; k < 4; k++) {
+                        size_t all, ec;
+                        key_count(d.db, k, &all, &ec);
+                        CHECK(all == 1 && ec == (size_t)(k <= want_k ? 1 : 0));
+                    }
+                }
+                atomic_store(&settle_fill_hook, NULL);
+                CHECK(atomic_load(&r15_drop_hook_hits) == 3);
+                /* Active day 3 (phi > NOW) must still NOT settle even at 85% fill. */
+                ecpolicy_set_test_fill_pct(85);
+                wait_rounds(5);
+                size_t all3, ec3;
+                key_count(d.db, 3, &all3, &ec3);
+                CHECK(all3 == 1 && ec3 == 0);
+            }
+            CHECK(same(digest(d.db, "s"), digest(o, "s")));
+        }
+        t_close(&d);
+        if (o)
+            eng_close(o);
+    }
+
+    /* 2b. Under fill pressure (85%), a key with a selectable merge is STILL skipped; only keys merges leave alone
+     *     settle. Also verify real fstatvfs sampling runs at most once per second. */
+    {
+        where w;
+        fresh("r15fillm", &w);
+        r15_init_tiers_db(&w, NULL, 0);
+        atomic_store(&NOW, 3 * DAY + 1000);
+        ecpolicy_set_test_fill_pct(50);
+        eopts e = {.merge_threads = 1, .classes = 0, .idle = 1000000};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0 && d.db != NULL);
+        if (d.db) {
+            uint32_t s = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &s) == 0);
+            /* Key 1 optimized to level 1 (no merge selectable). */
+            write_rows(d.db, s, DAY, 4000, 2000, 1);
+            CHECK(eng_flush(d.db) == 0);
+            CHECK(eng_optimize(d.db) == 0);
+            /* Key 0 has two level-0 parts with merge_idle_s = 1000000 -> merge IS selectable. */
+            write_rows(d.db, s, 0, 4000, 2000, 0);
+            CHECK(eng_flush(d.db) == 0);
+            write_rows(d.db, s, 1000, 4000, 2000, 2);
+            CHECK(eng_flush(d.db) == 0);
+            ecpolicy_set_test_fill_pct(85);
+            CHECK(wait_settled(d.db, 1, 20000));
+            wait_rounds(5);
+            size_t all, ec;
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 2 && ec == 0); /* key 0 waited for merges even at 85% fill */
+        }
+        t_close(&d);
+
+        /* 2c. Regression: under fill pressure (85%), an active coarse key holding a fresh level-0 part beside an aged
+         *     level-1 part (so merge_selectable is true) MUST still fall through to the age rule and settle the aged
+         *     part rather than settling less than without fill pressure. */
+        {
+            where wc;
+            fresh("r15fillc", &wc);
+            r15_init_tiers_db(&wc, NULL, 1);
+            atomic_store(&NOW, 1000);
+            ecpolicy_set_test_fill_pct(50);
+            eopts ec_opt = {.merge_threads = 1, .classes = 1, .idle = 1000000};
+            CHECK(t_open(&wc, &ec_opt, &d) == 0 && d.db != NULL);
+            if (d.db) {
+                uint32_t s = 0;
+                CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &s) == 0);
+                int64_t t0 = 0;
+                CHECK(eng_class_switch(d.db, s, 1, &t0) == 0);
+                /* Aged part on day 0, optimized to level 1. */
+                write_rows(d.db, s, 0, 2000, 10000, 0);
+                CHECK(eng_flush(d.db) == 0);
+                CHECK(eng_optimize(d.db) == 0);
+                /* Fresh level-0 part on day 6 inside the same class-1 week (makes merge_selectable true!). */
+                write_rows(d.db, s, 6 * DAY, 2000, 10000, 1);
+                CHECK(eng_flush(d.db) == 0);
+                /* Advance past tier_after_s (7d) for part 1 (day 0), NOT for part 2 (day 6), with fill at 85%. */
+                atomic_store(&NOW, 8 * DAY);
+                ecpolicy_set_test_fill_pct(85);
+                for (int i = 0; i < 2000; i++) {
+                    size_t all, ec;
+                    key_count(d.db, 1, &all, &ec);
+                    if (ec)
+                        break;
+                    sleep_ms(10);
+                }
+                wait_rounds(4);
+                size_t all, ec;
+                key_count(d.db, 1, &all, &ec);
+                CHECK(all == 2 && ec == 1);
+            }
+            t_close(&d);
+        }
+
+        /* Real fstatvfs sampling rate limit: 8 rapid rounds sample at most once per second of elapsed monotonic time. */
+        ecpolicy_set_test_fill_pct(-1);
+        where w2;
+        fresh("r15statvfs", &w2);
+        r15_init_tiers_db(&w2, NULL, 0);
+        atomic_store(&NOW, 1000);
+        eopts e2 = {.merge_threads = 0, .classes = 0};
+        int64_t t0_mono = eng_mono_ms();
+        uint64_t fs0 = atomic_load(&ecpolicy_fill_samples);
+        CHECK(t_open(&w2, &e2, &d) == 0 && d.db != NULL);
+        if (d.db) {
+            wait_rounds(8);
+            uint64_t fs1 = atomic_load(&ecpolicy_fill_samples);
+            int64_t elapsed_ms = eng_mono_ms() - t0_mono;
+            uint64_t max_allowed = (uint64_t)(elapsed_ms > 0 ? elapsed_ms : 0) / ECPOLICY_FILL_SAMPLE_MS + 2;
+            CHECK(fs1 - fs0 >= 1 && fs1 - fs0 <= max_allowed);
+            CHECK(ecpolicy_fill_pct(d.db) <= 100);
+        }
+        t_close(&d);
+    }
+
+    /* 3. Store availability gate (< k'+m stores UP -> DOWN or REPLACING): no settle runs, logged once per transition,
+     *    settles_waiting counter increments; once all stores are back UP, settling resumes cleanly. Kills
+     *    `settledegraded`. */
+    {
+        where w;
+        fresh("r15down", &w);
+        tiers_settings gs;
+        memset(&gs, 0, sizeof gs);
+        gs.set_mask = TSDB_TIER_SET_AFTER;
+        gs.tier_after_s = 3600;
+        r15_init_tiers_db(&w, &gs, 0);
+        atomic_store(&NOW, 1000);
+        ecpolicy_set_test_fill_pct(10);
+        eopts e = {.merge_threads = 0, .classes = 0};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0 && d.db != NULL);
+        if (d.db) {
+            uint32_t s = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &s) == 0);
+            /* Large noisy parts (> 128 KiB) so derived k' = 2, m = 1 -> k' + m = 3 stores needed. */
+            write_rows(d.db, s, 0, 60000, 500, NOISY);
+            write_rows(d.db, s, DAY, 60000, 500, NOISY);
+            CHECK(eng_flush(d.db) == 0);
+            acc want = digest(d.db, "s");
+            chunk_backend *be = tier_backend(d.t);
+            CHECK(be != NULL && chunk_be_nstores(be) == 3);
+
+            /* Take store 2 DOWN_MISSING at runtime (mark state DOWN before clearing st[2] so readers never observe
+             * state==UP with st==NULL). */
+            pthread_mutex_lock(&be->mu);
+            atomic_store(&be->state[2], CHUNK_STORE_DOWN_MISSING);
+            chunk_store *saved = atomic_exchange(&be->st[2], NULL);
+            pthread_mutex_unlock(&be->mu);
+
+            /* Capture stderr across 8 rounds with key 0 due: must wait, count up, and log ONCE. */
+            char cap_path[PATH_MAX + 32];
+            snprintf(cap_path, sizeof cap_path, "%s/stderr.cap", w.root);
+            fflush(stderr);
+            int saved_err = dup(2);
+            int cfd = open(cap_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (cfd >= 0) {
+                dup2(cfd, 2);
+                close(cfd);
+            }
+            uint64_t w0 = eng_tier_settles_waiting(d.db);
+            uint64_t tw0 = ecsettle_tier_waiting(d.t);
+            atomic_store(&NOW, DAY + HOUR + 1000); /* key 0 due, key 1 not yet due */
+            wait_rounds(8);
+            int drc = settle_key(d.db, 0, NULL);
+            size_t all, ec;
+            key_count(d.db, 0, &all, &ec);
+            uint64_t w1 = eng_tier_settles_waiting(d.db);
+            uint64_t tw1 = ecsettle_tier_waiting(d.t);
+            bool waiting_now = eng_tier_settle_is_waiting(d.db);
+
+            /* Bring store 2 back UP (restore st[2] before setting state UP). */
+            pthread_mutex_lock(&be->mu);
+            atomic_store(&be->st[2], saved);
+            atomic_store(&be->state[2], CHUNK_STORE_UP);
+            pthread_mutex_unlock(&be->mu);
+            bool settled0 = wait_settled(d.db, 0, 20000);
+            wait_rounds(2);
+            bool waiting_after = eng_tier_settle_is_waiting(d.db);
+
+            fflush(stderr);
+            if (saved_err >= 0) {
+                dup2(saved_err, 2);
+                close(saved_err);
+            }
+            char logbuf[4096];
+            memset(logbuf, 0, sizeof logbuf);
+            int rfd = open(cap_path, O_RDONLY);
+            if (rfd >= 0) {
+                ssize_t nr = read(rfd, logbuf, sizeof logbuf - 1);
+                if (nr > 0)
+                    logbuf[nr] = '\0';
+                close(rfd);
+            }
+            CHECK(drc == TSDB_ERR_UNAVAILABLE);
+            CHECK(all == 1 && ec == 0);
+            CHECK(w1 > w0 && tw1 > tw0 && waiting_now && !waiting_after);
+            CHECK(r15_count_substr(logbuf, "settle waiting:") == 1);
+            CHECK(r15_count_substr(logbuf, "settle resuming:") == 1);
+            CHECK(settled0);
+            CHECK(same(digest(d.db, "s"), want));
+
+            /* Store 2 REPLACING: also blocks settling and increments counter; settles once back UP. */
+            atomic_store(&be->state[2], CHUNK_STORE_REPLACING);
+            uint64_t w2 = eng_tier_settles_waiting(d.db);
+            atomic_store(&NOW, 2 * DAY + HOUR + 1000); /* key 1 due */
+            wait_rounds(6);
+            key_count(d.db, 1, &all, &ec);
+            CHECK(all == 1 && ec == 0);
+            CHECK(eng_tier_settles_waiting(d.db) > w2 && eng_tier_settle_is_waiting(d.db));
+            atomic_store(&be->state[2], CHUNK_STORE_UP);
+            CHECK(wait_settled(d.db, 1, 20000));
+            CHECK(same(digest(d.db, "s"), want));
+
+            /* Regression: if tier->halted was latched (e.g. store DOWN at open or gc saw it DOWN), returning stores
+             * to UP must NOT falsely log "settle resuming:" — it must log "tier halted until reopen" once and keep
+             * counting waits in settles_waiting. */
+            write_rows(d.db, s, 2 * DAY, 60000, 500, NOISY);
+            CHECK(eng_flush(d.db) == 0);
+            want = digest(d.db, "s");
+            atomic_store(&d.t->halted, true);
+            fflush(stderr);
+            saved_err = dup(2);
+            cfd = open(cap_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (cfd >= 0) {
+                dup2(cfd, 2);
+                close(cfd);
+            }
+            uint64_t w3 = eng_tier_settles_waiting(d.db);
+            atomic_store(&NOW, 3 * DAY + HOUR + 1000); /* key 2 due */
+            wait_rounds(6);
+            uint64_t w4 = eng_tier_settles_waiting(d.db);
+            bool halted_wait = eng_tier_settle_is_waiting(d.db);
+            key_count(d.db, 2, &all, &ec);
+            fflush(stderr);
+            if (saved_err >= 0) {
+                dup2(saved_err, 2);
+                close(saved_err);
+            }
+            memset(logbuf, 0, sizeof logbuf);
+            rfd = open(cap_path, O_RDONLY);
+            if (rfd >= 0) {
+                ssize_t nr = read(rfd, logbuf, sizeof logbuf - 1);
+                if (nr > 0)
+                    logbuf[nr] = '\0';
+                close(rfd);
+            }
+            CHECK(all == 1 && ec == 0);
+            CHECK(w4 > w3 && halted_wait);
+            CHECK(r15_count_substr(logbuf, "tier halted until reopen") == 1);
+            CHECK(r15_count_substr(logbuf, "settle resuming:") == 0);
+
+            CHECK(t_close(&d) == 0);
+            CHECK(t_open(&w, &e, &d) == 0);
+            if (d.db) {
+                CHECK(wait_settled(d.db, 2, 20000));
+                CHECK(same(digest(d.db, "s"), want));
+            }
+        }
+        t_close(&d);
+    }
+
+    ecpolicy_set_test_fill_pct(-1);
+    printf("  r15policy: tier_after_s (class 0 & coarse), tier_high_pct (oldest first, merge-respecting, <=1/s "
+           "fstatvfs), store UP gate (DOWN/REPLACING wait, log once, counter up, resume)\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", *child = NULL, *rchild = NULL;
@@ -3122,6 +3599,7 @@ int main(int argc, char **argv)
     RUN(gcpower);
     RUN(coldops);
     RUN(reencode);
+    RUN(r15policy);
 #undef RUN
     if (failures) {
         fprintf(stderr, "test_settle: %d failures\n", failures);

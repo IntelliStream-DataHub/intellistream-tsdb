@@ -76,11 +76,24 @@ typedef struct eccold_deg_wait {
 } eccold_deg_wait;
 eccold_deg_wait *ecsettle_deg_wait(eng *db);
 
-/* ------------------------------------------------------------ the policy (src/ecpolicy.c, E5) */
+/* ------------------------------------------------------------ the policy (src/ecpolicy.c, E5, R15 D6) */
 /* Picks what settles next in db (under db->lock, which the caller holds): the key into *key and its parts, referenced,
  * into sel[0 .. return value) (at most cap; the caller passes them to eng_settle and unrefs them). 0: nothing is due.
  * now_ms: eng_now_ms. */
 size_t ecpolicy_pick_locked(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
+/* R15 (D6, E55): sample db's volume filesystem used % via fstatvfs(db->dirfd) at most once per second per engine.
+ * Called ONLY from the settle thread (never on the append path), outside db->lock. Returns 0..100. */
+uint32_t ecpolicy_sample_fill(eng *db);
+/* Last sampled (or test-overridden) used % of db's volume filesystem (0..100). Lock-free, no syscall. */
+uint32_t ecpolicy_fill_pct(const eng *db);
+/* R15 (D6, E55): monotonic counter of settle-thread rounds in which a due settle was deferred on a single-server tier
+ * because not all directory stores (always >= k'+m; placement hashes across every store) were UP (DOWN or REPLACING)
+ * or the tier was halted/unwritable. Exported by r15-full as tsdb_tier_settles_waiting. */
+uint64_t eng_tier_settles_waiting(const eng *db);
+uint64_t ecsettle_tier_waiting(const struct tier *t);
+/* True while db's most recent settle round on a single-server tier found a due settle blocked by store availability
+ * or a halted/unwritable tier. */
+bool eng_tier_settle_is_waiting(const eng *db);
 /* R10 (E6): picks a contiguous range of parts of one key to re-encode (caller holds no engine lock): > ec_objects_max
  * combinable .ec objects, or tombstones in newer combinable parts covering > 10% of .ec rows (evaluated outside
  * db->lock); bounded by max_part_bytes and MAX_MERGE_PARTS; skips keys with a pending eckeep digest or recent
@@ -88,6 +101,10 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now_ms, int64_t *key, part **sel, s
 size_t ecpolicy_pick_reencode(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
 /* tests: the cluster branch takes every key as too big for one marker (it says so and marks the key failed) */
 extern bool ecpolicy_test_cap_hit;
+/* tests (active only under TSDB_TEST_HOOKS): override the filesystem fill % (0..100; < 0 restores real fstatvfs). */
+void ecpolicy_set_test_fill_pct(int pct);
+/* tests: count of real fstatvfs() calls performed by ecpolicy_sample_fill (proves <= 1/s rate limit). */
+extern atomic_uint_fast64_t ecpolicy_fill_samples;
 /* A settle of key failed (not STOPPED): the policy leaves the key alone for an hour. */
 void ecpolicy_failed(eng *db, int64_t key, int64_t now_ms);
 /* A settle happened (eager mode counts them: at most ECPOLICY_EAGER_PER_MIN a minute per engine). */
@@ -97,6 +114,7 @@ void ecpolicy_reencode_failed(eng *db, int64_t key, int64_t now_ms);
 /* A re-encode happened (eager mode counts them: at most ECPOLICY_EAGER_REENCODE_PER_MIN a minute per engine). */
 void ecpolicy_reencoded(eng *db, int64_t now_ms);
 #define ECPOLICY_BACKOFF_MS (3600 * 1000LL)
+#define ECPOLICY_FILL_SAMPLE_MS 1000LL
 #define ECPOLICY_EAGER_PER_MIN 30
 #define ECPOLICY_EAGER_REENCODE_PER_MIN 15
 #define ECPOLICY_EAGER_MIN_BYTES (1u << 20)
@@ -167,7 +185,11 @@ enum { SETTLE_MUT_NONE = 0, SETTLE_MUT_RANKDOWN, SETTLE_MUT_NOCHECK, SETTLE_MUT_
        /* R10 re-encode mutants (tests/test_settle.c --mutant NAME): reencodedroptomb: drops tombstones covering older
         * parts during re-encode; reencoderankdown: ranks the re-encoded output below other parts in memory;
         * reencodemarkunavail: marks an .ec source damaged on TSDB_ERR_UNAVAILABLE during re-encode */
-       SETTLE_MUT_DROPTOMB, SETTLE_MUT_RERANKDOWN, SETTLE_MUT_MARKUNAVAIL };
+       SETTLE_MUT_DROPTOMB, SETTLE_MUT_RERANKDOWN, SETTLE_MUT_MARKUNAVAIL,
+       /* R15 settle policy mutants (tests/test_settle.c --case r15policy --mutant NAME): afterignored: uses grace_s
+        * instead of tier_after_s on a TIERS-opened tier; highnotoldest: picks the newest eligible key instead of the
+        * oldest under tier_high_pct; settledegraded: settles on a single-server tier while a store is DOWN/REPLACING */
+       SETTLE_MUT_AFTERIGNORED, SETTLE_MUT_HIGHNOTOLDEST, SETTLE_MUT_SETTLEDEGRADED };
 extern int settle_mutant;
 int settle_mutant_parse(const char *name); /* -1 when unknown */
 /* For tests: the streaming xxh64 the fill hashes the object with, fed lens[0..n) bytes of buf in turn (it must equal

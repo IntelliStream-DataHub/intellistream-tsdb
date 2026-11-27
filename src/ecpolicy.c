@@ -4,16 +4,22 @@
  * (src/settle.c) asks ecpolicy_pick_locked once per engine and round; it names one key and the parts of it to settle.
  *
  *  - Class 0 (one base partition, a day by default): the key settles whole once its end (partition_range's hi) is
- *    grace_s old by eng_now_ms and no merge of it is selectable: the parts of a day at rest are merged into as few
- *    as the merge policy makes (an idle partition is merged whole, merge_idle_s), so the settle encodes final parts
- *    and never an input that a merge would rewrite a minute later (merges skip settled parts: src/ecskip.h).
+ *    age-eligible by eng_now_ms (tier_after_s — 604,800 s by default — for a tier opened from TIERS per R15 D6/§15.7,
+ *    or grace_s — 3,600 s — for TSDB_TEST_TIER) and no merge of it is selectable: the parts of a day at rest are merged
+ *    into as few as the merge policy makes (an idle partition is merged whole, merge_idle_s), so the settle encodes
+ *    final parts and never an input that a merge would rewrite a minute later (merges skip settled parts: src/ecskip.h).
  *    "Selectable" is what the merge threads will do: with merge_threads = 0 nothing is (D11: no merges never stops
  *    settling), and with merge_idle_s < 0 only a merge in flight is (no part is rewritten alone and no pair merged
  *    as idle; a pair that the size and age rule takes some day is not waited for: the key may settle as two objects
  *    where a merge would have made one).
  *  - Classes 1-3 (7, 28 or 364 base partitions): such a key takes rows for weeks, so it settles part by part, each
- *    once its newest row is grace_s old, and at most once per coarse_s, counted from the settle time in the newest
- *    .ec record of the key (the record is on disk: the pace survives a restart; never an mtime).
+ *    once its newest row is tier_after_s (for TIERS) or grace_s old, and at most once per coarse_s, counted from the
+ *    settle time in the newest .ec record of the key (the record is on disk: the pace survives a restart; never mtime).
+ *  - Fill pressure (R15 D6, §15.7; single-server TIERS volumes with tier_high_pct > 0, non-eager): when the volume
+ *    filesystem's used % (sampled by the settle thread via fstatvfs at most 1/s, never on the append path) is at or
+ *    above tier_high_pct (80% by default), finished keys (phi <= now) settle earlier, oldest key first, still only
+ *    keys merges leave alone; if none qualify, falls through to the normal age walk so fill pressure never settles
+ *    less than the age rule.
  *  - Eager (tier eager=1, jepsen's): a part settles once its newest row is grace_s old, but only after a merge round
  *    has run on it (level > 0) or above ECPOLICY_EAGER_MIN_BYTES, and at most ECPOLICY_EAGER_PER_MIN settles a minute
  *    per engine, so that a jepsen run settles often without settling every flush.
@@ -208,20 +214,58 @@ static bool merge_selectable(const eng *db, size_t a, size_t b)
 
 bool ecpolicy_test_cap_hit;
 
+static inline int settle_mut(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    return settle_mutant;
+#else
+    return 0;
+#endif
+}
+
+static inline int64_t sec_to_ms_sat(uint64_t s)
+{
+    return s > (uint64_t)(INT64_MAX / 1000) ? INT64_MAX : (int64_t)s * 1000;
+}
+
+static inline bool age_reached(int64_t ref_ms, int64_t now_ms, int64_t age_ms)
+{
+    if (age_ms <= 0)
+        return now_ms >= ref_ms;
+    if (now_ms < ref_ms)
+        return false;
+    return (uint64_t)now_ms - (uint64_t)ref_ms >= (uint64_t)age_ms;
+}
+
 size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size_t cap)
 {
     ecpolicy_state *ps = ecpolicy_of(db);
     const tier_settings *cfg = db->tier ? tier_eng_settings(db) : NULL;
     if (!ps || !cfg || !cap)
         return 0;
-    int64_t grace = cfg->grace_s * 1000, coarse = cfg->coarse_s * 1000;
-    pthread_mutex_lock(&ps->pmu);
-    ecpolicy_state snap = *ps; /* the fail list and the eager count (pmu is a leaf: not held across the walk) */
-    pthread_mutex_unlock(&ps->pmu);
     /* R8: a cluster ec volume settles on its leader only (settle_engine asks), never on a diverged engine (item 9) */
     bool cluster = db->ec_cluster;
     if (cluster && atomic_load(&db->diverged))
         return 0;
+    /* R15 (D6, E55): a single-server tier opened from TIERS settles after tier_after_s (604,800 s by default, or
+     * per-volume TIERS SETTINGS; TSDB_TEST_TIER grace_s= overrides tier_after_s in tier.c). */
+    int64_t grace;
+    if (!cluster && cfg->from_tiers) {
+        if (settle_mut() == SETTLE_MUT_AFTERIGNORED) {
+            /* Planted bug: ignore tier_after_s and use grace_s (falling back to TIER_GRACE_S_DEFAULT because
+             * tier.c copies tier_after_s into grace_s when opening from TIERS). */
+            int64_t g = cfg->grace_s != (int64_t)cfg->tier_after_s ? cfg->grace_s : (int64_t)TIER_GRACE_S_DEFAULT;
+            grace = g * 1000;
+        } else {
+            grace = sec_to_ms_sat(cfg->tier_after_s);
+        }
+    } else {
+        grace = cfg->grace_s * 1000;
+    }
+    int64_t coarse = cfg->coarse_s * 1000;
+    pthread_mutex_lock(&ps->pmu);
+    ecpolicy_state snap = *ps; /* the fail list and the eager count (pmu is a leaf: not held across the walk) */
+    pthread_mutex_unlock(&ps->pmu);
     int64_t force = (cfg->force_s > 0 ? cfg->force_s : ECCOLD_FORCE_S_DEFAULT) * 1000;
     uint64_t cap_ms = atomic_load(&db->lead_cap_ms);
     int64_t retain = cap_ms ? (int64_t)cap_ms : ECCOLD_RETAIN_S_DEFAULT * 1000LL;
@@ -229,6 +273,69 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
     if (!cluster && cfg->eager && now - snap.eager_win_ms < 60000 && now >= snap.eager_win_ms &&
         snap.eager_n >= ECPOLICY_EAGER_PER_MIN)
         return 0;
+
+    /* R15 (D6, §15.7): above tier_high_pct of the volume's filesystem, settle finished keys earlier, oldest key first,
+     * still only keys merges leave alone. If no key is eligible here (e.g., an active coarse key with a fresh level-0
+     * part alongside an aged level-1 part), fall through to the normal age walk so fill pressure never settles less
+     * than the age rule. */
+    bool high_fill = !cluster && !cfg->eager && cfg->from_tiers && cfg->tier_high_pct > 0 &&
+                     ecpolicy_fill_pct(db) >= cfg->tier_high_pct;
+    if (high_fill) {
+        bool have = false;
+        int64_t best_k = 0, best_plo = 0, best_phi = 0;
+        size_t best_lo = 0, best_hi = 0;
+        bool pick_newest = settle_mut() == SETTLE_MUT_HIGHNOTOLDEST;
+        for (size_t a = 0; a < db->nparts;) {
+            size_t b = a + 1;
+            int64_t k = db->parts[a]->partition;
+            while (b < db->nparts && db->parts[b]->partition == k)
+                b++;
+            size_t lo_i = a, hi_i = b;
+            a = b;
+            if (partition_dropping(db, k) || failed_recently(&snap, k, now))
+                continue;
+            int64_t plo, phi;
+            partition_range(db, k, &plo, &phi);
+            if (phi == INT64_MAX || phi > now) /* do not churn keys still taking current-window writes */
+                continue;
+            bool blocked = false, any_settle = false;
+            for (size_t i = lo_i; i < hi_i; i++) {
+                const part *p = db->parts[i];
+                blocked |= p->settling || atomic_load(&p->damaged);
+                any_settle |= settleable(p);
+            }
+            if (blocked || !any_settle)
+                continue;
+            if (merge_selectable(db, lo_i, hi_i) && settle_mut() != SETTLE_MUT_BUSY)
+                continue;
+            bool better;
+            if (!have)
+                better = true;
+            else if (pick_newest)
+                better = phi > best_phi || (phi == best_phi && (plo > best_plo || (plo == best_plo && k > best_k)));
+            else
+                better = phi < best_phi || (phi == best_phi && (plo < best_plo || (plo == best_plo && k < best_k)));
+            if (better) {
+                have = true;
+                best_k = k;
+                best_plo = plo;
+                best_phi = phi;
+                best_lo = lo_i;
+                best_hi = hi_i;
+            }
+        }
+        if (have) {
+            size_t n = 0;
+            for (size_t i = best_lo; i < best_hi && n < cap; i++)
+                if (settleable(db->parts[i]))
+                    sel[n++] = db->parts[i];
+            for (size_t i = 0; i < n; i++)
+                part_ref(sel[i]);
+            *key = best_k;
+            return n;
+        }
+    }
+
     for (size_t a = 0; a < db->nparts;) {
         size_t b = a + 1;
         int64_t k = db->parts[a]->partition;
@@ -254,9 +361,9 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
         partition_range(db, k, &plo, &phi);
         size_t n = 0;
         if (cluster) { /* D21: whole keys of any class, no per-part, coarse or eager settle */
-            if (phi == INT64_MAX || now - phi < grace)
+            if (phi == INT64_MAX || !age_reached(phi, now, grace))
                 continue;
-            if (merge_selectable(db, lo_i, hi_i) && settle_mutant != SETTLE_MUT_BUSY)
+            if (merge_selectable(db, lo_i, hi_i) && settle_mut() != SETTLE_MUT_BUSY)
                 continue;
             if (expires_within(db, lo_i, hi_i, now, margin))
                 continue;
@@ -286,14 +393,14 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
         } else if (cfg->eager) {
             for (size_t i = lo_i; i < hi_i && n < cap; i++) {
                 part *p = db->parts[i];
-                if (settleable(p) && p->max_ts <= now - grace &&
+                if (settleable(p) && age_reached(p->max_ts, now, grace) &&
                     (p->level > 0 || p->map_len > ECPOLICY_EAGER_MIN_BYTES))
                     sel[n++] = p;
             }
         } else if (cls == 0) {
-            if (phi == INT64_MAX || now - phi < grace)
+            if (phi == INT64_MAX || !age_reached(phi, now, grace))
                 continue;
-            if (merge_selectable(db, lo_i, hi_i) && settle_mutant != SETTLE_MUT_BUSY)
+            if (merge_selectable(db, lo_i, hi_i) && settle_mut() != SETTLE_MUT_BUSY)
                 continue;
             for (size_t i = lo_i; i < hi_i && n < cap; i++)
                 if (settleable(db->parts[i]))
@@ -303,7 +410,7 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
                 continue;
             for (size_t i = lo_i; i < hi_i && n < cap; i++) {
                 part *p = db->parts[i];
-                if (settleable(p) && (p->max_ts <= now - grace || settle_mutant == SETTLE_MUT_COARSEWHOLE))
+                if (settleable(p) && (age_reached(p->max_ts, now, grace) || settle_mut() == SETTLE_MUT_COARSEWHOLE))
                     sel[n++] = p;
             }
         }
