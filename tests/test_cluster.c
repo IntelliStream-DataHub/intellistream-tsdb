@@ -27866,6 +27866,244 @@ static void scen_ecbackgc(void)
 #endif
 }
 
+/* Helper for scen_scrub: find first parity chunk (pos >= h.g.k with h.g.m == 2) under <store>/s<vol>. */
+static int find_parity_chunk(const char *sdir, uint32_t vol, char *path_out, size_t cap, char oid_out[33],
+                             unsigned *pos_out)
+{
+    char vdir[PATH_MAX + 64];
+    snprintf(vdir, sizeof vdir, "%s/s%" PRIu32, sdir, vol);
+    DIR *d = opendir(vdir);
+    if (!d)
+        return 0;
+    struct dirent *e;
+    int found = 0;
+    while ((e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+        if (len < 41 || e->d_name[0] != 'o' || e->d_name[33] != '.')
+            continue;
+        char *end = NULL;
+        unsigned long pos = strtoul(e->d_name + 34, &end, 10);
+        if (!end || strcmp(end, ".chunk") != 0)
+            continue;
+        char cand[PATH_MAX + 128];
+        snprintf(cand, sizeof cand, "%s/%s", vdir, e->d_name);
+        int fd = open(cand, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        uint8_t hb[CHUNK_HDR_BYTES];
+        ssize_t rn = pread(fd, hb, sizeof hb, 0);
+        close(fd);
+        chunk_hdr h;
+        if (rn != (ssize_t)sizeof hb || chunk_hdr_decode(hb, &h) != 0 || h.g.m != 2 || h.pos < h.g.k ||
+            h.pos != (uint16_t)pos)
+            continue;
+        snprintf(path_out, cap, "%s", cand);
+        memcpy(oid_out, e->d_name + 1, 32);
+        oid_out[32] = '\0';
+        *pos_out = (unsigned)pos;
+        found = 1;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+
+/* scrub (R12, r12-chunk; E25, E26, §5.9): 4+2 EC volume on 7 nodes, flip a parity byte at rest ->
+ *   1. Clean scrub pass exports tsdb_chunk_scrub_{bytes,chunks,damaged}_total{store="0"} and age_seconds, and
+ *      CREPORT_SEC_CHUNKSCRUB arrives in STATUS on the Raft leader.
+ *   2. Flipping a parity cell byte at rest triggers CHUNK_DAMAGED over R8's CHUNK link to the volume leader
+ *      within one pass at test pace (verified via both the leader's log line and counter metric). */
+static void scen_scrub(void)
+{
+    scenario("scrub");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#endif
+    int mports[7] = {0};
+    for (int i = 0; i < 7; i++) {
+        penv[i] = "TSDB_CHUNKSCRUB_TEST=interval_ms=200,mb_s=50";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of seven members");
+
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    static char sdirs[7][PATH_MAX + 96];
+    for (int i = 0; i < 7; i++) {
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/scs%d", base, i);
+        chunk_store_make(sdirs[i], uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i],
+                 "--chunk-dir %s --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200",
+                 sdirs[i]);
+        restart_xargs(i, xa[i]);
+        mports[i] = th_mport;
+        if (mports[i] <= 0)
+            die("scrub: server %d reported no metrics port after restart", i);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with their volumes open");
+
+    uint32_t num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "sc42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("scrub: ec=4+2 add: %s (%s)", cluster_strerror(rc), text);
+
+    struct meta_volume e = {0};
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "sc42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("scrub: no record of sc42 with a leader 30 s after add");
+    int L = server_of(e.leader);
+    if (L < 0)
+        die("scrub: sc42 leader %" PRIu32 " is no server of the test", e.leader);
+    printf("  sc42 (volume %" PRIu32 ") led by server %d\n", num, L);
+
+    tsdbc *c = client(L);
+    tsdb_sid ide[ECB_SERIES];
+    const int64_t day0 = 1704067200000LL;
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "scb.s%d", s);
+        ide[s] = ecb_series(c, nm, "sc42");
+    }
+    for (int b = 0; b < 2; b++) {
+        for (int s = 0; s < ECB_SERIES; s++) {
+            static int64_t ts[ECB_ROWS];
+            static float val[ECB_ROWS];
+            ecb_rows_of(s, b, day0, ts, val);
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("scrub: insert into sc42: %s", ers(rc));
+        }
+        usleep(1000000);
+    }
+
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) == 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("scrub: no .ec part in leader's v%" PRIu32 " 120 s after writes", num);
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("scrub: .part files left in leader's v%" PRIu32 ":%s", num, live);
+
+    /* Find a parity chunk (*.4.chunk or *.5.chunk) across the 7 storage nodes. */
+    int target_srv = -1;
+    char ppath[PATH_MAX + 128] = "";
+    char poid[33] = "";
+    unsigned ppos = 0;
+    for (int i = 0; i < 7 && target_srv < 0; i++) {
+        if (find_parity_chunk(sdirs[i], num, ppath, sizeof ppath, poid, &ppos))
+            target_srv = i;
+    }
+    if (target_srv < 0)
+        die("scrub: no parity chunk (pos >= 4) found across 7 stores for volume %" PRIu32, num);
+    printf("  found parity chunk on server %d: oid=%s pos=%u\n", target_srv, poid, ppos);
+
+    /* Wait for at least one clean chunk scrub pass on target_srv and verify metrics + heartbeat section. */
+    char mbuf[65536];
+    int clean_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 20000; usleep(100000)) {
+        metrics_get(mports[target_srv], mbuf, sizeof mbuf);
+        int64_t chunks = 0, bytes = 0, dmg = -1;
+        if (metrics_find_i64(mbuf, "\ntsdb_chunk_scrub_chunks_total{store=\"0\"} ", &chunks) && chunks >= 1 &&
+            metrics_find_i64(mbuf, "\ntsdb_chunk_scrub_bytes_total{store=\"0\"} ", &bytes) && bytes > 0 &&
+            metrics_find_i64(mbuf, "\ntsdb_chunk_scrub_damaged_total{store=\"0\"} ", &dmg) && dmg == 0 &&
+            strstr(mbuf, "\ntsdb_chunk_scrub_age_seconds{store=\"0\"} ")) {
+            clean_ok = 1;
+            break;
+        }
+    }
+    if (!clean_ok)
+        die("scrub: server %d did not complete a clean chunk scrub pass with expected metrics", target_srv);
+
+    int sec_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000 && !sec_ok; usleep(150000)) {
+        int rl = leader_of(0);
+        if (rl < 0)
+            continue;
+        struct view sv;
+        view(rl, &sv);
+        char needle[96];
+        snprintf(needle, sizeof needle, "chunk_scrub node=%" PRIu32 " store=0 state=UP", ids[target_srv]);
+        for (uint32_t k = 0; k < sv.st.nheard; k++) {
+            if (sv.st.heard[k].id == ids[target_srv] && sv.st.heard[k].sections &&
+                strstr(sv.st.heard[k].sections, needle)) {
+                sec_ok = 1;
+                break;
+            }
+        }
+        view_free(&sv);
+    }
+    if (!sec_ok)
+        die("scrub: CREPORT_SEC_CHUNKSCRUB section for server %d did not arrive in STATUS", target_srv);
+
+    /* Flip one byte inside a cell of the parity chunk at rest. */
+    int fd = open(ppath, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        die("scrub: open parity chunk %s: %s", ppath, strerror(errno));
+    uint8_t byte = 0;
+    if (pread(fd, &byte, 1, CHUNK_HDR_BYTES + 16) != 1)
+        die("scrub: pread parity chunk %s: %s", ppath, strerror(errno));
+    byte ^= 0x5au;
+    if (pwrite(fd, &byte, 1, CHUNK_HDR_BYTES + 16) != 1 || fsync(fd) != 0)
+        die("scrub: pwrite/fsync parity chunk %s: %s", ppath, strerror(errno));
+    close(fd);
+
+    /* Wait for storage server scrub to detect damage and report CHUNK_DAMAGED to volume leader L. */
+    char want_log[160];
+    snprintf(want_log, sizeof want_log, "volume %" PRIu32 ": CHUNK_DAMAGED from node %" PRIu32 " oid=%s pos=%u", num,
+             ids[target_srv], poid, ppos);
+    char want_metric[96];
+    snprintf(want_metric, sizeof want_metric, "\ntsdb_chunk_scrub_reports_received_total{volume=\"%" PRIu32 "\"} ", num);
+
+    int saw_store_dmg = 0, saw_leader_log = 0, saw_leader_cnt = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 20000; usleep(100000)) {
+        if (!saw_store_dmg) {
+            metrics_get(mports[target_srv], mbuf, sizeof mbuf);
+            int64_t dmg = 0;
+            if (metrics_find_i64(mbuf, "\ntsdb_chunk_scrub_damaged_total{store=\"0\"} ", &dmg) && dmg >= 1)
+                saw_store_dmg = 1;
+        }
+        if (!saw_leader_log && log_has(L, want_log))
+            saw_leader_log = 1;
+        if (!saw_leader_cnt) {
+            metrics_get(mports[L], mbuf, sizeof mbuf);
+            int64_t rcnt = 0;
+            if (metrics_find_i64(mbuf, want_metric, &rcnt) && rcnt >= 1)
+                saw_leader_cnt = 1;
+        }
+        if (saw_store_dmg && saw_leader_log && saw_leader_cnt)
+            break;
+    }
+    if (!saw_store_dmg)
+        die("scrub: server %d did not count parity rot in tsdb_chunk_scrub_damaged_total", target_srv);
+    if (!saw_leader_log)
+        die("scrub: volume leader %d log missing expected line: %s", L, want_log);
+    if (!saw_leader_cnt)
+        die("scrub: volume leader %d counter %s did not increment", L, want_metric + 1);
+
+    /* Healthy reads still succeed bit-exact after parity rot. */
+    struct ecb_sum rs;
+    if ((rc = ecb_read(c, ide[0], &rs)) != 0 || rs.n != 2 * ECB_ROWS)
+        die("scrub: read after parity rot failed: rc=%d rows=%" PRIu64, rc, rs.n);
+    tsdbc_close(c);
+    printf("  CHUNK_DAMAGED reached leader %d (log + counter) within one pass\n", L);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -27922,7 +28160,7 @@ int main(int argc, char **argv)
                {"nodehold", scen_nodehold}, {"nodeout", scen_nodeout}, {"nodedrain", scen_nodedrain},
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
                {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
-               {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}};
+               {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

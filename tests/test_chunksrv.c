@@ -250,15 +250,19 @@ static struct chunksrv *open1(const char *path)
 static void test_wire(void)
 {
     uint8_t buf[128];
-    for (uint8_t op = CS_OP_READ; op <= CS_OP_EPOCH; op++) {
+    for (uint8_t op = CS_OP_READ; op <= CS_OP_DAMAGED; op++) {
+        if (op == CS_OP_PUT)
+            continue;
         struct cs_req r = {.rid = 77, .op = op, .volume = 3, .epoch = 9, .pos = 4, .off = 100, .len = 10,
-                           .has_cursor = op == CS_OP_LIST};
+                           .bad_cells = 0x25ull, .has_cursor = op == CS_OP_LIST || op == CS_OP_OBJLIST};
         memset(r.vuuid, 5, 16);
         memset(r.oid, 6, 16);
         size_t n = cs_req_encode(&r, buf, sizeof buf);
         CHECK(n > 0);
         struct cs_req d;
         CHECK(cs_req_decode(buf, n, &d) == 0 && d.rid == 77 && d.op == op && d.volume == 3 && d.epoch == 9);
+        if (op == CS_OP_DAMAGED)
+            CHECK(d.pos == 4 && d.bad_cells == 0x25ull && memcmp(d.oid, r.oid, 16) == 0);
         for (size_t k = 0; k < n; k++) /* every shorter frame, and one longer */
             CHECK(cs_req_decode(buf, k, &d) == -1);
         buf[n] = 0;
@@ -288,12 +292,17 @@ static void test_wire(void)
     r = (struct cs_req){.op = CS_OP_DEL, .pos = CHUNK_POS_MAX};
     n = cs_req_encode(&r, buf, sizeof buf);
     CHECK(cs_req_decode(buf, n, &d) == -1);
+    r = (struct cs_req){.op = CS_OP_DAMAGED, .pos = CHUNK_POS_MAX};
+    n = cs_req_encode(&r, buf, sizeof buf);
+    CHECK(cs_req_decode(buf, n, &d) == -1);
     buf[8] = 99; /* an unknown op */
     CHECK(cs_req_decode(buf, n, &d) == -1);
     /* answers (rid 8, op 1, rc 4, check 8, body): a body of the wrong length for its op; each sealed as sent */
     uint8_t a[64] = {0};
     struct cs_resp rr;
 #define RESP_OK(len) (cs_resp_seal(a, (len)), cs_resp_decode(a, (len), &rr))
+    a[8] = CS_OP_DAMAGED;
+    CHECK(RESP_OK(21) == 0 && RESP_OK(21 + 1) == -1);
     a[8] = CS_OP_PUT;
     CHECK(RESP_OK(21 + 8) == 0 && RESP_OK(21 + 7) == -1);
     a[8] = CS_OP_EPOCH;
@@ -1616,6 +1625,78 @@ static void test_objlist_reopen_chunkr(void)
     pthread_mutex_destroy(&ctx.mu);
 }
 
+/* Exercises chunksrv's scrub pause triggers (external pause_all + in-flight put burst) and reconcile. */
+static void test_scrub_pause(void)
+{
+    char d[PATH_MAX], p0[PATH_MAX + 32];
+    fresh("scrubpause", d, sizeof d);
+    snprintf(p0, sizeof p0, "%s/st0", d);
+    CHECK(chunk_store_init(p0, NULL, NULL) == 0);
+    const char *paths[1] = {p0};
+    char err[256];
+    struct chunksrv *cs = chunksrv_open(paths, 1, err, sizeof err);
+    CHECK(cs != NULL);
+    if (!cs)
+        return;
+
+    /* Put 4 chunks into store 0. */
+    chunk_store *st0 = chunk_be_store(chunksrv_backend(cs), 0);
+    CHECK(st0 != NULL);
+    for (int i = 0; i < 4; i++) {
+        cdata c;
+        cdata_make(&c, 1, 0, 4096, 2 * 4096 * 2, (uint64_t)(40 + i));
+        chunk_ident id = {.volume = c.m.volume, .pos = c.m.pos};
+        memcpy(id.vuuid, c.m.vuuid, 16);
+        memcpy(id.oid, c.m.oid, 16);
+        CHECK(chunk_store_put(st0, &id, &c.m.g, 1, c.cells, c.sums) == 0);
+        cdata_free(&c);
+    }
+
+    /* 1. External pause (sfill / CHUNKR): scrub must stay at 0 chunks while paused. */
+    chunksrv_scrub_pause_all(cs, 1);
+    struct chunksrv_scrub_cfg scfg = {
+        .scrub_days = 14,
+        .scrub_mb_s = 100,
+        .scrub_out_count = 8,
+        .pass_interval_ms = 60000,
+        .put_burst_conc = 1,
+    };
+    CHECK(chunksrv_scrub_start(cs, &scfg) == 0);
+    usleep(200000);
+    chunk_scrub_stats ss = {0};
+    CHECK(chunksrv_scrub_stats(cs, 0, &ss) == 0 && ss.chunks_total == 0);
+
+    /* 2. Hold an in-flight put (>= put_burst_conc=1) and release external pause: scrub must STILL stay paused! */
+    cdata pc;
+    cdata_make(&pc, 2, 0, 4096, 2 * 4096 * 2, 99);
+    uint8_t meta[CS_PUT_META_LEN];
+    cs_put_meta_encode(&pc.m, meta);
+    struct cap rcap = {0};
+    struct cs_put *put = NULL;
+    CHECK(chunksrv_put_begin(cs, 1, 1, meta, sizeof meta, cs_put_total(&pc.m), cap_reply, &rcap, &put) == 0);
+    chunksrv_scrub_pause_all(cs, -1);
+    usleep(200000);
+    CHECK(chunksrv_scrub_stats(cs, 0, &ss) == 0 && ss.chunks_total == 0);
+
+    /* Abort the in-flight put: scrub must unpause and complete the pass over all 4 chunks. */
+    chunksrv_put_end(put, TSDB_ERR_IO);
+    free(rcap.body);
+    cdata_free(&pc);
+
+    bool done = false;
+    for (int t = 0; t < 100; t++) {
+        if (chunksrv_scrub_stats(cs, 0, &ss) == 0 && ss.passes_done >= 1 && ss.chunks_total >= 4) {
+            done = true;
+            break;
+        }
+        usleep(50000);
+    }
+    CHECK(done);
+    chunksrv_scrub_reconcile(cs);
+    chunksrv_scrub_stop(cs);
+    chunksrv_close(cs);
+}
+
 int main(int argc, char **argv)
 {
     const char *mutant = NULL, *base = "/tmp";
@@ -1684,6 +1765,7 @@ int main(int argc, char **argv)
     test_eio();
     test_net();
     test_objlist_reopen_chunkr();
+    test_scrub_pause();
     test_slow_disk();
 out:
     if (fails == 0) {

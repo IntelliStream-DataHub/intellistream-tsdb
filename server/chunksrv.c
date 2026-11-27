@@ -116,6 +116,7 @@ static size_t req_body_len(uint8_t op)
     case CS_OP_REOPEN: return 16;
     case CS_OP_GCPENDING: return 0;
     case CS_OP_RECONCILE: return 2 + 8;
+    case CS_OP_DAMAGED: return 16 + 2 + 8;
     default: return (size_t)-1;
     }
 }
@@ -153,6 +154,10 @@ size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap)
     } else if (r->op == CS_OP_RECONCILE) {
         put16(b, r->pos);
         put64(b + 2, r->off);
+    } else if (r->op == CS_OP_DAMAGED) {
+        memcpy(b, r->oid, 16);
+        put16(b + 16, r->pos);
+        put64(b + 18, r->bad_cells);
     }
     put64(out + REQ_HDR + bl, xh(out, REQ_HDR + bl));
     return REQ_HDR + bl + CS_CHECK_LEN;
@@ -211,6 +216,12 @@ int cs_req_decode(const uint8_t *p, size_t n, struct cs_req *r)
         r->off = get64(b + 2);
         if (r->pos >= CHUNK_POS_MAX)
             return -1;
+    } else if (r->op == CS_OP_DAMAGED) {
+        memcpy(r->oid, b, 16);
+        r->pos = get16(b + 16);
+        if (r->pos >= CHUNK_POS_MAX)
+            return -1;
+        r->bad_cells = get64(b + 18);
     }
     return 0;
 }
@@ -305,7 +316,7 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     r->body_len = n - RESP_HDR;
     if (get64(p + 13) != resp_check(p, n) && chunksrv_mutant != CS_MUT_NORESPCHECK)
         return -1;
-    if (r->op < CS_OP_READ || r->op > CS_OP_RECONCILE || r->rc > 0)
+    if (r->op < CS_OP_READ || r->op > CS_OP_DAMAGED || r->rc > 0)
         return -1;
     if (r->rc != 0)
         return r->body_len == 0 ? 0 : -1;
@@ -325,6 +336,7 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     case CS_OP_GCPENDING:
         return bl >= 5 && b[4] <= 1 && get32(b) <= CS_GCPENDING_MAX && bl == 5 + 16 * (size_t)get32(b) ? 0 : -1;
     case CS_OP_RECONCILE: return bl == 0 ? 0 : -1;
+    case CS_OP_DAMAGED: return bl == 0 ? 0 : -1;
     }
     return -1;
 }
@@ -519,7 +531,28 @@ struct chunksrv {
     _Atomic(void *) reconcile_arg;
     _Atomic(chunksrv_read_pace_fn) read_pace;
     _Atomic(void *) read_pace_arg;
+    _Atomic(chunksrv_damaged_fn) damaged;
+    _Atomic(void *) damaged_arg;
     struct chunksrv_stats st;
+
+    /* per-store background chunk scrubbers and activity pause tracking (R12, r12-chunk) */
+    pthread_mutex_t smu;
+    chunk_scrub *scrubs[CHUNKSRV_DIRS_MAX];
+    chunk_store *scrub_st[CHUNKSRV_DIRS_MAX];
+    int nscrubs;
+    bool scrub_enabled;
+    struct chunksrv_scrub_cfg scrub_cfg;
+    uint32_t scrub_put_burst_conc;
+    uint64_t scrub_put_burst_bps;
+    atomic_int scrub_pause_ext;
+    atomic_int puts_inflight;
+    uint64_t put_win_s;
+    uint64_t put_win_bytes;
+    uint64_t put_pause_since_s;
+    uint64_t put_yield_until_s;
+    chunk_scrub_report_fn scrub_on_damage;
+    chunk_scrub_out_fn scrub_on_out;
+    void *scrub_ctx;
 
     /* the network half (chunksrv_listen) */
     struct peerlink *pl;
@@ -575,6 +608,9 @@ struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_
     pthread_mutex_init(&cs->rqmu, NULL);
     pthread_cond_init(&cs->rqcv, NULL);
     pthread_mutex_init(&cs->cmu, NULL);
+    pthread_mutex_init(&cs->smu, NULL);
+    cs->scrub_put_burst_conc = 2;
+    cs->scrub_put_burst_bps = 16ull << 20;
     uint64_t r;
     if (chunk_random(&r, sizeof r) != 0) { /* a restarted client's ids never meet a late answer to its previous life */
         snprintf(err, errlen, "cannot read random bytes");
@@ -605,6 +641,7 @@ void chunksrv_close(struct chunksrv *cs)
 {
     if (!cs)
         return;
+    chunksrv_scrub_stop(cs);
     if (cs->listening)
         chunksrv_unlisten(cs);
     if (cs->be)
@@ -617,6 +654,7 @@ void chunksrv_close(struct chunksrv *cs)
     pthread_mutex_destroy(&cs->rqmu);
     pthread_cond_destroy(&cs->rqcv);
     pthread_mutex_destroy(&cs->cmu);
+    pthread_mutex_destroy(&cs->smu);
     free(cs);
 }
 
@@ -723,12 +761,210 @@ void chunksrv_set_read_pacer(struct chunksrv *cs, chunksrv_read_pace_fn fn, void
     atomic_store(&cs->read_pace, fn);
 }
 
+void chunksrv_set_damaged(struct chunksrv *cs, chunksrv_damaged_fn fn, void *arg)
+{
+    atomic_store(&cs->damaged_arg, arg);
+    atomic_store(&cs->damaged, fn);
+}
+
+static uint64_t cs_mono_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec;
+}
+
+static void cs_note_put_bytes(struct chunksrv *cs, uint64_t bytes)
+{
+    uint64_t s = cs_mono_s();
+    pthread_mutex_lock(&cs->smu);
+    if (cs->put_win_s != s) {
+        cs->put_win_s = s;
+        cs->put_win_bytes = 0;
+    }
+    cs->put_win_bytes += bytes;
+    pthread_mutex_unlock(&cs->smu);
+}
+
+#define CS_SCRUB_PUT_PAUSE_MAX_S 60ull /* max continuous put-burst pause before granting a scrub yield window */
+#define CS_SCRUB_PUT_YIELD_S 5ull      /* scrub progress window granted under sustained write load */
+
+static bool cs_scrub_is_paused(void *ctx, int store_idx)
+{
+    (void)store_idx;
+    struct chunksrv *cs = ctx;
+    if (atomic_load_explicit(&cs->scrub_pause_ext, memory_order_relaxed) > 0)
+        return true;
+    int inflight = atomic_load_explicit(&cs->puts_inflight, memory_order_relaxed);
+    uint64_t s = cs_mono_s();
+    pthread_mutex_lock(&cs->smu);
+    bool burst = (uint32_t)inflight >= cs->scrub_put_burst_conc ||
+                 (cs->put_win_s == s && cs->put_win_bytes >= cs->scrub_put_burst_bps);
+    if (!burst) {
+        cs->put_pause_since_s = 0;
+    } else if (s < cs->put_yield_until_s) {
+        burst = false;
+    } else if (cs->put_pause_since_s == 0) {
+        cs->put_pause_since_s = s;
+    } else if (s - cs->put_pause_since_s >= CS_SCRUB_PUT_PAUSE_MAX_S) {
+        cs->put_yield_until_s = s + CS_SCRUB_PUT_YIELD_S;
+        cs->put_pause_since_s = 0;
+        burst = false;
+    }
+    pthread_mutex_unlock(&cs->smu);
+    return burst;
+}
+
+static int cs_scrub_on_damage(void *ctx, const chunk_scrub_damage *dmg)
+{
+    struct chunksrv *cs = ctx;
+    return cs->scrub_on_damage ? cs->scrub_on_damage(cs->scrub_ctx, dmg) : 0;
+}
+
+static void cs_scrub_on_out(void *ctx, int store_idx, uint64_t day_damaged)
+{
+    struct chunksrv *cs = ctx;
+    if (cs->scrub_on_out)
+        cs->scrub_on_out(cs->scrub_ctx, store_idx, day_damaged);
+}
+
+void chunksrv_scrub_reconcile(struct chunksrv *cs)
+{
+    if (!cs || !cs->be)
+        return;
+    int ns = chunk_be_nstores(cs->be);
+    if (ns > CHUNKSRV_DIRS_MAX)
+        ns = CHUNKSRV_DIRS_MAX;
+
+    for (int i = 0; i < ns; i++) {
+        chunk_store *raw = chunk_be_raw_store(cs->be, i);
+        chunk_store *open_st = chunk_be_store(cs->be, i);
+
+        pthread_mutex_lock(&cs->smu);
+        if (!cs->scrub_enabled) {
+            pthread_mutex_unlock(&cs->smu);
+            return;
+        }
+        chunk_store *cur_st = cs->scrub_st[i];
+        bool retired = cur_st != NULL && raw != cur_st;
+        bool need_start = (cur_st == NULL || retired) && open_st != NULL;
+        chunk_scrub *old_sc = NULL;
+        struct chunksrv_scrub_cfg cfg_copy = cs->scrub_cfg;
+        if (retired) {
+            old_sc = cs->scrubs[i];
+            cs->scrubs[i] = NULL;
+            cs->scrub_st[i] = NULL;
+        }
+        pthread_mutex_unlock(&cs->smu);
+
+        if (old_sc)
+            chunk_scrub_stop(old_sc);
+        if (need_start) {
+            chunk_scrub_cfg scfg = {
+                .store_idx = i,
+                .scrub_days = cfg_copy.scrub_days,
+                .scrub_mb_s = cfg_copy.scrub_mb_s,
+                .scrub_out_count = cfg_copy.scrub_out_count,
+                .pass_interval_ms = cfg_copy.pass_interval_ms,
+                .be = cs->be,
+                .on_damage = cs_scrub_on_damage,
+                .on_out = cs_scrub_on_out,
+                .is_paused = cs_scrub_is_paused,
+                .ctx = cs,
+            };
+            chunk_scrub *nsc = chunk_scrub_start(open_st, &scfg);
+            if (!nsc)
+                continue;
+            pthread_mutex_lock(&cs->smu);
+            if (cs->scrub_enabled && cs->scrub_st[i] == NULL && chunk_be_raw_store(cs->be, i) == open_st) {
+                cs->scrubs[i] = nsc;
+                cs->scrub_st[i] = open_st;
+                if (i + 1 > cs->nscrubs)
+                    cs->nscrubs = i + 1;
+                nsc = NULL;
+            }
+            pthread_mutex_unlock(&cs->smu);
+            if (nsc)
+                chunk_scrub_stop(nsc);
+        }
+    }
+}
+
+int chunksrv_scrub_start(struct chunksrv *cs, const struct chunksrv_scrub_cfg *cfg)
+{
+    if (!cs || !cs->be || !cfg)
+        return 0;
+    int ns = chunk_be_nstores(cs->be);
+    if (ns > CHUNKSRV_DIRS_MAX)
+        ns = CHUNKSRV_DIRS_MAX;
+
+    pthread_mutex_lock(&cs->smu);
+    if (cs->scrub_enabled) {
+        pthread_mutex_unlock(&cs->smu);
+        return 0;
+    }
+    cs->scrub_enabled = true;
+    cs->scrub_cfg = *cfg;
+    cs->nscrubs = ns;
+    cs->scrub_put_burst_conc = cfg->put_burst_conc ? cfg->put_burst_conc : 2u;
+    cs->scrub_put_burst_bps = cfg->put_burst_bps ? cfg->put_burst_bps : (16ull << 20);
+    cs->scrub_on_damage = cfg->on_damage;
+    cs->scrub_on_out = cfg->on_out;
+    cs->scrub_ctx = cfg->ctx;
+    pthread_mutex_unlock(&cs->smu);
+
+    chunksrv_scrub_reconcile(cs);
+    return 0;
+}
+
+void chunksrv_scrub_stop(struct chunksrv *cs)
+{
+    if (!cs)
+        return;
+    chunk_scrub *tmp[CHUNKSRV_DIRS_MAX] = {0};
+    int ns = 0;
+    pthread_mutex_lock(&cs->smu);
+    cs->scrub_enabled = false;
+    ns = cs->nscrubs;
+    for (int i = 0; i < ns && i < CHUNKSRV_DIRS_MAX; i++) {
+        tmp[i] = cs->scrubs[i];
+        cs->scrubs[i] = NULL;
+        cs->scrub_st[i] = NULL;
+    }
+    cs->nscrubs = 0;
+    pthread_mutex_unlock(&cs->smu);
+    for (int i = 0; i < ns && i < CHUNKSRV_DIRS_MAX; i++)
+        chunk_scrub_stop(tmp[i]);
+}
+
+int chunksrv_scrub_stats(struct chunksrv *cs, int store_idx, chunk_scrub_stats *out)
+{
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (!cs || store_idx < 0 || store_idx >= CHUNKSRV_DIRS_MAX)
+        return -1;
+    pthread_mutex_lock(&cs->smu);
+    chunk_scrub *sc = store_idx < cs->nscrubs ? cs->scrubs[store_idx] : NULL;
+    if (sc)
+        chunk_scrub_get_stats(sc, out);
+    pthread_mutex_unlock(&cs->smu);
+    return sc ? 0 : -1;
+}
+
+void chunksrv_scrub_pause_all(struct chunksrv *cs, int delta)
+{
+    if (!cs || delta == 0)
+        return;
+    atomic_fetch_add_explicit(&cs->scrub_pause_ext, delta, memory_order_relaxed);
+}
+
 /* Each counter is read on its own (relaxed, as STAT writes them): a plain struct copy races the workers. */
 void chunksrv_get_stats(struct chunksrv *cs, struct chunksrv_stats *st)
 {
 #define LD(f) st->f = __atomic_load_n(&cs->st.f, __ATOMIC_RELAXED)
     LD(requests); LD(malformed); LD(puts_ok); LD(puts_refused); LD(put_bytes); LD(reads); LD(read_bytes); LD(fenced);
-    LD(unsure_refused); LD(source_raises); LD(answer_mismatch);
+    LD(unsure_refused); LD(source_raises); LD(answer_mismatch); LD(damaged_reports);
 #undef LD
 }
 
@@ -825,6 +1061,8 @@ static void ident_of(const struct cs_req *r, chunk_ident *id)
 
 static void do_read(struct chunksrv *cs, int kind, const struct cs_req *r, cs_reply_fn reply, void *arg)
 {
+    if (kind == PL_KIND_CHUNKR)
+        atomic_fetch_add_explicit(&cs->scrub_pause_ext, 1, memory_order_relaxed);
     chunk_ident id;
     ident_of(r, &id);
     chunk_rd *rd = NULL;
@@ -841,6 +1079,8 @@ static void do_read(struct chunksrv *cs, int kind, const struct cs_req *r, cs_re
         rc = chunk_rd_read(rd, r->off, b + RESP_HDR, r->len);
     if (rd)
         chunk_rd_close(rd);
+    if (kind == PL_KIND_CHUNKR)
+        atomic_fetch_sub_explicit(&cs->scrub_pause_ext, 1, memory_order_relaxed);
     if (rc == 0) {
         if (kind == PL_KIND_CHUNKR) {
             chunksrv_read_pace_fn pfn = atomic_load(&cs->read_pace);
@@ -1118,10 +1358,22 @@ static void do_reconcile(struct chunksrv *cs, const struct cs_req *r, cs_reply_f
     reply_rc(reply, arg, r->rid, CS_OP_RECONCILE, 0, NULL, 0);
 }
 
+static void do_damaged(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, cs_reply_fn reply, void *arg)
+{
+    chunksrv_damaged_fn fn = atomic_load(&cs->damaged);
+    if (!fn) {
+        reply_rc(reply, arg, r->rid, CS_OP_DAMAGED, TSDB_ERR_UNAVAILABLE, NULL, 0);
+        return;
+    }
+    int rc = fn(atomic_load(&cs->damaged_arg), peer, r->volume, r->oid, r->pos, r->bad_cells);
+    if (rc == 0)
+        STAT(cs, damaged_reports);
+    reply_rc(reply, arg, r->rid, CS_OP_DAMAGED, rc, NULL, 0);
+}
+
 static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, const struct cs_req *r, cs_reply_fn reply,
                                void *arg)
 {
-    (void)peer;
     STAT(cs, requests);
     if (r->op == CS_OP_OBJLIST) {
         do_objlist(cs, r, reply, arg);
@@ -1137,6 +1389,10 @@ static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, con
     }
     if (r->op == CS_OP_RECONCILE) {
         do_reconcile(cs, r, reply, arg);
+        return 0;
+    }
+    if (r->op == CS_OP_DAMAGED) {
+        do_damaged(cs, peer, r, reply, arg);
         return 0;
     }
     if (!cs->be) {
@@ -1270,6 +1526,7 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
     }
     if (p->ncells)
         p->cell_len = chunk_pos_cell_len(&p->m.g, p->m.pos, 0);
+    atomic_fetch_add_explicit(&cs->puts_inflight, 1, memory_order_relaxed);
     *out = p;
     return 0;
 }
@@ -1333,10 +1590,13 @@ void chunksrv_put_end(struct cs_put *p, int status)
             rc = chunk_wr_commit(p->w);
             p->w = NULL; /* commit releases the writer, whatever it returns */
         }
-        if (rc == 0)
+        if (rc == 0) {
             STATN(p->cs, put_bytes, p->total);
+            cs_note_put_bytes(p->cs, p->total);
+        }
         put_answer(p, rc);
     }
+    atomic_fetch_sub_explicit(&p->cs->puts_inflight, 1, memory_order_relaxed);
     put_free(p);
 }
 
@@ -2033,6 +2293,54 @@ int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, in
                   uint8_t **body, size_t *body_len)
 {
     return chunksrv_call_kind(cs, peer, PL_KIND_CHUNK, r, timeout_ms, rc, body, body_len);
+}
+
+struct self_cap {
+    int32_t rc;
+    uint8_t *body;
+    size_t body_len;
+    bool got;
+};
+
+static void self_reply(void *arg, const uint8_t *p, size_t n)
+{
+    struct self_cap *c = arg;
+    struct cs_resp resp;
+    if (cs_resp_decode(p, n, &resp) != 0)
+        return;
+    c->rc = resp.rc;
+    if (resp.body_len > 0) {
+        c->body = malloc(resp.body_len);
+        if (c->body) {
+            memcpy(c->body, resp.body, resp.body_len);
+            c->body_len = resp.body_len;
+        }
+    }
+    c->got = true;
+}
+
+int chunksrv_call_self(struct chunksrv *cs, uint32_t self, const struct cs_req *r, int32_t *rc, uint8_t **body,
+                       size_t *body_len)
+{
+    *body = NULL;
+    *body_len = 0;
+    if (!cs || !r)
+        return TSDB_ERR_INVALID;
+    struct cs_req q = *r;
+    q.rid = atomic_fetch_add(&cs->rid, 1);
+    uint8_t buf[REQ_HDR + 64];
+    size_t n = cs_req_encode(&q, buf, sizeof buf);
+    if (!n)
+        return TSDB_ERR_INVALID;
+    struct self_cap cap = {0};
+    if (chunksrv_handle(cs, self, buf, n, self_reply, &cap) != 0 || !cap.got) {
+        free(cap.body);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    *rc = cap.rc;
+    *body = cap.body;
+    *body_len = cap.body_len;
+    return 0;
 }
 
 struct jarg {

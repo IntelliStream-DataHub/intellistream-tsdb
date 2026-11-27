@@ -260,6 +260,11 @@ int chunk_be_store_state(const chunk_backend *be, int i); /* CHUNK_STORE_*; -1 f
  * store i is already DOWN (returns 0 without altering its DOWN reason). Returns TSDB_ERR_INVALID for an index out of
  * range or a reason other than CHUNK_STORE_DOWN_IOERR / CHUNK_STORE_DOWN_STALLED. */
 int chunk_be_set_down(chunk_backend *be, int i, int reason);
+/* Marks store `i` locally DOWN (CHUNK_STORE_DOWN_DAMAGED or CHUNK_STORE_DOWN_IOERR) without closing its open
+ * descriptors: chunk_be_open_store/chunk_be_store/chunk_be_store_ref return NULL for it so reads decode around it and
+ * puts/deletes/lists/heals skip it. When `expected` is non-NULL, transitions only if slot `i` still holds `expected`.
+ * Returns 1 if it transitioned from UP, 0 otherwise. */
+int chunk_be_mark_down(chunk_backend *be, int i, const chunk_store *expected, int state);
 uint64_t chunk_be_epoch(chunk_backend *be, uint32_t volume);
 /* A request showed epoch e: the fence is at least e, durable in every store before it returns. If a store fails to
  * store it, the first such error is returned even though the others hold it (the fence is in memory and in the stores

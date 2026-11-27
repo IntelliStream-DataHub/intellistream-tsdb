@@ -31,6 +31,7 @@
 #include "internal.h"
 #include "chunk.h"
 #include "chunk_priv.h"
+#include "chunkscrub.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -758,6 +759,8 @@ void chunk_store_unref(chunk_store *st)
 void chunk_store_close(chunk_store *st) { chunk_store_unref(st); }
 
 const uint8_t *chunk_store_id(const chunk_store *st) { return st->id; }
+int chunk_store_dirfd(const chunk_store *st) { return st ? st->dirfd : -1; }
+const char *chunk_store_path(const chunk_store *st) { return st && st->path ? st->path : ""; }
 /* Test hooks (tests/test_chunk_heal.c): a store that failed in service, as an EIO on a directory fsync makes it (that path
  * is test_chunk.c's), and one flipped byte in the first cell of a chunk, as a write that landed wrong. */
 void chunk_store_test_fail(chunk_store *st) { store_fail(st, "test hook", EIO); }
@@ -1176,37 +1179,50 @@ static int rd_load(int fd, const uint8_t oid[16], unsigned pos, const uint8_t *w
     return rd_load_ex(fd, oid, pos, want_vuuid, full, out, hdr_out, NULL);
 }
 
-static int chunk_rd_open_ex(chunk_store *st, const chunk_ident *id, chunk_rd **out, bool *real_io)
+static int rd_open_impl(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos,
+                        const uint8_t *want_vuuid, bool scrub_mode, chunk_rd **out, bool *real_io)
 {
     if (real_io)
         *real_io = false;
     pthread_mutex_lock(&st->mu);
     vol_state *v;
-    int rc = vol_get(st, id->volume, false, &v);
+    int rc = vol_get(st, volume, false, &v);
     int vfd = rc == 0 ? v->dirfd : -1;
     pthread_mutex_unlock(&st->mu);
     if (rc)
         return rc;
     char name[80];
-    chunk_name(name, sizeof name, id->oid, id->pos);
+    chunk_name(name, sizeof name, oid, pos);
     int fd = openat(vfd, name, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         int e = errno;
         if (e == ENOENT)
             return TSDB_ERR_NOTFOUND;
+        if (scrub_mode && (e == EMFILE || e == ENFILE || e == ENOMEM))
+            return TSDB_ERR_NOMEM; /* transient resource pressure, not disk damage */
         if (real_io && is_storage_io_errno(e))
             *real_io = true;
         return TSDB_ERR_IO;
     }
-    rc = rd_load_ex(fd, id->oid, id->pos, id->vuuid, true, out, NULL, real_io);
+    rc = rd_load_ex(fd, oid, pos, want_vuuid, true, out, NULL, real_io);
     if (rc)
         close(fd);
     return rc;
 }
 
+static int chunk_rd_open_ex(chunk_store *st, const chunk_ident *id, chunk_rd **out, bool *real_io)
+{
+    return rd_open_impl(st, id->volume, id->oid, id->pos, id->vuuid, false, out, real_io);
+}
+
 int chunk_rd_open(chunk_store *st, const chunk_ident *id, chunk_rd **out)
 {
     return chunk_rd_open_ex(st, id, out, NULL);
+}
+
+int chunk_rd_open_any(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos, chunk_rd **out)
+{
+    return rd_open_impl(st, volume, oid, pos, NULL, true, out, NULL);
 }
 
 void chunk_rd_close(chunk_rd *r)
@@ -1235,24 +1251,50 @@ int chunk_rd_read(chunk_rd *r, uint64_t off, void *buf, size_t len)
     return chunk_rd_read_ex(r, off, buf, len, NULL);
 }
 
-int chunk_rd_scrub(chunk_rd *r, uint64_t *bad)
+int chunk_rd_scrub_ex(chunk_rd *r, uint64_t *bad, uint64_t *bad_bitmap, uint64_t *bytes_out,
+                      chunk_scrub_cell_cb on_cell, void *ctx)
 {
-    uint64_t nbad = 0, off = 0;
+    uint64_t nbad = 0, bmap = 0, off = 0, total = 0;
     size_t cap = r->h.g.cell < r->h.chunk_len ? r->h.g.cell : (size_t)r->h.chunk_len;
     uint8_t *buf = malloc(cap ? cap : 1);
     if (!buf)
         return TSDB_ERR_NOMEM;
     int rc = 0;
-    for (uint64_t i = 0; i < r->ncells && rc == 0; i++) {
+    uint64_t limit = r->ncells;
+#ifdef TSDB_TEST_HOOKS
+    if (chunkscrub_mutant == CHUNKSCRUB_MUT_SKIPCELL && limit > 0) /* planted bug: skips the last cell */
+        limit--;
+#endif
+    for (uint64_t i = 0; i < limit && rc == 0; i++) {
         size_t cl = (size_t)chunk_pos_cell_len(&r->h.g, r->h.pos, i);
         rc = chunk_rd_read(r, off, buf, cl);
-        if (rc == 0 && xxh64(buf, cl, 0) != r->sums[i])
-            nbad++;
+        if (rc == 0) {
+            total += cl;
+            if (xxh64(buf, cl, 0) != r->sums[i]) {
+                nbad++;
+                bmap |= (i < 63 ? (1ull << i) : (1ull << 63));
+            }
+            if (on_cell) {
+                int cbrc = on_cell(ctx, cl);
+                if (cbrc != 0)
+                    rc = cbrc;
+            }
+        }
         off += cl;
     }
     free(buf);
-    *bad = nbad;
+    if (bad)
+        *bad = nbad;
+    if (bad_bitmap)
+        *bad_bitmap = bmap;
+    if (bytes_out)
+        *bytes_out = total;
     return rc;
+}
+
+int chunk_rd_scrub(chunk_rd *r, uint64_t *bad)
+{
+    return chunk_rd_scrub_ex(r, bad, NULL, NULL, NULL, NULL);
 }
 
 /* What store_list says of one chunk file (c->oid and c->pos set): 0, or 1 when it is not there (removed under a scan) */
@@ -1371,8 +1413,13 @@ int chunk_store_peek(chunk_store *st, uint32_t volume, const uint8_t oid[16], un
     char name[80];
     chunk_name(name, sizeof name, oid, pos);
     int fd = openat(vfd, name, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    if (fd < 0) {
+        if (errno == ENOENT)
+            return TSDB_ERR_NOTFOUND;
+        if (errno == EMFILE || errno == ENFILE || errno == ENOMEM)
+            return TSDB_ERR_NOMEM; /* transient resource pressure, not disk damage */
+        return TSDB_ERR_IO;
+    }
     rc = rd_load(fd, oid, pos, NULL, false, NULL, h);
     close(fd);
     return rc;
@@ -1411,7 +1458,7 @@ static struct fence *fence_find(chunk_backend *be, uint32_t vol, bool add)
     return &be->f[be->nf++];
 }
 
-chunk_store *chunk_be_open_store(const chunk_backend *be, int i)
+chunk_store *chunk_be_raw_store(const chunk_backend *be, int i)
 {
     return be && i >= 0 && i < be->n ? atomic_load_explicit(&be->st[i], memory_order_acquire) : NULL;
 }
@@ -1422,11 +1469,37 @@ chunk_store *chunk_be_store_ref(const chunk_backend *be, int i)
         return NULL;
     chunk_backend *mbe = (chunk_backend *)be;
     pthread_mutex_lock(&mbe->st_mu);
+    int s = atomic_load_explicit(&mbe->state[i], memory_order_acquire);
+    chunk_store *st = (s == CHUNK_STORE_UP || s == CHUNK_STORE_REPLACING || chunk_mutant == CHUNK_MUT_DOWNNOREAD)
+                          ? atomic_load_explicit(&mbe->st[i], memory_order_relaxed)
+                          : NULL;
+    if (st)
+        chunk_store_ref(st);
+    pthread_mutex_unlock(&mbe->st_mu);
+    return st;
+}
+
+chunk_store *chunk_be_raw_store_ref(const chunk_backend *be, int i)
+{
+    if (!be || i < 0 || i >= be->n)
+        return NULL;
+    chunk_backend *mbe = (chunk_backend *)be;
+    pthread_mutex_lock(&mbe->st_mu);
     chunk_store *st = atomic_load_explicit(&mbe->st[i], memory_order_relaxed);
     if (st)
         chunk_store_ref(st);
     pthread_mutex_unlock(&mbe->st_mu);
     return st;
+}
+
+chunk_store *chunk_be_open_store(const chunk_backend *be, int i)
+{
+    if (i < 0 || i >= be->n)
+        return NULL;
+    int s = atomic_load_explicit(&be->state[i], memory_order_acquire);
+    if (s != CHUNK_STORE_UP && s != CHUNK_STORE_REPLACING)
+        return NULL;
+    return atomic_load_explicit(&be->st[i], memory_order_acquire);
 }
 
 chunk_store *chunk_be_store(chunk_backend *be, int i) { return chunk_be_open_store(be, i); }
@@ -1440,6 +1513,23 @@ int chunk_be_store_state(const chunk_backend *be, int i)
         atomic_load_explicit(&be->st_failed[i], memory_order_acquire))
         return CHUNK_STORE_DOWN_IOERR;
     return s;
+}
+
+int chunk_be_mark_down(chunk_backend *be, int i, const chunk_store *expected, int state)
+{
+    if (!be || i < 0 || i >= be->n ||
+        (state != CHUNK_STORE_DOWN_DAMAGED && state != CHUNK_STORE_DOWN_IOERR))
+        return 0;
+    pthread_mutex_lock(&be->st_mu);
+    int changed = 0;
+    chunk_store *cur = atomic_load_explicit(&be->st[i], memory_order_acquire);
+    if ((!expected || cur == expected) && !atomic_load_explicit(&be->st_failed[i], memory_order_acquire) &&
+        (!cur || !chunk_store_failed(cur))) {
+        int exp_state = CHUNK_STORE_UP;
+        changed = atomic_compare_exchange_strong(&be->state[i], &exp_state, state) ? 1 : 0;
+    }
+    pthread_mutex_unlock(&be->st_mu);
+    return changed;
 }
 
 bool chunk_be_store_path_copy(const chunk_backend *be, int i, char *buf, size_t cap)
@@ -1832,10 +1922,14 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
     if (store_out)
         *store_out = -1;
     int worst = TSDB_ERR_NOTFOUND;
+    bool saw_down = false;
+    bool saw_nomem = false;
     int primary = be->n > 0 ? chunk_be_place(be, id->oid, id->pos) : -1;
     if (primary >= 0 && primary < be->n) {
         chunk_store *st = chunk_be_store_ref(be, primary);
-        if (st) {
+        if (!st) {
+            saw_down = true;
+        } else {
             bool real_io = false;
             int rc = chunk_rd_open_ex(st, id, out, &real_io);
             chunk_store_unref(st);
@@ -1846,7 +1940,9 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
             }
             if (rc == TSDB_ERR_IO && real_io)
                 chunk_be_note_ioerr(be, primary);
-            if (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && worst != TSDB_ERR_IO))
+            if (rc == TSDB_ERR_NOMEM)
+                saw_nomem = true;
+            else if (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && worst != TSDB_ERR_IO))
                 worst = rc;
         }
     }
@@ -1854,8 +1950,10 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
         if (i == primary)
             continue;
         chunk_store *st = chunk_be_store_ref(be, i);
-        if (!st)
+        if (!st) {
+            saw_down = true;
             continue;
+        }
         bool real_io = false;
         int rc = chunk_rd_open_ex(st, id, out, &real_io);
         chunk_store_unref(st);
@@ -1866,8 +1964,16 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
         }
         if (rc == TSDB_ERR_IO && real_io)
             chunk_be_note_ioerr(be, i);
-        if (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && worst != TSDB_ERR_IO))
+        if (rc == TSDB_ERR_NOMEM)
+            saw_nomem = true;
+        else if (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && worst != TSDB_ERR_IO))
             worst = rc;
+    }
+    if (worst == TSDB_ERR_NOTFOUND) {
+        if (saw_nomem)
+            return TSDB_ERR_NOMEM;
+        if (saw_down)
+            return TSDB_ERR_UNAVAILABLE;
     }
     return worst;
 }

@@ -27,9 +27,11 @@
 #include <unistd.h>
 
 #include "cluster.h"
+#include "creport.h"
 #include "peerlink.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/chunk_priv.h"
+#include "../src/chunkscrub.h"
 #include "../src/internal.h"
 
 #ifdef __ELF__
@@ -45,7 +47,251 @@ static struct {
     uint64_t rate;
     int checked; /* the owner check ran */
     int last_up; /* stores up last reported (-1: never) */
+    uint32_t scrub_days;
+    uint32_t scrub_mb_s;
+    uint32_t scrub_out_count;
+    uint32_t scrub_interval_ms;
 } G;
+
+/* ---- R12 chunk scrub: CHUNK_DAMAGED delivery, heartbeat section, Prometheus metrics ---- */
+
+static int cc_on_damage(void *ctx, const chunk_scrub_damage *dmg)
+{
+    (void)ctx;
+    if (!dmg || atomic_load(&G.stop))
+        return TSDB_ERR_UNAVAILABLE;
+
+    uint32_t leader = 0, self = 0;
+    uint64_t epoch = 0;
+    bool vol_unknown = false;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (c) {
+        self = c->self;
+        const struct cluster_copy_vol *cv = cluster_copy_vol(c, dmg->volume);
+        if (!cv || cv->redundancy != META_RED_EC) {
+            vol_unknown = true;
+        } else if (cv->leader != 0) {
+            leader = cv->leader;
+            epoch = cv->epoch;
+        }
+        cluster_copy_put(c);
+    }
+    if (vol_unknown)
+        return 0; /* volume removed or not EC: drop report (E14 orphan rules clean up, D9) */
+    if (leader == 0)
+        return TSDB_ERR_UNAVAILABLE;
+
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return TSDB_ERR_UNAVAILABLE;
+
+    struct cs_req req = {
+        .op = CS_OP_DAMAGED,
+        .volume = dmg->volume,
+        .epoch = epoch,
+        .pos = dmg->pos,
+        .bad_cells = dmg->bad_cells,
+    };
+    memcpy(req.oid, dmg->oid, 16);
+
+    int32_t prc = TSDB_ERR_UNAVAILABLE;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int rc = (self && leader == self) ? chunksrv_call_self(cs, self, &req, &prc, &body, &bl)
+                                      : chunksrv_call(cs, leader, &req, 500, &prc, &body, &bl);
+    free(body);
+    chunksrv_cluster_release();
+    return (rc == 0 && prc == 0) ? 0 : TSDB_ERR_UNAVAILABLE;
+}
+
+static void cc_on_out(void *ctx, int store_idx, uint64_t day_damaged)
+{
+    (void)ctx;
+    (void)store_idx;
+    (void)day_damaged;
+    cluster_beat_soon();
+}
+
+static void cscrub_put32(uint8_t *p, uint32_t v)
+{
+    for (int i = 0; i < 4; i++)
+        p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void cscrub_put64(uint8_t *p, uint64_t v)
+{
+    for (int i = 0; i < 8; i++)
+        p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint32_t cscrub_get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t cscrub_get64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--)
+        v = (v << 8) | p[i];
+    return v;
+}
+
+#define CSCRUB_SEC_VER 1u
+#define CSCRUB_SEC_HDR 4u
+#define CSCRUB_SEC_ENTRY 40u
+
+struct cscrub_sec_row {
+    uint32_t store_idx;
+    uint32_t state;
+    uint64_t bytes_total;
+    uint64_t chunks_total;
+    uint64_t damaged_total;
+    uint32_t day_damaged;
+    uint32_t age_s;
+};
+
+struct cscrub_sec_val {
+    uint32_t n;
+    struct cscrub_sec_row rows[];
+};
+
+static ssize_t cscrub_sec_encode(uint8_t *buf, size_t cap)
+{
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return 0;
+    chunk_backend *be = chunksrv_backend(cs);
+    int ns = be ? chunk_be_nstores(be) : 0;
+    if (ns <= 0) {
+        chunksrv_cluster_release();
+        return 0;
+    }
+    if (ns > CHUNKSRV_DIRS_MAX)
+        ns = CHUNKSRV_DIRS_MAX;
+    size_t need = CSCRUB_SEC_HDR + (size_t)ns * CSCRUB_SEC_ENTRY;
+    if (need > cap) {
+        chunksrv_cluster_release();
+        return -1;
+    }
+    buf[0] = CSCRUB_SEC_VER;
+    buf[1] = (uint8_t)ns;
+    buf[2] = 0;
+    buf[3] = 0;
+    for (int i = 0; i < ns; i++) {
+        chunk_scrub_stats st;
+        if (chunksrv_scrub_stats(cs, i, &st) != 0)
+            memset(&st, 0, sizeof st);
+        int bstate = chunk_be_store_state(be, i);
+        uint32_t ustate = bstate >= 0 ? (uint32_t)bstate : 0u;
+        uint32_t dd = st.day_damaged > UINT32_MAX ? UINT32_MAX : (uint32_t)st.day_damaged;
+        uint32_t age = st.age_s > UINT32_MAX ? UINT32_MAX : (uint32_t)st.age_s;
+        uint8_t *e = buf + CSCRUB_SEC_HDR + (size_t)i * CSCRUB_SEC_ENTRY;
+        cscrub_put32(e, (uint32_t)i);
+        cscrub_put32(e + 4, ustate);
+        cscrub_put64(e + 8, st.bytes_total);
+        cscrub_put64(e + 16, st.chunks_total);
+        cscrub_put64(e + 24, st.damaged_total);
+        cscrub_put32(e + 32, dd);
+        cscrub_put32(e + 36, age);
+    }
+    chunksrv_cluster_release();
+    return (ssize_t)need;
+}
+
+static int cscrub_sec_decode(uint32_t member_id, const uint8_t *data, size_t len, void **out_val)
+{
+    (void)member_id;
+    if (len < CSCRUB_SEC_HDR || data[0] != CSCRUB_SEC_VER || data[2] != 0 || data[3] != 0)
+        return -1;
+    uint32_t n = data[1];
+    if (n > CHUNKSRV_DIRS_MAX || len != CSCRUB_SEC_HDR + (size_t)n * CSCRUB_SEC_ENTRY)
+        return -1;
+    struct cscrub_sec_val *v = calloc(1, sizeof *v + (size_t)n * sizeof v->rows[0]);
+    if (!v)
+        return -1;
+    v->n = n;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *e = data + CSCRUB_SEC_HDR + (size_t)i * CSCRUB_SEC_ENTRY;
+        v->rows[i].store_idx = cscrub_get32(e);
+        v->rows[i].state = cscrub_get32(e + 4);
+        v->rows[i].bytes_total = cscrub_get64(e + 8);
+        v->rows[i].chunks_total = cscrub_get64(e + 16);
+        v->rows[i].damaged_total = cscrub_get64(e + 24);
+        v->rows[i].day_damaged = cscrub_get32(e + 32);
+        v->rows[i].age_s = cscrub_get32(e + 36);
+    }
+    *out_val = v;
+    return 0;
+}
+
+static void cscrub_sec_free(void *val) { free(val); }
+
+static size_t cscrub_sec_format(uint32_t member_id, const void *val, char *buf, size_t cap)
+{
+    if (!val || !buf || cap == 0)
+        return 0;
+    const struct cscrub_sec_val *v = val;
+    uint64_t warn_s = (uint64_t)(G.scrub_days ? G.scrub_days : CHUNKSCRUB_DEFAULT_DAYS) * 2ull * 86400ull;
+    size_t off = 0;
+    for (uint32_t i = 0; i < v->n && off + 1 < cap; i++) {
+        const struct cscrub_sec_row *r = &v->rows[i];
+        int n = snprintf(buf + off, cap - off,
+                         "chunk_scrub node=%" PRIu32 " store=%" PRIu32 " state=%s chunks=%" PRIu64 " bytes=%" PRIu64
+                         " damaged=%" PRIu64 " day_damaged=%" PRIu32 " age_s=%" PRIu32 "%s\n",
+                         member_id, r->store_idx, chunk_store_state_name((int)r->state), r->chunks_total,
+                         r->bytes_total, r->damaged_total, r->day_damaged, r->age_s,
+                         (uint64_t)r->age_s > warn_s ? " warn=stale" : "");
+        if (n > 0)
+            off += (size_t)n < cap - off ? (size_t)n : cap - off - 1;
+    }
+    buf[off] = '\0';
+    return off;
+}
+
+enum cscrub_metric_kind {
+    CSM_BYTES = 0,
+    CSM_CHUNKS,
+    CSM_DAMAGED,
+    CSM_AGE,
+};
+
+static void cscrub_collect_metric(void *ctx, struct creport_sink *sink)
+{
+    int kind = (int)(intptr_t)ctx;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return;
+    chunk_backend *be = chunksrv_backend(cs);
+    int ns = be ? chunk_be_nstores(be) : 0;
+    if (ns > CHUNKSRV_DIRS_MAX)
+        ns = CHUNKSRV_DIRS_MAX;
+    for (int i = 0; i < ns; i++) {
+        chunk_scrub_stats st;
+        if (chunksrv_scrub_stats(cs, i, &st) != 0)
+            continue;
+        char sbuf[16];
+        snprintf(sbuf, sizeof sbuf, "%d", i);
+        struct creport_label lbl = {"store", sbuf};
+        switch (kind) {
+        case CSM_BYTES:
+            creport_sink_put_u64(sink, &lbl, 1, st.bytes_total);
+            break;
+        case CSM_CHUNKS:
+            creport_sink_put_u64(sink, &lbl, 1, st.chunks_total);
+            break;
+        case CSM_DAMAGED:
+            creport_sink_put_u64(sink, &lbl, 1, st.damaged_total);
+            break;
+        case CSM_AGE:
+            creport_sink_put(sink, &lbl, 1, (double)st.age_s);
+            break;
+        default:
+            break;
+        }
+    }
+    chunksrv_cluster_release();
+}
 
 static void report_up(struct chunksrv *cs)
 {
@@ -282,8 +528,21 @@ static void *cc_main(void *arg)
                     self = me.id;
                     cs = G.cs;
                     atomic_store(&G.pub, cs);
-                    fprintf(stderr, "tsdbd: chunk server up as node %" PRIu32 ", %d stores\n", me.id,
-                            chunksrv_stores(cs, NULL, false));
+                    int nst = chunksrv_stores(cs, NULL, false);
+                    fprintf(stderr, "tsdbd: chunk server up as node %" PRIu32 ", %d stores\n", me.id, nst);
+                    if (nst > 0) {
+                        struct chunksrv_scrub_cfg scfg = {
+                            .scrub_days = G.scrub_days,
+                            .scrub_mb_s = G.scrub_mb_s,
+                            .scrub_out_count = G.scrub_out_count,
+                            .pass_interval_ms = G.scrub_interval_ms,
+                            .on_damage = cc_on_damage,
+                            .on_out = cc_on_out,
+                            .ctx = NULL,
+                        };
+                        if (chunksrv_scrub_start(cs, &scfg) != 0)
+                            fprintf(stderr, "tsdbd: chunk scrub: could not start store scrubbers\n");
+                    }
                 } else if (G.cs) {
                     fprintf(stderr, "tsdbd: chunk server: cannot make its links (tried again)\n");
                 }
@@ -307,6 +566,7 @@ static void *cc_main(void *arg)
                 }
             }
             report_up(cs);
+            chunksrv_scrub_reconcile(cs);
         }
         nanosleep(&(struct timespec){0, 100 * 1000000L}, NULL);
     }
@@ -338,9 +598,59 @@ int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char 
     }
     G.rate = rate;
     G.last_up = -1;
+    G.scrub_days = CHUNKSCRUB_DEFAULT_DAYS;
+    G.scrub_mb_s = CHUNKSCRUB_DEFAULT_MB_S;
+    G.scrub_out_count = CHUNKSCRUB_DEFAULT_OUT_COUNT;
+    G.scrub_interval_ms = 0;
+#ifdef TSDB_TEST_HOOKS
+    const char *te = getenv("TSDB_CHUNKSCRUB_TEST");
+    if (te) {
+        const char *p;
+        unsigned v = 0;
+        if ((p = strstr(te, "days=")) != NULL && sscanf(p, "days=%u", &v) == 1 && v > 0)
+            G.scrub_days = v;
+        if ((p = strstr(te, "mb_s=")) != NULL && sscanf(p, "mb_s=%u", &v) == 1 && v > 0)
+            G.scrub_mb_s = v;
+        if ((p = strstr(te, "out_count=")) != NULL && sscanf(p, "out_count=%u", &v) == 1 && v > 0)
+            G.scrub_out_count = v;
+        if ((p = strstr(te, "interval_ms=")) != NULL && sscanf(p, "interval_ms=%u", &v) == 1 && v > 0)
+            G.scrub_interval_ms = v;
+    }
+    const char *mu = getenv("TSDB_CHUNKSCRUB_MUTANT");
+    if (mu && *mu) {
+        int m = chunkscrub_mutant_parse(mu);
+        if (m < 0) {
+            snprintf(err, errlen, "TSDB_CHUNKSCRUB_MUTANT=%s is not a planted bug", mu);
+            chunksrv_close(G.cs);
+            G.cs = NULL;
+            return -1;
+        }
+        chunkscrub_mutant = m;
+        fprintf(stderr, "tsdbd: chunk scrub MUTANT %s (tests only)\n", mu);
+    }
+#endif
+    (void)creport_section(CREPORT_SEC_CHUNKSCRUB, cscrub_sec_encode, cscrub_sec_decode, cscrub_sec_free,
+                          cscrub_sec_format);
+    (void)creport_metric_collector("tsdb_chunk_scrub_bytes_total", CREPORT_COUNTER,
+                                   "Total chunk bytes verified by background scrub on this local store.",
+                                   cscrub_collect_metric, (void *)(intptr_t)CSM_BYTES);
+    (void)creport_metric_collector("tsdb_chunk_scrub_chunks_total", CREPORT_COUNTER,
+                                   "Total chunks verified by background scrub on this local store.",
+                                   cscrub_collect_metric, (void *)(intptr_t)CSM_CHUNKS);
+    (void)creport_metric_collector("tsdb_chunk_scrub_damaged_total", CREPORT_COUNTER,
+                                   "Total damaged chunks detected by background scrub on this local store.",
+                                   cscrub_collect_metric, (void *)(intptr_t)CSM_DAMAGED);
+    (void)creport_metric_collector("tsdb_chunk_scrub_age_seconds", CREPORT_GAUGE,
+                                   "Seconds since the start of the last completed whole chunk scrub pass (or first pass).",
+                                   cscrub_collect_metric, (void *)(intptr_t)CSM_AGE);
     atomic_store(&G.stop, 0);
     if (pthread_create(&G.thr, NULL, cc_main, NULL) != 0) {
         snprintf(err, errlen, "cannot start the chunk server's thread");
+        creport_section_unregister(CREPORT_SEC_CHUNKSCRUB);
+        creport_metric_collector_del("tsdb_chunk_scrub_bytes_total");
+        creport_metric_collector_del("tsdb_chunk_scrub_chunks_total");
+        creport_metric_collector_del("tsdb_chunk_scrub_damaged_total");
+        creport_metric_collector_del("tsdb_chunk_scrub_age_seconds");
         chunksrv_close(G.cs);
         G.cs = NULL;
         return -1;
@@ -356,6 +666,13 @@ void chunksrv_cluster_stop(void)
     atomic_store(&G.stop, 1);
     pthread_join(G.thr, NULL);
     G.started = 0;
+    if (G.cs)
+        chunksrv_scrub_stop(G.cs);
+    creport_section_unregister(CREPORT_SEC_CHUNKSCRUB);
+    creport_metric_collector_del("tsdb_chunk_scrub_bytes_total");
+    creport_metric_collector_del("tsdb_chunk_scrub_chunks_total");
+    creport_metric_collector_del("tsdb_chunk_scrub_damaged_total");
+    creport_metric_collector_del("tsdb_chunk_scrub_age_seconds");
     if (atomic_load(&G.pub)) {
         /* the cluster thread is stopped (tsdbd stops it first): nothing hands a socket over any more */
         cluster_set_peerlink_kind(PL_KIND_CHUNK, NULL);

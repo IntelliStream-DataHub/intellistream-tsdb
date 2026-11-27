@@ -560,6 +560,19 @@ cgroup, so `nice` does not keep your work out of its way.
   file name against every predicate, `make NO_EC=1`), `test_settle.c`, `test_settle_oracle.c`, `test_ecgc.c`, each with
   its planted bugs (`--mutant NAME`, a Makefile loop that requires each to fail). A test that cannot run without the codec
   prints that it is skipped.
+- `src/chunkscrub.[ch]` (per-store background chunk scrubber; R12, r12-chunk, E25, E26, §5.9): walks every volume's
+  chunks per store verifying header/size/sums/footer and every cell's xxh64 (`chunk_rd_scrub_ex`), paced to `scrub_mb_s`
+  (default 50 MiB/s) within `scrub_days` (default 14 d), paused during heals/fills (`sfill`), remote chunk reads
+  (`CHUNKR`), and put bursts (`CHUNKB`). Advisory `<store>/SCRUB` cursor persisted via tmp/fsync/rename/dir-fsync on an
+  independent store dirfd; missing or corrupt `SCRUB` logs and restarts cleanly. Damaged chunks (including EIO, never
+  clean) are reported once per pass via `CS_OP_DAMAGED` on R8's `CHUNK` link to the volume leader
+  (`server/chunksrv_cluster.c`, `server/chunkpeer_cluster.c`; leader-side cell repair orchestration belongs to the
+  separate repair track); UTC-day damage above `scrub_out_count` (default 8) marks
+  the store `CHUNK_STORE_DOWN_DAMAGED` locally (`chunk_be_mark_down`, `chunk_be_open_store` returns NULL so reads decode
+  around it and puts/lists/deletes/heals skip it) and suspends further walking of the failing store. Heartbeat section `CREPORT_SEC_CHUNKSCRUB` (9) and Prometheus metrics
+  `tsdb_chunk_scrub_*` (`docs/metrics.md`). Test knobs `TSDB_CHUNKSCRUB_TEST` and `TSDB_CHUNKSCRUB_MUTANT`
+  (`TSDB_TEST_HOOKS`). `tests/test_chunkscrub.c`, `make chunkscrub-mutants`
+  (`scrubskipcell scrubeioclean scrubrestart`), `test_cluster scrub`.
 - `server/chunksrv.[ch]`, `server/chunksrv_cluster.c` (R8 D9-D11, E14, E26, E27): the chunk server, a peerlink of its own on
   every cluster member with kinds `PL_KIND_CHUNK` (6, requests and answers, worked by 4 FIFO workers) and `PL_KIND_CHUNKB`
   (7, puts as bulk files under `--chunk-rate-mb-s`; the link's callbacks only queue, a put thread per peer does the store

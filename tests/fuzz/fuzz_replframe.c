@@ -245,7 +245,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         if (w == 0) {
             struct cs_req r;
             if (cs_req_decode(p, n, &r) == 0) {
-                if (r.op < CS_OP_READ || r.op > CS_OP_RECONCILE || r.op == CS_OP_PUT || r.pos >= CHUNK_POS_MAX)
+                if (r.op < CS_OP_READ || r.op > CS_OP_DAMAGED || r.op == CS_OP_PUT || r.pos >= CHUNK_POS_MAX)
                     abort();
                 uint32_t max = r.op == CS_OP_READ      ? CS_READ_MAX
                                : r.op == CS_OP_SUMS    ? CS_SUMS_MAX
@@ -261,7 +261,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         } else if (w == 1) {
             struct cs_resp r;
             if (cs_resp_decode(p, n, &r) == 0) {
-                if (r.rc > 0 || r.op < CS_OP_READ || r.op > CS_OP_RECONCILE)
+                if (r.rc > 0 || r.op < CS_OP_READ || r.op > CS_OP_DAMAGED)
                     abort();
                 if (r.body_len && (r.body < p || r.body + r.body_len != p + n))
                     abort();
@@ -435,6 +435,13 @@ void fuzz_seeds(const char *dir)
     cr.op = CS_OP_EPOCH;
     cl = cs_req_encode(&cr, cb, sizeof cb);
     put_frame(dir, "seed-cs-epoch", 9, 0, cb, cl);
+    cr.op = CS_OP_DAMAGED, cr.pos = 4, cr.bad_cells = 0x15ull;
+    cl = cs_req_encode(&cr, cb, sizeof cb);
+    put_frame(dir, "seed-cs-damaged", 9, 0, cb, cl);
+    memset(cb, 0, sizeof cb); /* an answer: rid 7, DAMAGED, rc 0, empty body */
+    le(cb, 7, 8), cb[8] = CS_OP_DAMAGED;
+    cs_resp_seal(cb, 21);
+    put_frame(dir, "seed-cs-resp-damaged", 9, 1, cb, 21);
     memset(cb, 0, sizeof cb); /* an answer: rid 5, EPOCH, rc 0, fence 9, sure */
     le(cb, 5, 8), cb[8] = CS_OP_EPOCH, le(cb + 21, 9, 8);
     cs_resp_seal(cb, 21 + 9);

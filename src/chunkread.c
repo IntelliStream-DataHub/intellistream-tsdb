@@ -787,7 +787,10 @@ struct chunk_obj {
 
 static int st_of(int rc)
 {
-    return rc == TSDB_ERR_NOTFOUND ? CHUNK_ST_ABSENT : rc == TSDB_ERR_CORRUPT ? CHUNK_ST_DAMAGED : CHUNK_ST_IOERR;
+    return rc == TSDB_ERR_NOTFOUND    ? CHUNK_ST_ABSENT
+           : rc == TSDB_ERR_CORRUPT   ? CHUNK_ST_DAMAGED
+           : rc == TSDB_ERR_UNAVAILABLE ? CHUNK_ST_DOWN
+                                      : CHUNK_ST_IOERR;
 }
 
 static bool obj_store_down(const chunk_backend *be, int st_idx)
@@ -836,7 +839,8 @@ static int obj_open_pos(chunk_obj *o, unsigned p, bool *have, int *worst)
         return 0;
     }
     o->st[p] = st_of(rc);
-    if (worst && (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && *worst != TSDB_ERR_IO)))
+    if (worst && (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && *worst != TSDB_ERR_IO) ||
+                  (rc == TSDB_ERR_NOMEM && *worst == TSDB_ERR_NOTFOUND)))
         *worst = rc;
     return rc;
 }
@@ -965,6 +969,8 @@ int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[1
         chunk_obj_close(o);
         if (obj_away)
             return TSDB_ERR_UNAVAILABLE;
+        if (worst == TSDB_ERR_NOMEM)
+            return TSDB_ERR_NOMEM;
         return worst == TSDB_ERR_NOTFOUND ? TSDB_ERR_NOTFOUND : TSDB_ERR_CORRUPT;
     }
     if (away)

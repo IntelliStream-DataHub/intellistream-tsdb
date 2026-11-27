@@ -40,6 +40,11 @@
 #include <stdint.h>
 
 #include "../src/chunk.h"
+#include "../src/chunkscrub.h"
+
+/* R12 (r12-chunk): custom heartbeat section registered via creport_section() carrying per-store chunk scrub counts,
+ * UTC-day damage counts, and oldest unscrubbed age. */
+#define CREPORT_SEC_CHUNKSCRUB 11
 
 struct peerlink;
 struct plink;
@@ -53,10 +58,11 @@ enum {
     CS_OP_DEL = 4,
     CS_OP_EPOCH = 5,
     CS_OP_PUT = 6,     /* answers only */
-    CS_OP_OBJLIST = 7,   /* R9 (D11): paged list of committed .ec object records with stripe_version < max_version */
-    CS_OP_REOPEN = 8,    /* R9 (D11): notify a log replica to eccache_reopen(volume, oid) after a chunk fill */
-    CS_OP_GCPENDING = 9, /* R9 (D15): list oids on leader's committed MK_GC pending-delete list (and kick GC) */
-    CS_OP_RECONCILE = 10,/* R9 (D15): nudge a stripe holder to run reconcile for (volume, pos, stripe_version) */
+    CS_OP_OBJLIST = 7,    /* R9 (D11): paged list of committed .ec object records with stripe_version < max_version */
+    CS_OP_REOPEN = 8,     /* R9 (D11): notify a log replica to eccache_reopen(volume, oid) after a chunk fill */
+    CS_OP_GCPENDING = 9,  /* R9 (D15): list oids on leader's committed MK_GC pending-delete list (and kick GC) */
+    CS_OP_RECONCILE = 10, /* R9 (D15): nudge a stripe holder to run reconcile for (volume, pos, stripe_version) */
+    CS_OP_DAMAGED = 11,   /* R12 (E25, D5): storage server reports a damaged chunk to the volume's leader */
 };
 
 #define CS_READ_MAX (4u << 20)        /* bytes of one CS_OP_READ */
@@ -91,8 +97,9 @@ struct cs_req {
     uint64_t epoch;
     uint8_t vuuid[16], oid[16];
     uint16_t pos;
-    uint64_t off; /* READ: offset in the cell area; SUMS: first cell */
-    uint32_t len; /* READ: bytes; SUMS: count; LIST: max */
+    uint64_t off;       /* READ: offset in the cell area; SUMS: first cell */
+    uint32_t len;       /* READ: bytes; SUMS: count; LIST: max */
+    uint64_t bad_cells; /* DAMAGED: bad cell bitmap (bit i < 63, bit 63 sticky for >= 63; 0 = structural/IO) */
     bool has_cursor;
 };
 /* An answer: [u64 rid][u8 op][i32 rc] and, when rc is 0, the op's body:
@@ -188,6 +195,29 @@ void chunksrv_set_reconcile(struct chunksrv *cs, chunksrv_reconcile_fn fn, void 
 /* R9 (D18): optional send-side byte pacer for CS_OP_READ responses served over PL_KIND_CHUNKR (kind 8). */
 typedef void (*chunksrv_read_pace_fn)(void *arg, uint32_t volume, size_t bytes);
 void chunksrv_set_read_pacer(struct chunksrv *cs, chunksrv_read_pace_fn fn, void *arg);
+/* R12 (E25, D5): server-side handler for CS_OP_DAMAGED on the volume's leader. Returns 0 when acknowledged (including
+ * unknown/retired objects left for E14 orphan GC) or negative TSDB_ERR_* (e.g. TSDB_ERR_UNAVAILABLE if not leader). */
+typedef int (*chunksrv_damaged_fn)(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16], uint16_t pos,
+                                   uint64_t bad_cells);
+void chunksrv_set_damaged(struct chunksrv *cs, chunksrv_damaged_fn fn, void *arg);
+
+/* Per-store chunk scrub lifecycle on a chunksrv instance (R12, r12-chunk). */
+struct chunksrv_scrub_cfg {
+    uint32_t scrub_days;
+    uint32_t scrub_mb_s;
+    uint32_t scrub_out_count;
+    uint32_t pass_interval_ms;
+    uint32_t put_burst_conc; /* 0: default 2 concurrent puts */
+    uint64_t put_burst_bps;  /* 0: default 16 MiB/s put burst threshold */
+    chunk_scrub_report_fn on_damage;
+    chunk_scrub_out_fn on_out;
+    void *ctx;
+};
+int chunksrv_scrub_start(struct chunksrv *cs, const struct chunksrv_scrub_cfg *cfg);
+void chunksrv_scrub_reconcile(struct chunksrv *cs);
+void chunksrv_scrub_stop(struct chunksrv *cs);
+int chunksrv_scrub_stats(struct chunksrv *cs, int store_idx, chunk_scrub_stats *out);
+void chunksrv_scrub_pause_all(struct chunksrv *cs, int delta);
 
 /* One answer frame (a CS_T_RESP payload) to the requester. */
 typedef void (*cs_reply_fn)(void *arg, const uint8_t *p, size_t n);
@@ -206,7 +236,7 @@ void chunksrv_put_end(struct cs_put *p, int status);
 
 struct chunksrv_stats {
     uint64_t requests, malformed, puts_ok, puts_refused, put_bytes, reads, read_bytes, fenced, unsure_refused,
-        source_raises, answer_mismatch;
+        source_raises, answer_mismatch, damaged_reports;
 };
 void chunksrv_get_stats(struct chunksrv *cs, struct chunksrv_stats *st);
 
@@ -238,6 +268,9 @@ void chunksrv_set_rate(struct chunksrv *cs, uint64_t bytes_per_s);
  * empty), or TSDB_ERR_UNAVAILABLE (no link, or no answer within timeout_ms). */
 int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, int timeout_ms, int32_t *rc,
                   uint8_t **body, size_t *body_len);
+/* In-process call to this server's own chunksrv handler (when the target peer is self). */
+int chunksrv_call_self(struct chunksrv *cs, uint32_t self, const struct cs_req *r, int32_t *rc, uint8_t **body,
+                       size_t *body_len);
 /* Like chunksrv_call, selecting the peerlink kind (PL_KIND_CHUNK for foreground/OBJLIST/REOPEN, PL_KIND_CHUNKR for
  * rebuild reads). */
 int chunksrv_call_kind(struct chunksrv *cs, uint32_t peer, int kind, const struct cs_req *r, int timeout_ms,

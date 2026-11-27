@@ -21,6 +21,18 @@ void *chunk_rs_get(unsigned k, unsigned m);
 int chunk_wr_cell_trusted(chunk_wr *w, const void *data, size_t len, uint64_t sum);
 /* The volumes a store has an EPOCH for (malloc'ed, caller frees), with their epochs. */
 int chunk_store_volumes(chunk_store *st, uint32_t **vols, uint64_t **epochs, size_t *n);
+int chunk_store_dirfd(const chunk_store *st);
+const char *chunk_store_path(const chunk_store *st);
+
+/* Opens a chunk for reading without requiring a specific vuuid (for per-store scrub, which walks names). Checks
+ * header, size, sums table, and footer. */
+int chunk_rd_open_any(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos, chunk_rd **out);
+/* Extended cell scrubber behind chunk_rd_scrub: verifies every cell's xxh64, accumulates *bad count and *bad_bitmap
+ * (bit i for cell i < 63, bit 63 sticky for any cell >= 63), counts cell bytes read in *bytes_out, and invokes
+ * optional on_cell(ctx, cell_bytes) after each cell (non-zero stops early and is returned). */
+typedef int (*chunk_scrub_cell_cb)(void *ctx, size_t bytes);
+int chunk_rd_scrub_ex(chunk_rd *r, uint64_t *bad, uint64_t *bad_bitmap, uint64_t *bytes_out,
+                      chunk_scrub_cell_cb on_cell, void *ctx);
 
 /* True while the volume's EPOCH lost a slot at open and has not been raised since (puts and deletes are refused). */
 bool chunk_store_epoch_unsure(chunk_store *st, uint32_t volume);
@@ -68,6 +80,8 @@ void chunk_store_unref(chunk_store *st);
 void chunk_store_bind_be(chunk_store *st, chunk_backend *be, int idx);
 /* Acquires a reference to open store i under st_mu; caller must chunk_store_unref(). NULL when DOWN. */
 chunk_store *chunk_be_store_ref(const chunk_backend *be, int i);
+/* Acquires a reference to raw store i regardless of state under st_mu; caller must chunk_store_unref(). */
+chunk_store *chunk_be_raw_store_ref(const chunk_backend *be, int i);
 /* Releases any store parked on pending_close[i] by chunk_be_set_down (call on attach worker or close only). */
 void chunk_be_release_down(chunk_backend *be, int i);
 /* Reads chunk bytes and sets *real_io = true only on a real kernel storage I/O error (not truncated file or EINVAL). */
@@ -85,6 +99,8 @@ int chunk_be_pos_store(const chunk_backend *be, const uint8_t oid[16], unsigned 
 int chunk_be_prepare(chunk_backend *be, uint32_t volume, uint64_t e);
 /* The store i if it is open (UP or REPLACING), else NULL. */
 chunk_store *chunk_be_open_store(const chunk_backend *be, int i);
+/* The raw store pointer at index i regardless of state (NULL only if never opened); for replace/scrub checks. */
+chunk_store *chunk_be_raw_store(const chunk_backend *be, int i);
 /* Opens a store as chunk_store_open does, without the log lines of its refusals (the backend logs one line). */
 int chunk_store_open_quiet(const char *path, const uint8_t *expect_id, chunk_store **out);
 int chunk_store_open_db_quiet(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, chunk_store **out);

@@ -413,7 +413,7 @@ int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_hea
         return TSDB_ERR_INVALID;
     int stt = chunk_be_store_state(be, store);
     if (stt != CHUNK_STORE_UP && stt != CHUNK_STORE_REPLACING)
-        return stt == CHUNK_STORE_DOWN_IOERR && chunk_be_open_store(be, store) ? TSDB_ERR_IO : TSDB_ERR_UNAVAILABLE;
+        return stt == CHUNK_STORE_DOWN_IOERR && chunk_be_raw_store(be, store) ? TSDB_ERR_IO : TSDB_ERR_UNAVAILABLE;
     chunk_store *tgt = chunk_be_store_ref(be, store);
     if (!tgt)
         return TSDB_ERR_UNAVAILABLE;
@@ -765,7 +765,7 @@ static bool id_taken(chunk_backend *be, int except, const uint8_t id[16])
     for (int i = 0; i < be->n; i++) {
         if (i == except)
             continue;
-        chunk_store *st = chunk_be_store_ref(be, i);
+        chunk_store *st = chunk_be_raw_store_ref(be, i);
         bool match = st && memcmp(chunk_store_id(st), id, 16) == 0;
         chunk_store_unref(st);
         if (match)
@@ -780,8 +780,8 @@ int chunk_be_attach(chunk_backend *be, int index, const char *path, const uint8_
     if (index < 0 || index >= be->n || !path)
         return TSDB_ERR_INVALID;
     int stt = chunk_be_store_state(be, index);
-    if (stt == CHUNK_STORE_UP || stt == CHUNK_STORE_REPLACING || chunk_be_open_store(be, index))
-        return TSDB_ERR_INVALID; /* open already (or failed in service: its descriptors cannot be trusted) */
+    if (stt == CHUNK_STORE_UP || stt == CHUNK_STORE_REPLACING || chunk_be_raw_store(be, index))
+        return TSDB_ERR_INVALID; /* open already (or failed/damaged in service: its descriptors cannot be trusted) */
     chunk_store *ns = NULL;
     int rc = check_epoch(be, o);
     if (rc)
@@ -945,7 +945,7 @@ int chunk_be_replace(chunk_backend *be, int index, const char *new_path, uint8_t
         rc = fence_new_store(be, ns);
     chunk_heal_report lost_m0;
     memset(&lost_m0, 0, sizeof lost_m0);
-    chunk_store *old = rc == 0 ? chunk_be_store_ref(be, index) : NULL;
+    chunk_store *old = rc == 0 ? chunk_be_raw_store_ref(be, index) : NULL;
     if (old) {
         count_lost_m0(be, index, old, o, &lost_m0);
         chunk_store_unref(old);
