@@ -258,6 +258,80 @@ const char *tsdb_volume_path(tsdb *db, uint32_t index);
 int tsdb_volume_add(tsdb *db, const char *path, uint32_t *index);
 int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index);
 
+/* ---- local settled tier (docs/design-cluster-data.md §15.7, E55) ----
+ * A single-server database may settle older partitions onto local erasure-coded chunk stores
+ * recorded in TIERS beside VOLUMES. Stores are added explicitly by tsdb_tier_add (or
+ * tsdb_tier_add_dir while tsdbd runs); each store's META binds it to this database's db_id
+ * (written into the root META by the first tier add). */
+enum {
+    TSDB_TIER_CLASS_UNKNOWN = 0,
+    TSDB_TIER_CLASS_NVME = 1,
+    TSDB_TIER_CLASS_SSD = 2,
+    TSDB_TIER_CLASS_HDD = 3,
+};
+
+enum {
+    TSDB_TIER_SINGLE_COPY = 1u << 0,      /* redundant underneath (RAID, ZFS, NFS/ZFS); permits m = 0 */
+    TSDB_TIER_ALLOW_SHARED_DEV = 1u << 1, /* allow sharing st_dev with /, root, volumes or stores (tests) */
+};
+
+/* Adds a tier chunk store at `path` (created one level if absent), with stated device class
+ * `tier_class` (NULL, "", "unknown", "nvme", "ssd", or "hdd") and `flags` (0 or TSDB_TIER_*).
+ * Refused without TSDB_EC, on a read-only or cluster handle, for an invalid or nested path,
+ * a non-empty directory or a store belonging to another database, or a path on the same device
+ * (st_dev) as /, the root, any volume or another store unless TSDB_TIER_ALLOW_SHARED_DEV is set.
+ * tsdb_tier_add_dir does the same without opening the database, also beside a running writer. */
+int tsdb_tier_add(tsdb *db, const char *path, const char *tier_class, uint32_t flags);
+int tsdb_tier_add_dir(const char *dir, const char *path, const char *tier_class, uint32_t flags);
+
+enum {
+    TSDB_TIER_SET_REDUNDANCY = 1u << 0,
+    TSDB_TIER_SET_AFTER = 1u << 1,
+    TSDB_TIER_SET_HIGH_PCT = 1u << 2,
+    TSDB_TIER_SET_YOUNG_HIGH_PCT = 1u << 3,
+    TSDB_TIER_SET_REBUILD_MB_S = 1u << 4,
+    TSDB_TIER_SET_SCRUB_MB_S = 1u << 5,
+    TSDB_TIER_SET_SCRUB_DAYS = 1u << 6,
+};
+
+typedef struct tsdb_tier_settings {
+    uint32_t volume;         /* UINT32_MAX: database-wide default; else volume index */
+    uint32_t set_mask;       /* TSDB_TIER_SET_* bits selecting which fields to apply */
+    uint16_t k, m;           /* redundancy k+m (TSDB_TIER_SET_REDUNDANCY) */
+    uint64_t tier_after_s;   /* settle grace in seconds (TSDB_TIER_SET_AFTER) */
+    uint32_t tier_high_pct;  /* fast-disk fill mark to start settling (TSDB_TIER_SET_HIGH_PCT) */
+    uint32_t young_high_pct; /* fast-disk fill mark to refuse inserts (TSDB_TIER_SET_YOUNG_HIGH_PCT) */
+    uint32_t rebuild_mb_s;   /* rebuild pace cap in MB/s (TSDB_TIER_SET_REBUILD_MB_S) */
+    uint32_t scrub_mb_s;     /* scrub pace cap in MB/s (TSDB_TIER_SET_SCRUB_MB_S) */
+    uint32_t scrub_days;     /* scrub interval in days (TSDB_TIER_SET_SCRUB_DAYS) */
+} tsdb_tier_settings;
+
+typedef struct tsdb_tier_store_info {
+    uint8_t id[16];
+    uint8_t cls;         /* TSDB_TIER_CLASS_* */
+    uint8_t single_copy;
+    uint8_t state;       /* 0 active, 1 lost, 2 replaced */
+    char path[4096];
+    uint64_t bytes;
+    uint64_t damaged_cells;
+} tsdb_tier_store_info;
+
+typedef struct tsdb_tier_info {
+    size_t nstores;
+    tsdb_tier_store_info *stores; /* freed with tsdb_tier_info_free */
+    uint16_t k, m;
+    int32_t margin;
+    uint64_t settles_waiting;
+    int64_t days_to_full; /* -1 if unknown */
+} tsdb_tier_info;
+
+/* Stubbed until their R15 tracks land (return TSDB_ERR_INVALID logging "not built"). */
+int tsdb_tier_set(tsdb *db, const tsdb_tier_settings *settings);
+int tsdb_tier_lost(tsdb *db, const char *store, const char *replace_path, uint32_t flags);
+int tsdb_tier_salvage(tsdb *db, int64_t partition, int all_partitions, int force);
+int tsdb_tier_status(tsdb *db, tsdb_tier_info *out);
+void tsdb_tier_info_free(tsdb_tier_info *info);
+
 /* Carries a database of the previous disk format (8) over to this release's (9) in place, without opening it:
  * every volume and the root, volumes first. Refuses (TSDB_ERR_INVALID, with a message on stderr) unless each
  * directory was closed cleanly by the release that wrote it (no WAL segment, intent file or tmp part) and refuses

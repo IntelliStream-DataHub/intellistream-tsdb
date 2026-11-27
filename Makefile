@@ -67,7 +67,7 @@ endif
 # where the tests make their scratch directories (each run makes its own below it)
 SCRATCH ?= $(or $(TMPDIR),/tmp)
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe ecpart diverge bucketed disk
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe ecpart diverge bucketed disk tiers
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
@@ -153,7 +153,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
+R7_HDR := src/ecpart.h src/tier.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -379,6 +379,11 @@ $(B)/disk.o: src/disk.h src/chunk.h
 $(B)/test_disks: tests/test_disks.c src/disk.h src/chunk.h src/internal.h $(LIB) $(CRASHFS_SO) $(B)/tsdb
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+# TIERS catalog, root META db_id, store META db= binding, tsdb_tier_add and crashfs power loss (R15 D2, D3, D18)
+$(B)/tiers.o: src/tiers.h src/chunk.h
+$(B)/test_tiers: tests/test_tiers.c src/tiers.h src/chunk.h src/internal.h $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 # the disk side of tsdbd's volume manager (server/cvolfs.c): make v<N>, REPL's open generation and nonce; power loss
 # at every step (crashfs); the mutant runs plant the bugs it guards against and must fail
 $(B)/test_cvolfs: tests/test_cvolfs.c server/cvolfs.c server/cvolfs.h server/cvolset.c server/cvolset.h server/cluster.h server/snapinst.c server/snapinst.h src/replfile.h src/cvol.h src/internal.h $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
@@ -407,7 +412,7 @@ BT_TARGETS := test-groups-1 test-groups-2 test-groups-3 test-groups-4
 UNITS_GROUPS := test-units-c test-units-d test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-h3 test-units-h4 test-units-h5 test-units-i
 UNITS_B_GROUPS := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-units-b6 test-units-b7 test-units-b8 test-units-b9
 # the binaries of `make test`, once: the groups below build the same set, so that a binary added here is built for every group
-TEST_BINS := $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_disks $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_replwire $(B)/test_margins $(B)/test_pout $(B)/test_plrdma
+TEST_BINS := $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_disks $(B)/test_tiers $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_replwire $(B)/test_margins $(B)/test_pout $(B)/test_plrdma
 $(UNITS_GROUPS) test-groups $(BT_TARGETS): $(TEST_BINS)
 test: $(TEST_BINS)
 	./$(B)/test_tsdb $(SCRATCH)
@@ -535,6 +540,8 @@ test-units-g:
 	$(MUT) --name test_cvolfs --list "nosync nodirsync nononce trustunsure tornstale samerid removenodirsync" -- ./$(B)/test_cvolfs --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_disks $(SCRATCH)
 	$(MUT) --name test_disks --list "rotationalflip bindtwice disknosync" -- ./$(B)/test_disks --mutant @M@ @D@ # each planted bug must fail it
+	./$(B)/test_tiers $(SCRATCH)
+	$(if $(EC_OBJ),$(MUT) --name test_tiers --list "tiersnosync nodbid samedev" -- ./$(B)/test_tiers --mutant @M@ @D@) # each planted bug must fail it
 test-units-h1:
 	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs" -- ./$(B)/test_replica --mutant @M@ @D@
 test-units-h2:
@@ -744,6 +751,7 @@ $(B)/fuzz-replframe: $(B)/peerlink.o $(B)/plrdma.o $(B)/tsdb_crypto.o $(B)/replw
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 $(B)/fuzz-disk: src/disk.h
+$(B)/fuzz-tiers: src/tiers.h
 
 fuzz-replay: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
 	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 FUZZ_TMP=$(SCRATCH) ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
@@ -1048,7 +1056,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants margin-mutants lease-mutants chunkpeer-mutants ecgc-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants margin-mutants lease-mutants chunkpeer-mutants ecgc-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1224,6 +1232,10 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 # disk class detection, DISK metadata and crashfs mutants (src/disk.c, tests/test_disks.c)
 disk-mutants: $(B)/test_disks $(CRASHFS_SO) $(B)/tsdb
 	$(MUT) --name test_disks --list "rotationalflip bindtwice disknosync" -- ./$(B)/test_disks --mutant @M@ @D@
+
+# TIERS catalog, db_id binding, device isolation and crashfs mutants (src/tiers.c, src/volumes.c, tests/test_tiers.c)
+tiers-mutants: $(B)/test_tiers $(CRASHFS_SO)
+	$(if $(EC_OBJ),$(MUT) --name test_tiers --list "tiersnosync nodbid samedev" -- ./$(B)/test_tiers --mutant @M@ @D@)
 
 # the replica set change mutants (server/rset.c, cvolset*.c, cset.c; tests/rset_mutants.sh pins each to its FAIL line)
 rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb

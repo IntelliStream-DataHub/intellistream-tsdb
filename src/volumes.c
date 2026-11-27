@@ -51,6 +51,8 @@
 #include "eckeep.h"
 #include "stats_priv.h"
 #include "tier.h"
+#include "tiers.h"
+#include "chunk.h"
 #include "settle.h"
 
 #include <dirent.h>
@@ -95,6 +97,9 @@ struct tsdb {
      * back, each engine holds its own (tier_want before every engine open below) */
     struct tier *tier;
     uint64_t id;
+    /* R15 (D2, D3): database id from root META db_id= (written by the first tier add, read at every open). */
+    bool has_db_id;
+    uint8_t db_id[16];
     /* Keep t->lock on its own 64-byte cache line away from read-only handle fields above and
      * read-hot vols/paths/nvols below (explicit padding keeps calloc UBSan-clean). */
     char pad_lock_pre[64];
@@ -547,7 +552,8 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     for (char *l = txt, *next; *l; l = next) { /* every line but the root's volume number, its old parts and its uuid (R7) */
         next = strchr(l, '\n');
         next = next ? next + 1 : l + strlen(l);
-        if (strncmp(l, "volume=", 7) != 0 && strncmp(l, "parts_v8=", 9) != 0 && strncmp(l, "vuuid=", 6) != 0) {
+        if (strncmp(l, "volume=", 7) != 0 && strncmp(l, "parts_v8=", 9) != 0 && strncmp(l, "vuuid=", 6) != 0 &&
+            strncmp(l, "db_id=", 6) != 0) {
             memcpy(buf + n, l, (size_t)(next - l));
             n += (size_t)(next - l);
         }
@@ -1090,14 +1096,42 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     } else if (rc == TSDB_ERR_NOTFOUND) {
         rc = 0; /* read only, written by an older version: no volumes */
     }
-    /* a writer may cut a torn tail of VOLUMES: not while tsdb-cli appends a volume */
-    int vfd = t->opt.read_only ? -1 : openat(t->dirfd, VOLUMES_FILE, O_RDWR | O_CLOEXEC);
-    if (rc == 0 && vfd < 0 && !t->opt.read_only && errno != ENOENT)
-        rc = TSDB_ERR_IO;
+    /* a writer may cut a torn tail of VOLUMES or TIERS: always under VOLUMES's OFD write lock (never while
+     * tsdb-cli appends a volume or a tier store). Create VOLUMES only if TIERS exists without one. */
+    int vfd = -1;
+    if (rc == 0 && !t->opt.read_only) {
+        vfd = openat(t->dirfd, VOLUMES_FILE, O_RDWR | O_CLOEXEC);
+        if (vfd < 0 && errno == ENOENT && faccessat(t->dirfd, TIERS_FILE, F_OK, AT_SYMLINK_NOFOLLOW) == 0)
+            vfd = openat(t->dirfd, VOLUMES_FILE, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (vfd < 0 && errno != ENOENT)
+            rc = TSDB_ERR_IO;
+    }
     if (rc == 0 && vfd >= 0)
         rc = volumes_lock(vfd, F_WRLCK);
     if (rc == 0)
         rc = load_layout(t);
+    /* Load TIERS BEFORE reading db_id so an unlocked read-only open can never observe a newly appended TIERS
+     * store without the db_id that was durably written to root META before it. Only cut torn tails when holding
+     * VOLUMES's write lock (vfd >= 0). */
+    size_t tier_stores = 0;
+    if (rc == 0) {
+        tiers_view tv;
+        rc = tiers_load(t->dirfd, vfd >= 0, t->opt.fsync, &tv);
+        if (rc == 0) {
+            tier_stores = tv.nstores;
+            tiers_view_free(&tv);
+        }
+    }
+    if (rc == 0) {
+        int drc = tiers_db_id_read(t->dirfd, &t->has_db_id, t->db_id);
+        if (drc != 0 && drc != TSDB_ERR_NOTFOUND)
+            rc = drc;
+    }
+    if (rc == 0 && tier_stores > 0 && !t->has_db_id) {
+        fprintf(stderr, "tsdb: %s: %s lists %zu store(s) but root META has no db_id=: the open fails\n", t->dir,
+                TIERS_FILE, tier_stores);
+        rc = TSDB_ERR_CORRUPT;
+    }
     struct stat vst;
     if (rc == 0 && vfd >= 0 && fstat(vfd, &vst) == 0)
         t->vols_seen = stamp_of(&vst); /* after a cut: what load_layout read */
@@ -1730,6 +1764,448 @@ int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index)
     }
     close(dirfd);
     return rc;
+}
+
+/* ------------------------------------------------------------ local settled tier (R15) */
+
+bool tiers_tsdb_db_id(const tsdb *t, uint8_t out[16])
+{
+    if (!t)
+        return false;
+    tsdb *m = (tsdb *)t;
+    pthread_rwlock_rdlock(&m->lock);
+    bool has = m->has_db_id;
+    if (has && out)
+        memcpy(out, m->db_id, 16);
+    pthread_rwlock_unlock(&m->lock);
+    return has;
+}
+
+#ifdef TSDB_EC
+static inline int tier_add_mut(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    return tiers_test_mutant;
+#else
+    return 0;
+#endif
+}
+
+/* Inspects an existing store candidate directory before initializing it.
+ * - Empty (or only META.tmp from a crashed chunk_store_init2): ok, *adopt_out = false.
+ * - Valid chunk store META bound to our db_id (not yet in TIERS) and no other files: ok, *adopt_out = true.
+ * - Anything else (another db's store META, unbound/cluster META, or any other entry): refused with TSDB_ERR_INVALID. */
+static int tier_dir_check(const char *canon, bool has_db_id, const uint8_t db_id[16], const tiers_view *tv,
+                          bool *adopt_out, uint8_t sid_out[16])
+{
+    *adopt_out = false;
+    int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    DIR *d = fdopendir(fd);
+    if (!d) {
+        close(fd);
+        return TSDB_ERR_IO;
+    }
+    bool has_meta = false;
+    char other[256] = "";
+    struct dirent *e;
+    errno = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if (strcmp(e->d_name, "META") == 0) {
+            has_meta = true;
+        } else if (strcmp(e->d_name, "META.tmp") == 0) {
+            /* crashed chunk_store_init2 temporary; unlinked on retry */
+        } else if (!other[0]) {
+            snprintf(other, sizeof other, "%s", e->d_name);
+        }
+    }
+    int rerr = errno;
+    closedir(d);
+    if (rerr)
+        return TSDB_ERR_IO;
+
+    if (has_meta) {
+        uint8_t exist_sid[16];
+        chunk_store_owner ow = {0};
+        int mrc = chunk_store_meta_read(canon, exist_sid, &ow);
+        if (mrc == 0 && ow.db_set) {
+            char have_hex[33];
+            chunk_oid_hex(ow.db_id, have_hex);
+            if (!has_db_id) {
+                fprintf(stderr, "tsdb: tier add %s: store META belongs to database %s: refused\n", canon, have_hex);
+                return TSDB_ERR_INVALID;
+            }
+            if (memcmp(ow.db_id, db_id, 16) != 0) {
+                char want_hex[33];
+                chunk_oid_hex(db_id, want_hex);
+                fprintf(stderr, "tsdb: tier add %s: store META belongs to database %s, not %s: refused\n", canon,
+                        have_hex, want_hex);
+                return TSDB_ERR_INVALID;
+            }
+            bool known = false;
+            for (size_t i = 0; i < tv->nseen_ids; i++)
+                if (memcmp(tv->seen_ids[i], exist_sid, 16) == 0)
+                    known = true;
+            if (known) {
+                fprintf(stderr, "tsdb: tier add %s: store is already recorded in TIERS: refused\n", canon);
+                return TSDB_ERR_INVALID;
+            }
+            if (other[0]) {
+                fprintf(stderr, "tsdb: tier add %s: directory is not empty (found %s): refused\n", canon, other);
+                return TSDB_ERR_INVALID;
+            }
+            memcpy(sid_out, exist_sid, 16);
+            *adopt_out = true;
+            return 0;
+        }
+        if (mrc == 0) {
+            fprintf(stderr, "tsdb: tier add %s: directory already holds a chunk store META (unbound or cluster): "
+                            "refused\n", canon);
+            return TSDB_ERR_INVALID;
+        }
+        fprintf(stderr, "tsdb: tier add %s: directory is not empty (found META): refused\n", canon);
+        return TSDB_ERR_INVALID;
+    }
+
+    if (other[0]) {
+        fprintf(stderr, "tsdb: tier add %s: directory is not empty (found %s): refused\n", canon, other);
+        return TSDB_ERR_INVALID;
+    }
+    return 0;
+}
+
+static int sync_adopted_store(const char *canon)
+{
+    int dfd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return TSDB_ERR_IO;
+    int mfd = openat(dfd, "META", O_RDONLY | O_CLOEXEC);
+    int rc = 0;
+    if (mfd < 0 || tsdb_fsync(mfd) != 0)
+        rc = TSDB_ERR_IO;
+    if (mfd >= 0)
+        close(mfd);
+    if (rc == 0 && tsdb_fsync(dfd) != 0)
+        rc = TSDB_ERR_IO;
+    close(dfd);
+    return rc;
+}
+
+static int tier_add_impl(int rootfd, const char *root, bool sync, const char *path, const char *tier_class,
+                         uint32_t flags, uint8_t db_id_out[16], bool *have_db_id)
+{
+    if (have_db_id)
+        *have_db_id = false;
+    if (flags & ~(TSDB_TIER_SINGLE_COPY | TSDB_TIER_ALLOW_SHARED_DEV))
+        return TSDB_ERR_INVALID;
+    uint8_t cls = 0;
+    if (tiers_class_parse(tier_class, &cls) != 0) {
+        fprintf(stderr, "tsdb: tier add: unknown class '%s' (expected nvme, ssd, hdd or unknown)\n",
+                tier_class ? tier_class : "");
+        return TSDB_ERR_INVALID;
+    }
+    if (path_valid(path) != 0)
+        return TSDB_ERR_INVALID;
+
+    /* Root META must be a local single-server database root (volume=0) of this format. */
+    char *mtxt = NULL;
+    size_t mlen = 0;
+    int rc = read_file_all(rootfd, "META", &mtxt, &mlen);
+    if (rc != 0)
+        return rc;
+    {
+        char *vl = strstr(mtxt, "version="), unknown[96];
+        unsigned feats;
+        meta_requires_parse(mtxt, &feats, unknown, sizeof unknown);
+        long vnum = meta_volume(mtxt);
+        bool has_v8 = false;
+        for (const char *l = mtxt; *l && !has_v8;) {
+            if (strncmp(l, "parts_v8=", 9) == 0)
+                has_v8 = true;
+            const char *nl = strchr(l, '\n');
+            l = nl ? nl + 1 : l + strlen(l);
+        }
+        if ((vl ? atoi(vl + 8) : 0) != FORMAT_VERSION || unknown[0] ||
+            (feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) || vnum != 0) {
+            fprintf(stderr, "tsdb: tier add: %s/META is not a local format %d database root: refused\n", root,
+                    FORMAT_VERSION);
+            free(mtxt);
+            return TSDB_ERR_INVALID;
+        }
+        if (has_v8) {
+            fprintf(stderr, "tsdb: tier add: %s/META still records format-8 parts (parts_v8=); run `tsdb %s optimize` "
+                            "before adding a tier: refused\n", root, root);
+            free(mtxt);
+            return TSDB_ERR_INVALID;
+        }
+        free(mtxt);
+    }
+
+    /* Reject obvious nesting with the root before creating any directory on disk. */
+    char norm[PATH_MAX];
+    path_norm(path, norm);
+    if (path_within(norm, root) || path_within(root, norm)) {
+        fprintf(stderr, "tsdb: tier add %s: overlaps database root %s: refused\n", norm, root);
+        return TSDB_ERR_INVALID;
+    }
+
+    char canon[PATH_MAX];
+    bool made = mkdir(path, 0755) == 0;
+    if (!made && errno != EEXIST)
+        return TSDB_ERR_IO;
+    if (!realpath(path, canon)) {
+        rc = TSDB_ERR_IO;
+        goto fail_mkdir;
+    }
+    if (path_valid(canon) != 0) {
+        rc = TSDB_ERR_INVALID;
+        goto fail_mkdir;
+    }
+    struct stat st_new;
+    if (stat(canon, &st_new) != 0) {
+        rc = TSDB_ERR_IO;
+        goto fail_mkdir;
+    }
+    if (!S_ISDIR(st_new.st_mode)) {
+        fprintf(stderr, "tsdb: tier add %s: not a directory: refused\n", canon);
+        rc = TSDB_ERR_INVALID;
+        goto fail_mkdir;
+    }
+
+    int vfd = openat(rootfd, VOLUMES_FILE, O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (vfd < 0) {
+        rc = TSDB_ERR_IO;
+        goto fail_mkdir;
+    }
+    char **vpaths = NULL;
+    size_t nv = 0;
+    off_t vsize = 0;
+    tiers_view tv;
+    tiers_view_init(&tv);
+
+    rc = volumes_lock(vfd, F_WRLCK);
+    if (rc == 0)
+        rc = volumes_parse(vfd, true, sync, &vpaths, &nv, &vsize);
+    if (rc == 0)
+        rc = tiers_load(rootfd, true, sync, &tv);
+    bool has_db_id = false;
+    uint8_t db_id[16];
+    memset(db_id, 0, sizeof db_id);
+    if (rc == 0)
+        rc = tiers_db_id_read(rootfd, &has_db_id, db_id);
+
+    /* Never mint a fresh db_id when TIERS already lists stores bound to a missing/lost db_id. */
+    if (rc == 0 && tv.nstores > 0 && !has_db_id) {
+        fprintf(stderr, "tsdb: tier add %s: %s already lists %zu store(s) but root META has no db_id=: refused\n",
+                canon, TIERS_FILE, tv.nstores);
+        rc = TSDB_ERR_CORRUPT;
+    }
+
+    if (rc == 0 && tv.nstores >= TIERS_STORES_MAX) {
+        fprintf(stderr, "tsdb: tier add %s: database already has %d tier stores (maximum)\n", canon, TIERS_STORES_MAX);
+        rc = TSDB_ERR_INVALID;
+    }
+
+    /* Path nesting and same-directory refusals against root, volumes and existing stores. */
+    if (rc == 0 && (path_within(canon, root) || path_within(root, canon) || same_dir(canon, root) > 0)) {
+        fprintf(stderr, "tsdb: tier add %s: overlaps database root %s: refused\n", canon, root);
+        rc = TSDB_ERR_INVALID;
+    }
+    for (size_t i = 0; rc == 0 && i < nv; i++) {
+        if (path_within(canon, vpaths[i]) || path_within(vpaths[i], canon) || same_dir(canon, vpaths[i]) > 0) {
+            fprintf(stderr, "tsdb: tier add %s: overlaps volume %s: refused\n", canon, vpaths[i]);
+            rc = TSDB_ERR_INVALID;
+        }
+    }
+    for (size_t i = 0; rc == 0 && i < tv.nstores; i++) {
+        if (path_within(canon, tv.stores[i].path) || path_within(tv.stores[i].path, canon) ||
+            same_dir(canon, tv.stores[i].path) > 0) {
+            fprintf(stderr, "tsdb: tier add %s: overlaps existing tier store %s: refused\n", canon, tv.stores[i].path);
+            rc = TSDB_ERR_INVALID;
+        }
+    }
+
+    /* Device (st_dev) isolation check (E58, D18) unless TSDB_TIER_ALLOW_SHARED_DEV is passed. */
+    if (rc == 0 && !(flags & TSDB_TIER_ALLOW_SHARED_DEV) && tier_add_mut() != TIERS_MUT_SAMEDEV) {
+        struct stat st_cmp;
+        if (stat("/", &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
+            fprintf(stderr, "tsdb: tier add %s: is on the same device as /: refused (pass --allow-shared-device for "
+                            "tests)\n", canon);
+            rc = TSDB_ERR_INVALID;
+        }
+        if (rc == 0 && fstat(rootfd, &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
+            fprintf(stderr, "tsdb: tier add %s: is on the same device as database root %s: refused (pass "
+                            "--allow-shared-device for tests)\n", canon, root);
+            rc = TSDB_ERR_INVALID;
+        }
+        for (size_t i = 0; rc == 0 && i < nv; i++) {
+            if (stat(vpaths[i], &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
+                fprintf(stderr, "tsdb: tier add %s: is on the same device as volume %s: refused (pass "
+                                "--allow-shared-device for tests)\n", canon, vpaths[i]);
+                rc = TSDB_ERR_INVALID;
+            }
+        }
+        for (size_t i = 0; rc == 0 && i < tv.nstores; i++) {
+            if (stat(tv.stores[i].path, &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
+                fprintf(stderr, "tsdb: tier add %s: is on the same device as tier store %s: refused (pass "
+                                "--allow-shared-device for tests)\n", canon, tv.stores[i].path);
+                rc = TSDB_ERR_INVALID;
+            }
+        }
+    }
+
+    /* Check directory contents (empty, or crashed add of this db, never non-empty or foreign db). */
+    bool adopt = false;
+    uint8_t sid[16];
+    memset(sid, 0, sizeof sid);
+    if (rc == 0)
+        rc = tier_dir_check(canon, has_db_id, db_id, &tv, &adopt, sid);
+
+    /* Step 1: ensure db_id in root META durably BEFORE initializing store or appending TIERS. */
+    if (rc == 0)
+        rc = tiers_db_id_ensure(rootfd, sync, db_id);
+    if (rc == 0 && db_id_out)
+        memcpy(db_id_out, db_id, 16);
+    if (rc == 0 && have_db_id)
+        *have_db_id = true;
+
+    /* Step 2: initialize store META (bound to db_id) durably BEFORE TIERS records it. */
+    if (rc == 0 && made && sync && tier_add_mut() != TIERS_MUT_NOSYNC)
+        rc = sync_parent(canon);
+    if (rc == 0) {
+        if (adopt) {
+            if (sync && tier_add_mut() != TIERS_MUT_NOSYNC)
+                rc = sync_adopted_store(canon);
+        } else {
+            chunk_store_owner ow = {0};
+            if (tier_add_mut() != TIERS_MUT_NODBID) {
+                ow.db_set = true;
+                memcpy(ow.db_id, db_id, 16);
+            }
+            rc = chunk_store_init2(canon, NULL, ow.db_set ? &ow : NULL, sid);
+        }
+    }
+
+    /* Step 3: append STORE record to TIERS under the VOLUMES OFD write lock (fdatasync + root dir fsync if new). */
+    if (rc == 0)
+        rc = tiers_append_store(rootfd, sync, sid, cls, (flags & TSDB_TIER_SINGLE_COPY) != 0, canon);
+
+    tiers_view_free(&tv);
+    paths_free(vpaths, nv);
+    close(vfd); /* releases VOLUMES OFD lock */
+
+fail_mkdir:
+    if (rc != 0 && made)
+        rmdir(path);
+    return rc;
+}
+#endif /* TSDB_EC */
+
+int tsdb_tier_add(tsdb *t, const char *path, const char *tier_class, uint32_t flags)
+{
+#ifndef TSDB_EC
+    (void)t;
+    (void)path;
+    (void)tier_class;
+    (void)flags;
+    fprintf(stderr, "tsdb: tier add: not built with the erasure codec (TSDB_EC)\n");
+    return TSDB_ERR_INVALID;
+#else
+    if (!t)
+        return TSDB_ERR_INVALID;
+    if (t->opt.read_only)
+        return TSDB_ERR_READONLY;
+    if (t->cluster) {
+        fprintf(stderr, "tsdb: tier add: cluster handles do not use local tiers: refused\n");
+        return TSDB_ERR_INVALID;
+    }
+    if (eng_check(t->vols[0]))
+        return TSDB_ERR_IO;
+    uint8_t db_id[16];
+    bool have_db_id = false;
+    pthread_mutex_lock(&t->create_lock);
+    int rc = tier_add_impl(t->dirfd, t->dir, t->opt.fsync, path, tier_class, flags, db_id, &have_db_id);
+    if (have_db_id) {
+        pthread_rwlock_wrlock(&t->lock);
+        t->has_db_id = true;
+        memcpy(t->db_id, db_id, 16);
+        pthread_rwlock_unlock(&t->lock);
+    }
+    pthread_mutex_unlock(&t->create_lock);
+    return rc;
+#endif
+}
+
+int tsdb_tier_add_dir(const char *dir, const char *path, const char *tier_class, uint32_t flags)
+{
+#ifndef TSDB_EC
+    (void)dir;
+    (void)path;
+    (void)tier_class;
+    (void)flags;
+    fprintf(stderr, "tsdb: tier add: not built with the erasure codec (TSDB_EC)\n");
+    return TSDB_ERR_INVALID;
+#else
+    if (!dir || !*dir)
+        return TSDB_ERR_INVALID;
+    char root[PATH_MAX];
+    if (!realpath(dir, root))
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    int dirfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirfd < 0)
+        return TSDB_ERR_IO;
+    int rc = tier_add_impl(dirfd, root, true, path, tier_class, flags, NULL, NULL);
+    close(dirfd);
+    return rc;
+#endif
+}
+
+int tsdb_tier_set(tsdb *db, const tsdb_tier_settings *settings)
+{
+    (void)db;
+    (void)settings;
+    fprintf(stderr, "tsdb: tsdb_tier_set: not built\n");
+    return TSDB_ERR_INVALID;
+}
+
+int tsdb_tier_lost(tsdb *db, const char *store, const char *replace_path, uint32_t flags)
+{
+    (void)db;
+    (void)store;
+    (void)replace_path;
+    (void)flags;
+    fprintf(stderr, "tsdb: tsdb_tier_lost: not built\n");
+    return TSDB_ERR_INVALID;
+}
+
+int tsdb_tier_salvage(tsdb *db, int64_t partition, int all_partitions, int force)
+{
+    (void)db;
+    (void)partition;
+    (void)all_partitions;
+    (void)force;
+    fprintf(stderr, "tsdb: tsdb_tier_salvage: not built\n");
+    return TSDB_ERR_INVALID;
+}
+
+int tsdb_tier_status(tsdb *db, tsdb_tier_info *out)
+{
+    (void)db;
+    if (out)
+        memset(out, 0, sizeof *out);
+    fprintf(stderr, "tsdb: tsdb_tier_status: not built\n");
+    return TSDB_ERR_INVALID;
+}
+
+void tsdb_tier_info_free(tsdb_tier_info *info)
+{
+    if (!info)
+        return;
+    free(info->stores);
+    memset(info, 0, sizeof *info);
 }
 
 /* Holds name for one creation; waits while another creation holds it. Only creations in flight are held, a few

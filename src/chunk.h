@@ -127,15 +127,22 @@ typedef struct chunk_wr chunk_wr;
 /* Makes the store: the directory (one level may be created), its META with a store id (id NULL: random). Refuses a
  * directory that already has a META (TSDB_ERR_INVALID). Synced with its parent. */
 int chunk_store_init(const char *path, const uint8_t *id, uint8_t id_out[16]);
-/* Who a store belongs to (design-cluster-data.md D11): `tsdb chunk-store init PATH --cluster UUID --node ID` writes
- * both into META, and tsdbd refuses at start a store of another cluster or node (a disk moved between members). */
+/* Who a store belongs to:
+ * - cluster/node (design-cluster-data.md D11): `tsdb chunk-store init PATH --cluster UUID --node ID` writes both into
+ *   META, and tsdbd refuses at start a store of another cluster or node (a disk moved between members).
+ * - database id (R15 D3): `tsdb_tier_add` writes `db=<32-hex>` into META, and opening with an expected db_id refuses a
+ *   store belonging to another database naming both. */
 typedef struct chunk_store_owner {
-    bool set; /* false: a store made without one (chunk_store_init) */
+    bool set; /* false: a store made without a cluster/node owner */
     uint8_t cluster[16];
     uint32_t node;
+    bool db_set; /* true: a single-server tier store bound to db_id (`db=<32-hex>`, D3) */
+    uint8_t db_id[16];
 } chunk_store_owner;
 int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_owner *owner, uint8_t id_out[16]);
 void chunk_store_get_owner(const chunk_store *st, chunk_store_owner *out);
+/* Reads a store directory's META without locking or opening volumes: 0, TSDB_ERR_NOTFOUND, TSDB_ERR_CORRUPT, IO. */
+int chunk_store_meta_read(const char *path, uint8_t id_out[16], chunk_store_owner *ow_out);
 /* Opens it. expect_id (16 bytes) names the store the caller believes this directory to be: another id is
  * CHUNK_ERR_STORE_ID (a disk that came back as another one: a lost disk, E27); no META is TSDB_ERR_NOTFOUND; a
  * damaged one TSDB_ERR_CORRUPT. Volumes found are loaded with their EPOCH, leftover tmp_* files removed. The directory
@@ -145,6 +152,9 @@ void chunk_store_get_owner(const chunk_store *st, chunk_store_owner *out);
  * deletes (CHUNK_ERR_EPOCH_UNSURE) until chunk_store_raise gives it the epoch the metadata group holds. A readdir that
  * fails is an error, never the end of the directory. */
 int chunk_store_open(const char *path, const uint8_t *expect_id, chunk_store **out);
+/* Opens a store and, when expect_db is non-NULL, requires META's db= line to match expect_db (D3); a store of another
+ * database (or without db=) is refused with CHUNK_ERR_STORE_ID naming both ids. */
+int chunk_store_open_db(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, chunk_store **out);
 void chunk_store_close(chunk_store *st);
 const uint8_t *chunk_store_id(const chunk_store *st);
 bool chunk_store_failed(const chunk_store *st); /* a failed write or sync: it acknowledges nothing more (reads go on) */
