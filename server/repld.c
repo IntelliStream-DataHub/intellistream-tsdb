@@ -111,6 +111,7 @@
 #include <unistd.h>
 
 #include "repld.h"
+#include "tsdb_protocol.h"
 #include "crashpt.h"
 #include "peerlink.h"
 #include "replwire.h"
@@ -233,6 +234,56 @@ static int node_index(const struct rvol *rv, uint32_t node)
         if (rv->rec.rep[i].node == node)
             return (int)i;
     return -1;
+}
+
+static int peer_in_isr_locked(const struct rvol *rv, int idx)
+{
+    if (idx < 0 || (uint32_t)idx >= rv->rec.nrep)
+        return 0;
+    uint32_t node = rv->rec.rep[idx].node;
+    for (uint32_t i = 0; i < rv->rec.nisr && i < META_REPLICAS_MAX; i++)
+        if (rv->rec.isr[i] == node)
+            return 1;
+    return 0;
+}
+
+static int self_in_isr_locked(const struct rvol *rv)
+{
+    return peer_in_isr_locked(rv, rv->self);
+}
+
+static int isr_full_locked(const struct rvol *rv)
+{
+    for (uint32_t i = 0; i < rv->rec.nisr && i < META_REPLICAS_MAX; i++) {
+        int k = node_index(rv, rv->rec.isr[i]);
+        if (k >= 0 && k != rv->self && rv->peer[k].full)
+            return 1;
+    }
+    return 0;
+}
+
+static int vol_full_locked(const struct rvol *rv)
+{
+    return cluster_self_full() || isr_full_locked(rv);
+}
+
+static void full_sync_locked(struct rvol *rv)
+{
+    int f = isr_full_locked(rv);
+    if (f != rv->isr_full) {
+        rv->isr_full = f;
+        __atomic_add_fetch(&G.nfull_isr, f ? 1 : -1, __ATOMIC_RELEASE);
+    }
+    if (rv->mode == M_WRITER && !rv->failed) {
+        int vf = cluster_self_full() || f;
+        if (vf && !rv->full_said) {
+            say("volume %" PRIu32 ": FULL (backpressure active; refusing writes with UNAVAILABLE FULL)", rv->number);
+            rv->full_said = 1;
+        } else if (!vf && rv->full_said) {
+            say("volume %" PRIu32 ": FULL cleared; accepting writes", rv->number);
+            rv->full_said = 0;
+        }
+    }
 }
 
 static struct plink *link_of(uint32_t node, int bulk)
@@ -689,10 +740,31 @@ static void ahead_mark(struct rpeer *p, uint64_t now)
 /* Catch-up of the peers whose cursor is behind what the core wants them to have: one read per peer per call. */
 static void catch_up(struct rvol *rv, struct eng *db)
 {
-    for (int i = 0; !rv->stop && i < (int)rv->rec.nrep; i++) {
+    for (int i = 0; !rv->stop && rv->core && i < (int)rv->rec.nrep; i++) {
         struct rpeer *p = &rv->peer[i];
         if (i == rv->self || p->sent >= p->want)
             continue;
+        if (!peer_in_isr_locked(rv, i) && p->full) {
+            /* E30 (D17): a FULL non-ISR replica pauses its own catch-up; skip WAL reads/sends while it reports FULL,
+             * and send a periodic empty heartbeat APPEND so its next ACK clears p->full once fill drops. */
+            uint64_t now = now_ms();
+            if (!p->full_probe_ms || now - p->full_probe_ms >= 500) {
+                p->full_probe_ms = now;
+                uint64_t ppos = p->acked <= p->sent ? p->acked : p->sent;
+                struct repl_msg hm = {.type = REPL_M_APPEND,
+                                      .from = rv->self,
+                                      .to = i,
+                                      .leader = rv->self,
+                                      .epoch = repl_epoch(rv->core),
+                                      .prev_pos = ppos,
+                                      .prev_epoch = epoch_at(rv, ppos),
+                                      .commit = repl_commit(rv->core),
+                                      .set_version = repl_get_set_version(rv->core),
+                                      .meta.leader = -1};
+                send_msg(rv, &hm);
+            }
+            continue;
+        }
         uint64_t from = p->sent + 1;
         pthread_mutex_unlock(&rv->mu);
         uint8_t *buf = NULL;
@@ -840,7 +912,7 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
         } else {
             for (int i = 0; i < (int)rv->rec.nrep && nt < REPL_MAX_NODES; i++) {
                 struct rpeer *p = &rv->peer[i];
-                if (i != rv->self && p->sent + 1 == first) {
+                if (i != rv->self && p->sent + 1 == first && (peer_in_isr_locked(rv, i) || !p->full)) {
                     targets[nt++] = (struct send_target){
                         .idx = i, .node = rv->rec.rep[i].node,
                         .also_bulk = G.bulk_frame && ++p->bulk_n % 16 == 0};
@@ -952,6 +1024,15 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
     }
     /* no read lease (§7.1): a write that raced the check in tsdbd is refused the same way, never taken as a deposal */
     if (rv->mode == M_WRITER && !cluster_lease_valid() && !(G.late_wal && rv->stop)) {
+        pthread_mutex_unlock(&rv->mu);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    /* E30 (D17): refuse client data writes (small rows and COMMIT markers) before the WAL append while this server
+     * or any current ISR member is FULL; settles (MK_COLD), GC, digests, drops and NOW continue so young data drains. */
+    if (rv->mode == M_WRITER && (eng_admit_marker == 0 || eng_admit_marker == MK_COMMIT) && vol_full_locked(rv) &&
+        G.mutant != RM_FULLAFTERADMIT) {
+        atomic_fetch_add_explicit(&rv->full_refusals, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&G.full_refusals_total, 1, memory_order_relaxed);
         pthread_mutex_unlock(&rv->mu);
         return TSDB_ERR_UNAVAILABLE;
     }
@@ -1076,6 +1157,8 @@ static void bulk_out(struct rvol *rv, int fd, uint64_t size, const char *mname, 
     for (int i = 0; i < (int)rv->rec.nrep && i < META_REPLICAS_MAX; i++) {
         if (i == rv->self || (to >= 0 && i != to))
             continue;
+        if (to < 0 && !peer_in_isr_locked(rv, i) && rv->peer[i].full)
+            continue; /* E30 (D17): do not ship part files to a FULL non-ISR replica; it FETCHes once FULL clears */
         struct plink *l = link_of(rv->rec.rep[i].node, 1);
         struct shipjob *sj = l ? malloc(sizeof *sj) : NULL;
         if (!sj)
@@ -1300,6 +1383,29 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
     if (brc != 0 || size != total || total > (1ull << 32) || !vol_listed(r->volume)) {
         free(r);
         return -1;
+    }
+    /* E30 (D17): refuse incoming bulk part files for a non-ISR replica while this server is FULL so large writes on
+     * the healthy ISR never fill a FULL disk via staging/spilling; the replica FETCHes them once FULL clears. */
+    if (cluster_self_full()) {
+        struct rvol *rv = vol_find(r->volume);
+        int reject_full = 0;
+        if (rv) {
+            pthread_mutex_lock(&rv->mu);
+            if (rv->mode == M_REPLICA && !self_in_isr_locked(rv)) {
+                reject_full = 1;
+                if (!rv->full_pause_said) {
+                    say("volume %" PRIu32 ": non-ISR replica is FULL (fill %" PRIu8 "%% >= %" PRIu32
+                        "%%): pausing catch-up", rv->number, cluster_get_fill_pct(), rv->rec.young_high_pct);
+                    rv->full_pause_said = 1;
+                }
+            }
+            pthread_mutex_unlock(&rv->mu);
+            vol_put(rv);
+        }
+        if (reject_full) {
+            free(r);
+            return -1;
+        }
     }
     if (total > G.spill_bytes) {
         /* a large file goes to disk as it arrives, never whole into memory (r3d review M3) */
@@ -2195,8 +2301,11 @@ static void exec(struct rvol *rv, struct repl_action *a)
         } else if (a->msg.to == REPL_META) {
             meta_msg(rv, &a->msg);
         } else {
-            if (G.slow_ack && a->msg.type == REPL_M_ACK && rv->mode == M_REPLICA)
-                slow_ack(rv, &a->msg);
+            if (a->msg.type == REPL_M_ACK) {
+                if (G.slow_ack && rv->mode == M_REPLICA)
+                    slow_ack(rv, &a->msg);
+                a->msg.full = cluster_self_full();
+            }
             send_msg(rv, &a->msg);
         }
         break;
@@ -2259,6 +2368,14 @@ static void exec(struct rvol *rv, struct repl_action *a)
         vol_fail(rv, a->reason ? a->reason : "the core failed");
         break;
     case REPL_A_SNAPSHOT: /* the core repeats the notice until the replica catches up */
+        if (rv->mode == M_REPLICA && !self_in_isr_locked(rv) && cluster_self_full()) {
+            if (!rv->full_pause_said) {
+                say("volume %" PRIu32 ": non-ISR replica is FULL (fill %" PRIu8 "%% >= %" PRIu32
+                    "%%): pausing catch-up", rv->number, cluster_get_fill_pct(), rv->rec.young_high_pct);
+                rv->full_pause_said = 1;
+            }
+            break;
+        }
         rsnap_need(rv, (int)a->pos);
         break;
     }
@@ -2395,6 +2512,7 @@ void rec_set(struct rvol *rv, const struct cluster_vol_rec *r)
         rv->rec_short = s;
         __atomic_add_fetch(&G.nshort, s ? 1 : -1, __ATOMIC_RELEASE);
     }
+    full_sync_locked(rv);
 }
 
 /* After a META on the writer (rv->mu held): says when the ISR fell below min_isr and when it is back, and hands a
@@ -2606,11 +2724,29 @@ static void handle(struct rvol *rv, struct item *it)
         p->acked = G.mutant == RM_KEEPWRITTEN ? rv->cur.m.written : rv->cur.m.durable;
         p->heard = 1;
         p->acked_ms = now_ms();
+        p->full = rv->cur.m.full != 0;
+        if (!p->full)
+            p->full_probe_ms = 0;
         if (rv->cur.m.written != p->wrote || !p->wrote_ms) {
             p->wrote = rv->cur.m.written;
             p->wrote_ms = now_ms();
         }
         ahead_mark(p, now_ms());
+        full_sync_locked(rv);
+    } else if (rv->mode == M_REPLICA && rv->cur.m.type == REPL_M_APPEND && rv->cur.m.nrec > 0 &&
+               !self_in_isr_locked(rv) && cluster_self_full()) {
+        if (!rv->full_pause_said) {
+            say("volume %" PRIu32 ": non-ISR replica is FULL (fill %" PRIu8 "%% >= %" PRIu32
+                "%%): pausing catch-up", rv->number, cluster_get_fill_pct(), rv->rec.young_high_pct);
+            rv->full_pause_said = 1;
+        }
+        /* Strip data records so nothing is appended to the WAL while FULL; the empty APPEND still triggers epoch
+         * checks, applies already-held committed rows, and sends an ACK carrying RW_ACK_FULL. The leader already
+         * skips non-ISR FULL peers via p->full; checking our local rv->rec here is defense in depth (any brief lag
+         * if this replica just re-entered the ISR self-heals on the next metadata push). */
+        rv->cur.m.nrec = 0;
+        rv->cur.m.rec = NULL;
+        rv->cur.nbytes = 0;
     }
     int cur_verified = G.mutant != RM_NOMSGCHECK && G.mutant != RM_NODESCCMP;
     repl_recv(rv->core, &rv->cur.m);
@@ -3021,6 +3157,12 @@ static void *vol_main(void *arg)
                 rv->ret_check_ms = now;
                 retain_refresh(rv);
             }
+            if (rv->mode == M_WRITER)
+                full_sync_locked(rv);
+            if (rv->full_pause_said && (rv->mode != M_REPLICA || self_in_isr_locked(rv) || !cluster_self_full())) {
+                say("volume %" PRIu32 ": FULL cleared; resuming catch-up", rv->number);
+                rv->full_pause_said = 0;
+            }
             if (rset_apply(rv) == 2) { /* a set change kept back at its META was applied now: the core gets the record */
                 struct item mi = {.kind = IN_META};
                 handle(rv, &mi);
@@ -3254,6 +3396,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "checklate")      ? RM_CHECKLATE
                : !strcmp(mu, "downnocap")      ? RM_DOWNNOCAP
                : !strcmp(mu, "keepafterout")   ? RM_KEEPAFTEROUT
+               : !strcmp(mu, "fullafteradmit") ? RM_FULLAFTERADMIT
                                                : RM_NONE;
     rw_mutant = !mu                         ? RW_MUT_NONE
                 : !strcmp(mu, "checknocmp") ? RW_MUT_NOCMP
@@ -3313,6 +3456,8 @@ void repld_init(tsdb *t, const char *dir)
     G.late_tick = te && strstr(te, "latetick");
     G.slow_ack = te && strstr(te, "slowack");
     G.drain_hold = te && strstr(te, "drainhold");
+    if (te && strstr(te, "fullafteradmit") && !G.mutant)
+        G.mutant = RM_FULLAFTERADMIT;
     if (te && strstr(te, "spill"))
         G.spill_bytes = 64u << 10;
     if (G.mutant == RM_NOSPILL)
@@ -3514,6 +3659,8 @@ int repld_open(const struct cluster_vol_rec *r)
 fail:
     if (rv->rec_short) /* counted by rec_set above; a listed driver gives it back in repld_close_end */
         __atomic_add_fetch(&G.nshort, -1, __ATOMIC_RELEASE);
+    if (rv->isr_full)
+        __atomic_add_fetch(&G.nfull_isr, -1, __ATOMIC_RELEASE);
     vol_free(rv); /* never listed, no thread: nothing else holds it (the core and index of a failed core_build too) */
     return rc ? rc : TSDB_ERR_INVALID;
 }
@@ -3575,6 +3722,51 @@ int repld_isr_short(uint32_t v)
     pthread_mutex_unlock(&rv->mu);
     vol_put(rv);
     return s;
+}
+
+int repld_full(uint32_t v)
+{
+    if (!cluster_self_full() && !__atomic_load_n(&G.nfull_isr, __ATOMIC_ACQUIRE))
+        return 0; /* neither this server nor any ISR peer is FULL: zero-lock fast path */
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return 0;
+    pthread_mutex_lock(&rv->mu);
+    int f = rv->mode == M_WRITER && !rv->failed && vol_full_locked(rv);
+    pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
+    return f;
+}
+
+void repld_note_full_refusal(uint32_t v)
+{
+    atomic_fetch_add_explicit(&G.full_refusals_total, 1, memory_order_relaxed);
+    struct rvol *rv = vol_find(v);
+    if (rv) {
+        atomic_fetch_add_explicit(&rv->full_refusals, 1, memory_order_relaxed);
+        vol_put(rv);
+    }
+}
+
+uint64_t repld_full_refusals(uint32_t v)
+{
+    if (v == UINT32_MAX || v == TSDB_VOL_ANY)
+        return atomic_load_explicit(&G.full_refusals_total, memory_order_relaxed);
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return 0;
+    uint64_t n = atomic_load_explicit(&rv->full_refusals, memory_order_relaxed);
+    vol_put(rv);
+    return n;
+}
+
+int repld_full_after_admit(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    return G.mutant == RM_FULLAFTERADMIT;
+#else
+    return 0;
+#endif
 }
 
 unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max)
@@ -3763,6 +3955,9 @@ int repld_close_end(uint32_t v, uint64_t *log_end)
         if (rv->rec_short)
             __atomic_add_fetch(&G.nshort, -1, __ATOMIC_RELEASE);
         rv->rec_short = 0;
+        if (rv->isr_full)
+            __atomic_add_fetch(&G.nfull_isr, -1, __ATOMIC_RELEASE);
+        rv->isr_full = 0;
         /* the driver is joined: nothing appends from here on, so this end is the one an install must stay above (a
          * DIVERGED replica's log is what a rebuild replaces: 0, as in rsnap.c's check before the close) */
         if (log_end && rv->failed && rv->div_rebuild && G.mutant != RM_SNAPDIVLOGEND)

@@ -201,6 +201,20 @@ fn lost_is_not_retried() {
 }
 
 #[test]
+fn full_is_retried() {
+    // reason TSDB_WHY_FULL (4, E30 backpressure): retried like any UNAVAILABLE until it clears
+    let mut body = unavailable_body(1, 150);
+    body[4] = 4; // TSDB_WHY_FULL
+    let f = Fake::start(move |r| if r.nth < 2 { Reply(-11, body.clone()) } else { ok() });
+    let mut c = Client::connect(f.addr).unwrap();
+    let t0 = Instant::now();
+    c.flush().unwrap();
+    assert!(t0.elapsed() >= Duration::from_millis(280), "waited {:?}", t0.elapsed());
+    assert_eq!(f.seen(OP_FLUSH).len(), 3, "expected 2 FULL retries + 1 success");
+    assert_eq!(c.last_error().unavailable[0].reason, 4);
+}
+
+#[test]
 fn retry_off_returns_the_first_refusal() {
     let f = Fake::start(|_| unavailable(5));
     let mut c = Client::connect(f.addr).unwrap();

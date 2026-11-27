@@ -334,6 +334,22 @@ class HaTest {
     }
 
     @Test
+    void fullIsRetried() throws Exception {
+        /* reason TSDB_WHY_FULL (4, E30 backpressure): retried like any UNAVAILABLE until it clears */
+        byte[] body = unavailableBody(1, 150);
+        body[4] = 4; /* TSDB_WHY_FULL */
+        try (Fake f = new Fake(r -> r.nth < 2 ? new Reply(-11, body) : ok());
+                TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
+            long t0 = System.nanoTime();
+            c.flush();
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            assertTrue(ms >= 280, "waited " + ms + " ms");
+            assertEquals(3, f.seen(OP_FLUSH).size(), "expected 2 FULL retries + 1 success");
+            assertEquals(4, c.lastError().unavailable().get(0).reason());
+        }
+    }
+
+    @Test
     void retryOffReturnsTheFirstRefusal() throws Exception {
         try (Fake f = new Fake(r -> unavailable(5)); TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
             c.setRetry(Duration.ZERO);

@@ -150,6 +150,23 @@ def test_lost_is_not_retried(fake):
         c.flush()  # the refusal is an answer: the connection goes on
 
 
+def test_full_is_retried(fake):
+    # reason TSDB_WHY_FULL (4, E30 backpressure): retried like any UNAVAILABLE until it clears
+    body = bytearray(unavailable_body(1, 150))
+    body[4] = 4  # TSDB_WHY_FULL
+    f0 = fake(lambda op, nth: (-11, bytes(body)))
+    with Client("127.0.0.1", f0.port, retry=0) as c:
+        with pytest.raises(TsdbUnavailable) as e:
+            c.flush()
+        assert e.value.entries[0]["reason"] == 4
+    f = fake(lambda op, nth: (-11, bytes(body)) if nth < 2 else (0, b""))
+    with Client("127.0.0.1", f.port) as c:
+        t0 = time.monotonic()
+        c.flush()
+        assert time.monotonic() - t0 >= 0.28
+        assert len(f.seen(OP_FLUSH)) == 3
+
+
 def test_the_budget_runs_out(fake):
     f = fake(lambda op, nth: unavailable(400))
     with Client("127.0.0.1", f.port, retry=1.5) as c:

@@ -4,7 +4,7 @@
  * types; server/repld.c sends and receives them; docs/design-cluster.md 5.1-5.2, C25).
  *
  * Log link, frame type RW_T_MSG: one `struct repl_msg` of the core (src/repl.h) of one volume, little endian:
- *   u8 version (RW_VERSION), u8 msg type (REPL_M_*), u16 flags (bit 0: resync), u32 volume,
+ *   u8 version (RW_VERSION), u8 msg type (REPL_M_*), u16 flags (bit 0: resync, bit 1: RW_ACK_FULL), u32 volume,
  *   i32 from, to, leader, u64 epoch, prev_pos, prev_epoch, commit, durable, written, rid, last_epoch, end, start,
  *   set_version, replay (RW_VERSION 2: the replica set version of D8 and the ACK's replay start of D17),
  *   the vmeta (u64 epoch, isr_version, i32 leader, u32 isr, unanswered, u64 rid[REPL_MAX_NODES]),
@@ -42,7 +42,11 @@
 
 #include "../src/repl.h"
 
-#define RW_VERSION 3 /* 3: the driver check (rd-drvcheck) */
+/* RW_VERSION 3 (pre-1.0 E40: same 0.11.0 cycle as rd-drvcheck and PL_CL_VERSION 10; mixed builds predating r9-full
+ * are not supported). Flag bit 1 (RW_ACK_FULL) is valid on REPL_M_ACK only; unknown higher bits are refused. */
+#define RW_VERSION 3
+#define RW_F_RESYNC 1u /* ACK: the leader should send from written + 1 */
+#define RW_ACK_FULL 2u /* ACK: the sender's server is FULL (R9 E30, D17) */
 enum { RW_T_MSG = 1, RW_T_FETCH = 2 };
 #define RW_HEAD 212         /* the fixed part of an RW_T_MSG, up to and with nrec */
 #define RW_CHECK 8          /* the driver check */

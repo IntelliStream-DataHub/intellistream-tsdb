@@ -35,6 +35,16 @@ int repld_leading(uint32_t v, uint64_t *epoch);
 int repld_engine_failed(uint32_t v, const char *msg);
 /* 1 while volume v is led here with fewer in-sync replicas than its min_isr: writes are refused (REPL_E_ISR). */
 int repld_isr_short(uint32_t v);
+/* 1 while volume v is led here and this server or any current ISR member is FULL (R9 E30, D17): writes are refused
+ * at admission with UNAVAILABLE TSDB_WHY_FULL (retry_after 1000 ms). */
+int repld_full(uint32_t v);
+/* Records a FULL refusal for volume v (per-volume and process-total atomic counters, for STATUS and metrics). */
+void repld_note_full_refusal(uint32_t v);
+/* Refusal count for volume v (UINT32_MAX or TSDB_VOL_ANY: process-wide sum across volumes). Exported for STATUS
+ * and r14-report's Prometheus metrics without touching server/metrics.c here. */
+uint64_t repld_full_refusals(uint32_t v);
+/* 1 only when the planted mutant fullafteradmit is active (tests only; always 0 when TSDB_TEST_HOOKS is off). */
+int repld_full_after_admit(void);
 /* 1 while volume v is led here and a planned transfer refuses its writes (rtransfer.c): UNAVAILABLE PROMOTING, a
  * retry after about 50 ms, definite (never admitted). */
 int repld_draining(uint32_t v);

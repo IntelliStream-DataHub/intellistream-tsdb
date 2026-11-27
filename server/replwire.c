@@ -161,13 +161,14 @@ static int recs_ok(const struct repl_msg *m, const uint32_t *lens, size_t nbytes
 static size_t encode_msg_hdr(uint8_t *out, size_t cap, uint32_t volume, const struct repl_msg *m, const uint32_t *lens,
                              uint64_t seq, uint64_t off, size_t nbytes)
 {
-    if (m->type < REPL_M_APPEND || m->type > REPL_M_SNAPSHOT || !node_ok(m->from) || !node_ok(m->to) ||
-        !node_ok(m->leader) || !node_ok(m->meta.leader) || (m->nrec && !m->rec) || !recs_ok(m, lens, nbytes))
+    if (m->type < REPL_M_APPEND || m->type > REPL_M_SNAPSHOT || (m->full && m->type != REPL_M_ACK) ||
+        !node_ok(m->from) || !node_ok(m->to) || !node_ok(m->leader) || !node_ok(m->meta.leader) ||
+        (m->nrec && !m->rec) || !recs_ok(m, lens, nbytes))
         return 0;
     struct wr w = {.p = out, .cap = cap};
     w8(&w, RW_VERSION);
     w8(&w, (uint8_t)m->type);
-    w16(&w, m->resync ? 1 : 0);
+    w16(&w, (uint16_t)((m->resync ? RW_F_RESYNC : 0u) | (m->full ? RW_ACK_FULL : 0u)));
     w32(&w, volume);
     w32(&w, (uint32_t)m->from);
     /* w.n == RW_OFF_TO */
@@ -268,10 +269,12 @@ int rw_decode_msg(const uint8_t *p, size_t n, struct rw_msg *out, struct repl_re
     for (int i = 0; i < REPL_MAX_NODES; i++)
         m->meta.rid[i] = r64(&r);
     m->nrec = r32(&r);
-    if (r.bad || (flags & ~1u) || m->type < REPL_M_APPEND || m->type > REPL_M_SNAPSHOT || !node_ok(m->from) ||
-        !node_ok(m->to) || !node_ok(m->leader) || !node_ok(m->meta.leader))
+    if (r.bad || (flags & ~(RW_F_RESYNC | RW_ACK_FULL)) || ((flags & RW_ACK_FULL) && m->type != REPL_M_ACK) ||
+        m->type < REPL_M_APPEND || m->type > REPL_M_SNAPSHOT || !node_ok(m->from) || !node_ok(m->to) ||
+        !node_ok(m->leader) || !node_ok(m->meta.leader))
         return -1;
-    m->resync = flags & 1;
+    m->resync = (flags & RW_F_RESYNC) != 0;
+    m->full = (flags & RW_ACK_FULL) != 0;
     if (m->nrec) {
         if (m->type != REPL_M_APPEND || m->nrec > cap || !recs || !lens)
             return -1;

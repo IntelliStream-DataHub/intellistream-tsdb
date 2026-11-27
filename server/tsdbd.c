@@ -783,6 +783,15 @@ static bool vol_margins(uint32_t vol, struct margins *m)
  * settled tier's (vol_corrupt). Set around the reply by the read path that knows the read was settled (today the test
  * hook; r8n's read seam). */
 static __thread bool unav_cold;
+/* The refusal in hand is E30 FULL backpressure (repld_full): unav_entry reports TSDB_WHY_FULL even if the replica's
+ * fill clears in the window between the refusal and frame_put. */
+static __thread bool unav_full;
+
+static bool is_full_refused_op(uint8_t op)
+{
+    return op == TSDB_OP_INSERT || op == TSDB_OP_INSERT_VALUES || op == TSDB_OP_REPLACE_RANGE ||
+           op == TSDB_OP_DELETE_RANGE;
+}
 /* The metrics port's rows, one per cluster volume of the copy (no I/O but the test hook's file; any thread): *out is
  * malloc'ed, the caller frees it. (size_t)-1 when it cannot be allocated: the caller says so, never a silent gap. */
 static size_t metrics_margins(metrics_margin **out)
@@ -945,6 +954,11 @@ static tsdb_unavail unav_entry(uint16_t vol)
     vol_health(vol, &health, &reason, &e.since_ms, &e.outage_id, &retry, &dom_idx);
     if (health == TSDB_HEALTH_AVAILABLE && unav_write && cvol_active() && repld_isr_short(vol)) {
         e.reason = TSDB_WHY_UNREACHABLE; /* min_isr (REPL_E_ISR): the replicas come back or a shrink is undone */
+        e.retry_after_ms = unav_jitter(1000);
+        return e;
+    }
+    if (health == TSDB_HEALTH_AVAILABLE && unav_write && cvol_active() && (unav_full || repld_full(vol))) {
+        e.reason = TSDB_WHY_FULL; /* E30 (D17): leader or an ISR member >= young_high_pct */
         e.retry_after_ms = unav_jitter(1000);
         return e;
     }
@@ -1680,6 +1694,8 @@ static int cvol_refuse_ids(const tsdb_sid *ids, size_t n);
 static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n);
 static int32_t route_ids(conn *c, const tsdb_sid *ids, size_t n, bool read);
 
+static int cvol_full_after_admit_ids(const tsdb_sid *ids, size_t n);
+
 static int insert_packed(conn *c, const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
 {
     auth_conn *a = &c->auth;
@@ -1735,6 +1751,8 @@ static int insert_packed(conn *c, const uint8_t *p, size_t len, uint32_t n, tsdb
             if (rc == 0) {
                 rc = many ? tsdb_insert_values(db, series, ts, &col, n) : tsdb_insert_series_values(db, s, ts, &col, n);
                 dom_exit_all(list, nl);
+                if (rc == 0 && many)
+                    rc = cvol_full_after_admit_ids(series, n);
             }
         }
     }
@@ -2807,8 +2825,36 @@ static int cvol_refuse_ids(const tsdb_sid *ids, size_t n)
             unav_vol = (uint16_t)last;
             return TSDB_ERR_UNAVAILABLE;
         }
+        if (repld_full(last) && !repld_full_after_admit()) {
+            unav_full = true;
+            repld_note_full_refusal(last);
+            unav_vol = (uint16_t)last;
+            return TSDB_ERR_UNAVAILABLE;
+        }
         if (ns < sizeof seen / sizeof seen[0])
             seen[ns++] = (uint16_t)last;
+    }
+    return 0;
+}
+
+/* Planted mutant fullafteradmit: refuses a multi-series write AFTER the engine already appended and committed it. */
+static int cvol_full_after_admit_ids(const tsdb_sid *ids, size_t n)
+{
+    if (!cvol_active() || !repld_full_after_admit())
+        return 0;
+    uint32_t last = UINT32_MAX;
+    for (size_t i = 0; i < n; i++) {
+        tsdb_sid id = ids[i];
+        if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY ||
+            TSDB_SID_VOLUME(id) == last)
+            continue;
+        last = (uint32_t)TSDB_SID_VOLUME(id);
+        if (repld_full(last)) {
+            unav_full = true;
+            repld_note_full_refusal(last);
+            unav_vol = (uint16_t)last;
+            return TSDB_ERR_UNAVAILABLE;
+        }
     }
     return 0;
 }
@@ -3287,7 +3333,7 @@ static void handle_status(req *r)
     ST_PUT("node.id=%u\nnode.role=%s\nprotocol=%d\nvolumes=%u\n", cp ? (unsigned)cp->self : cvol_active() ? 0u : 1u,
            g_reader_only ? "follower" : "owner", TSDB_PROTOCOL_VERSION, (unsigned)nv);
     if (cp) {
-        ST_PUT("cluster.applied=%llu\n", (unsigned long long)cp->applied);
+        ST_PUT("cluster.applied=%llu\nnode.full=%d\n", (unsigned long long)cp->applied, cluster_self_full());
         for (uint32_t i = 0; i < cp->nmembers; i++) {
             const struct cluster_copy_member *m = &cp->members[i];
             if (m->id != cp->self)
@@ -3308,6 +3354,8 @@ static void handle_status(req *r)
             if (m.tier != MARGIN_TIER_NONE)
                 ST_PUT("vol.%u.settled_margin=%d\nvol.%u.tier=%s\n", (unsigned)v->number, m.settled,
                        (unsigned)v->number, margin_tier_name(m.tier));
+            ST_PUT("vol.%u.full=%d\nvol.%u.full_refusals=%llu\n", (unsigned)v->number, repld_full(v->number),
+                   (unsigned)v->number, (unsigned long long)repld_full_refusals(v->number));
         }
         cluster_copy_put(cp);
         struct fwd_peer_row fr[64]; /* forwarding one hop (ha.md 15.4 STATUS): per peer forwarded to */
@@ -3394,9 +3442,11 @@ static void handle(req *r)
     lguard.on = lguard.checked = lguard.failed = false;
     lguard.ids = NULL;
     rmv.on = false; /* per request, as lguard: no answer carries another request's route body */
+    unav_full = false;
     rt_req = r;
     rt_forwarded = false;
     handle_in(r);
+    unav_full = false;
     rt_req = NULL;
     rt_forwarded = false;
     rmv.on = false; /* a handler's route_ids answer went out with its reply; lguard's below is its own */
@@ -3433,6 +3483,7 @@ static void handle_in(req *r)
     }
     unav_vol = req_volume(r->op, p, len);
     unav_write = !(auth_ops[r->op].need & NEED_ANY) && (auth_ops[r->op].need & R_WRITE);
+    unav_full = false;
     if (test_route_moved && unav_vol != TSDB_VOL_ANY && unav_write && cvol_active() &&
         (cvol_why(unav_vol) >= 0 || (test_route_moved == 2 && (r->op == TSDB_OP_INSERT || r->op == TSDB_OP_INSERT_VALUES)))) {
         route_moved(c, r, unav_vol); /* tests: MOVED to the leader the copy names (TSDBD_TEST_ROUTE_MOVED) */
@@ -3450,6 +3501,13 @@ static void handle_in(req *r)
     }
     if (unav_vol != TSDB_VOL_ANY && unav_write && cvol_active() && repld_isr_short(unav_vol)) {
         reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* min_isr: refused before anything is written (D9) */
+        return;
+    }
+    if (unav_vol != TSDB_VOL_ANY && is_full_refused_op(r->op) && cvol_active() && repld_full(unav_vol) &&
+        !repld_full_after_admit()) {
+        unav_full = true;
+        repld_note_full_refusal(unav_vol);
+        reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* E30: refused before WAL append or lw_enter */
         return;
     }
     if (unav_vol != TSDB_VOL_ANY && cvol_active() && !(fwd_owner && fwdx_mutant == FWM_NOLEASE)) {
@@ -3713,6 +3771,8 @@ static void handle_op(req *r)
         const int64_t *ts = (const int64_t *)(const void *)(p + 16); /* the payload is malloc'd: 16-aligned */
         const float *v = (const float *)(const void *)(p + 16 + (size_t)n * 8);
         rc = many ? tsdb_insert(db, ids, ts, v, n) : tsdb_insert_series(db, s, ts, v, n);
+        if (rc == 0 && many)
+            rc = cvol_full_after_admit_ids(ids, n);
         break;
     }
     case TSDB_OP_QUERY_RAW: {
@@ -3824,6 +3884,8 @@ static void handle_op(req *r)
         const uint8_t *vals = p + TSDB_VALUES_HEADER + (size_t)n * 8;
         tsdb_values col = {(tsdb_type)p[4], vals, valid ? vals + vb : NULL};
         rc = many ? tsdb_insert_values(db, ids, ts, &col, n) : tsdb_insert_series_values(db, s, ts, &col, n);
+        if (rc == 0 && many)
+            rc = cvol_full_after_admit_ids(ids, n);
         break;
     }
     case TSDB_OP_QUERY_VALUES:
@@ -4037,6 +4099,12 @@ static void handle_op(req *r)
     case TSDB_OP_TOPOLOGY: handle_topology(r); return;
     case TSDB_OP_STATUS: handle_status(r); return;
     default: rc = TSDB_ERR_INVALID; break;
+    }
+    if (rc == 0 && unav_vol != TSDB_VOL_ANY && is_full_refused_op(r->op) && cvol_active() &&
+        repld_full_after_admit() && repld_full(unav_vol)) {
+        unav_full = true;
+        repld_note_full_refusal(unav_vol);
+        rc = TSDB_ERR_UNAVAILABLE;
     }
     if (rc == 0 && (r->op == TSDB_OP_INSERT || r->op == TSDB_OP_INSERT_VALUES)) {
         uint32_t n;
@@ -4958,6 +5026,7 @@ static void fwd_serve(struct fjob *j)
     uint64_t waited_ms = (uint64_t)(now_ns() - j->t_in) / 1000000;
     lguard.on = false;
     rmv.on = false;
+    unav_full = false;
     if (e.hops != 1) {
         reply_error(&pc, r.id, r.op, TSDB_ERR_INVALID);
     } else if (fwdx_mutant != FWM_OLDFRAME && fwdx_mutant != FWM_OWNERAGE &&

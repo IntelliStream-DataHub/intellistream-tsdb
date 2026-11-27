@@ -121,6 +121,7 @@ struct repl_msg {
                                      never below `start`), the replay floor's input; 0: its log is empty, nothing to
                                      replay (the leader bounds it by what it sends it, and by its own log start) */
     int resync;                   /* ACK: the leader should send from written + 1 */
+    int full;                     /* ACK: sender's server is FULL (R9 E30, D17; carried for replwire/repld) */
     struct repl_vmeta meta;       /* META, ISR_REQ */
 };
 

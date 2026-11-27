@@ -23475,6 +23475,469 @@ static void scen_metrics(void)
            nonholder, drop_ms, L, R2);
 }
 
+/* Atomically writes <state-dir>/fillpct for server i (used with TSDB_CLUSTER_TEST fill_pct_file=1). */
+static void fillpct_set(int i, int pct)
+{
+    char dir[PATH_MAX + 80], tmp[PATH_MAX + 140], dst[PATH_MAX + 128];
+    server_dir(i, dir, sizeof dir);
+    snprintf(tmp, sizeof tmp, "%s/state/fillpct.tmp", dir);
+    snprintf(dst, sizeof dst, "%s/state/fillpct", dir);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        die("fopen %s: %s", tmp, strerror(errno));
+    fprintf(f, "%d\n", pct);
+    fclose(f);
+    if (rename(tmp, dst) != 0)
+        die("rename %s -> %s: %s", tmp, dst, strerror(errno));
+}
+
+struct full_retry_arg {
+    int port;
+    tsdb_sid sid;
+    int64_t ts;
+    float val;
+    int rc;
+    int done;
+};
+
+static void *full_retry_thread(void *p)
+{
+    struct full_retry_arg *a = p;
+    tsdbc *c = NULL;
+    if (tsdbc_connect("127.0.0.1", a->port, &c) != 0) {
+        a->rc = TSDB_ERR_IO;
+        __atomic_store_n(&a->done, 1, __ATOMIC_RELEASE);
+        return NULL;
+    }
+    tsdbc_set_retry(c, 15000);
+    a->rc = tsdbc_insert_series(c, a->sid, &a->ts, &a->val, 1);
+    tsdbc_close(c);
+    __atomic_store_n(&a->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+struct full_scan_ctx {
+    int64_t *ts;
+    float *vals;
+    size_t n, cap;
+};
+
+static int full_scan_cb(void *arg, const int64_t *ts, const float *v, size_t n)
+{
+    struct full_scan_ctx *s = arg;
+    if (s->n + n > s->cap) {
+        size_t nc = s->cap ? s->cap * 2 : 256;
+        while (nc < s->n + n)
+            nc *= 2;
+        int64_t *nt = realloc(s->ts, nc * sizeof *nt);
+        float *nv = realloc(s->vals, nc * sizeof *nv);
+        if (!nt || !nv) {
+            free(nt);
+            free(nv);
+            return TSDB_ERR_NOMEM;
+        }
+        s->ts = nt;
+        s->vals = nv;
+        s->cap = nc;
+    }
+    memcpy(s->ts + s->n, ts, n * sizeof *ts);
+    memcpy(s->vals + s->n, v, n * sizeof *v);
+    s->n += n;
+    return 0;
+}
+
+static void full_check_unavail(tsdbc *c, const char *what)
+{
+    tsdb_unavail u[4];
+    unsigned nu = 0;
+    if (tsdbc_unavailable(c, u, 4, &nu) != 0 || nu < 1)
+        die("full: %s refused without UNAVAILABLE body (%u entries)", what, nu);
+    if (u[0].reason != TSDB_WHY_FULL)
+        die("full: %s refused with reason %u, expected TSDB_WHY_FULL (%u)", what, u[0].reason,
+            (unsigned)TSDB_WHY_FULL);
+    if (u[0].retry_after_ms < 800 || u[0].retry_after_ms > 1200)
+        die("full: %s retry_after_ms %u outside 1000 ms +-20%% [800, 1200]", what, u[0].retry_after_ms);
+}
+
+/* full (r9-full; E30, D17): 3-node cluster (young_high_pct 90). Raising fill_pct=92 on an ISR replica makes small
+ * writes, large writes, replaces and deletes return UNAVAILABLE TSDB_WHY_FULL (retry_after ~1000 ms) within 2 s;
+ * hysteresis keeps FULL at 89 and 88 and clears below 88 (at 87); a retrying C client succeeds once fill drops to 87;
+ * leader-self FULL also refuses and clears; jepsen-style check verifies every acknowledged row is present and ZERO
+ * refused rows are present (kills mutant fullafteradmit). */
+static void scen_full(void)
+{
+    scenario("full");
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "fill_pct_file=1";
+        start(i);
+        fillpct_set(i, 50);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num = 0;
+    int rc;
+    if ((rc = vol_add(0, "fl", 3, &num)) != 0 || num != 1)
+        die("full: volume add fl: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fl", i, 1, 0);
+    struct meta_volume v = {0};
+    if (!vol_rec(0, "fl", &v))
+        die("full: no record of fl");
+    int L = server_of(v.leader);
+    int R = (L + 1) % 3;
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 0);
+    tsdb_sid id = rep_series(c, "fl.s1", "fl", 30000);
+    await_isr(0, "fl", 3, 10000, "all 3 replicas in ISR");
+
+    int64_t ack_ts[256], ref_ts[256];
+    size_t n_ack = 0, n_ref = 0;
+    /* Baseline small writes succeed. */
+    for (int k = 0; k < 10; k++) {
+        int64_t ts = 1000 + k;
+        float val = (float)(10 + k);
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("full: baseline write %d failed: %s", k, ers(rc));
+        ack_ts[n_ack++] = ts;
+    }
+
+    /* Raise fill_pct=92 (>= young_high_pct 90) on ISR replica R: writes must get TSDB_WHY_FULL within 2 s. */
+    fillpct_set(R, 92);
+    uint64_t t_raise = now_ms();
+    int saw_full = 0;
+    for (int k = 0; now_ms() - t_raise < 2000; k++) {
+        int64_t ts = 2000 + k;
+        float val = 2.0f;
+        rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+        if (rc == TSDB_ERR_UNAVAILABLE) {
+            full_check_unavail(c, "small probe after fill_pct=92");
+            if (n_ref < sizeof ref_ts / sizeof ref_ts[0])
+                ref_ts[n_ref++] = ts;
+            saw_full = 1;
+            break;
+        }
+        if (rc != 0)
+            die("full: unexpected error waiting for FULL: %s", ers(rc));
+        if (n_ack < sizeof ack_ts / sizeof ack_ts[0])
+            ack_ts[n_ack++] = ts;
+        usleep(50000);
+    }
+    if (!saw_full)
+        die("full: writes did not return UNAVAILABLE TSDB_WHY_FULL within 2 s of fill_pct=92 on ISR replica %d", R);
+    uint64_t detect_ms = now_ms() - t_raise;
+
+    /* Small insert refused with TSDB_WHY_FULL. */
+    {
+        int64_t ts[5] = {3000, 3001, 3002, 3003, 3004};
+        float fv[5] = {3.0f, 3.1f, 3.2f, 3.3f, 3.4f};
+        rc = tsdbc_insert_series(c, id, ts, fv, 5);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("full: small batch while FULL returned %s, expected UNAVAILABLE", ers(rc));
+        full_check_unavail(c, "small batch");
+        for (int k = 0; k < 5; k++)
+            ref_ts[n_ref++] = ts[k];
+    }
+
+    /* Large insert (>= wal_max_batch_rows = 65536) refused before lw_enter with TSDB_WHY_FULL. */
+    const size_t large_n = 70000;
+    const int64_t large_lo = 100000, large_hi = 100000 + (int64_t)large_n - 1;
+    {
+        int64_t *lts = malloc(large_n * sizeof *lts);
+        float *lv = malloc(large_n * sizeof *lv);
+        if (!lts || !lv)
+            die("full: malloc large batch");
+        for (size_t k = 0; k < large_n; k++) {
+            lts[k] = large_lo + (int64_t)k;
+            lv[k] = 7.0f;
+        }
+        rc = tsdbc_insert_series(c, id, lts, lv, large_n);
+        free(lts);
+        free(lv);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("full: large insert (%zu rows) while FULL returned %s, expected UNAVAILABLE", large_n, ers(rc));
+        full_check_unavail(c, "large insert");
+    }
+
+    /* Replace range and delete range refused before lw_enter with TSDB_WHY_FULL. */
+    {
+        int64_t rts = 1000;
+        float rval = 999.0f;
+        tsdb_values rv_col = {.type = TSDB_FLOAT32, .values = &rval, .valid = NULL};
+        rc = tsdbc_replace_range(c, id, 1000, 1005, &rts, &rv_col, 1);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("full: replace_range while FULL returned %s, expected UNAVAILABLE", ers(rc));
+        full_check_unavail(c, "replace_range");
+
+        rc = tsdbc_delete_range(c, id, 1000, 1005);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("full: delete_range while FULL returned %s, expected UNAVAILABLE", ers(rc));
+        full_check_unavail(c, "delete_range");
+
+        /* Non-row housekeeping/metadata markers (MK_SERIES, MK_RETENTION) still proceed during FULL. */
+        tsdb_sid id2 = 0;
+        if ((rc = tsdbc_series_create(c, "fl.s2", TSDB_FLOAT32, "fl", &id2)) != 0 || !id2)
+            die("full: series_create while FULL failed: %s", ers(rc));
+        if ((rc = tsdbc_set_retention(c, id2, 86400000)) != 0)
+            die("full: set_retention while FULL failed: %s", ers(rc));
+    }
+
+    /* Verify STATUS exposes per-server node.full=1 on R and vol.1.full=1 + vol.1.full_refusals >= 5 on L. */
+    {
+        tsdbc *cr = client(R);
+        char *st = NULL;
+        if (tsdbc_status(cr, &st) != 0 || !st || !strstr(st, "node.full=1\n"))
+            die("full: STATUS on FULL replica %d missing node.full=1:\n%s", R, st ? st : "(null)");
+        free(st);
+        tsdbc_close(cr);
+
+        st = NULL;
+        if (tsdbc_status(c, &st) != 0 || !st || !strstr(st, "vol.1.full=1\n"))
+            die("full: STATUS on leader %d missing vol.1.full=1:\n%s", L, st ? st : "(null)");
+        const char *rp = strstr(st, "vol.1.full_refusals=");
+        if (!rp || strtoull(rp + 20, NULL, 10) < 5)
+            die("full: STATUS on leader %d vol.1.full_refusals < 5:\n%s", L, st);
+        free(st);
+    }
+
+    /* Hysteresis: fill_pct=89 and fill_pct=88 (>= young_high_pct - 2 = 88) MUST stay FULL. */
+    for (int hp = 89; hp >= 88; hp--) {
+        fillpct_set(R, hp);
+        usleep(400000);
+        int64_t ts = 3100 + (89 - hp);
+        float fv = 4.0f;
+        rc = tsdbc_insert_series(c, id, &ts, &fv, 1);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("full: hysteresis failed at fill_pct=%d (young_high_pct=90): write returned %s", hp, ers(rc));
+        full_check_unavail(c, "hysteresis check");
+        ref_ts[n_ref++] = ts;
+    }
+
+    /* C client with retry blocks on TSDB_WHY_FULL and succeeds automatically once fill_pct drops to 87 (< 90 - 2). */
+    struct full_retry_arg ra = {.port = cports[L], .sid = id, .ts = 4000, .val = 42.0f};
+    pthread_t rth;
+    if (pthread_create(&rth, NULL, full_retry_thread, &ra) != 0)
+        die("full: pthread_create");
+    usleep(400000);
+    if (__atomic_load_n(&ra.done, __ATOMIC_ACQUIRE))
+        die("full: retrying client finished while replica was still FULL (rc %d)", ra.rc);
+    fillpct_set(R, 87);
+    uint64_t t_drop = now_ms();
+    while (!__atomic_load_n(&ra.done, __ATOMIC_ACQUIRE) && now_ms() - t_drop < 10000)
+        usleep(50000);
+    if (!__atomic_load_n(&ra.done, __ATOMIC_ACQUIRE))
+        die("full: retrying client did not complete within 10 s after fill_pct dropped to 87");
+    pthread_join(rth, NULL);
+    if (ra.rc != 0)
+        die("full: retrying client failed after fill_pct=87: %s", ers(ra.rc));
+    ack_ts[n_ack++] = ra.ts;
+
+    /* Leader-self FULL: fill_pct=91 on leader L refuses writes with TSDB_WHY_FULL, clearing at 87. */
+    fillpct_set(L, 91);
+    uint64_t t_lfull = now_ms();
+    int saw_lfull = 0;
+    for (int k = 0; now_ms() - t_lfull < 2000; k++) {
+        int64_t ts = 5000 + k;
+        float fv = 5.0f;
+        rc = tsdbc_insert_series(c, id, &ts, &fv, 1);
+        if (rc == TSDB_ERR_UNAVAILABLE) {
+            full_check_unavail(c, "leader-self FULL");
+            if (n_ref < sizeof ref_ts / sizeof ref_ts[0])
+                ref_ts[n_ref++] = ts;
+            saw_lfull = 1;
+            break;
+        }
+        if (rc != 0)
+            die("full: unexpected error waiting for leader-self FULL: %s", ers(rc));
+        if (n_ack < sizeof ack_ts / sizeof ack_ts[0])
+            ack_ts[n_ack++] = ts;
+        usleep(50000);
+    }
+    if (!saw_lfull)
+        die("full: writes did not return UNAVAILABLE TSDB_WHY_FULL within 2 s of leader-self fill_pct=91");
+    fillpct_set(L, 87);
+    uint64_t t_lclr = now_ms();
+    int cleared_l = 0;
+    for (int k = 0; now_ms() - t_lclr < 2000; k++) {
+        int64_t ts = 6000 + k;
+        float fv = 6.0f;
+        rc = tsdbc_insert_series(c, id, &ts, &fv, 1);
+        if (rc == 0) {
+            if (n_ack < sizeof ack_ts / sizeof ack_ts[0])
+                ack_ts[n_ack++] = ts;
+            cleared_l = 1;
+            break;
+        }
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("full: unexpected error waiting for leader-self FULL clear: %s", ers(rc));
+        if (n_ref < sizeof ref_ts / sizeof ref_ts[0])
+            ref_ts[n_ref++] = ts;
+        usleep(50000);
+    }
+    if (!cleared_l)
+        die("full: leader-self FULL did not clear within 2 s of fill_pct=87");
+
+    /* Jepsen-style invariant check: EVERY acknowledged row must be present AND ZERO refused rows may appear! */
+    struct full_scan_ctx sc = {0};
+    if ((rc = tsdbc_query_raw(c, id, 0, INT64_MAX / 2, full_scan_cb, &sc)) != 0)
+        die("full: query_raw failed: %s", ers(rc));
+    for (size_t i = 0; i < sc.n; i++) {
+        int64_t t = sc.ts[i];
+        if (t >= large_lo && t <= large_hi)
+            die("full: refused row ts %" PRId64 " (from large insert) appeared in the database", t);
+        for (size_t j = 0; j < n_ref; j++)
+            if (t == ref_ts[j])
+                die("full: refused row ts %" PRId64 " appeared in the database", t);
+        if (t == 1000 && sc.vals[i] == 999.0f)
+            die("full: refused row ts 1000 replace_range value 999 appeared in the database");
+    }
+    for (size_t j = 0; j < n_ack; j++) {
+        int found = 0;
+        for (size_t i = 0; i < sc.n; i++)
+            if (sc.ts[i] == ack_ts[j]) {
+                found = 1;
+                break;
+            }
+        if (!found)
+            die("full: acknowledged row ts %" PRId64 " is missing from the database", ack_ts[j]);
+    }
+    if (sc.n != n_ack)
+        die("full: row count %zu != acknowledged %zu", sc.n, n_ack);
+    free(sc.ts);
+    free(sc.vals);
+    tsdbc_close(c);
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        envs[i] = NULL;
+    printf("  full: replica fill_pct=92 refused small/large/replace/delete with TSDB_WHY_FULL in %" PRIu64
+           " ms; hysteresis held at 89/88; retrying client succeeded at 87; leader-self FULL verified; %zu acked "
+           "present, 0 of %zu+%zu refused present\n",
+           detect_ms, n_ack, n_ref, large_n);
+}
+
+/* fullnonisr (r9-full; E30, D17): a non-ISR replica with fill_pct=95 pauses its own catch-up and logs once, while
+ * small and large writes to the volume continue succeeding on the healthy ISR; once fill_pct drops to 87, it resumes
+ * catch-up and rejoins the ISR. */
+static void scen_fullnonisr(void)
+{
+    scenario("fullnonisr");
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "fill_pct_file=1";
+        start(i);
+        fillpct_set(i, 50);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num = 0;
+    int rc;
+    if ((rc = vol_add(0, "fni", 3, &num)) != 0 || num != 1)
+        die("fullnonisr: volume add fni: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fni", i, 1, 0);
+    struct meta_volume v = {0};
+    if (!vol_rec(0, "fni", &v))
+        die("fullnonisr: no record of fni");
+    int L = server_of(v.leader);
+    int R = (L + 1) % 3;
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 0);
+    tsdb_sid id = rep_series(c, "fni.s1", "fni", 30000);
+    await_isr(0, "fni", 3, 10000, "all 3 replicas in ISR");
+
+    uint64_t expected_rows = 0;
+    for (int k = 0; k < 10; k++) {
+        int64_t ts = 1000 + k;
+        float fv = 1.0f;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &fv, 1)) != 0)
+            die("fullnonisr: initial write %d: %s", k, ers(rc));
+        expected_rows++;
+    }
+
+    /* Stop replica R until it drops out of the ISR, then write more rows so it lags behind. */
+    stop(R, SIGKILL);
+    for (int k = 0; k < 20; k++) {
+        int64_t ts = 2000 + k;
+        float fv = 2.0f;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &fv, 1)) != 0)
+            die("fullnonisr: write %d while R stopped: %s", k, ers(rc));
+        expected_rows++;
+    }
+    await_isr(L, "fni", 2, 15000, "stopped replica R dropped from ISR");
+
+    /* Restart non-ISR replica R with fill_pct=95: it must pause its own catch-up and log once. */
+    fillpct_set(R, 95);
+    start(R);
+    await_log(R, "non-ISR replica is FULL", 15000, "non-ISR replica R logged catch-up pause for FULL");
+
+    /* Writes (small and large) MUST continue succeeding on the healthy 2-member ISR while R is FULL and non-ISR! */
+    for (int k = 0; k < 20; k++) {
+        int64_t ts = 3000 + k;
+        float fv = 3.0f;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &fv, 1)) != 0)
+            die("fullnonisr: small write %d failed while non-ISR replica R was FULL: %s", k, ers(rc));
+        expected_rows++;
+    }
+    const size_t large_n = 70000;
+    {
+        int64_t *lts = malloc(large_n * sizeof *lts);
+        float *lv = malloc(large_n * sizeof *lv);
+        if (!lts || !lv)
+            die("fullnonisr: malloc large batch");
+        for (size_t k = 0; k < large_n; k++) {
+            lts[k] = 100000 + (int64_t)k;
+            lv[k] = 7.0f;
+        }
+        rc = tsdbc_insert_series(c, id, lts, lv, large_n);
+        free(lts);
+        free(lv);
+        if (rc != 0)
+            die("fullnonisr: large write failed while non-ISR replica R was FULL: %s", ers(rc));
+        expected_rows += large_n;
+    }
+
+    /* R must remain out of the ISR while FULL (catch-up paused) AND must not have staged/spilled the large write's
+     * part files onto its FULL disk (E30: bulk_out skips non-ISR FULL peers and bin_open refuses them). */
+    usleep(1000000);
+    if (!vol_rec(L, "fni", &v) || v.nisr != 2)
+        die("fullnonisr: expected ISR size 2 while non-ISR replica R is FULL, got %" PRIu32, v.nisr);
+    {
+        char sdir[PATH_MAX + 80], vdir[PATH_MAX + 128];
+        server_dir(R, sdir, sizeof sdir);
+        snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+        DIR *d = opendir(vdir);
+        if (!d)
+            die("fullnonisr: opendir %s: %s", vdir, strerror(errno));
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (!strncmp(de->d_name, "stage_", 6) || !strncmp(de->d_name, "spill_", 6) ||
+                !strncmp(de->d_name, "tmp_", 4))
+                die("fullnonisr: FULL non-ISR replica %d staged/spilled bulk file %s during large write", R, de->d_name);
+        }
+        closedir(d);
+    }
+
+    /* Drop fill_pct=87 on R: it must resume catch-up, log resume, and rejoin the 3-member ISR. */
+    fillpct_set(R, 87);
+    await_log(R, "FULL cleared; resuming catch-up", 10000, "non-ISR replica R logged resume");
+    await_isr(L, "fni", 3, 25000, "replica R caught up and rejoined ISR after fill dropped to 87");
+
+    if ((uint64_t)rows_of(c, id) != expected_rows)
+        die("fullnonisr: leader has %d rows, expected %" PRIu64, rows_of(c, id), expected_rows);
+    tsdbc_close(c);
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        envs[i] = NULL;
+    printf("  fullnonisr: non-ISR replica %d at fill_pct=95 paused catch-up while small+large writes (%" PRIu64
+           " rows) succeeded on healthy ISR; resumed and rejoined ISR at fill_pct=87\n",
+           R, expected_rows);
+}
+
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -23526,7 +23989,8 @@ int main(int argc, char **argv)
                {"outhold", scen_outhold}, {"outopening", scen_outopening}, {"outfailstop", scen_outfailstop},
                {"replfault", scen_replfault}, {"pace", scen_pace},
                {"downkeep", scen_downkeep}, {"downbudget", scen_downbudget}, {"holdkeep", scen_holdkeep},
-               {"outmove", scen_outmove}, {"ecout", scen_ecout}, {"metrics", scen_metrics}};
+               {"outmove", scen_outmove}, {"ecout", scen_ecout}, {"metrics", scen_metrics},
+               {"full", scen_full}, {"fullnonisr", scen_fullnonisr}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

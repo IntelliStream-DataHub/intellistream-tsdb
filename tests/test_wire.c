@@ -477,6 +477,28 @@ static void script_refuse_nobody(struct fake *f, int fd)
     }
 }
 
+/* First (intptr_t)f->arg requests get UNAVAILABLE with TSDB_WHY_FULL (retry_after 200 ms), then success. */
+static void script_refuse_full(struct fake *f, int fd)
+{
+    uint8_t body[512], op, ub[64];
+    size_t n, un;
+    uint32_t id;
+    int left = (int)(intptr_t)f->arg;
+    tsdb_unavail e = {.vol = 1, .reason = TSDB_WHY_FULL, .epoch = 2, .since_ms = 0, .retry_after_ms = 200,
+                      .outage_id = 0};
+    un = tsdb_wire_put_unavail(ub, sizeof ub, &e, 1);
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        note_req(f, id);
+        if (left > 0) {
+            left--;
+            reply(fd, id, TSDB_ERR_UNAVAILABLE, ub, un);
+        } else {
+            uint64_t sid = TSDB_SID(1, 5);
+            reply(fd, id, 0, &sid, 8);
+        }
+    }
+}
+
 static void test_unavailable(void)
 {
     struct fake f;
@@ -542,6 +564,20 @@ static void test_unavailable(void)
     CHECK(rc == TSDB_ERR_UNAVAILABLE);
     CHECK(atomic_load(&f.nreq) == 2 && dt >= 950 && dt < 2500);
     CHECK(tsdbc_last_error(c, &ei) == TSDB_ERR_UNAVAILABLE && !ei.has_body);
+    tsdbc_close(c);
+    fake_stop(&f);
+
+    /* TSDB_WHY_FULL (E30 backpressure): retried like any UNAVAILABLE until it clears */
+    fake_start(&f, 1, script_refuse_full);
+    f.arg = (void *)(intptr_t)2;
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    t0 = now_ms();
+    rc = tsdbc_series(c, "pump1.flow", 1, &sid);
+    dt = now_ms() - t0;
+    CHECK(rc == 0 && sid == TSDB_SID(1, 5));
+    CHECK(atomic_load(&f.nreq) == 3 && dt >= 350 && dt < 3000);
+    CHECK(tsdbc_last_error(c, &ei) == TSDB_ERR_UNAVAILABLE && ei.has_body && ei.nunavail == 1 &&
+          ei.unavail[0].reason == TSDB_WHY_FULL && ei.unavail[0].retry_after_ms == 200);
     tsdbc_close(c);
     fake_stop(&f);
 }

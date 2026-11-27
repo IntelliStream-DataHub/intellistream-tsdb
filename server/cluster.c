@@ -1266,6 +1266,8 @@ static struct {
     int fail_file;       /* TSDB_CLUSTER_TEST fail_sync_file=1: a sync fails with EIO while <state-dir>/failsync exists */
     char failfile[1100];
     int fill_pct_override; /* TSDB_CLUSTER_TEST fill_pct=N (-1: real statvfs) */
+    int fill_pct_file;     /* TSDB_CLUSTER_TEST fill_pct_file=1: live fill_pct from <state-dir>/fillpct */
+    char fillpctfile[1100];
     int nogasp;            /* TSDB_CLUSTER_TEST nogasp=1: planted mutant skipping fail-stop last-gasp beat */
     pthread_t fill_th;     /* dedicated background thread polling statvfs(C.dir) once/s (off cluster loop) */
     int fill_th_on;
@@ -1617,6 +1619,8 @@ static void test_knobs(void)
             C.copy_noleader = (unsigned)v;
         else if (sscanf(p, "fill_pct=%llu", &v) == 1 && (v <= 100 || v == 255))
             C.fill_pct_override = (int)v;
+        else if (sscanf(p, "fill_pct_file=%llu", &v) == 1)
+            C.fill_pct_file = v != 0;
         else if (sscanf(p, "nogasp=%llu", &v) == 1)
             C.nogasp = v != 0;
         p = strchr(p, ',');
@@ -2274,12 +2278,20 @@ static void cluster_metrics_publish(uint64_t now);
 
 /* After whatever moved the copy (an applied batch, an installed snapshot, a swap to the state file's copy, a
  * restore): a new snapshot of C.sm. The cluster thread only. */
+static _Atomic uint32_t g_young_high_pct; /* 0 until cluster settings are initialised */
+static void refresh_self_full(void);
+
 static void copy_publish(void)
 {
     if (cc_retired.v)
         cc_reclaim();
     if (!C.sm.initialised || (C.hold_copy && access(C.holdcopyfile, F_OK) == 0))
         return;
+    if (C.sm.set.young_high_pct >= 10 && C.sm.set.young_high_pct <= 99 &&
+        atomic_load_explicit(&g_young_high_pct, memory_order_relaxed) != C.sm.set.young_high_pct) {
+        atomic_store_explicit(&g_young_high_pct, C.sm.set.young_high_pct, memory_order_release);
+        refresh_self_full();
+    }
     uint32_t self = cl_mutant() == CLM_SELFONE ? 1 : C.have_node ? C.id : 0;
     struct cc_snap *cur = atomic_load(&cc_cur.v); /* ours: the published reference is the cluster thread's */
     if (cur && cur->pub.applied == C.sm.applied && cur->pub.applied_term == C.sm.applied_term &&
@@ -2584,10 +2596,54 @@ void cluster_set_chunk_stores(uint32_t n) { atomic_store_explicit(&g_chunk_store
 static _Atomic int g_hb_opening;
 static _Atomic int g_hb_failstop;
 static _Atomic uint8_t g_hb_fill_pct = 0xff; /* 0xff: unknown until r9-hb reports statvfs fill % */
+/* R9 (E30, D17): per-server FULL hysteresis state (g_young_high_pct declared above copy_publish). */
+static _Atomic int g_self_full;
+
+static void refresh_self_full(void)
+{
+    int cur = atomic_load_explicit(&g_self_full, memory_order_relaxed);
+    for (;;) {
+        /* Reload inside the CAS loop so a concurrent fill_pct or young_high_pct update never latches a stale sample.
+         * A 0xff (unknown / transient statvfs error) sample conservatively preserves the current FULL state. */
+        uint8_t pct = atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed);
+        uint32_t hi = atomic_load_explicit(&g_young_high_pct, memory_order_acquire);
+        if (pct == 0xff || hi < 10 || hi > 99)
+            return;
+        uint32_t lo = hi - 2;
+        int next = cur;
+        if (!cur && (uint32_t)pct >= hi)
+            next = 1;
+        else if (cur && (uint32_t)pct < lo)
+            next = 0;
+        if (next == cur)
+            return;
+        if (atomic_compare_exchange_weak_explicit(&g_self_full, &cur, next, memory_order_release,
+                                                  memory_order_relaxed)) {
+            if (next)
+                fprintf(stderr,
+                        "tsdbd: cluster: data directory fill %" PRIu8 "%% >= young_high_pct %" PRIu32
+                        "%%: server FULL (backpressure active)\n",
+                        pct, hi);
+            else
+                fprintf(stderr,
+                        "tsdbd: cluster: data directory fill %" PRIu8 "%% < %" PRIu32
+                        "%%: server FULL cleared\n",
+                        pct, lo);
+            return;
+        }
+    }
+}
 
 void cluster_set_opening(int opening) { atomic_store_explicit(&g_hb_opening, opening != 0, memory_order_relaxed); }
 void cluster_set_failstop(int failstop) { atomic_store_explicit(&g_hb_failstop, failstop != 0, memory_order_relaxed); }
-void cluster_set_fill_pct(uint8_t pct) { atomic_store_explicit(&g_hb_fill_pct, pct, memory_order_relaxed); }
+void cluster_set_fill_pct(uint8_t pct)
+{
+    atomic_store_explicit(&g_hb_fill_pct, pct, memory_order_relaxed);
+    refresh_self_full();
+}
+uint8_t cluster_get_fill_pct(void) { return atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed); }
+uint32_t cluster_young_high_pct(void) { return atomic_load_explicit(&g_young_high_pct, memory_order_acquire); }
+int cluster_self_full(void) { return atomic_load_explicit(&g_self_full, memory_order_acquire); }
 
 /* R9 (D4, r9-out): count of times automatic OUT proceeded past the mass-OUT guard bound (for metrics). */
 static _Atomic uint64_t g_out_guard_passed;
@@ -6034,7 +6090,24 @@ static void *fill_probe_main(void *arg)
 {
     char *path = arg;
     for (;;) {
-        cluster_set_fill_pct(statvfs_fill_pct(path));
+        uint8_t pct = 0xff;
+        int have_file = 0;
+#ifdef TSDB_TEST_HOOKS
+        if (C.fill_pct_file) {
+            FILE *fp = fopen(C.fillpctfile, "r");
+            if (fp) {
+                unsigned v = 0;
+                if (fscanf(fp, "%u", &v) == 1 && (v <= 100 || v == 255)) {
+                    pct = (uint8_t)v;
+                    have_file = 1;
+                }
+                fclose(fp);
+            }
+        }
+#endif
+        if (!have_file)
+            pct = C.fill_pct_override >= 0 ? (uint8_t)C.fill_pct_override : statvfs_fill_pct(path);
+        cluster_set_fill_pct(pct);
         pthread_mutex_lock(&g_fill_mu);
         if (!g_fill_stop) {
             struct timespec dl;
@@ -6043,7 +6116,15 @@ static void *fill_probe_main(void *arg)
 #else
             clock_gettime(CLOCK_REALTIME, &dl);
 #endif
-            dl.tv_sec += 1;
+            if (C.fill_pct_file) {
+                dl.tv_nsec += 100 * 1000000L;
+                if (dl.tv_nsec >= 1000000000L) {
+                    dl.tv_sec += 1;
+                    dl.tv_nsec -= 1000000000L;
+                }
+            } else {
+                dl.tv_sec += 1;
+            }
             pthread_cond_timedwait(&g_fill_cv, &g_fill_mu, &dl);
         }
         int stop = g_fill_stop;
@@ -6742,6 +6823,7 @@ static void vol_watch_duty(void)
             r->repl_retain_s = C.sm.set.repl_retain_s;
             r->idle_seal_ms = C.sm.set.idle_seal_ms;
             r->repl_retain_down_gb = C.sm.set.repl_retain_down_gb;
+            r->young_high_pct = C.sm.set.young_high_pct;
             r->rebuild_mb_s = C.sm.set.rebuild_mb_s;
             r->rebuild_max = C.sm.set.rebuild_max;
             r->transfer_wait_ms = C.sm.set.transfer_wait_ms;
@@ -8129,6 +8211,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     atomic_store(&g_users_ok, cl_mutant() == CLM_CAUGHTUPEARLY);
     atomic_store_explicit(&g_hb_failstop, 0, memory_order_relaxed);
     atomic_store_explicit(&g_hb_fill_pct, 0xff, memory_order_relaxed);
+    atomic_store_explicit(&g_young_high_pct, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_self_full, 0, memory_order_relaxed);
     if (cfg->witness)
         atomic_store_explicit(&g_hb_opening, 0, memory_order_relaxed);
     if (cfg->secret_len < CLUSTER_SECRET_MIN || cfg->secret_len > CLUSTER_SECRET_MAX) {
@@ -8185,6 +8269,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.hbfailstopfile, sizeof C.hbfailstopfile, "%s/hbfailstop", C.metadir);
     snprintf(C.nodeholdfile, sizeof C.nodeholdfile, "%s/nodehold", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
+    snprintf(C.fillpctfile, sizeof C.fillpctfile, "%s/fillpct", C.metadir);
     test_knobs();
     if (C.fill_pct_override >= 0)
         cluster_set_fill_pct((uint8_t)C.fill_pct_override);
@@ -8364,12 +8449,12 @@ int cluster_start(const struct cluster_cfg *cfg)
 #ifdef TSDB_TEST_HOOKS
     creport_test_init(C.metadir);
 #endif
-    if (C.dir[0] && C.fill_pct_override < 0) {
+    if ((C.dir[0] && C.fill_pct_override < 0) || C.fill_pct_file) {
         pthread_once(&g_fill_once, fill_cv_init);
         pthread_mutex_lock(&g_fill_mu);
         g_fill_stop = 0;
         pthread_mutex_unlock(&g_fill_mu);
-        char *fdir = strdup(C.dir);
+        char *fdir = strdup(C.dir[0] ? C.dir : "");
         if (fdir && pthread_create(&C.fill_th, NULL, fill_probe_main, fdir) == 0)
             C.fill_th_on = 1;
         else
@@ -8405,6 +8490,8 @@ void cluster_stop(void)
     atomic_store_explicit(&g_hb_opening, 0, memory_order_relaxed);
     atomic_store_explicit(&g_hb_failstop, 0, memory_order_relaxed);
     atomic_store_explicit(&g_hb_fill_pct, 0xff, memory_order_relaxed);
+    atomic_store_explicit(&g_young_high_pct, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_self_full, 0, memory_order_relaxed);
     if (C.copy_hold)
         pthread_join(C.copy_hold_th, NULL);
     if (C.copy_probe)

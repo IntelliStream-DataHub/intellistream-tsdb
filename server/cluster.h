@@ -302,6 +302,7 @@ struct cluster_vol_rec {
     uint8_t no_owner; /* no ISR member is up in the group's view: UNAVAILABLE(NO_OWNER), not MOVED to a dead leader */
     uint32_t repl_retain_mb, repl_retain_s, idle_seal_ms; /* the settings (meta.h) */
     uint32_t repl_retain_down_gb; /* R9 E29: per-server WAL retention budget for DOWN/held members, GB (meta.h) */
+    uint32_t young_high_pct;      /* R9 E30: data dir fill % at which a member enters FULL (meta.h) */
     uint32_t rebuild_mb_s, rebuild_max, transfer_wait_ms, leader_balance_s; /* R4's settings (meta.h, D16) */
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
@@ -422,6 +423,11 @@ void cluster_set_chunk_stores(uint32_t n);
 void cluster_set_opening(int opening);
 void cluster_set_failstop(int failstop);
 void cluster_set_fill_pct(uint8_t pct);
+/* R9 (E30, D17): lock-free getters for this server's data-dir fill %, cluster young_high_pct, and FULL hysteresis
+ * state (enters at fill_pct >= young_high_pct, clears only at fill_pct < young_high_pct - 2). Any thread. */
+uint8_t cluster_get_fill_pct(void);
+uint32_t cluster_young_high_pct(void);
+int cluster_self_full(void);
 /* R9 (D5): before tsdbd exits 1 on fail-stop, ask the cluster thread to send one last heartbeat with failstop=1 to the
  * Raft leader it knows and wait at most timeout_ms (capped at 100 ms). Safe no-op when the cluster thread is not
  * running. */
