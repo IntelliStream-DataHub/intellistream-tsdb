@@ -55,5 +55,8 @@ void cvolset_delete_bg(const char *path);
 /* the manager, on its first push after the start and after a committed removal: every v<N> of root that names a
  * volume the metadata copy holds without this server is set aside as removed (as cvolset_close does) */
 void cvolset_sweep(const char *root);
+/* R9 (D6): log one clear line naming a v<N>.fault-<rid> evidence directory at most once per process (called from both
+ * cvolset_sweep and cvolset_prepare so a directory is never logged twice). */
+void cvolset_log_fault_once(uint32_t number, const char *path);
 
 #endif

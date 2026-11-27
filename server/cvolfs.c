@@ -226,7 +226,7 @@ int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_o
          * damage, and so is one with no valid slot (replfile_load says so too) */
         say("volume %" PRIu32 ": %s/REPL %s: the volume is not opened", r->number, vdir,
             lr == TSDB_ERR_NOTFOUND ? "is missing" : lr == TSDB_ERR_CORRUPT ? "has no valid slot" : "cannot be read");
-        return -1;
+        return lr == TSDB_ERR_CORRUPT ? TSDB_ERR_CORRUPT : -1;
     }
     int rc = -1;
     uint64_t draw = 0;

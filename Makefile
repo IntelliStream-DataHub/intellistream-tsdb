@@ -653,7 +653,7 @@ CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail re
     fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
     snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
     reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
-CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs opening failgasp faultreason addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
     volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
@@ -1058,7 +1058,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants margin-mutants lease-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants margin-mutants lease-mutants hb-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1253,6 +1253,10 @@ rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(SCRATCH)
+# r9-hb: fail-stop last-gasp and promotion-guard mutants (nogasp, failstoppromo) must fail test_cluster failgasp
+hb-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(CRASHFS_SO)
+	$(MUT) --name hb --list "nogasp failstoppromo" -- env CRASHFS_SO=$(B)/libcrashfs.so TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ failgasp
 # r8f + r8n: the chunk peer's planted bugs in tsdbd (server/chunkpeer.c TSDB_CHUNKPEER_MUTANT), each must fail
 # test_cluster ecbasic or ecslow (nosumcmp and delbeforegc in test_chunkpeer: MK_GC now handles cluster deletes)
 chunkpeer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb

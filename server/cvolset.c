@@ -43,7 +43,30 @@ static struct {
         uint64_t rid; /* RESET: the record's new rid */
     } n[NOTES];
     unsigned nn;
+    char *fault_logged[128]; /* R9 (D6): v<N>.fault-<rid> paths already logged in this process */
+    unsigned nfault_logged;
 } N = {.mu = PTHREAD_MUTEX_INITIALIZER};
+
+void cvolset_log_fault_once(uint32_t number, const char *path)
+{
+    int say_it = 0;
+    pthread_mutex_lock(&N.mu);
+    unsigned i = 0;
+    while (i < N.nfault_logged && strcmp(N.fault_logged[i], path) != 0)
+        i++;
+    if (i == N.nfault_logged) {
+        say_it = 1;
+        if (N.nfault_logged < sizeof N.fault_logged / sizeof N.fault_logged[0]) {
+            char *dup = strdup(path);
+            if (dup)
+                N.fault_logged[N.nfault_logged++] = dup;
+        }
+    }
+    pthread_mutex_unlock(&N.mu);
+    if (say_it)
+        say("volume %" PRIu32 ": faulted replica directory %s left as evidence (never opened, never deleted "
+            "automatically)", number, path);
+}
 
 void cvolset_note(uint32_t number, int kind, uint64_t rid)
 {
@@ -171,6 +194,23 @@ int cvolset_prepare(const char *root, uint32_t number, const struct cvolfs_rec *
 {
     char vdir[4200], to[4300];
     snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, number);
+    /* R9 (D6): recognize v<N>.fault-<rid> set aside for a faulted replica: never opened, never deleted automatically,
+     * one clear log line naming the path. */
+    {
+        char pref[32];
+        int plen = snprintf(pref, sizeof pref, "v%" PRIu32 ".fault-", number);
+        DIR *d = opendir(root);
+        if (d) {
+            for (struct dirent *e; (e = readdir(d)) != NULL;) {
+                if (plen > 0 && strncmp(e->d_name, pref, (size_t)plen) == 0) {
+                    char fp[4400];
+                    snprintf(fp, sizeof fp, "%s/%s", root, e->d_name);
+                    cvolset_log_fault_once(number, fp);
+                }
+            }
+            closedir(d);
+        }
+    }
     uint64_t want = 0;
     int reset = cvolset_noted(number, CVS_RESET, &want, 0) && want == r->rid;
     struct stat sb;

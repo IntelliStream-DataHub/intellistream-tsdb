@@ -18638,6 +18638,437 @@ static void scen_r9stubs(void)
     printf("  cluster healthy after r9stubs: 3 nodes up, created volume r9health (#%" PRIu32 ")\n", vnum);
 }
 
+/* opening (r9-hb; D5, D17): HBS_NODE reports opening=1 from cluster thread start until every startup volume finishes
+ * its first open (TSDB_CLUSTER_TEST slow_open_ms=5000 holds the first open for 5 s), then clears to 0 and does NOT
+ * return to 1 when a new volume is added later; fill_pct reports real statvfs (0..100) and obeys fill_pct=N override. */
+static void scen_opening(void)
+{
+    scenario("opening");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "3 voters up before opening");
+    /* Verify real statvfs fill_pct is reported (0..100) and opening cleared to 0 with 0 startup volumes. */
+    uint64_t t0 = now_ms();
+    int settled_ok = 0;
+    while (!settled_ok && now_ms() - t0 < 10000) {
+        struct view vw;
+        view(0, &vw);
+        int ok = 1;
+        for (int i = 0; i < 3; i++) {
+            const struct cluster_heard *h = NULL;
+            for (uint32_t k = 0; k < vw.st.nheard; k++)
+                if (vw.st.heard[k].id == ids[i])
+                    h = &vw.st.heard[k];
+            if (!h || h->opening != 0 || h->fill_pct > 100)
+                ok = 0;
+        }
+        view_free(&vw);
+        if (ok)
+            settled_ok = 1;
+        else
+            usleep(100000);
+    }
+    if (!settled_ok)
+        die("servers with 0 startup volumes did not report opening=0 and valid fill_pct <= 100");
+    uint32_t v1 = 0;
+    int rc = vol_add(0, "op1", 3, &v1);
+    if (rc != 0 || v1 == 0)
+        die("vol_add op1: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "op1", i, 1, 0);
+    /* Restart server 1 with slow_open_ms=5000 and fill_pct=73: beats must say opening=1 until the 5 s open ends. */
+    stop(1, SIGTERM);
+    envs[1] = "slow_open_ms=5000,fill_pct=73";
+    start(1);
+    t0 = now_ms();
+    uint64_t seen_open_ms = 0, cleared_ms = 0;
+    int saw_opening = 0, saw_fill = 0;
+    while (now_ms() - t0 < 20000) {
+        struct view vw;
+        view(0, &vw);
+        const struct cluster_heard *h = NULL;
+        for (uint32_t k = 0; k < vw.st.nheard; k++)
+            if (vw.st.heard[k].id == ids[1])
+                h = &vw.st.heard[k];
+        if (h && h->incarnation >= 2) {
+            if (h->fill_pct == 73)
+                saw_fill = 1;
+            if (h->opening == 1) {
+                if (!saw_opening) {
+                    saw_opening = 1;
+                    seen_open_ms = now_ms();
+                }
+            } else if (saw_opening) {
+                cleared_ms = now_ms();
+                view_free(&vw);
+                break;
+            }
+        }
+        view_free(&vw);
+        usleep(100000);
+    }
+    if (!saw_opening)
+        die("leader never observed opening=1 from server 1 during slow_open_ms=5000 restart");
+    if (!cleared_ms)
+        die("server 1 never cleared opening back to 0 after slow_open_ms=5000");
+    if (cleared_ms - seen_open_ms < 3000)
+        die("server 1 cleared opening too early (%" PRIu64 " ms < 3000 ms for slow_open_ms=5000)",
+            cleared_ms - seen_open_ms);
+    if (!saw_fill)
+        die("leader never observed fill_pct=73 override from server 1");
+    /* A volume added AFTER startup must NOT set opening=1 again (even while delayed by slow_open_ms=5000). */
+    uint32_t v2 = 0;
+    if ((rc = vol_add(0, "op2", 3, &v2)) != 0 || v2 == 0)
+        die("vol_add op2: %s", cluster_strerror(rc));
+    char open_line[128];
+    snprintf(open_line, sizeof open_line, "volume %" PRIu32 " (op2): open as", v2);
+    t0 = now_ms();
+    while (!log_has(1, open_line) && now_ms() - t0 < 20000) {
+        struct view vw;
+        view(0, &vw);
+        for (uint32_t k = 0; k < vw.st.nheard; k++)
+            if (vw.st.heard[k].id == ids[1] && vw.st.heard[k].opening != 0)
+                die("server 1 set opening=1 again when volume op2 was added after startup");
+        view_free(&vw);
+        usleep(100000);
+    }
+    if (!log_has(1, open_line))
+        die("server 1 did not finish opening op2 within 20 s");
+    printf("  opening=1 held for %" PRIu64 " ms during slow_open_ms=5000, cleared to 0, stayed 0 on later vol_add; "
+           "fill_pct=73 verified\n",
+           cleared_ms - seen_open_ms);
+    stop_all();
+}
+
+/* failgasp (r9-hb; D5): a fail-stop sends one last failstop=1 beat (<= 100 ms) before exiting 1; the Raft leader
+ * records META_DOWN with META_DOWN_FAILSTOP within one beat (well below node_timeout_ms=20000). Tests both the
+ * cluster-thread fail-stop path (real crashfs EIO on Raft log fdatasync on server 1, skipped under ASan) and the
+ * tsdbd failwatch_main exit-1 path (injected root EIO via fail_root_file=1 on server 2), plus restart recovery back
+ * to META_UP. With mutant `nogasp` (TSDB_CLUSTER_MUTANT=nogasp or TSDB_CLUSTER_TEST=nogasp=1), no last beat is sent
+ * and the leader does not mark the node down/failstop in time, failing the test. */
+static void scen_failgasp(void)
+{
+    scenario("failgasp");
+    const char *so = NULL;
+    const char *skip = crashfs_skip(&so);
+    const char *ct = getenv("TSDB_CLUSTER_TEST");
+    int nogasp = ct && strstr(ct, "nogasp=1");
+    static char pe1[PATH_MAX * 3 + 256];
+    char dir1[PATH_MAX + 80], state1[PATH_MAX + 96], mark1[PATH_MAX + 80];
+    server_dir(1, dir1, sizeof dir1);
+    snprintf(state1, sizeof state1, "%s/state", dir1);
+    snprintf(mark1, sizeof mark1, "%s/eio-n1", base);
+    if (!skip) {
+        if ((mkdir(dir1, 0755) != 0 && errno != EEXIST) || (mkdir(state1, 0700) != 0 && errno != EEXIST))
+            die("mkdir %s: %s", state1, strerror(errno));
+        snprintf(pe1, sizeof pe1,
+                 "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_MODE=eio CRASHFS_EIO_ON=fdatasync CRASHFS_MARK=%s", so, state1,
+                 mark1);
+        penv[1] = pe1;
+    }
+    if (nogasp)
+        envs[1] = "nogasp=1";
+    envs[2] = nogasp ? "fail_root_file=1,nogasp=1" : "fail_root_file=1";
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_node_timeout_ms = 20000;
+    init_cluster(0, 600);
+    init_node_timeout_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "3 voters up before failgasp");
+    await_view(1, p_names_leader, &ids[0], "server 1 knows leader 0");
+    await_view(2, p_names_leader, &ids[0], "server 2 knows leader 0");
+
+    /* Part 1: real crashfs EIO on server 1's Raft log fdatasync -> cluster.c fail_stop() -> exit 1. */
+    if (!skip) {
+        signal_child(pids[1], SIGUSR2);
+        uint32_t vnum = 0;
+        int rc = vol_add(0, "fgvol", 3, &vnum);
+        if (rc != 0 || vnum == 0)
+            die("vol_add fgvol during EIO test: %s", cluster_strerror(rc));
+        uint64_t t_eio = now_ms();
+        int st = await_exit(1, 5000);
+        if (st != 1)
+            die("server 1 exited with %d on state-dir EIO, expected 1 (fail-stop)", st);
+        int got_fs = 0;
+        uint64_t t_down = 0;
+        uint8_t seen_state = META_UP, seen_reason = META_DOWN_NONE;
+        while (now_ms() - t_eio < 4000) {
+            struct view vw;
+            view(0, &vw);
+            const struct meta_member *m = meta_member(&vw.m, ids[1]);
+            if (m) {
+                seen_state = m->state;
+                seen_reason = m->down_reason;
+                if (m->state == META_DOWN && m->down_reason == META_DOWN_FAILSTOP && m->down_since_ms > 0) {
+                    got_fs = 1;
+                    t_down = now_ms();
+                    view_free(&vw);
+                    break;
+                }
+            }
+            view_free(&vw);
+            usleep(50000);
+        }
+        if (!got_fs)
+            die("leader 0 did not record server 1 DOWN/failstop within 4 s of state-dir EIO (state=%s reason=%s)",
+                meta_member_state_name(seen_state), meta_down_reason_name(seen_reason));
+        printf("  state-dir EIO fail-stop on server 1 recorded DOWN/failstop on leader in %" PRIu64
+               " ms (node_timeout 20000 ms)\n",
+               t_down - t_eio);
+        /* Restart server 1 (without EIO preload) and verify it comes back UP with down_reason NONE. */
+        penv[1] = NULL;
+        start(1);
+        struct state_want w1 = {ids[1], META_UP, 2};
+        await_view(0, p_member_state, &w1, "server 1 back UP after restart");
+        struct view vw;
+        view(0, &vw);
+        const struct meta_member *m1 = meta_member(&vw.m, ids[1]);
+        if (!m1 || m1->down_reason != META_DOWN_NONE || m1->down_since_ms != 0)
+            die("restarted server 1 still carries down_reason/down_since_ms");
+        view_free(&vw);
+    }
+
+    /* Part 2: tsdbd.c failwatch_main path -> cluster_failstop_beat(100) -> exit 1 on server 2.
+     * Also verify the promo_step lease guard: a volume led by server 2 is NOT promoted to epoch+1 before
+     * promote_safe_ns (lease_ms=2000) even though server 2 is marked DOWN/failstop immediately (mutant failstoppromo). */
+    struct meta_volume fgmv;
+    if (!vol_rec(0, "fgvol", &fgmv)) {
+        uint32_t vnum = 0;
+        int rc = vol_add(0, "fgvol", 3, &vnum);
+        if (rc != 0 || vnum == 0)
+            die("vol_add fgvol before part 2: %s", cluster_strerror(rc));
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, "fgvol", i, 1, 0);
+        if (!vol_rec(0, "fgvol", &fgmv))
+            die("no record of fgvol before part 2");
+    }
+    await_isr(0, "fgvol", 3, 30000, "all 3 replicas in ISR of fgvol before part 2");
+    if (fgmv.leader != ids[2]) {
+        uint8_t tbody[8];
+        size_t tblen = cluster_volume_force_encode(fgmv.number, ids[2], tbody);
+        uint8_t *treply = NULL;
+        size_t trlen = 0;
+        int trc = admin(0, CLUSTER_OP_VOLUME_TRANSFER, tbody, tblen, 1, &treply, &trlen);
+        free(treply);
+        if (trc != 0)
+            die("VOLUME_TRANSFER fgvol to node %" PRIu32 ": %s", ids[2], cluster_strerror(trc));
+        uint64_t tw = now_ms();
+        while (now_ms() - tw < 15000) {
+            if (vol_rec(0, "fgvol", &fgmv) && fgmv.leader == ids[2])
+                break;
+            usleep(50000);
+        }
+        if (fgmv.leader != ids[2])
+            die("fgvol did not transfer to server 2");
+    }
+    await_isr(0, "fgvol", 3, 30000, "all 3 replicas in ISR of fgvol under server 2");
+    /* Let server 2 receive a fresh lease-granting HB_ACK (heartbeat_ms=200, lease_ms=2000) right before fail-stop. */
+    usleep(300000);
+    uint64_t e0 = fgmv.epoch;
+    char dir2[PATH_MAX + 80], froot[PATH_MAX + 96];
+    server_dir(2, dir2, sizeof dir2);
+    snprintf(froot, sizeof froot, "%s/failroot", dir2);
+    FILE *ff = fopen(froot, "w");
+    if (!ff || fclose(ff) != 0)
+        die("create %s: %s", froot, strerror(errno));
+    uint64_t t_root = now_ms();
+    int got_fs2 = 0, got_promo = 0;
+    uint64_t t_down2 = 0, t_promo = 0;
+    uint8_t seen_state2 = META_UP, seen_reason2 = META_DOWN_NONE;
+    while (!(got_fs2 && got_promo) && now_ms() - t_root < 15000) {
+        struct view vw;
+        view(0, &vw);
+        const struct meta_member *m = meta_member(&vw.m, ids[2]);
+        if (m) {
+            seen_state2 = m->state;
+            seen_reason2 = m->down_reason;
+            if (!got_fs2 && m->state == META_DOWN && m->down_reason == META_DOWN_FAILSTOP && m->down_since_ms > 0) {
+                got_fs2 = 1;
+                t_down2 = now_ms();
+            }
+        }
+        const struct meta_volume *v = meta_volume(&vw.m, fgmv.number);
+        if (!got_promo && v && v->epoch > e0) {
+            got_promo = 1;
+            t_promo = now_ms();
+        }
+        view_free(&vw);
+        if (!(got_fs2 && got_promo))
+            usleep(50000);
+    }
+    int st2 = await_exit(2, 5000);
+    if (st2 != 1)
+        die("server 2 exited with %d on root EIO, expected 1 (fail-stop)", st2);
+    if (!got_fs2 || t_down2 - t_root >= 4000)
+        die("leader 0 did not record server 2 DOWN/failstop within 4 s of root EIO (state=%s reason=%s)",
+            meta_member_state_name(seen_state2), meta_down_reason_name(seen_reason2));
+    if (!got_promo)
+        die("fgvol was not promoted away from fail-stopped server 2 within 15 s");
+    if (t_promo - t_root < 1400)
+        die("fgvol promoted too early after failstop beat (%" PRIu64 " ms < 1400 ms; lease_ms 2000 ms)",
+            t_promo - t_root);
+    printf("  root EIO fail-stop on server 2 recorded DOWN/failstop in %" PRIu64
+           " ms (node_timeout 20000 ms); fgvol promoted safely after %" PRIu64 " ms\n",
+           t_down2 - t_root, t_promo - t_root);
+    stop_all();
+}
+
+/* Find the first live *.part file inside vdir (directly or in a partition subdir) and return 1 with its path in out. */
+static int find_part_file(const char *vdir, char *out, size_t cap)
+{
+    DIR *d = opendir(vdir);
+    if (!d)
+        return 0;
+    int found = 0;
+    for (struct dirent *e; !found && (e = readdir(d)) != NULL;) {
+        size_t nl = strlen(e->d_name);
+        if (nl > 5 && strcmp(e->d_name + nl - 5, ".part") == 0 && strncmp(e->d_name, "tmp_", 4) != 0 &&
+            strncmp(e->d_name, "stage_", 6) != 0 && strncmp(e->d_name, "retired_", 8) != 0) {
+            snprintf(out, cap, "%s/%s", vdir, e->d_name);
+            found = 1;
+            break;
+        }
+        if (strncmp(e->d_name, "p_", 2) != 0)
+            continue;
+        char pdir[PATH_MAX * 2];
+        snprintf(pdir, sizeof pdir, "%s/%s", vdir, e->d_name);
+        DIR *pd = opendir(pdir);
+        if (!pd)
+            continue;
+        for (struct dirent *pe; !found && (pe = readdir(pd)) != NULL;) {
+            size_t pnl = strlen(pe->d_name);
+            if (pnl > 5 && strcmp(pe->d_name + pnl - 5, ".part") == 0 && strncmp(pe->d_name, "tmp_", 4) != 0 &&
+                strncmp(pe->d_name, "stage_", 6) != 0 && strncmp(pe->d_name, "retired_", 8) != 0) {
+                snprintf(out, cap, "%s/%s", pdir, pe->d_name);
+                found = 1;
+            }
+        }
+        closedir(pd);
+    }
+    closedir(d);
+    return found;
+}
+
+/* faultreason (r9-hb; D6): a replica with a damaged .part file fails its open with TSDB_ERR_CORRUPT and is reported
+ * LOCAL_FAULT with fault_reason=CL_FAULT_CORRUPT_OPEN (corrupt-open); a replica with missing REPL is reported
+ * LOCAL_FAULT with CL_FAULT_REFUSED; and a v<N>.fault-<rid> directory is logged and left untouched at startup sweep. */
+static void scen_faultreason(void)
+{
+    scenario("faultreason");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "3 voters up before faultreason");
+    uint32_t v1 = 0, v2 = 0;
+    int rc;
+    if ((rc = vol_add(0, "fr1", 3, &v1)) != 0 || v1 == 0)
+        die("vol_add fr1: %s", cluster_strerror(rc));
+    if ((rc = vol_add(0, "fr2", 3, &v2)) != 0 || v2 == 0)
+        die("vol_add fr2: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++) {
+        await_open_gen(0, "fr1", i, 1, 0);
+        await_open_gen(0, "fr2", i, 1, 0);
+    }
+    struct meta_volume mv;
+    if (!vol_rec(0, "fr1", &mv))
+        die("no record of fr1");
+    int L = server_of(mv.leader);
+    if (L < 0 || L > 2)
+        die("leader of fr1 is %u", mv.leader);
+    tsdbc *c = client(L);
+    tsdb_sid sid = rep_series(c, rep_names[0], "fr1", 30000);
+    for (int k = 0; k < 50; k++) {
+        int64_t ts = 1000000 + 1000LL * k;
+        float val = (float)k;
+        if ((rc = tsdbc_insert_series(c, sid, &ts, &val, 1)) != 0)
+            die("write %d to fr1: %s", k, ers(rc));
+    }
+    if ((rc = tsdbc_flush(c)) != 0)
+        die("flush fr1 on leader: %s", ers(rc));
+    tsdbc_close(c);
+    await_isr(0, "fr1", 3, 30000, "all 3 replicas in ISR for fr1");
+    stop(L, SIGTERM);
+    /* Corrupt a .part file of v1 on L (flip its footer bytes so eng_open_replica returns TSDB_ERR_CORRUPT). */
+    char v1dir[PATH_MAX + 128], pfile[PATH_MAX * 2 + 256];
+    snprintf(v1dir, sizeof v1dir, "%s/n%d/v%" PRIu32, base, L, v1);
+    if (!find_part_file(v1dir, pfile, sizeof pfile))
+        die("no .part file found under %s after clean stop", v1dir);
+    {
+        int fd = open(pfile, O_RDWR);
+        struct stat sb;
+        if (fd < 0 || fstat(fd, &sb) != 0 || sb.st_size < 64)
+            die("cannot open/stat part %s", pfile);
+        uint8_t junk[64];
+        if (pread(fd, junk, sizeof junk, sb.st_size - 64) != 64)
+            die("pread part footer %s", pfile);
+        for (size_t k = 0; k < sizeof junk; k++)
+            junk[k] ^= 0xa5;
+        if (pwrite(fd, junk, sizeof junk, sb.st_size - 64) != 64 || fsync(fd) != 0)
+            die("corrupt part footer %s", pfile);
+        close(fd);
+    }
+    /* Remove v2/REPL on L so v2 is refused (CL_FAULT_REFUSED), and drop a v99.fault-<rid> evidence dir. */
+    char r2path[PATH_MAX + 128], fdir[PATH_MAX + 128], fmark[PATH_MAX + 160];
+    snprintf(r2path, sizeof r2path, "%s/n%d/v%" PRIu32 "/REPL", base, L, v2);
+    if (unlink(r2path) != 0)
+        die("unlink %s: %s", r2path, strerror(errno));
+    snprintf(fdir, sizeof fdir, "%s/n%d/v99.fault-0123456789abcdef", base, L);
+    if (mkdir(fdir, 0755) != 0)
+        die("mkdir %s: %s", fdir, strerror(errno));
+    snprintf(fmark, sizeof fmark, "%s/keep", fdir);
+    FILE *fm = fopen(fmark, "w");
+    if (!fm || fputs("evidence\n", fm) < 0 || fclose(fm) != 0)
+        die("write %s", fmark);
+    /* Restart L and inspect the Raft leader's STATUS view. */
+    start(L);
+    int via = (L + 1) % 3;
+    uint64_t t0 = now_ms();
+    int got_corrupt = 0, got_refused = 0;
+    while (!(got_corrupt && got_refused) && now_ms() - t0 < 20000) {
+        struct view vw;
+        view(via, &vw);
+        int lead = vw.st.leader ? server_of(vw.st.leader) : via;
+        if (lead >= 0 && lead != L && lead != via) {
+            view_free(&vw);
+            view(lead, &vw);
+        }
+        for (uint32_t k = 0; k < vw.st.nheard; k++) {
+            if (vw.st.heard[k].id != ids[L])
+                continue;
+            for (uint32_t j = 0; j < vw.st.heard[k].nvols; j++) {
+                const struct cluster_vol_report *vr = &vw.st.heard[k].vols[j].v;
+                if (vr->volume == v1 && vr->health == CL_HEALTH_LOCAL_FAULT &&
+                    vr->fault_reason == CL_FAULT_CORRUPT_OPEN)
+                    got_corrupt = 1;
+                if (vr->volume == v2 && vr->health == CL_HEALTH_LOCAL_FAULT && vr->fault_reason == CL_FAULT_REFUSED)
+                    got_refused = 1;
+            }
+        }
+        view_free(&vw);
+        if (!(got_corrupt && got_refused))
+            usleep(100000);
+    }
+    if (!got_corrupt)
+        die("leader did not observe LOCAL_FAULT corrupt-open for damaged part on server %d (vol %" PRIu32 ")", L, v1);
+    if (!got_refused)
+        die("leader did not observe LOCAL_FAULT refused for missing REPL on server %d (vol %" PRIu32 ")", L, v2);
+    if (log_count(L, "v99.fault-0123456789abcdef") != 1 || access(fmark, F_OK) != 0)
+        die("v99.fault-0123456789abcdef was not logged exactly once or was deleted automatically");
+    printf("  damaged part reported LOCAL_FAULT corrupt-open, missing REPL reported refused, v99.fault-<rid> logged "
+           "and preserved\n");
+    stop_all();
+}
+
 /* volcmd (r4-iface): the plumbing R4's tracks build on, before any of them sends. The Raft leader (server 0, hook
  * TSDB_CLUSTER_TEST volcmd_file=1) sends each VOLCMD kind to server 1 (the F_VOLCMD frame) and to itself (the
  * self-delivery of cl_volcmd_send); each server's driver routes it (IN_CMD: TRANSFER and CANCEL to rtransfer.c,
@@ -21697,11 +22128,9 @@ static void scen_outfailstop(void)
 
     pout_touch(target, "hbfailstop", "1\n");
     uint64_t t_fs = now_ms();
-    /* Lease safety: before lease_ms (~2000 ms) runs out, target must stay META_UP and fsvol must NOT promote. */
+    /* Lease safety: before lease_ms (~2000 ms) runs out, fsvol must NOT promote (even though DOWN/failstop records
+     * within one beat via r9-hb, promo_step holds promotion until promote_safe_ns expires). */
     while (now_ms() - t_fs < 1200) {
-        if (member_state_of(0, ids[target], NULL, NULL) != META_UP)
-            die("outfailstop: node %" PRIu32 " marked DOWN before read lease expired (at %" PRIu64 " ms)", ids[target],
-                now_ms() - t_fs);
         if (vol_rec(0, "fsvol", &v) && v.epoch != ep0)
             die("outfailstop: fsvol promoted from epoch %" PRIu64 " to %" PRIu64 " before lease expired (at %" PRIu64
                 " ms)",
@@ -22360,7 +22789,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"snapmove", scen_snapmove}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"opening", scen_opening}, {"failgasp", scen_failgasp}, {"faultreason", scen_faultreason}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast},

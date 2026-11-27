@@ -529,6 +529,17 @@ void cluster_status_free(struct cluster_status *st)
     st->heard = NULL;
 }
 
+const char *cluster_fault_reason_name(uint8_t r)
+{
+    switch (r) {
+    case CL_FAULT_NONE: return "none";
+    case CL_FAULT_FAILSTOP: return "failstop";
+    case CL_FAULT_CORRUPT_OPEN: return "corrupt-open";
+    case CL_FAULT_REFUSED: return "refused";
+    default: return "?";
+    }
+}
+
 int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status *st)
 {
     struct rd r = {body, len, 0, 0};
@@ -555,6 +566,9 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         h->flags = get8(&r);
         h->core_dropped = get8(&r);
         h->read_barrier = get8(&r);
+        h->opening = get8(&r);
+        h->failstop = get8(&r);
+        h->fill_pct = get8(&r);
         h->state_free = get64(&r);
         h->nvols = get32(&r);
         if (r.bad || h->nvols > CLUSTER_REPORT_VOLS)
@@ -567,6 +581,7 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
             v->volume = get32(&r);
             v->role = get8(&r);
             v->health = get8(&r);
+            v->fault_reason = get8(&r);
             v->epoch = get64(&r);
             getstr(&r, v->domain, sizeof v->domain);
             v->series_len = get64(&r);
@@ -1035,7 +1050,7 @@ struct dres {
     raft_config cfg;
 };
 static struct {
-    char dir[1024], metadir[1040], logdir[1060], nodefile[1060], snapfile[1060], identfile[1060], pendfile[1060];
+    char dir[4096], metadir[1040], logdir[1060], nodefile[1060], snapfile[1060], identfile[1060], pendfile[1060];
     char copyfile[1060], retiredfile[1060];
     uint64_t pend_index; /* the install image kept in pendfile (keep_install), 0 for none */
     char adv[META_ADDR_MAX], padv[META_ADDR_MAX], rack[META_RACK_MAX], feed[META_FEED_MAX], bmc[META_BMC_MAX];
@@ -1230,12 +1245,69 @@ static struct {
     pthread_t copy_hold_th;
     int fail_file;       /* TSDB_CLUSTER_TEST fail_sync_file=1: a sync fails with EIO while <state-dir>/failsync exists */
     char failfile[1100];
+    int fill_pct_override; /* TSDB_CLUSTER_TEST fill_pct=N (-1: real statvfs) */
+    int nogasp;            /* TSDB_CLUSTER_TEST nogasp=1: planted mutant skipping fail-stop last-gasp beat */
+    pthread_t fill_th;     /* dedicated background thread polling statvfs(C.dir) once/s (off cluster loop) */
+    int fill_th_on;
+    atomic_int gasp_req;   /* 1 when cluster_failstop_beat asked for an immediate failstop beat */
+    int gasp_done;         /* protected by g_gasp_mu */
+    int in_failstop;       /* cluster thread is sending its last-gasp beat inside fail_stop() */
+    uint64_t gasp_wait_ns, gasp_wait_deadline;
+    uint32_t gasp_wait_lead;
 
     struct buf fb; /* the frame being built; never held across a call that builds another */
     raft_entry ents[RAFT_WIRE_MAX_ENTRIES];
 } C;
 
+static pthread_mutex_t g_gasp_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_gasp_cv;
+static pthread_once_t g_gasp_once = PTHREAD_ONCE_INIT;
+static int g_gasp_running;
+
+static pthread_mutex_t g_fill_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_fill_cv;
+static pthread_once_t g_fill_once = PTHREAD_ONCE_INIT;
+static int g_fill_stop;
+
+static void fill_cv_init(void)
+{
+#ifndef __APPLE__
+    pthread_condattr_t a;
+    pthread_condattr_init(&a);
+    pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+    pthread_cond_init(&g_fill_cv, &a);
+    pthread_condattr_destroy(&a);
+#else
+    pthread_cond_init(&g_fill_cv, NULL);
+#endif
+}
+
+static void gasp_cv_init(void)
+{
+#ifndef __APPLE__
+    pthread_condattr_t a;
+    pthread_condattr_init(&a);
+    pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+    pthread_cond_init(&g_gasp_cv, &a);
+    pthread_condattr_destroy(&a);
+#else
+    pthread_cond_init(&g_gasp_cv, NULL);
+#endif
+}
+
+static void gasp_finish(void)
+{
+    C.gasp_wait_ns = 0;
+    C.gasp_wait_deadline = 0;
+    C.gasp_wait_lead = 0;
+    pthread_mutex_lock(&g_gasp_mu);
+    C.gasp_done = 1;
+    pthread_cond_broadcast(&g_gasp_cv);
+    pthread_mutex_unlock(&g_gasp_mu);
+}
+
 static uint8_t my_flags(void);
+static void fail_stop_gasp(void);
 static void fail_stop(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn));
 static void fail_stop(const char *fmt, ...)
 {
@@ -1245,6 +1317,7 @@ static void fail_stop(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     fputs(": stopping (fail-stop)\n", stderr);
     va_end(ap);
+    fail_stop_gasp();
     _exit(1);
 }
 
@@ -1426,6 +1499,7 @@ static void test_knobs(void)
     C.ring_max = RING_BYTES;
     C.free_min = FREE_MIN_DEFAULT;
     C.stall_ns = SYNC_STALL_NS;
+    C.fill_pct_override = -1;
 #ifdef TSDB_TEST_HOOKS
     const char *t = getenv("TSDB_CLUSTER_TEST");
     for (const char *p = t; p && *p;) {
@@ -1521,6 +1595,10 @@ static void test_knobs(void)
             C.copy_hold = (unsigned)v;
         else if (sscanf(p, "copy_noleader=%llu", &v) == 1)
             C.copy_noleader = (unsigned)v;
+        else if (sscanf(p, "fill_pct=%llu", &v) == 1 && (v <= 100 || v == 255))
+            C.fill_pct_override = (int)v;
+        else if (sscanf(p, "nogasp=%llu", &v) == 1)
+            C.nogasp = v != 0;
         p = strchr(p, ',');
         if (p)
             p++;
@@ -1821,7 +1899,9 @@ enum cl_mutant {
     CLM_BOOTEMPTY = 35,    /* core_boot drops the state the member served: STATUS shows an empty image until the core
                             * catches up (test_cluster userpromote) */
     CLM_COPYNODEADLINE = 36, /* cluster_copy_caught_up ignores the deadline of the floor it heard (a stalled loop) */
-    CLM_COPYNOFLOOR = 37     /* cluster_copy_caught_up does not compare the published copy with the floor */
+    CLM_COPYNOFLOOR = 37,    /* cluster_copy_caught_up does not compare the published copy with the floor */
+    CLM_NOGASP = 38,         /* cluster_failstop_beat skips sending the fail-stop last-gasp heartbeat (test_cluster failgasp) */
+    CLM_FAILSTOPPROMO = 39   /* promo_step skips promote_safe_ns for a META_DOWN_FAILSTOP old leader (test_cluster failgasp) */
 };
 static int cl_mutant(void)
 {
@@ -1868,6 +1948,8 @@ static int cl_mutant(void)
             : !strcmp(e, "bootempty")     ? CLM_BOOTEMPTY
             : !strcmp(e, "copynodeadline") ? CLM_COPYNODEADLINE
             : !strcmp(e, "copynofloor")   ? CLM_COPYNOFLOOR
+            : !strcmp(e, "nogasp")        ? CLM_NOGASP
+            : !strcmp(e, "failstoppromo") ? CLM_FAILSTOPPROMO
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -2703,6 +2785,11 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                     if (h->vols[j].v.volume == v->volume && h->vols[j].fault_ns &&
                         !strcmp(h->vols[j].v.domain, v->domain))
                         nv[i].fault_ns = h->vols[j].fault_ns;
+            }
+            /* R9 (D6): optional trailing array of n fault_reason bytes (backward-compatible with older senders). */
+            if (!s.bad && s.off < s.len) {
+                for (uint32_t i = 0; i < n; i++)
+                    nv[i].v.fault_reason = get8(&s);
             }
             if (s.bad) {
                 free(nv);
@@ -3845,8 +3932,8 @@ static void on_hb(struct conn *c, struct rd *r)
     }
     /* the lease (§7.1): only the Raft leader grants, and only while its own lease from the core holds (check-quorum:
      * no other Raft leader can exist before it ends), so an answer is never given after a new Raft leader began its
-     * wait of one lease */
-    uint64_t until = h->send_ns && !h->failstop && !promo_holds_lease(node) ? core_lease_until(now) : 0;
+     * wait of one lease. A server sending a fail-stop last-gasp beat (D5) is exiting and gets no lease. */
+    uint64_t until = !h->failstop && h->send_ns && !promo_holds_lease(node) ? core_lease_until(now) : 0;
     int granted = until != 0;
     if (granted && until != UINT64_MAX && now >= until) /* only the mutants can: test_cluster lease looks for it */
         say("BUG: grants node %" PRIu32 " a lease %" PRIu64 " ms past the end of its own (term %" PRIu64 ")", node,
@@ -3875,6 +3962,8 @@ static void on_hb_ack(struct conn *c, struct rd *r)
     uint32_t lease_ms = get32(r), drift = get32(r);
     if (r->bad)
         return;
+    if (C.gasp_wait_ns && echo == C.gasp_wait_ns && (!C.gasp_wait_lead || c->id == C.gasp_wait_lead))
+        gasp_finish();
     /* the lease: from the Raft leader itself, about a heartbeat this server sent (its own clock, echoed), and never
      * from a leader of a term older than one this server heard of (a deposed leader answering heartbeats it had
      * queued while it was stopped) */
@@ -3882,8 +3971,10 @@ static void on_hb_ack(struct conn *c, struct rd *r)
     uint64_t known = C.r && raft_get_term(C.r) > C.hint_term ? raft_get_term(C.r) : C.hint_term;
     if (term < known)
         return;
+    int failstopping = atomic_load_explicit(&g_hb_failstop, memory_order_relaxed) != 0;
     int from_leader = granted && leader && leader == c->id;
-    if ((from_leader || (cl_mutant() == CLM_LEASEANYVOTER && c->id)) && echo && echo <= now && drift < 1000000)
+    if (!failstopping && (from_leader || (cl_mutant() == CLM_LEASEANYVOTER && c->id)) && echo && echo <= now &&
+        drift < 1000000)
         lease_extend(cluster_lease_end(echo, lease_ms, drift));
     if (term > C.hint_term || leader)
         C.hint_leader = leader;
@@ -3895,7 +3986,7 @@ static void on_hb_ack(struct conn *c, struct rd *r)
         C.users_floor = commit;
     /* the same leader's commit index, the latest one, good while the lease of this beat holds (from its send time):
      * cluster_copy_caught_up */
-    if (from_leader && commit && echo && echo <= now && drift < 1000000) {
+    if (!failstopping && from_leader && commit && echo && echo <= now && drift < 1000000) {
         uint64_t end = cluster_lease_end(echo, lease_ms, drift), cap = echo + 2000000000ull;
         copy_floor_note(commit, end < cap ? end : cap);
     }
@@ -4083,6 +4174,9 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
     put8(b, h && h->have_flags ? h->flags : 0);
     put8(b, h ? h->core_dropped : 0);
     put8(b, h ? h->read_barrier : 0);
+    put8(b, h ? h->opening : 0);
+    put8(b, h ? h->failstop : 0);
+    put8(b, h ? h->fill_pct : 0xff);
     put64(b, h && h->have_flags ? h->state_free : 0);
     put32(b, h ? h->nvols : 0);
     for (uint32_t i = 0; h && i < h->nvols; i++) {
@@ -4090,6 +4184,7 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
         put32(b, v->volume);
         put8(b, v->role);
         put8(b, v->health);
+        put8(b, v->fault_reason);
         put64(b, v->epoch);
         putstr(b, v->domain);
         put64(b, v->series_len);
@@ -5657,6 +5752,8 @@ static void on_frame(struct conn *c, uint8_t type, const uint8_t *p, size_t n)
         handshake(c, type, &r);
         return;
     }
+    if (C.in_failstop && type != F_HB_ACK)
+        return;
     switch (type) {
     case F_RAFT: on_raft(c, &r); break;
     case F_HB: on_hb(c, &r); break;
@@ -5738,11 +5835,14 @@ static void conn_read(struct conn *c)
                 c->dead = 1;
                 break;
             }
+            /* Advance rb.off before on_frame so a noreturn fail_stop() -> fail_stop_gasp() polling this connection
+             * never re-parses the in-flight frame with an already-incremented seq_in. */
+            c->rb.off += 4 + (size_t)n;
             on_frame(c, f[0], f + 1, n - 1 - TAG);
         } else {
+            c->rb.off += 4 + (size_t)n;
             on_frame(c, f[0], f + 1, n - 1);
         }
-        c->rb.off += 4 + (size_t)n;
         if (c->handoff) {
             conn_handoff(c);
             break;
@@ -5806,6 +5906,52 @@ static uint64_t state_free_bytes(void)
     if (statvfs(C.metadir, &sv) != 0)
         return UINT64_MAX;
     return (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
+}
+
+/* R9 (D17): data directory filesystem used percentage (0..100, or 0xff on error / no data_dir). Runs on its own
+ * background thread (fill_probe_main) once per second so a hung NFS mount in shared mode never blocks the cluster
+ * loop (Raft, heartbeats, leases) or the serving loop; overridden by TSDB_CLUSTER_TEST fill_pct=N in tests. */
+static uint8_t statvfs_fill_pct(const char *path)
+{
+    if (!path || !path[0])
+        return 0xff;
+    struct statvfs sv;
+    if (statvfs(path, &sv) != 0 || sv.f_blocks == 0)
+        return 0xff;
+    uint64_t total = (uint64_t)sv.f_blocks;
+    uint64_t bfree = (uint64_t)sv.f_bfree;
+    uint64_t bavail = (uint64_t)sv.f_bavail;
+    uint64_t used = bfree <= total ? total - bfree : 0;
+    uint64_t denom = used + bavail;
+    if (denom == 0)
+        return 100;
+    uint64_t pct = (uint64_t)(((__uint128_t)used * 100u) / denom);
+    return (uint8_t)(pct > 100 ? 100 : pct);
+}
+
+static void *fill_probe_main(void *arg)
+{
+    char *path = arg;
+    for (;;) {
+        cluster_set_fill_pct(statvfs_fill_pct(path));
+        pthread_mutex_lock(&g_fill_mu);
+        if (!g_fill_stop) {
+            struct timespec dl;
+#ifndef __APPLE__
+            clock_gettime(CLOCK_MONOTONIC, &dl);
+#else
+            clock_gettime(CLOCK_REALTIME, &dl);
+#endif
+            dl.tv_sec += 1;
+            pthread_cond_timedwait(&g_fill_cv, &g_fill_mu, &dl);
+        }
+        int stop = g_fill_stop;
+        pthread_mutex_unlock(&g_fill_mu);
+        if (stop)
+            break;
+    }
+    free(path);
+    return NULL;
 }
 
 /* this server's flags (item 6): a witness holds no volumes; a node whose state directory is nearly full, whose core
@@ -5872,6 +6018,9 @@ static void put_sections(struct buf *b, uint64_t now)
         put64(b, v->open_gen);
         put64(b, v->open_nonce);
     }
+    /* R9 (D6): trailing per-volume fault_reason byte (ignored by older parsers, read by new ones). */
+    for (uint32_t i = 0; i < rep.nvols; i++)
+        put8(b, rep.vols[i].fault_reason);
     sec_end(b, at);
     at = sec_begin(b, HBS_DOMAINS);
     put32(b, rep.ndoms);
@@ -5931,7 +6080,7 @@ static void put_sections(struct buf *b, uint64_t now)
 
 static void heartbeat(uint64_t now)
 {
-    if (!C.have_node)
+    if (!C.have_node || atomic_load_explicit(&g_hb_failstop, memory_order_relaxed))
         return;
     users_push();
     raft_config cfg;
@@ -5982,6 +6131,166 @@ static void heartbeat(uint64_t now)
         conn_send(c, 0);
 }
 
+/* R9 (D5): send one last heartbeat with failstop=1 to the Raft leader this server knows (and voters) before exit 1,
+ * flushing the socket immediately so the leader records META_DOWN / META_DOWN_FAILSTOP within one beat. */
+static void send_failstop_beat(uint64_t now)
+{
+    if (!C.have_node) {
+        gasp_finish();
+        return;
+    }
+    raft_config cfg;
+    int have_cfg = 0;
+    if (C.r) {
+        cfg = *raft_get_config(C.r);
+        have_cfg = 1;
+    } else if (config_of(&C.sm, &cfg)) {
+        have_cfg = 1;
+    }
+    heard_set(C.id, now, C.incarnation, C.sm.applied, C.adv, C.padv);
+    frame_begin(&C.fb, F_HB);
+    put32(&C.fb, C.id);
+    put64(&C.fb, C.incarnation);
+    put64(&C.fb, C.sm.applied);
+    putstr(&C.fb, C.adv);
+    putstr(&C.fb, C.padv);
+    put_sections(&C.fb, now);
+    {
+        struct rd me = {C.fb.p + 4 + 1, C.fb.len - 4 - 1, 0, 0};
+        (void)get32(&me), (void)get64(&me), (void)get64(&me);
+        char skip[META_ADDR_MAX];
+        getstr(&me, skip, sizeof skip);
+        getstr(&me, skip, sizeof skip);
+        heard_sections(heard_get(C.id), &me, now);
+    }
+    frame_end(&C.fb);
+    uint32_t lead = C.r ? (uint32_t)raft_get_leader(C.r) : C.hint_leader;
+    uint32_t lead_rem = lead;
+    int sent = 0;
+    for (unsigned i = 0; have_cfg && i < cfg.n; i++) {
+        if (cfg.m[i].id == lead_rem)
+            lead_rem = 0;
+        if (cfg.m[i].learner || cfg.m[i].id == C.id)
+            continue;
+        struct conn *c = conn_to(cfg.m[i].id);
+        if (c) {
+            conn_send(c, 0);
+            if (!c->dead && c->state == CS_READY && c->wb.len > c->wb.off)
+                conn_write(c);
+            sent = 1;
+        }
+    }
+    if (lead_rem && lead_rem != C.id) {
+        struct conn *c = conn_to(lead_rem);
+        if (c) {
+            conn_send(c, 0);
+            if (!c->dead && c->state == CS_READY && c->wb.len > c->wb.off)
+                conn_write(c);
+            sent = 1;
+        }
+    }
+    if (!sent) {
+        gasp_finish();
+        return;
+    }
+    C.gasp_wait_ns = now;
+    C.gasp_wait_lead = (lead && lead != C.id) ? lead : 0;
+    C.gasp_wait_deadline = now + 100 * MS;
+}
+
+/* Inline fail-stop last-gasp beat for cluster-thread fail_stop() exits (e.g. Raft log sync EIO): bounded at 100 ms. */
+static void fail_stop_gasp(void)
+{
+    pthread_mutex_lock(&g_gasp_mu);
+    int run = g_gasp_running;
+    pthread_mutex_unlock(&g_gasp_mu);
+    if (C.in_failstop || !run || !C.have_node || C.nogasp || cl_mutant() == CLM_NOGASP)
+        return;
+    C.in_failstop = 1;
+    atomic_store_explicit(&g_lease_ns, 0, memory_order_release);
+    cluster_set_failstop(1);
+    uint64_t now = iso_now_ns();
+    send_failstop_beat(now);
+    if (!C.gasp_wait_ns)
+        return;
+    struct pollfd pf[64];
+    struct conn *cs[64];
+    while (C.gasp_wait_ns) {
+        now = iso_now_ns();
+        if (now >= C.gasp_wait_deadline)
+            break;
+        size_t nf = 0;
+        for (size_t i = 0; i < C.nconns && nf < 64; i++) {
+            struct conn *c = C.conns[i];
+            if (c->dead || c->fd < 0)
+                continue;
+            short ev = POLLIN;
+            if (c->state == CS_CONNECTING || c->wb.len > c->wb.off)
+                ev |= POLLOUT;
+            pf[nf] = (struct pollfd){c->fd, ev, 0};
+            cs[nf++] = c;
+        }
+        if (!nf)
+            break;
+        int rem = (int)((C.gasp_wait_deadline - now) / MS + 1);
+        int rc = poll(pf, nf, rem > 100 ? 100 : rem);
+        if (rc <= 0)
+            break;
+        for (size_t i = 0; i < nf; i++) {
+            struct conn *c = cs[i];
+            short re = pf[i].revents;
+            if (!re || c->dead)
+                continue;
+            if (c->state == CS_CONNECTING && (re & (POLLOUT | POLLERR | POLLHUP))) {
+                int err = 0;
+                socklen_t el = sizeof err;
+                if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) {
+                    c->dead = 1;
+                    continue;
+                }
+                send_hello(c);
+            }
+            if (re & (POLLIN | POLLHUP | POLLERR))
+                conn_read(c);
+            if (!c->dead && c->state != CS_CONNECTING && c->wb.len > c->wb.off)
+                conn_write(c);
+        }
+    }
+}
+
+void cluster_failstop_beat(unsigned timeout_ms)
+{
+    pthread_once(&g_gasp_once, gasp_cv_init);
+    pthread_mutex_lock(&g_gasp_mu);
+    if (!g_gasp_running || C.nogasp || cl_mutant() == CLM_NOGASP) {
+        pthread_mutex_unlock(&g_gasp_mu);
+        return;
+    }
+    if (!timeout_ms || timeout_ms > 100)
+        timeout_ms = 100;
+    /* Clear our read lease at once before telling the leader we are fail-stopping. */
+    atomic_store_explicit(&g_lease_ns, 0, memory_order_release);
+    cluster_set_failstop(1);
+    C.gasp_done = 0;
+    atomic_store_explicit(&C.gasp_req, 1, memory_order_release);
+    ssize_t w = write(C.stop_pipe[1], "g", 1);
+    (void)w;
+    struct timespec dl;
+#ifndef __APPLE__
+    clock_gettime(CLOCK_MONOTONIC, &dl);
+#else
+    clock_gettime(CLOCK_REALTIME, &dl);
+#endif
+    uint64_t ns = (uint64_t)dl.tv_nsec + (uint64_t)timeout_ms * 1000000ull;
+    dl.tv_sec += (time_t)(ns / 1000000000ull);
+    dl.tv_nsec = (long)(ns % 1000000000ull);
+    while (g_gasp_running && !C.gasp_done) {
+        if (pthread_cond_timedwait(&g_gasp_cv, &g_gasp_mu, &dl) == ETIMEDOUT)
+            break;
+    }
+    pthread_mutex_unlock(&g_gasp_mu);
+}
+
 /* MEMBER_ADDR when `h` names other addresses than the record (h NULL: none), then MEMBER_STATE when state >= 0.
  * When state == META_DOWN and keep_since_ms > 0 (recording a restarting opening member's new incarnation while
  * keeping it DOWN), down_since_ms is preserved so opening_hold_s stays bounded from the original DOWN time. */
@@ -6007,7 +6316,7 @@ static void propose_member_r(uint32_t id, int state, uint64_t inc, uint8_t down_
                 wms = 1;
             uint64_t since_ms = keep_since_ms ? keep_since_ms : wms;
             uint64_t op_clk = wms >= since_ms ? wms : since_ms;
-            meta_op_member_state(&e, id, state, inc, down_reason, since_ms, op_clk);
+            meta_op_member_state(&e, id, state, inc, down_reason ? down_reason : META_DOWN_TIMEOUT, since_ms, op_clk);
         } else {
             meta_op_member_state(&e, id, state, inc, META_DOWN_NONE, 0, 0);
         }
@@ -6015,14 +6324,14 @@ static void propose_member_r(uint32_t id, int state, uint64_t inc, uint8_t down_
     if (propose(&e, 0, 0, id) == ISO_OK) {
         if (h)
             say("proposes node %" PRIu32 " at %s, peer %s (incarnation %" PRIu64 ")", id, addr, peer, inc);
-        if (state >= 0)
-            say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", id, meta_member_state_name(state), inc);
+        if (state >= 0) {
+            if (state == META_DOWN)
+                say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ", %s)", id, meta_member_state_name(state),
+                    inc, meta_down_reason_name(down_reason ? down_reason : META_DOWN_TIMEOUT));
+            else
+                say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", id, meta_member_state_name(state), inc);
+        }
     }
-}
-
-static void propose_member(uint32_t id, int state, uint64_t inc, struct heard *h, uint64_t now)
-{
-    propose_member_r(id, state, inc, META_DOWN_TIMEOUT, 0, h, now);
 }
 
 /* The earliest time (this server's clock) at which a promotion away from server `id` is safe: one lease with the drift
@@ -6056,8 +6365,8 @@ static void member_states(uint64_t now)
     uint64_t to = (uint64_t)s->node_timeout_ms * MS;
     /* A new leader does not know when the others last heard from anyone, nor the leases given before: it proposes
      * nothing but a member it hears itself coming back (DOWN, or a new incarnation: a restart, whose volumes open
-     * only once the group holds that incarnation) until the wait is over. A restarted volume leader resigns only
-     * then, and its restart often is what made this server the Raft leader (test_cluster resign). */
+     * only once the group holds that incarnation) or a fresh fail-stop beat until the wait is over. A restarted volume
+     * leader resigns only then, and its restart often is what made this server the Raft leader (test_cluster resign). */
     int settled = leader_settled(now);
     if (!settled && cl_mutant() == CLM_UPWAITS)
         return;
@@ -6078,9 +6387,10 @@ static void member_states(uint64_t now)
         int st = m->state;
         uint64_t keep_since = m->down_since_ms;
         uint8_t keep_reason = m->down_reason ? m->down_reason : META_DOWN_TIMEOUT;
+        int fs = id != C.id && fresh && h && h->failstop && inc >= minc;
         /* a member that came back elsewhere (with --port 0, or on another host) is recorded there, or nobody
          * reaches it: only addresses its own heartbeat carried, of the run the record is about or a later one */
-        struct heard *moved = fresh && h && inc >= minc && h->peer[0] && h->addr[0] &&
+        struct heard *moved = fresh && !fs && h && inc >= minc && h->peer[0] && h->addr[0] &&
                                       (strcmp(h->peer, m->peer) != 0 || strcmp(h->addr, m->addr) != 0) &&
                                       (!h->moved_ns || since(now, h->moved_ns) >= to)
                                   ? h
@@ -6089,7 +6399,7 @@ static void member_states(uint64_t now)
             /* OUT is reversible (D2): a returning server with a new incarnation comes back UP immediately so its
              * vol_watch_duty sees the new incarnation and opens its volumes. */
             if (alive && inc > minc)
-                propose_member(id, META_UP, inc, moved, now);
+                propose_member_r(id, META_UP, inc, META_DOWN_NONE, 0, moved, now);
             continue;
         }
         /* A DOWN member that restarted while still opening gets its new incarnation recorded immediately (still
@@ -6098,21 +6408,22 @@ static void member_states(uint64_t now)
         int down_opening_inc = st == META_DOWN && alive && is_opening && inc > minc;
         int comes_back = alive && inc >= minc &&
                          ((st == META_DOWN && !is_opening) || (st == META_UP && inc > minc));
-        if (!settled && !comes_back && !down_opening_inc)
+        if (!settled && !comes_back && !down_opening_inc && !fs)
             continue;
         if (down_opening_inc)
             propose_member_r(id, META_DOWN, inc, keep_reason, keep_since, moved, now);
-        else if (st == META_UP && is_failstop && fresh && lease_safe)
-            propose_member_r(id, META_DOWN, minc, META_DOWN_FAILSTOP, 0, NULL, now);
-        else if (st == META_DOWN && m->down_reason != META_DOWN_FAILSTOP && is_failstop)
-            propose_member_r(id, META_DOWN, minc, META_DOWN_FAILSTOP, keep_since, NULL, now);
+        else if (fs && (st == META_UP || (st == META_DOWN && (m->down_reason != META_DOWN_FAILSTOP || inc > minc))))
+            /* R9 (D5): a fresh failstop=1 last-gasp beat marks the member DOWN/failstop immediately; promo_step
+             * continues to hold volume promotions until promote_safe_ns(id) expires. */
+            propose_member_r(id, META_DOWN, inc, META_DOWN_FAILSTOP, st == META_DOWN && inc == minc ? keep_since : 0,
+                             NULL, now);
         else if (st == META_UP && !fresh && lease_safe)
             propose_member_r(id, META_DOWN, minc, is_failstop ? META_DOWN_FAILSTOP : META_DOWN_TIMEOUT, 0, NULL, now);
         else if (comes_back)
-            propose_member(id, META_UP, inc, moved, now);
+            propose_member_r(id, META_UP, inc, META_DOWN_NONE, 0, moved, now);
         else if (moved)
-            propose_member(id, -1, inc, moved, now);
-        else if (fresh && h && h->have_flags && inc >= minc && h->flags != m->flags &&
+            propose_member_r(id, -1, inc, META_DOWN_NONE, 0, moved, now);
+        else if (fresh && !fs && h && h->have_flags && inc >= minc && h->flags != m->flags &&
                  (!h->flags_ns || since(now, h->flags_ns) >= to)) {
             /* the flags its heartbeat reports differ from the record (item 6): voter_ok lost to a full disk or a
              * dropped core, volumes_ok back after a repair; the record is what the placement reads */
@@ -6551,10 +6862,12 @@ static void propose_isr(uint64_t now)
 /* ------------------------------------------------------------------ promotion (design-cluster.md 6.2, r3e-failover)
  *
  * The Raft leader keeps, in memory, one promotion per replicated volume whose leader is gone: the record leader DOWN
- * (UNHEARD: member_states marks it so only after promote_safe_ns, so its lease has run out), its heartbeat reporting
- * the volume LOCAL_FAULT (FENCED, D13: the driver stopped it and the volume answers UNAVAILABLE, never a read), or
- * its RESIGN of the record's epoch (RESIGNED: a restarted leader never resumes, `led` in REPL). It sends FENCE(v, e+1)
- * to every ISR member (resent every PROMO_RESEND_NS until it answers; this server's own through the handler), and
+ * (UNHEARD: member_states marks timeout-DOWN only after promote_safe_ns so its lease has run out; a META_DOWN_FAILSTOP
+ * member is marked DOWN immediately on its last-gasp beat and waits for promote_safe_ns in promo_step), its heartbeat
+ * reporting the volume LOCAL_FAULT (FENCED, D13: the driver stopped it and the volume answers UNAVAILABLE, never a
+ * read), or its RESIGN of the record's epoch (RESIGNED: a restarted leader never resumes, `led` in REPL). It sends
+ * FENCE(v, e+1) to every ISR member (resent every PROMO_RESEND_NS until it answers; this server's own through the
+ * handler), and
  * proposes VOLUME_LEADER on the basis (epoch, ISR version) once every member it hears has answered, or after
  * PROMO_WAIT_NS with one answer at least. A live old leader (RESIGNED) is not passed by until it answered (its core is
  * deposed by the fence) or its lease ran out (promote_safe_ns): until then on_hb grants it no lease. The promotion
@@ -6800,6 +7113,12 @@ static void on_fence(struct conn *c, struct rd *r)
     }
     if (C.drop_fence && access(C.dropfencefile, F_OK) == 0)
         return;
+    if (atomic_load_explicit(&g_hb_failstop, memory_order_relaxed))
+        return; /* fail-stopping server is exiting and must not write a fence to disk */
+#ifdef TSDB_TEST_HOOKS
+    if (C.hb_failstop_file && exists(C.hbfailstopfile))
+        return;
+#endif
     if (g_fence_fn)
         g_fence_fn(g_fence_arg, vol, fence, c->id);
 }
@@ -6927,7 +7246,10 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
             old_ok = 1;
     }
     const struct meta_member *om = meta_member(&C.sm, p->old);
-    if (!old_ok && (!om || om->state != META_UP || now >= promote_safe_ns(p->old) || cl_mutant() == CLM_OLDPASS))
+    int fs_down = om && ((om->state == META_DOWN && om->down_reason == META_DOWN_FAILSTOP) || om->state == META_OUT) &&
+                  cl_mutant() != CLM_FAILSTOPPROMO;
+    if (!old_ok && (!om || (om->state != META_UP && !fs_down) || now >= promote_safe_ns(p->old) ||
+                    cl_mutant() == CLM_OLDPASS))
         old_ok = 1;
     if (!nrep) {
         if (!p->said && since(now, p->t0) >= PROMO_WAIT_NS && p->reason != META_GR_PLANNED) {
@@ -7269,6 +7591,11 @@ static void place_duty(uint64_t now)
                 pf[nf].whole = h->fills[j].whole;
                 nf++;
             }
+        } else if (id == C.id) {
+            pm[i].opening = (uint8_t)(atomic_load_explicit(&g_hb_opening, memory_order_relaxed) != 0);
+            pm[i].failstop = (uint8_t)(atomic_load_explicit(&g_hb_failstop, memory_order_relaxed) != 0);
+            pm[i].fill_pct = atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed);
+            pm[i].chunk_stores = atomic_load_explicit(&g_chunk_stores, memory_order_relaxed);
         }
     }
     struct place_in in = {
@@ -7562,6 +7889,10 @@ static void *cluster_main(void *arg)
         if (C.sm.applied != C.uw_seen &&
             (C.push_every_apply || atomic_load_explicit(&g_uw_want, memory_order_relaxed) > C.uw_at))
             users_push();
+        if (atomic_exchange_explicit(&C.gasp_req, 0, memory_order_acq_rel))
+            send_failstop_beat(now);
+        if (C.gasp_wait_ns && now >= C.gasp_wait_deadline)
+            gasp_finish();
         if (now >= C.next_hb || (now >= C.next_duty && atomic_exchange(&g_beat_soon, 0))) {
             uint32_t hb = settings()->heartbeat_ms;
             C.next_hb = now + (uint64_t)(hb < 10 ? 10 : hb) * MS;
@@ -7613,9 +7944,19 @@ static void *cluster_main(void *arg)
             if (d != UINT64_MAX)
                 timeout = d <= now ? 0 : (d - now) / MS + 1 < 50 ? (int)((d - now) / MS + 1) : 50;
         }
+        if (C.gasp_wait_ns) {
+            int rem = C.gasp_wait_deadline <= now ? 0 : (int)((C.gasp_wait_deadline - now) / MS + 1);
+            if (rem < timeout)
+                timeout = rem;
+        }
         int rc = poll(pf, n0 + 3, timeout);
         if (rc < 0 && errno != EINTR)
             fail_stop("poll: %s", strerror(errno));
+        if (rc > 0 && (pf[1].revents & POLLIN)) {
+            char drain[32];
+            while (read(C.stop_pipe[0], drain, sizeof drain) > 0)
+                ;
+        }
         if (rc > 0 && (pf[0].revents & POLLIN)) {
             for (int k = 0; k < 64 && C.nconns < MAX_CONNS; k++) {
                 int fd = accept4(C.lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -7665,6 +8006,7 @@ static void *cluster_main(void *arg)
         }
         C.nconns = k;
     }
+    gasp_finish();
     copy_flush(iso_now_ns(), 1);
     free(pf);
     return NULL;
@@ -7677,6 +8019,10 @@ int cluster_start(const struct cluster_cfg *cfg)
     open_sent_rot = 0;
     open_sent_term = 0;
     atomic_store(&g_users_ok, cl_mutant() == CLM_CAUGHTUPEARLY);
+    atomic_store_explicit(&g_hb_failstop, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_hb_fill_pct, 0xff, memory_order_relaxed);
+    if (cfg->witness)
+        atomic_store_explicit(&g_hb_opening, 0, memory_order_relaxed);
     if (cfg->secret_len < CLUSTER_SECRET_MIN || cfg->secret_len > CLUSTER_SECRET_MAX) {
         fprintf(stderr, "tsdbd: cluster: the secret must have %d to %d bytes\n", CLUSTER_SECRET_MIN,
                 CLUSTER_SECRET_MAX);
@@ -7685,11 +8031,14 @@ int cluster_start(const struct cluster_cfg *cfg)
     if (!cfg->peer_advertise || !cfg->peer_advertise[0] || strlen(cfg->peer_advertise) >= META_ADDR_MAX ||
         strlen(cfg->advertise) >= META_ADDR_MAX || strlen(cfg->rack) >= META_RACK_MAX ||
         strlen(cfg->power_feed) >= META_FEED_MAX || strlen(cfg->bmc) >= META_BMC_MAX || !cfg->state_dir ||
-        !cfg->state_dir[0] || strlen(cfg->state_dir) >= sizeof C.metadir) {
-        fprintf(stderr, "tsdbd: cluster: an address, the rack, the power feed, the BMC or the state directory is "
-                        "missing or too long\n");
+        !cfg->state_dir[0] || strlen(cfg->state_dir) >= sizeof C.metadir ||
+        (cfg->data_dir && strlen(cfg->data_dir) >= sizeof C.dir)) {
+        fprintf(stderr, "tsdbd: cluster: an address, the rack, the power feed, the BMC, the state directory or the "
+                        "data directory is missing or too long\n");
         return -1;
     }
+    if (cfg->data_dir && cfg->data_dir[0])
+        snprintf(C.dir, sizeof C.dir, "%s", cfg->data_dir);
     snprintf(C.adv, sizeof C.adv, "%s", cfg->advertise);
     snprintf(C.padv, sizeof C.padv, "%s", cfg->peer_advertise);
     snprintf(C.rack, sizeof C.rack, "%s", cfg->rack);
@@ -7729,6 +8078,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.nodeholdfile, sizeof C.nodeholdfile, "%s/nodehold", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
+    if (C.fill_pct_override >= 0)
+        cluster_set_fill_pct((uint8_t)C.fill_pct_override);
     if (C.users_probe)
         cluster_set_users_watch(users_probe_watch, NULL);
     meta_init(&C.sm);
@@ -7889,11 +8240,30 @@ int cluster_start(const struct cluster_cfg *cfg)
         fprintf(stderr, "tsdbd: cluster: cannot start the disk worker\n");
         return -1;
     }
+    pthread_once(&g_gasp_once, gasp_cv_init);
+    pthread_mutex_lock(&g_gasp_mu);
+    C.gasp_done = 0;
+    g_gasp_running = 1;
+    pthread_mutex_unlock(&g_gasp_mu);
     if (pthread_create(&C.th, NULL, cluster_main, NULL) != 0) {
+        pthread_mutex_lock(&g_gasp_mu);
+        g_gasp_running = 0;
+        pthread_mutex_unlock(&g_gasp_mu);
         fprintf(stderr, "tsdbd: cluster: cannot start its thread\n");
         return -1;
     }
     C.running = 1;
+    if (C.dir[0] && C.fill_pct_override < 0) {
+        pthread_once(&g_fill_once, fill_cv_init);
+        pthread_mutex_lock(&g_fill_mu);
+        g_fill_stop = 0;
+        pthread_mutex_unlock(&g_fill_mu);
+        char *fdir = strdup(C.dir);
+        if (fdir && pthread_create(&C.fill_th, NULL, fill_probe_main, fdir) == 0)
+            C.fill_th_on = 1;
+        else
+            free(fdir);
+    }
     if (C.copy_hold && pthread_create(&C.copy_hold_th, NULL, cc_hold_main, (void *)(uintptr_t)C.copy_hold) != 0)
         C.copy_hold = 0;
     if (C.copy_probe && pthread_create(&C.copy_probe_th, NULL, copy_probe_main, NULL) != 0)
@@ -7905,10 +8275,25 @@ void cluster_stop(void)
 {
     if (!C.running)
         return;
+    pthread_mutex_lock(&g_gasp_mu);
+    g_gasp_running = 0;
+    pthread_cond_broadcast(&g_gasp_cv);
+    pthread_mutex_unlock(&g_gasp_mu);
     atomic_store(&C.stop, 1);
     ssize_t w = write(C.stop_pipe[1], "x", 1);
     (void)w;
     pthread_join(C.th, NULL);
+    if (C.fill_th_on) {
+        pthread_mutex_lock(&g_fill_mu);
+        g_fill_stop = 1;
+        pthread_cond_broadcast(&g_fill_cv);
+        pthread_mutex_unlock(&g_fill_mu);
+        pthread_join(C.fill_th, NULL);
+        C.fill_th_on = 0;
+    }
+    atomic_store_explicit(&g_hb_opening, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_hb_failstop, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_hb_fill_pct, 0xff, memory_order_relaxed);
     if (C.copy_hold)
         pthread_join(C.copy_hold_th, NULL);
     if (C.copy_probe)

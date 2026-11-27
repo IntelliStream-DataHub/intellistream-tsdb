@@ -94,6 +94,8 @@ enum { MV_NONE = 0, MV_WAIT, MV_OPEN, MV_REFUSED, MV_INSTALL /* cvol_install hol
 struct mvol {
     uint32_t number;
     int state;
+    uint8_t fault_reason; /* enum cluster_fault_reason when state == MV_REFUSED (R9, D6) */
+    int opened_once;      /* 1 once open_engine ran for this volume in this process */
     int writer;   /* opened as the writer */
     uint64_t rid; /* the directory's */
     uint64_t gen; /* the generation this open saved */
@@ -114,6 +116,10 @@ static struct {
     pthread_t th;
     int started, stop, dirty, active;
     int synced; /* the manager has gone through the volume records of a metadata copy once (every one declared) */
+    uint32_t init_vols[CLUSTER_REPORT_VOLS]; /* R9 (D5): volumes held at startup (first push) */
+    uint32_t ninit;
+    int init_done; /* 1 once every startup volume finished its first open (opened or refused); never cleared again */
+    unsigned slow_open_ms; /* TSDB_CLUSTER_TEST slow_open_ms=N (tests only) */
     tsdb *t;
     char dir[4096];
     _Atomic uint32_t self; /* written by the watch (under mu), read by the manager thread without it */
@@ -144,13 +150,16 @@ static struct mvol *mv_get(uint32_t number)
 /* step 1 and 2 for a record not seen yet (the disk side is cvolfs_prepare); the new state under mu */
 static void prepare(const struct cluster_vol_rec *r)
 {
-    struct mvol m = {.number = r->number, .state = MV_REFUSED, .epoch = r->epoch, .rec_rid = r->rid};
+    struct mvol m = {.number = r->number, .state = MV_REFUSED, .fault_reason = CL_FAULT_REFUSED,
+                     .epoch = r->epoch, .rec_rid = r->rid};
     pthread_mutex_lock(&M.mu);
     uint32_t self = M.self;
     int stale_first = M.stale_first;
     pthread_mutex_unlock(&M.mu);
     int rc = tsdb_cvol_declare(M.t, r->number, r->name);
     if (rc != 0) {
+        if (rc == TSDB_ERR_CORRUPT)
+            m.fault_reason = CL_FAULT_CORRUPT_OPEN;
         say("volume %" PRIu32 " (%s): cannot be declared: %s", r->number, r->name, tsdb_strerror(rc));
     } else {
         struct cvolfs_rec fr = {.number = r->number,
@@ -164,14 +173,18 @@ static void prepare(const struct cluster_vol_rec *r)
         snprintf(fr.name, sizeof fr.name, "%s", r->name);
         memcpy(fr.uuid, r->uuid, 16);
         memcpy(fr.cluster, r->cluster, 16);
-        if (cvolfs_prepare(M.dir, &fr, &o) == 0) {
+        int prc = cvolfs_prepare(M.dir, &fr, &o);
+        if (prc == 0) {
             m.rid = o.rid;
             m.gen = o.gen;
             m.nonce = o.nonce;
             m.unsure = o.unsure;
             m.state = MV_WAIT;
+            m.fault_reason = CL_FAULT_NONE;
             say("volume %" PRIu32 " (%s): open generation %" PRIu64 ", waiting for the metadata group to record it",
                 r->number, r->name, m.gen);
+        } else if (prc == TSDB_ERR_CORRUPT) {
+            m.fault_reason = CL_FAULT_CORRUPT_OPEN;
         }
     }
     int stored = 0;
@@ -195,17 +208,40 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
 {
     char vdir[4200];
     snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, M.dir, r->number);
+    pthread_mutex_lock(&M.mu);
+    int do_slow = M.slow_open_ms > 0 && !m->opened_once;
+    unsigned slow_ms = M.slow_open_ms;
+    pthread_mutex_unlock(&M.mu);
+    if (do_slow) {
+        say("volume %" PRIu32 " (%s): delaying first open by %u ms (TSDB_CLUSTER_TEST slow_open_ms)", r->number,
+            r->name, slow_ms);
+        unsigned rem = slow_ms;
+        while (rem > 0) {
+            pthread_mutex_lock(&M.mu);
+            int stp = M.stop;
+            pthread_mutex_unlock(&M.mu);
+            if (stp)
+                return;
+            unsigned step = rem > 50 ? 50 : rem;
+            struct timespec d = {0, (long)step * 1000000L};
+            nanosleep(&d, NULL);
+            rem -= step;
+        }
+    }
     int writer = r->leader == M.self && M.writes;
     /* replication (server/repld.c) opens it as a replica with REPL's floor; the record's leader promotes itself */
     int rc = chunkpeer_cluster_prepare(r->number, vdir); /* r8f: an ec volume's META asks for the peer cold ops */
     if (rc == 0)
         rc = M.writes ? tsdb_cvol_open(M.t, r->number, vdir, !writer, 0) : repld_open(r);
     pthread_mutex_lock(&M.mu);
+    m->opened_once = 1;
     if (rc == 0) {
         m->state = MV_OPEN;
+        m->fault_reason = CL_FAULT_NONE;
         m->writer = writer;
     } else {
         m->state = MV_REFUSED;
+        m->fault_reason = rc == TSDB_ERR_CORRUPT ? CL_FAULT_CORRUPT_OPEN : CL_FAULT_REFUSED;
     }
     pthread_mutex_unlock(&M.mu);
     if (rc == 0)
@@ -214,6 +250,31 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
             m->gen);
     else
         say("volume %" PRIu32 " (%s): the open of %s failed: %s", r->number, r->name, vdir, tsdb_strerror(rc));
+}
+
+/* R9 (D5): clear HBS_NODE `opening` once every startup volume (recorded on the first push) has finished its first open
+ * (opened, refused, or removed); never sets opening=1 again for volumes added later. */
+static void check_init_done(void)
+{
+    int done = 0;
+    pthread_mutex_lock(&M.mu);
+    if (M.synced && !M.init_done) {
+        done = 1;
+        for (uint32_t i = 0; i < M.ninit; i++) {
+            const struct mvol *m = mv_get(M.init_vols[i]);
+            if (m && m->state != MV_OPEN && m->state != MV_REFUSED) {
+                done = 0;
+                break;
+            }
+        }
+        if (done)
+            M.init_done = 1;
+    }
+    pthread_mutex_unlock(&M.mu);
+    if (done) {
+        cluster_set_opening(0);
+        cluster_beat_soon();
+    }
 }
 
 /* cvolset_record's CVS_AGAIN (a replica reset, or a committed removal): the manager drops what it made of the volume, so
@@ -245,6 +306,11 @@ static void *mgr_main(void *arg)
         uint32_t n = M.nrecs;
         int first = !M.synced;
         memcpy(recs, M.recs, n * sizeof recs[0]);
+        if (first) {
+            M.ninit = n;
+            for (uint32_t i = 0; i < n; i++)
+                M.init_vols[i] = recs[i].number;
+        }
         pthread_mutex_unlock(&M.mu);
         if (first && !M.writes)
             cvolset_sweep(M.dir); /* D12: a v<N> of a removal committed while this server was down is set aside */
@@ -283,7 +349,8 @@ static void *mgr_main(void *arg)
                     (r->open_gen > m->gen && M.mutant == 3) || (M.servebeforeopen && m->installed))
                     ready = 1;
                 else if (r->open_gen >= m->gen)
-                    older = 1, m->state = MV_REFUSED; /* the group holds another open at or above this one's */
+                    older = 1, m->state = MV_REFUSED,
+                    m->fault_reason = CL_FAULT_REFUSED; /* the group holds another open at or above this one's */
             }
             pthread_mutex_unlock(&M.mu);
             if (ready)
@@ -319,6 +386,9 @@ static void *mgr_main(void *arg)
         M.synced = 1;
         if (n)
             M.stale_first = 0; /* the manager has acted on a lowered push: later ones are as they are */
+        pthread_mutex_unlock(&M.mu);
+        check_init_done();
+        pthread_mutex_lock(&M.mu);
     }
     pthread_mutex_unlock(&M.mu);
     return NULL;
@@ -357,6 +427,7 @@ static void on_report(void *arg, struct cluster_report *out)
         int writer = m->writer || (m->state == MV_OPEN && tsdb_cvol_role(M.t, m->number) == CVOL_WRITER);
         v->role = m->state == MV_OPEN && writer ? CL_ROLE_OWNER : CL_ROLE_NONE;
         v->health = m->state == MV_REFUSED ? CL_HEALTH_LOCAL_FAULT : CL_HEALTH_OK;
+        v->fault_reason = m->state == MV_REFUSED ? m->fault_reason : CL_FAULT_NONE;
         v->epoch = m->epoch;
         v->rid = m->rid;
         v->open_gen = m->gen;
@@ -364,12 +435,17 @@ static void on_report(void *arg, struct cluster_report *out)
     }
     pthread_mutex_unlock(&M.mu);
     for (uint32_t i = 0; i < out->nvols; i++) { /* after M.mu: the driver's locks are never taken under it */
-        if (repld_failed(out->vols[i].volume))
+        if (repld_failed(out->vols[i].volume)) {
             out->vols[i].health = CL_HEALTH_LOCAL_FAULT; /* D13: reported in the next heartbeat (r3e-failover acts) */
+            out->vols[i].fault_reason = CL_FAULT_FAILSTOP;
+        }
         /* D8: a DIVERGED volume (its file, read by the open) is LOCAL_FAULT from the first heartbeat after the open,
          * not only once the driver's tick has stopped it: in between, a restarted replica would report OK */
-        if (!M.divergeisr && M.t && tsdb_volume_diverged(M.t, out->vols[i].volume) == 1)
+        if (!M.divergeisr && M.t && tsdb_volume_diverged(M.t, out->vols[i].volume) == 1) {
             out->vols[i].health = CL_HEALTH_LOCAL_FAULT;
+            if (out->vols[i].fault_reason == CL_FAULT_NONE)
+                out->vols[i].fault_reason = CL_FAULT_FAILSTOP;
+        }
         uint64_t pe = 0;
         int l = repld_leading(out->vols[i].volume, &pe); /* the driver's writer only while its core leads: a deposed */
         if (l >= 0)                                       /* one is no OWNER (the Raft leader's lease check) */
@@ -455,6 +531,9 @@ int cvol_start(tsdb *t, const char *dir)
     while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
         ;
     M.unreach_ms = UNREACH_MS;
+    M.ninit = 0;
+    M.init_done = 0;
+    M.slow_open_ms = 0;
 #ifdef TSDB_TEST_HOOKS
     const char *w = getenv("TSDB_CLUSTER_WRITES");
     M.writes = w && !strcmp(w, "1");
@@ -484,6 +563,11 @@ int cvol_start(tsdb *t, const char *dir)
                                                       : CVOLFS_MUT_NONE;
     const char *ct = getenv("TSDB_CLUSTER_TEST");
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");
+    if (ct) {
+        const char *so = strstr(ct, "slow_open_ms=");
+        if (so && sscanf(so, "slow_open_ms=%u", &M.slow_open_ms) == 1 && M.slow_open_ms)
+            say("TSDB_CLUSTER_TEST: delaying each volume's first open by %u ms (tests only)", M.slow_open_ms);
+    }
     const char *cv = getenv("TSDB_CVOL_TEST");
     if (cv && sscanf(cv, "unreach_ms=%u", &M.unreach_ms) == 1)
         say("TSDB_CVOL_TEST: a peer is reported unreachable after %u ms (tests only)", M.unreach_ms);
@@ -494,7 +578,10 @@ int cvol_start(tsdb *t, const char *dir)
     if (M.mutant || cvolfs_test_mutant)
         say("MUTANT %s (tests only)", mu);
 #endif
+    /* R9 (D5): opening=1 from cluster thread start until every startup volume finishes its first open */
+    cluster_set_opening(1);
     if (pthread_create(&M.th, NULL, mgr_main, NULL) != 0) {
+        cluster_set_opening(0);
         say("cannot start the volume manager thread");
         return -1;
     }

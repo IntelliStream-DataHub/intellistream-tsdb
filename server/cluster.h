@@ -18,6 +18,7 @@ struct cluster_cfg {
     const char *state_dir;      /* tsdbd's --state-dir: the cluster's files (NODE, IDENT, raft/, snapshot, copy,
                                  * retired). A local file system, never --dir (NFS in shared mode); made when
                                  * missing (its parent must exist) */
+    const char *data_dir;       /* tsdbd's --dir (NULL for a witness): data-dir filesystem fill % in HBS_NODE (D17) */
     int peer_fd;                /* bound and listening; cluster_start takes it over */
     const char *advertise;      /* the client address others reach this server at, host:port */
     const char *peer_advertise; /* the peer address, host:port */
@@ -109,14 +110,23 @@ enum cluster_mode { CLUSTER_MODE_NONE = 0, CLUSTER_MODE_CORE = 1, CLUSTER_MODE_W
  * report's epoch is then the epoch it promotes to */
 enum cluster_vol_role { CL_ROLE_NONE = 0, CL_ROLE_OWNER = 1, CL_ROLE_RELEASING = 2, CL_ROLE_PROMOTING = 3 };
 enum cluster_vol_health { CL_HEALTH_OK = 0, CL_HEALTH_LOCAL_FAULT = 1, CL_HEALTH_DOMAIN_FAULT = 2 };
+/* R9 (D6): why a volume is reported CL_HEALTH_LOCAL_FAULT in HBS_VOLUMES. */
+enum cluster_fault_reason {
+    CL_FAULT_NONE = 0,         /* healthy, or older sender without reason byte */
+    CL_FAULT_FAILSTOP = 1,     /* replication driver fail-stopped the volume on engine error or DIVERGED */
+    CL_FAULT_CORRUPT_OPEN = 2, /* volume open failed with TSDB_ERR_CORRUPT (damaged part, WAL, META or REPL) */
+    CL_FAULT_REFUSED = 3,      /* volume refused at prepare/open for another reason (missing/stale REPL, I/O) */
+};
+const char *cluster_fault_reason_name(uint8_t r);
 enum cluster_dom_state { CL_DOM_OK = 0, CL_DOM_SLOW = 1, CL_DOM_FAULT = 2 };
 #define CLUSTER_REPORT_VOLS 256
 #define CLUSTER_REPORT_DOMS 64
 
 struct cluster_vol_report { /* a volume this server owns */
     uint32_t volume;
-    uint8_t role;   /* enum cluster_vol_role */
-    uint8_t health; /* enum cluster_vol_health: why it is not well, when it is not */
+    uint8_t role;         /* enum cluster_vol_role */
+    uint8_t health;       /* enum cluster_vol_health: why it is not well, when it is not */
+    uint8_t fault_reason; /* enum cluster_fault_reason: why health == CL_HEALTH_LOCAL_FAULT (R9, D6) */
     uint64_t epoch;
     char domain[META_DOMAIN_MAX]; /* the storage domain its files live on ("" when unknown) */
     uint64_t series_len, states_len;   /* the dictionaries' lengths */
@@ -411,6 +421,10 @@ void cluster_set_chunk_stores(uint32_t n);
 void cluster_set_opening(int opening);
 void cluster_set_failstop(int failstop);
 void cluster_set_fill_pct(uint8_t pct);
+/* R9 (D5): before tsdbd exits 1 on fail-stop, ask the cluster thread to send one last heartbeat with failstop=1 to the
+ * Raft leader it knows and wait at most timeout_ms (capped at 100 ms). Safe no-op when the cluster thread is not
+ * running. */
+void cluster_failstop_beat(unsigned timeout_ms);
 /* The applied index through which the users watch has every change of the group's users (the index of the copy when
  * the watch was last given, or found to have, its users): a forwarded request's owner refuses it with UNAVAILABLE while
  * this is below the index the entry node's users were at (fwdreq.h), so a user added a moment ago is retried, never
@@ -456,7 +470,10 @@ struct cluster_heard {
     uint8_t flags;       /* enum meta_member_flags as the member reported them */
     uint8_t core_dropped;
     uint8_t read_barrier; /* 1: the node runs with the read barrier */
-    uint64_t state_free; /* free bytes of its state directory */
+    uint8_t opening;      /* R9 (D5): HBS_NODE 1 while initial startup volume opens are in progress */
+    uint8_t failstop;     /* R9 (D5): HBS_NODE 1 on a fail-stop last-gasp heartbeat */
+    uint8_t fill_pct;     /* R9 (D17): HBS_NODE data-dir fill % (0..100, or 0xff unknown) */
+    uint64_t state_free;  /* free bytes of its state directory */
     uint32_t nvols, ndoms;
     struct cluster_vol_status *vols;
     struct cluster_dom_report *doms;

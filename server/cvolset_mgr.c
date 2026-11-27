@@ -122,6 +122,10 @@ void cvolset_sweep(const char *root)
             char p[4400];
             snprintf(p, sizeof p, "%s/%s", root, e->d_name);
             cvolset_delete_bg(p);
+        } else if (!strncmp(end, ".fault-", 7)) { /* R9 (D6): faulted replica kept as evidence, never deleted */
+            char p[4400];
+            snprintf(p, sizeof p, "%s/%s", root, e->d_name);
+            cvolset_log_fault_once((uint32_t)v, p);
         }
     }
     closedir(d);

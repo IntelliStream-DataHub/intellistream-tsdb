@@ -30,9 +30,10 @@ struct cvolfs_open {
 
 /* Makes <root>/v<N> whole or not at all, if it does not exist yet; then loads its REPL, checks it against `r` (identity,
  * rid, generation, nonce: an older copy of the directory, another instance, another directory), and saves generation + 1
- * under a new random nonce (REPL's fdatasync) before returning it in *out. 0, or -1 with a line on stderr naming the
- * path: the volume is then not opened (a failed save is fail-stop for the volume: the handle is dropped, never
- * retried; a missing REPL, one with no valid slot, or an I/O error are refusals as well). */
+ * under a new random nonce (REPL's fdatasync) before returning it in *out. 0, TSDB_ERR_CORRUPT when REPL has no valid
+ * slot, or -1 for other refusals, with a line on stderr naming the path: the volume is then not opened (a failed save
+ * is fail-stop for the volume: the handle is dropped, never retried; a missing REPL, one with no valid slot, or an I/O
+ * error are refusals as well). */
 int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_open *out);
 
 /* One log line in tsdbd's "volumes" format, on stderr. */

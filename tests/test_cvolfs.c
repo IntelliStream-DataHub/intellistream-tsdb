@@ -829,6 +829,37 @@ static void test_unnamed(void)
     printf("  unnamed: a cut push says nothing past its last record\n");
 }
 
+/* R9 (D6): v<N>.fault-<rid> set aside for a faulted replica is recognized at prepare: never opened, never deleted
+ * automatically, logs one clear line naming its path, and does not block making a fresh v<N>. */
+static void test_fault_aside(void)
+{
+    char root[PATH_MAX + 32], fdir[PATH_MAX + 96], ffile[PATH_MAX + 128], log[8192];
+    fresh("fault-aside", root, sizeof root);
+    snprintf(fdir, sizeof fdir, "%s/v1.fault-0123456789abcdef", root);
+    CHECK(mkdir(fdir, 0755) == 0);
+    snprintf(ffile, sizeof ffile, "%s/evidence.txt", fdir);
+    FILE *f = fopen(ffile, "w");
+    CHECK(f && fputs("keep me\n", f) >= 0);
+    if (f)
+        fclose(f);
+    struct cvolfs_rec r = rec(1, 0, 0);
+    struct cvolfs_open o;
+    cap_begin();
+    CHECK(cvolfs_prepare(root, &r, &o) == 0);
+    cap_end(log, sizeof log);
+    CHECK(o.gen == 1 && exists(root, "v1/REPL"));
+    CHECK(exists(root, "v1.fault-0123456789abcdef") && exists(root, "v1.fault-0123456789abcdef/evidence.txt"));
+    CHECK(strstr(log, fdir) != NULL && strstr(log, "never deleted automatically") != NULL);
+    /* A second prepare of v1 must not log the same v1.fault-<rid> path a second time. */
+    r = rec(1, o.gen, o.nonce);
+    cap_begin();
+    CHECK(cvolfs_prepare(root, &r, &o) == 0);
+    cap_end(log, sizeof log);
+    CHECK(strstr(log, fdir) == NULL);
+    CHECK(exists(root, "v1.fault-0123456789abcdef/evidence.txt"));
+    printf("  fault-aside: v1.fault-<rid> logged once with path, never opened or deleted automatically\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 4 && strcmp(argv[1], "--child") == 0) {
@@ -868,6 +899,7 @@ int main(int argc, char **argv)
         test_refusals();
         test_unsure();
         test_unnamed();
+        test_fault_aside();
     } else if (cvolfs_test_mutant == CVOLFS_MUT_SAMERID) {
         test_basic();
         test_refusals();

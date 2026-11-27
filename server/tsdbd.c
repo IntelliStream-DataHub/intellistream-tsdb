@@ -6011,6 +6011,9 @@ static void *accept_main(void *arg)
 }
 
 static atomic_bool db_failed;
+#ifdef TSDB_TEST_HOOKS
+static char fail_root_path[4200]; /* TSDB_CLUSTER_TEST fail_root_file=1: <dir>/failroot triggers root fail-stop */
+#endif
 
 /* Polls tsdb_failed: a failure can come from any worker or from a background
  * thread of the library, with no request to report it. */
@@ -6019,10 +6022,18 @@ static void *failwatch_main(void *arg)
     int lfd = *(int *)arg;
     char msg[512];
     while (!stopping) {
-        if (dom_failwatch(msg, sizeof msg)) {
+        int triggered = dom_failwatch(msg, sizeof msg);
+#ifdef TSDB_TEST_HOOKS
+        if (!triggered && fail_root_path[0] && access(fail_root_path, F_OK) == 0) {
+            snprintf(msg, sizeof msg, "injected root EIO (%.400s)", fail_root_path);
+            triggered = 1;
+        }
+#endif
+        if (triggered) {
             fprintf(stderr, "tsdbd: storage failure, exiting: %s\n", msg);
             atomic_store(&db_failed, true);
             shutdown(lfd, SHUT_RDWR); /* new clients go elsewhere; ends the accept thread */
+            cluster_failstop_beat(100); /* R9 (D5): one last beat (<= 100 ms) so leader marks DOWN/failstop at once */
             struct timespec grace = {0, 200000000}; /* replies in flight (TSDB_ERR_IO for writes) go out */
             nanosleep(&grace, NULL);
             stopping = 1;
@@ -7249,6 +7260,13 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+#ifdef TSDB_TEST_HOOKS
+    {
+        const char *ct = getenv("TSDB_CLUSTER_TEST");
+        if (ct && strstr(ct, "fail_root_file=1"))
+            snprintf(fail_root_path, sizeof fail_root_path, "%s/failroot", dir);
+    }
+#endif
     if ((rc = tsdb_thread_create(&acceptor, accept_main, &lfd)) != 0 ||
         (rc = tsdb_thread_create(&failwatch, failwatch_main, &lfd)) != 0) {
         fprintf(stderr, "tsdbd: cannot start a thread: %s\n", strerror(rc));
@@ -7375,9 +7393,10 @@ int main(int argc, char **argv)
         snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
         if (peer_advertise) /* what the metadata says, not the real peer port (a proxy in front of it, a NAT) */
             snprintf(padv, sizeof padv, "%s", peer_advertise);
-        struct cluster_cfg cc = {.state_dir = state_dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
-                                 .rack = rack, .power_feed = power_feed, .bmc = bmc, .read_barrier_off = rb_off,
-                                 .secret = secret, .secret_len = secret_len, .loop_gated = 1};
+        struct cluster_cfg cc = {.state_dir = state_dir, .data_dir = dir, .peer_fd = pfd, .advertise = cadv,
+                                 .peer_advertise = padv, .rack = rack, .power_feed = power_feed, .bmc = bmc,
+                                 .read_barrier_off = rb_off, .secret = secret, .secret_len = secret_len,
+                                 .loop_gated = 1};
         if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_start() != 0 ||
             fwd_cluster_start(fwd_on_event, NULL) != 0)
             return 1;
