@@ -39,6 +39,8 @@ uint64_t cl_wall_ms(void);
 int cl_pend_member(uint32_t id);
 /* number of chunk stores currently UP on member `id` as last reported in HBS_STORES (0 if none/unknown) */
 uint32_t cl_member_chunk_stores(uint32_t id);
+/* R10 (D26, D28): last HBS_LIVE_OBJS report heard from `node` for `volume` (1 if found and copied to *out, else 0) */
+int cl_heard_live_objs(uint32_t node, uint32_t volume, struct cluster_live_objs_report *out);
 /* the answer to an admin op (conn and reqid as the op's entry point got them) */
 void cl_admin_reply(uint64_t conn, uint32_t reqid, int32_t rc, const void *body, size_t len);
 /* sends a VOLCMD to member `node` (to this server's own handler when it is this server): 0, or -1 with no connection

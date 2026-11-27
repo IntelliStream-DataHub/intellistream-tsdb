@@ -174,6 +174,17 @@ struct cluster_fill_report {
     uint64_t total;   /* objects to fill */
     uint8_t whole;    /* 1 once every object below version is held and verified */
 };
+#define CLUSTER_REPORT_LIVE_VOLS 256
+/* R10 (D26, D28): per-led-volume live EC object counts per stripe_version reported in HBS_LIVE_OBJS
+ * (skippable heartbeat section). */
+struct cluster_live_objs_report {
+    uint32_t volume;
+    uint64_t epoch;
+    uint64_t stripe_version;
+    uint8_t overflow; /* 1: leader had > META_LIVE_SV_MAX distinct nonzero stripe_versions */
+    uint32_t nsv;     /* 0..META_LIVE_SV_MAX, ascending by stripe_version */
+    struct meta_live_sv sv[META_LIVE_SV_MAX];
+};
 struct cluster_report {
     uint32_t nvols, ndoms, nunreach, nisr, nfills;
     struct cluster_vol_report vols[CLUSTER_REPORT_VOLS];
@@ -358,6 +369,9 @@ struct cluster_copy_vol {
     uint32_t stripe[META_STRIPE_MAX];
     struct meta_stripe_pos stripe_pos[META_STRIPE_MAX]; /* R9 (D9, D10): per-position WHOLE/FILLING + prev */
     uint64_t stripe_version;
+    struct meta_conv conv; /* R10 (D26): active redundancy conversion record (phase == META_CONV_NONE when idle) */
+    uint8_t mixed_redundancy, mixed_k, mixed_m; /* R10 (D29): leftover EC geometry after a cancelled REENCODE */
+    uint64_t mixed_sv_lo, mixed_sv_hi;
 };
 struct cluster_copy {
     uint64_t applied, applied_term, restore_gen;
@@ -439,6 +453,8 @@ uint32_t cluster_young_high_pct(void);
 int cluster_self_full(void);
 /* R9 (D10, D11; filled by r9-fill): HBS_FILL entries published by sfill for the heartbeat path. Any thread. */
 void cluster_set_fills(const struct cluster_fill_report *fills, uint32_t nfills);
+/* R10 (D26, D28): HBS_LIVE_OBJS entries published by volume leaders for the heartbeat path. Any thread. */
+void cluster_set_live_objs(const struct cluster_live_objs_report *live, uint32_t nlive);
 /* R9 (D5): before tsdbd exits 1 on fail-stop, ask the cluster thread to send one last heartbeat with failstop=1 to the
  * Raft leader it knows and wait at most timeout_ms (capped at 100 ms). Safe no-op when the cluster thread is not
  * running. */
@@ -507,6 +523,8 @@ struct cluster_heard {
     struct creport_vol_progress *progress_vols;
     uint32_t nprogress_stores;
     struct creport_store_progress *progress_stores;
+    uint32_t nlive_objs;
+    struct cluster_live_objs_report *live_objs;
 };
 struct cluster_status {
     uint32_t self;

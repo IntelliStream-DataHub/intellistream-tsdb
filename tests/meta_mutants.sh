@@ -25,7 +25,8 @@ shift
 # R8's erasure-coded volumes: 50 stripeuncond, 51 minisrone, 52 gcresumeany, 53 stripeatapply, 54 forcenosuspend.
 # R9's failure handling, holds, DESTROYED, stripe fill states and replace: 55 outfinal, 56 holdunbounded,
 # 57 wholeanyversion, 58 destroyedback, 59 downsinceapply, 60 replacenosnap, 61 destroyedkeepreplace.
-muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49 50 51 52 53 54 55 56 57 58 59 60 61}
+# R10's conversion record and STRIPE_SET live-object refusal: 62 stripelive, 63 convskip, 64 retireclear, 65 livestale, 66 reencskip.
+muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66}
 if [ -n "$part" ]; then
     k=${part%/*}
     n=${part#*/}
@@ -46,7 +47,9 @@ fi
 # R9's 55-59 and 61 caught in --sim-only: 55 by the simulator's OUT -> UP back-path check, 56-58 and 61 by
 # meta_check_step / check_named / check_one_op, 59 by ref_hash member divergence (60 replacenosnap is caught by
 # snapshot round-trip in unit tests and ref_hash after Raft snapshots in sim).
-SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 50 52 53 55 56 57 58 59 61 "
+# R10's 62-66 caught in --sim-only by meta_check_step and check_one_op (STRIPE_SET drop live-object check, phase order,
+# retired_ver preservation, VOLUME_LIVE_OBJS epoch guard, and REENCODE -> DROP live-object check).
+SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 50 52 53 55 56 57 58 59 61 62 63 64 65 66 "
 sim=
 for n in $muts; do
     case "$SIM_MUTANTS" in *" $n "*) sim="$sim $n" ;; esac

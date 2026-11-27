@@ -34,7 +34,7 @@ What the preview does **not** do yet. Please do not skip this list:
   every server ([Logins](#logins)).
 - **It is not for production.** The format of the metadata and the peer protocol may change in a later 0.x
   release. A build of the preview does not talk to a build from before such a change: you start the cluster again
-  with `tsdb cluster init`, you do not upgrade it. This build's metadata is version 8 and its peer protocol version 11;
+  with `tsdb cluster init`, you do not upgrade it. This build's metadata is version 9 and its peer protocol version 11;
   a server that finds a state directory or a peer of another version stops, or refuses the peer, with a line naming both
   versions. The changes of replica sets, moves and rebuilds (R4) are in those versions, so a cluster made before them
   must be made again.

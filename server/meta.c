@@ -31,25 +31,27 @@
  * (R4: set_version, a replica's `replaces`, the last grant's target and end, rebuild_mb_s, rebuild_max,
  * transfer_wait_ms, leader_balance_s); 6: erasure-coded volumes (R8: redundancy, k, m, the stripe group and its version,
  * gc_suspended, gc_gen); 7: failure handling, holds, DESTROYED, stripe fill states and R9 settings (D2-D4, D9-D10,
- * D23); 8: member `replaced_by` for `node replace OLD NEW` failover resume (r9-ops, D22). A preview cluster is
- * initialised again, not upgraded (the plan's D9): an image of another version is refused, and its reader names both
- * (meta_snapshot_version). */
+ * D23); 8: member `replaced_by` for `node replace OLD NEW` failover resume (r9-ops, D22); 9: R10 redundancy conversion
+ * record (`conv`, `conv_cancel_gen`), `retired_ver` on `stripe_pos`, and leader live-object counts per `stripe_version`
+ * (E2, §6.4, D26, D28). A preview cluster is initialised again, not upgraded (the plan's D9): an image of another
+ * version is refused, and its reader names both (meta_snapshot_version). */
 #define SNAP_VERSION META_SNAP_VERSION
 
 /* tests/test_meta.c --mutant N plants bug N (MUT(n)) in a build with -DMETA_MUTANTS; the simulator and the unit tests
  * must catch every one (a checker that catches nothing proves nothing). Without the define, MUT is 0. */
 #ifdef META_MUTANTS
-uint64_t meta_mutants;
-#define MUT(n) ((meta_mutants >> (n)) & 1)
+int meta_mutant;
+#define MUT(n) (meta_mutant == (n))
 #else
 #define MUT(n) 0
 #endif
 
-#define ENTRY_MAGIC 0x35454d54u    /* "TME5": entries of snapshot version 8 (r9-ops grew INIT/MEMBER_ADD with replaced_by) */
+#define ENTRY_MAGIC 0x36454d54u    /* "TME6": entries of snapshot version 9 (R10 conversion ops and live-object reports) */
 #define ENTRY_MAGIC_V1 0x31454d54u /* "TME1": entries of the builds of versions 1-4, refused by name */
 #define ENTRY_MAGIC_V2 0x32454d54u /* "TME2": entries of the builds of version 5, refused by name */
 #define ENTRY_MAGIC_V3 0x33454d54u /* "TME3": entries of the builds of version 6, refused by name */
 #define ENTRY_MAGIC_V4 0x34454d54u /* "TME4": entries of the builds of version 7, refused by name */
+#define ENTRY_MAGIC_V5 0x35454d54u /* "TME5": entries of the builds of version 8, refused by name */
 #define SNAP_MAGIC 0x31534d54u     /* "TMS1" */
 
 uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c */
@@ -87,6 +89,12 @@ const char *meta_stripe_state_name(int s)
 {
     static const char *n[] = {"whole", "filling"};
     return s >= 0 && s <= META_STRIPE_FILLING ? n[s] : "?";
+}
+
+const char *meta_conv_phase_name(int phase)
+{
+    static const char *n[] = {"none", "grow", "record", "reencode", "drop", "shrink"};
+    return phase >= 0 && phase <= META_CONV_LAST ? n[phase] : "?";
 }
 
 void meta_settings_default(struct meta_settings *s)
@@ -519,6 +527,22 @@ static int member_live(const struct meta_state *m, const struct meta_liveness *l
     return 1;
 }
 
+static int stripe_margin_for(const struct meta_state *m, const struct meta_volume *v,
+                             const struct meta_liveness *liveness, uint32_t k, uint32_t npos)
+{
+    uint32_t lim = npos < v->nstripe ? npos : v->nstripe;
+    if (lim > META_STRIPE_MAX)
+        lim = META_STRIPE_MAX;
+    int present = 0;
+    for (uint32_t p = 0; p < lim; p++) {
+        if (v->stripe_pos[p].state == META_STRIPE_FILLING)
+            continue; /* missing for objects below this position's set_ver */
+        if (member_live(m, liveness, v->stripe[p]))
+            present++;
+    }
+    return present - (int)k;
+}
+
 void meta_vol_margins(const struct meta_state *m, const struct meta_volume *v, const struct meta_liveness *liveness,
                       int *young, int *settled)
 {
@@ -526,18 +550,27 @@ void meta_vol_margins(const struct meta_state *m, const struct meta_volume *v, c
         *young = v->kind == META_VOL_SHARED ? 0 : (int)v->nisr - (int)v->min_isr;
     if (!settled)
         return;
-    if (v->redundancy != META_RED_EC || v->nstripe == 0) {
-        *settled = 0;
-        return;
+    int have = 0, best = 0;
+    if (v->redundancy == META_RED_EC && v->nstripe > 0) {
+        best = stripe_margin_for(m, v, liveness, v->ec_k, (uint32_t)v->ec_k + v->ec_m);
+        have = 1;
     }
-    int present = 0;
-    for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
-        if (v->stripe_pos[p].state == META_STRIPE_FILLING)
-            continue; /* missing for objects below this position's set_ver */
-        if (member_live(m, liveness, v->stripe[p]))
-            present++;
+    /* During REENCODE/DROP, old objects may still use the original EC geometry: take the minimum (D29). */
+    if ((v->conv.phase == META_CONV_REENCODE || v->conv.phase == META_CONV_DROP) &&
+        v->conv.orig_redundancy == META_RED_EC && v->nstripe >= (uint32_t)v->conv.orig_k + v->conv.orig_m) {
+        int om = stripe_margin_for(m, v, liveness, v->conv.orig_k, (uint32_t)v->conv.orig_k + v->conv.orig_m);
+        if (!have || om < best)
+            best = om;
+        have = 1;
     }
-    *settled = present - (int)v->ec_k;
+    /* After a cancelled REENCODE, leftover target-geometry EC objects keep capping settled margin until cleared (D29). */
+    if (v->mixed_redundancy == META_RED_EC && v->nstripe >= (uint32_t)v->mixed_k + v->mixed_m) {
+        int mm = stripe_margin_for(m, v, liveness, v->mixed_k, (uint32_t)v->mixed_k + v->mixed_m);
+        if (!have || mm < best)
+            best = mm;
+        have = 1;
+    }
+    *settled = have ? best : 0;
 }
 
 /* ---------------------------------------------------------------- bytes */
@@ -1271,11 +1304,63 @@ static void op_vol_only(struct meta_entry *e, uint8_t kind, uint32_t number)
 void meta_op_gc_suspend(struct meta_entry *e, uint32_t number) { op_vol_only(e, META_OP_GC_SUSPEND, number); }
 void meta_op_gc_resume(struct meta_entry *e, uint32_t number) { op_vol_only(e, META_OP_GC_RESUME, number); }
 
+void meta_op_volume_redundancy(struct meta_entry *e, uint32_t number, const struct meta_redundancy_target *target,
+                               uint64_t epoch)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_VOLUME_REDUNDANCY);
+    put32(&w, number);
+    put64(&w, epoch);
+    put8(&w, target->redundancy);
+    put8(&w, target->ec_k);
+    put8(&w, target->ec_m);
+    put32(&w, target->replicas);
+    op_end(e, st);
+}
+
+void meta_op_volume_conv_step(struct meta_entry *e, uint32_t number, uint8_t from_phase, uint8_t to_phase,
+                              const uint32_t *stripe, uint32_t nstripe)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_VOLUME_CONV_STEP);
+    put32(&w, number);
+    put8(&w, from_phase);
+    put8(&w, to_phase);
+    uint32_t ns = (stripe && nstripe <= META_STRIPE_MAX) ? nstripe : 0;
+    put32(&w, ns);
+    for (uint32_t i = 0; i < ns; i++)
+        put32(&w, stripe[i]);
+    op_end(e, st);
+}
+
+void meta_op_volume_conv_cancel(struct meta_entry *e, uint32_t number)
+{
+    op_vol_only(e, META_OP_VOLUME_CONV_CANCEL, number);
+}
+
+void meta_op_volume_live_objs(struct meta_entry *e, uint32_t number, uint64_t epoch, uint64_t stripe_version,
+                              uint8_t overflow, const struct meta_live_sv *sv, uint32_t nsv)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_VOLUME_LIVE_OBJS);
+    put32(&w, number);
+    put64(&w, epoch);
+    put64(&w, stripe_version);
+    put8(&w, overflow);
+    uint32_t n = (sv && nsv <= META_LIVE_SV_MAX) ? nsv : 0;
+    put32(&w, n);
+    for (uint32_t i = 0; i < n; i++) {
+        put64(&w, sv[i].stripe_version);
+        put64(&w, sv[i].count);
+    }
+    op_end(e, st);
+}
+
 void meta_op_volume_force(struct meta_entry *e, const struct meta_volume *v, uint32_t node)
 {
     /* the leader's log may lack markers the old ISR committed: no orphan may be judged by it until the operator says
-     * so (E14) */
-    if (v->redundancy == META_RED_EC && !MUT(54)) /* forcenosuspend */
+     * so (E14), including while retired EC positions still exist during ec -> replicas conversion or after cancel */
+    if ((v->redundancy == META_RED_EC || v->nstripe > 0) && !MUT(54)) /* forcenosuspend */
         meta_op_gc_suspend(e, v->number);
     uint32_t ids[META_REPLICAS_MAX];
     uint64_t rids[META_REPLICAS_MAX];
@@ -1529,6 +1614,52 @@ static void slot_pend_remove(struct meta_state *m, int32_t at)
 {
     memmove(&m->pend[at], &m->pend[at + 1], (m->npend - (uint32_t)at - 1) * sizeof m->pend[0]);
     m->npend--;
+}
+
+static uint32_t vol_active_nstripe(const struct meta_volume *v)
+{
+    return v->redundancy == META_RED_EC ? (uint32_t)v->ec_k + v->ec_m : 0;
+}
+
+/* 1 iff all pre-conversion EC objects (stripe_version < conv.new_stripe_version) are proven gone under the volume's
+ * current epoch by a non-overflow VOLUME_LIVE_OBJS report (§6.4 step 3, D29). Required before leaving REENCODE when
+ * orig_redundancy == META_RED_EC, including grows/reshapes that have no retired positions to drop. */
+static int reencode_done(const struct meta_volume *v)
+{
+    if (v->conv.orig_redundancy != META_RED_EC)
+        return 1;
+    if (!v->conv.new_stripe_version || v->live_epoch != v->epoch || v->live_overflow ||
+        v->live_sv_at < v->conv.new_stripe_version)
+        return 0;
+    for (uint32_t i = 0; i < v->nlive_sv && i < META_LIVE_SV_MAX; i++)
+        if (v->live_sv[i].stripe_version < v->conv.new_stripe_version && v->live_sv[i].count > 0)
+            return 0;
+    return 1;
+}
+
+static void vol_live_clear(struct meta_volume *v)
+{
+    v->live_epoch = 0;
+    v->live_sv_at = 0;
+    v->live_overflow = 0;
+    v->nlive_sv = 0;
+    memset(v->live_sv, 0, sizeof v->live_sv);
+}
+
+/* 1 if v's current-epoch live-object report proves zero live objects name any position in [from .. v->nstripe) (D28). */
+static int stripe_drop_safe(const struct meta_volume *v, uint32_t from)
+{
+    if (v->live_epoch != v->epoch || v->live_overflow)
+        return 0;
+    for (uint32_t p = from; p < v->nstripe; p++) {
+        uint64_t rv = v->stripe_pos[p].retired_ver;
+        if (!rv || v->live_sv_at < rv)
+            return 0;
+        for (uint32_t i = 0; i < v->nlive_sv; i++)
+            if (v->live_sv[i].count > 0 && v->live_sv[i].stripe_version < rv)
+                return 0;
+    }
+    return 1;
 }
 
 /* The actor guard of USER_PUT and USER_DEL (the bytes of r from `at` on; none: 0): a change a user asked for through
@@ -2003,6 +2134,8 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             if (replaces) { /* a move (D10): one per volume, of a member that is not itself moving in */
                 if (shared)
                     return META_ERR_INVALID;
+                if (v->conv.phase != META_CONV_NONE)
+                    return META_ERR_STATE; /* no concurrent move while a redundancy conversion runs (D26) */
                 int a = replica_at(v, replaces);
                 if (a < 0)
                     return META_ERR_NOTFOUND;
@@ -2028,6 +2161,14 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                 return META_ERR_INVALID; /* the ISR shrinks first: a move never lowers the in-sync copies */
             if (v->nrep <= v->min_isr)
                 return META_ERR_INVALID; /* min_isr <= replicas: a volume never asks for copies it cannot have */
+            if (v->conv.phase != META_CONV_NONE) {
+                /* §6.4 step 5: never shrink log replicas before SHRINK, and never below target_replicas during SHRINK */
+                uint32_t floor = v->conv.target_replicas;
+                if (v->conv.phase < META_CONV_SHRINK && v->conv.orig_replicas > floor)
+                    floor = v->conv.orig_replicas;
+                if (v->nrep <= floor)
+                    return META_ERR_STATE;
+            }
             int b = -1; /* the learner moving in for `node`: this REMOVE ends its move */
             for (uint32_t j = 0; j < v->nrep; j++)
                 if (v->rep[j].replaces == node)
@@ -2319,7 +2460,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         m->restore_gen = gen;
         /* after a restore the leaders' logs may lack markers that were committed before it (E14, §5.7) */
         for (uint32_t i = 0; i < m->nvolumes; i++)
-            if (m->volumes[i].redundancy == META_RED_EC)
+            if (m->volumes[i].redundancy == META_RED_EC || m->volumes[i].nstripe > 0)
                 m->volumes[i].gc_suspended = 1;
         return META_OK;
     }
@@ -2334,10 +2475,32 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         int rc = vol_get(m, number, touched, *ntouched, &v);
         if (rc)
             return rc;
-        if (v->redundancy != META_RED_EC || pos >= v->nstripe)
+        if (v->nstripe == 0 || pos >= v->nstripe)
             return META_ERR_INVALID;
         if (sv != v->stripe_version && !MUT(50)) /* stripeuncond */
             return META_ERR_STALE;
+        if (node == 0) {
+            /* Drop retired positions [pos .. v->nstripe - 1] (shrink nstripe to pos; D28). */
+            if (st != META_STRIPE_WHOLE || prev != 0)
+                return META_ERR_INVALID;
+            if (v->conv.phase != META_CONV_NONE && v->conv.phase != META_CONV_DROP)
+                return META_ERR_STATE;
+            uint32_t active = vol_active_nstripe(v);
+            if (pos < active)
+                return META_ERR_INVALID; /* never drop an active geometry position */
+            if (v->mixed_redundancy == META_RED_EC && pos < (uint32_t)v->mixed_k + v->mixed_m)
+                return META_ERR_STATE; /* leftover cancelled-REENCODE objects still use these positions */
+            if (!MUT(62) && !stripe_drop_safe(v, pos)) /* stripelive: skip live-object refusal */
+                return META_ERR_STATE;
+            for (uint32_t i = pos; i < v->nstripe; i++) {
+                v->stripe[i] = 0;
+                memset(&v->stripe_pos[i], 0, sizeof v->stripe_pos[i]);
+            }
+            v->nstripe = pos;
+            v->stripe_version++;
+            touched[(*ntouched)++] = number;
+            return META_OK;
+        }
         const struct meta_member *mb = meta_member(m, node);
         if (!mb || mb->state >= META_OUT)
             return META_ERR_INVALID;
@@ -2348,9 +2511,11 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             return META_ERR_INVALID; /* a filling position goes whole only by STRIPE_WHOLE (D10) */
         if (prev && (!meta_member(m, prev) || prev == node))
             return META_ERR_INVALID;
+        uint64_t rver = MUT(64) ? 0 : v->stripe_pos[pos].retired_ver; /* retireclear: drop retired_ver on replace */
         v->stripe[pos] = node;
         v->stripe_version++;
-        v->stripe_pos[pos] = (struct meta_stripe_pos){.state = st, .prev = prev, .set_ver = v->stripe_version};
+        v->stripe_pos[pos] =
+            (struct meta_stripe_pos){.state = st, .prev = prev, .set_ver = v->stripe_version, .retired_ver = rver};
         touched[(*ntouched)++] = number;
         return META_OK;
     }
@@ -2363,13 +2528,308 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         int rc = vol_get(m, number, touched, *ntouched, &v);
         if (rc)
             return rc;
-        if (v->redundancy != META_RED_EC || pos >= v->nstripe || v->stripe_pos[pos].state != META_STRIPE_FILLING)
+        if (v->nstripe == 0 || pos >= v->nstripe || v->stripe_pos[pos].state != META_STRIPE_FILLING)
             return META_ERR_INVALID;
         if (sv != v->stripe_version && !MUT(57)) /* wholeanyversion */
             return META_ERR_STALE;
         v->stripe_pos[pos].state = META_STRIPE_WHOLE;
         v->stripe_whole_gen++;
         v->stripe_whole_ver = sv;
+        touched[(*ntouched)++] = number;
+        return META_OK;
+    }
+    case META_OP_VOLUME_REDUNDANCY: {
+        uint32_t number = get32(r);
+        uint64_t epoch = get64(r);
+        struct meta_redundancy_target t;
+        t.redundancy = get8(r);
+        t.ec_k = get8(r);
+        t.ec_m = get8(r);
+        t.replicas = get32(r);
+        if (r->bad)
+            return META_ERR_FORMAT;
+        struct meta_volume *v;
+        int rc = vol_get(m, number, touched, *ntouched, &v);
+        if (rc)
+            return rc;
+        if (epoch != v->epoch)
+            return META_ERR_STALE;
+        if (v->kind != META_VOL_REPLICATED)
+            return META_ERR_INVALID;
+        if (v->conv.phase != META_CONV_NONE)
+            return META_ERR_EXISTS; /* a conversion already runs on this volume (D26) */
+        if (v->mixed_redundancy != META_RED_REPLICAS)
+            return META_ERR_STATE; /* leftover objects from a cancelled conversion have not finished clearing */
+        for (uint32_t i = 0; i < v->nrep; i++)
+            if (v->rep[i].replaces || v->rep[i].learner)
+                return META_ERR_STATE; /* a move or replica set change runs on v */
+        for (uint32_t p = 0; p < v->nstripe; p++)
+            if (v->stripe_pos[p].state == META_STRIPE_FILLING)
+                return META_ERR_STATE; /* a stripe position change runs on v */
+        uint32_t trep = 0;
+        if (t.redundancy == META_RED_EC) {
+            if (t.ec_k < 1 || t.ec_k > META_EC_K_MAX || t.ec_m < 1 || t.ec_m > META_EC_M_MAX)
+                return META_ERR_INVALID;
+            trep = t.replicas ? t.replicas : (uint32_t)t.ec_m + 1;
+            if (trep != (uint32_t)t.ec_m + 1)
+                return META_ERR_INVALID;
+            if (v->redundancy == META_RED_EC && v->ec_k == t.ec_k && v->ec_m == t.ec_m)
+                return META_ERR_INVALID; /* already at this geometry (retired positions drop directly via STRIPE_SET) */
+        } else if (t.redundancy == META_RED_REPLICAS) {
+            if (t.ec_k || t.ec_m)
+                return META_ERR_INVALID;
+            trep = t.replicas ? t.replicas : m->set.replication;
+            if (trep < 1 || trep > META_REPLICAS_MAX)
+                return META_ERR_INVALID;
+            if (v->redundancy == META_RED_REPLICAS && v->nrep == trep && v->nstripe == 0)
+                return META_ERR_INVALID; /* already at this replication */
+        } else {
+            return META_ERR_INVALID;
+        }
+        v->conv = (struct meta_conv){
+            .phase = META_CONV_GROW,
+            .target_redundancy = t.redundancy,
+            .target_k = t.ec_k,
+            .target_m = t.ec_m,
+            .target_replicas = trep,
+            .new_stripe_version = 0,
+            .orig_redundancy = v->redundancy,
+            .orig_k = v->ec_k,
+            .orig_m = v->ec_m,
+            .orig_replicas = v->nrep,
+            .orig_min_isr = v->min_isr,
+        };
+        touched[(*ntouched)++] = number;
+        return META_OK;
+    }
+    case META_OP_VOLUME_CONV_STEP: {
+        uint32_t number = get32(r);
+        uint8_t from_phase = get8(r), to_phase = get8(r);
+        uint32_t ns = get32(r), stripe[META_STRIPE_MAX];
+        if (ns > META_STRIPE_MAX)
+            r->bad = 1;
+        for (uint32_t i = 0; i < ns && !r->bad; i++)
+            stripe[i] = get32(r);
+        if (r->bad || from_phase < META_CONV_GROW || from_phase > META_CONV_LAST || to_phase > META_CONV_LAST)
+            return META_ERR_FORMAT;
+        struct meta_volume *v;
+        int rc = vol_get(m, number, touched, *ntouched, &v);
+        if (rc)
+            return rc;
+        if (v->conv.phase == META_CONV_NONE)
+            return META_ERR_STATE;
+        if (v->conv.phase != from_phase)
+            return META_ERR_STALE; /* conditional on current phase */
+        uint8_t next = from_phase == META_CONV_SHRINK ? META_CONV_NONE : (uint8_t)(from_phase + 1);
+        if (to_phase != next) {
+            /* convskip: MUT(63) allows skipping forward across phases */
+            if (!MUT(63) || (to_phase != META_CONV_NONE && to_phase <= from_phase))
+                return META_ERR_INVALID;
+        }
+        if (from_phase != META_CONV_RECORD && ns != 0)
+            return META_ERR_INVALID;
+        if (from_phase == META_CONV_GROW) {
+            if (v->nrep < v->conv.target_replicas || v->nisr < v->conv.target_replicas)
+                return META_ERR_STATE; /* log group must reach target_replicas in ISR first (D26, §6.4) */
+        } else if (from_phase == META_CONV_RECORD) {
+            if (v->nrep < v->conv.target_replicas)
+                return META_ERR_STATE;
+            for (uint32_t i = 0; i < v->nstripe; i++)
+                if (v->stripe_pos[i].state == META_STRIPE_FILLING)
+                    return META_ERR_STATE; /* no stripe position fill may be in flight at RECORD */
+            if (v->conv.target_redundancy == META_RED_EC) {
+                uint32_t new_min = meta_volume_min_isr(META_RED_EC, v->conv.target_m, v->nrep, m->set.min_isr);
+                if (v->nisr < new_min)
+                    return META_ERR_STATE; /* ISR must meet the new min_isr before RECORD (§6.4 step 1) */
+                uint32_t need = (uint32_t)v->conv.target_k + v->conv.target_m;
+                for (uint32_t i = 0; i < need && i < v->nstripe; i++) {
+                    const struct meta_member *sm = meta_member(m, v->stripe[i]);
+                    if (!sm || sm->state >= META_OUT)
+                        return META_ERR_INVALID; /* reused stripe position's member is OUT or DESTROYED */
+                }
+                if (need > v->nstripe) {
+                    if (ns != need)
+                        return META_ERR_INVALID;
+                    for (uint32_t i = 0; i < v->nstripe; i++)
+                        if (stripe[i] != v->stripe[i])
+                            return META_ERR_INVALID; /* existing positions never renumbered (E9) */
+                    for (uint32_t i = v->nstripe; i < need; i++) {
+                        const struct meta_member *sm = meta_member(m, stripe[i]);
+                        if (!sm || sm->state >= META_OUT || has_id(stripe, i, stripe[i]))
+                            return META_ERR_INVALID;
+                    }
+                } else if (ns != 0) {
+                    if (ns != need)
+                        return META_ERR_INVALID;
+                    for (uint32_t i = 0; i < need; i++)
+                        if (stripe[i] != v->stripe[i])
+                            return META_ERR_INVALID;
+                }
+                v->redundancy = META_RED_EC;
+                v->ec_k = v->conv.target_k;
+                v->ec_m = v->conv.target_m;
+                v->min_isr = new_min;
+                v->stripe_version++;
+                v->conv.new_stripe_version = v->stripe_version;
+                if (need > v->nstripe) {
+                    for (uint32_t i = v->nstripe; i < need; i++) {
+                        v->stripe[i] = stripe[i];
+                        v->stripe_pos[i] = (struct meta_stripe_pos){
+                            .state = META_STRIPE_WHOLE, .prev = 0, .set_ver = v->stripe_version, .retired_ver = 0};
+                    }
+                    v->nstripe = need;
+                }
+                for (uint32_t i = 0; i < need; i++)
+                    v->stripe_pos[i].retired_ver = 0;
+                for (uint32_t i = need; i < v->nstripe; i++)
+                    if (v->stripe_pos[i].retired_ver == 0)
+                        v->stripe_pos[i].retired_ver = v->stripe_version;
+                vol_live_clear(v);
+            } else {
+                if (ns != 0)
+                    return META_ERR_INVALID;
+                uint32_t new_min;
+                if (v->conv.orig_redundancy == META_RED_REPLICAS) {
+                    /* Replicas -> replicas: preserve operator's min_isr, capped at target_replicas and nrep. */
+                    uint32_t cap = v->conv.target_replicas < v->nrep ? v->conv.target_replicas : v->nrep;
+                    new_min = v->conv.orig_min_isr < cap ? v->conv.orig_min_isr : cap;
+                    if (new_min < 1)
+                        new_min = 1;
+                } else {
+                    new_min = meta_volume_min_isr(META_RED_REPLICAS, 0, v->nrep, m->set.min_isr);
+                }
+                if (v->nisr < new_min)
+                    return META_ERR_STATE; /* ISR must meet the new min_isr before RECORD */
+                v->redundancy = META_RED_REPLICAS;
+                v->ec_k = 0;
+                v->ec_m = 0;
+                v->min_isr = new_min;
+                if (v->nstripe > 0 || v->stripe_version > 0) {
+                    v->stripe_version++;
+                    v->conv.new_stripe_version = v->stripe_version;
+                    for (uint32_t i = 0; i < v->nstripe; i++)
+                        if (v->stripe_pos[i].retired_ver == 0)
+                            v->stripe_pos[i].retired_ver = v->stripe_version;
+                }
+                vol_live_clear(v);
+            }
+        } else if (from_phase == META_CONV_REENCODE) {
+            if (!reencode_done(v) && !MUT(66)) /* reencskip: leave REENCODE with old EC objects still live/unknown */
+                return META_ERR_STATE;
+        } else if (from_phase == META_CONV_DROP) {
+            if (v->nstripe != vol_active_nstripe(v) && !MUT(63))
+                return META_ERR_STATE; /* retired stripe positions must be dropped first */
+        } else if (from_phase == META_CONV_SHRINK) {
+            if (v->nrep > v->conv.target_replicas)
+                return META_ERR_STATE; /* excess log replicas must be removed first */
+        }
+        if (to_phase == META_CONV_NONE)
+            memset(&v->conv, 0, sizeof v->conv);
+        else
+            v->conv.phase = to_phase;
+        touched[(*ntouched)++] = number;
+        return META_OK;
+    }
+    case META_OP_VOLUME_CONV_CANCEL: {
+        uint32_t number = get32(r);
+        if (r->bad)
+            return META_ERR_FORMAT;
+        struct meta_volume *v;
+        int rc = vol_get(m, number, touched, *ntouched, &v);
+        if (rc)
+            return rc;
+        if (v->conv.phase == META_CONV_NONE || v->conv.phase >= META_CONV_DROP)
+            return META_ERR_STATE; /* --cancel only before DROP (D26) */
+        if (v->conv.phase == META_CONV_REENCODE) {
+            /* If target was EC, objects may have been written under that geometry in [new_stripe_version .. sv]:
+             * keep a persisted mixed-geometry record so meta_vol_margins never overstates settled margin until a
+             * current-epoch VOLUME_LIVE_OBJS proves 0 live objects remain in that range (D29). */
+            if (v->redundancy == META_RED_EC) {
+                v->mixed_redundancy = META_RED_EC;
+                v->mixed_k = v->ec_k;
+                v->mixed_m = v->ec_m;
+                v->mixed_sv_lo = v->conv.new_stripe_version;
+                v->mixed_sv_hi = v->stripe_version;
+            }
+            /* Revert geometry & operator's min_isr back to orig; never drop stripe positions without live-object check. */
+            v->redundancy = v->conv.orig_redundancy;
+            v->ec_k = v->conv.orig_k;
+            v->ec_m = v->conv.orig_m;
+            uint32_t restored = v->conv.orig_min_isr <= v->nrep ? v->conv.orig_min_isr : v->nrep;
+            if (restored < 1)
+                restored = 1;
+            if (v->redundancy == META_RED_EC) {
+                uint32_t ec_floor = v->ec_m < v->nrep ? v->ec_m : v->nrep;
+                if (restored < ec_floor)
+                    restored = ec_floor;
+            }
+            v->min_isr = restored;
+            uint32_t active = vol_active_nstripe(v);
+            if (v->nstripe > 0 || v->stripe_version > 0) {
+                v->stripe_version++;
+                for (uint32_t i = 0; i < active && i < v->nstripe; i++)
+                    v->stripe_pos[i].retired_ver = 0;
+                for (uint32_t i = active; i < v->nstripe; i++)
+                    if (v->stripe_pos[i].retired_ver == 0)
+                        v->stripe_pos[i].retired_ver = v->stripe_version;
+            }
+            vol_live_clear(v);
+        }
+        memset(&v->conv, 0, sizeof v->conv);
+        v->conv_cancel_gen++;
+        touched[(*ntouched)++] = number;
+        return META_OK;
+    }
+    case META_OP_VOLUME_LIVE_OBJS: {
+        uint32_t number = get32(r);
+        uint64_t epoch = get64(r), sv = get64(r);
+        uint8_t overflow = get8(r);
+        uint32_t n = get32(r);
+        struct meta_live_sv items[META_LIVE_SV_MAX];
+        if (overflow > 1 || n > META_LIVE_SV_MAX)
+            r->bad = 1;
+        for (uint32_t i = 0; i < n && !r->bad; i++) {
+            items[i].stripe_version = get64(r);
+            items[i].count = get64(r);
+        }
+        if (r->bad)
+            return META_ERR_FORMAT;
+        struct meta_volume *v;
+        int rc = vol_get(m, number, touched, *ntouched, &v);
+        if (rc)
+            return rc;
+        if (v->kind != META_VOL_REPLICATED)
+            return META_ERR_INVALID;
+        if ((epoch != v->epoch && !MUT(65)) || sv != v->stripe_version) /* livestale: accept stale epoch */
+            return META_ERR_STALE;
+        for (uint32_t i = 0; i < n; i++)
+            if (items[i].stripe_version < 1 || items[i].stripe_version > v->stripe_version ||
+                (i > 0 && items[i].stripe_version <= items[i - 1].stripe_version))
+                return META_ERR_INVALID;
+        v->live_epoch = epoch;
+        v->live_sv_at = sv;
+        v->live_overflow = overflow;
+        v->nlive_sv = n;
+        copy_n(v->live_sv, items, n * sizeof items[0]);
+        if (n < META_LIVE_SV_MAX)
+            memset(v->live_sv + n, 0, (META_LIVE_SV_MAX - n) * sizeof v->live_sv[0]);
+        /* Clear leftover cancelled-REENCODE mixed record once a non-overflow current-epoch report proves 0 live
+         * objects remain in [mixed_sv_lo .. mixed_sv_hi]. */
+        if (v->mixed_redundancy == META_RED_EC && !overflow && v->live_epoch == v->epoch &&
+            v->live_sv_at >= v->mixed_sv_hi) {
+            int still = 0;
+            for (uint32_t i = 0; i < n; i++)
+                if (items[i].count > 0 && items[i].stripe_version >= v->mixed_sv_lo &&
+                    items[i].stripe_version <= v->mixed_sv_hi)
+                    still = 1;
+            if (!still) {
+                v->mixed_redundancy = META_RED_REPLICAS;
+                v->mixed_k = 0;
+                v->mixed_m = 0;
+                v->mixed_sv_lo = 0;
+                v->mixed_sv_hi = 0;
+            }
+        }
         touched[(*ntouched)++] = number;
         return META_OK;
     }
@@ -2389,7 +2849,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             if (rc)
                 return rc;
         }
-        if (v->redundancy != META_RED_EC)
+        if (v->redundancy != META_RED_EC && v->nstripe == 0)
             return META_ERR_INVALID;
         if (kind == META_OP_GC_SUSPEND) {
             v->gc_suspended = 1;
@@ -2531,7 +2991,7 @@ int meta_entry_older(const void *data, size_t len)
     struct rd r = {data, len, 0, 0};
     uint32_t magic = get32(&r);
     return (magic == ENTRY_MAGIC_V1 || magic == ENTRY_MAGIC_V2 || magic == ENTRY_MAGIC_V3 ||
-            magic == ENTRY_MAGIC_V4) &&
+            magic == ENTRY_MAGIC_V4 || magic == ENTRY_MAGIC_V5) &&
            !r.bad;
 }
 
@@ -2628,12 +3088,38 @@ static void put_volume(struct wr *w, const struct meta_volume *v)
         put8(w, v->stripe_pos[j].state);
         put32(w, v->stripe_pos[j].prev);
         put64(w, v->stripe_pos[j].set_ver);
+        put64(w, v->stripe_pos[j].retired_ver);
     }
     put64(w, v->stripe_version);
     put64(w, v->stripe_whole_gen);
     put64(w, v->stripe_whole_ver);
     put8(w, v->gc_suspended);
     put64(w, v->gc_gen);
+    put8(w, v->conv.phase);
+    put8(w, v->conv.target_redundancy);
+    put8(w, v->conv.target_k);
+    put8(w, v->conv.target_m);
+    put32(w, v->conv.target_replicas);
+    put64(w, v->conv.new_stripe_version);
+    put8(w, v->conv.orig_redundancy);
+    put8(w, v->conv.orig_k);
+    put8(w, v->conv.orig_m);
+    put32(w, v->conv.orig_replicas);
+    put32(w, v->conv.orig_min_isr);
+    put64(w, v->conv_cancel_gen);
+    put8(w, v->mixed_redundancy);
+    put8(w, v->mixed_k);
+    put8(w, v->mixed_m);
+    put64(w, v->mixed_sv_lo);
+    put64(w, v->mixed_sv_hi);
+    put64(w, v->live_epoch);
+    put64(w, v->live_sv_at);
+    put8(w, v->live_overflow);
+    put32(w, v->nlive_sv);
+    for (uint32_t j = 0; j < v->nlive_sv; j++) {
+        put64(w, v->live_sv[j].stripe_version);
+        put64(w, v->live_sv[j].count);
+    }
 }
 
 static void encode_body(struct wr *w, const struct meta_state *m)
@@ -2792,6 +3278,7 @@ static int get_volume(struct rd *r, struct meta_volume *v)
         v->stripe_pos[j].state = get8(r);
         v->stripe_pos[j].prev = get32(r);
         v->stripe_pos[j].set_ver = get64(r);
+        v->stripe_pos[j].retired_ver = get64(r);
         if (v->stripe_pos[j].state > META_STRIPE_FILLING)
             return -1;
     }
@@ -2800,11 +3287,74 @@ static int get_volume(struct rd *r, struct meta_volume *v)
     v->stripe_whole_ver = get64(r);
     v->gc_suspended = get8(r);
     v->gc_gen = get64(r);
-    if (v->redundancy == META_RED_EC) {
+    v->conv.phase = get8(r);
+    v->conv.target_redundancy = get8(r);
+    v->conv.target_k = get8(r);
+    v->conv.target_m = get8(r);
+    v->conv.target_replicas = get32(r);
+    v->conv.new_stripe_version = get64(r);
+    v->conv.orig_redundancy = get8(r);
+    v->conv.orig_k = get8(r);
+    v->conv.orig_m = get8(r);
+    v->conv.orig_replicas = get32(r);
+    v->conv.orig_min_isr = get32(r);
+    v->conv_cancel_gen = get64(r);
+    v->mixed_redundancy = get8(r);
+    v->mixed_k = get8(r);
+    v->mixed_m = get8(r);
+    v->mixed_sv_lo = get64(r);
+    v->mixed_sv_hi = get64(r);
+    v->live_epoch = get64(r);
+    v->live_sv_at = get64(r);
+    v->live_overflow = get8(r);
+    v->nlive_sv = get32(r);
+    if (r->bad || v->conv.phase > META_CONV_LAST || v->live_overflow > 1 || v->nlive_sv > META_LIVE_SV_MAX)
+        return -1;
+    for (uint32_t j = 0; j < v->nlive_sv; j++) {
+        v->live_sv[j].stripe_version = get64(r);
+        v->live_sv[j].count = get64(r);
+        if (v->live_sv[j].stripe_version < 1 || v->live_sv[j].stripe_version > v->stripe_version ||
+            (j > 0 && v->live_sv[j].stripe_version <= v->live_sv[j - 1].stripe_version))
+            return -1;
+    }
+    if (v->live_epoch == 0 ? (v->live_sv_at || v->live_overflow || v->nlive_sv)
+                           : (v->live_epoch > v->epoch || v->live_sv_at > v->stripe_version))
+        return -1;
+    if (v->mixed_redundancy == META_RED_REPLICAS) {
+        if (v->mixed_k || v->mixed_m || v->mixed_sv_lo || v->mixed_sv_hi)
+            return -1;
+    } else if (v->mixed_redundancy == META_RED_EC) {
+        if (v->kind != META_VOL_REPLICATED || v->conv.phase != META_CONV_NONE || v->mixed_k < 1 ||
+            v->mixed_k > META_EC_K_MAX || v->mixed_m < 1 || v->mixed_m > META_EC_M_MAX ||
+            (uint32_t)v->mixed_k + v->mixed_m > v->nstripe || v->mixed_sv_lo < 1 ||
+            v->mixed_sv_lo > v->mixed_sv_hi || v->mixed_sv_hi >= v->stripe_version)
+            return -1;
+    } else {
+        return -1;
+    }
+    if (v->conv.phase == META_CONV_NONE) {
+        if (v->conv.target_redundancy || v->conv.target_k || v->conv.target_m || v->conv.target_replicas ||
+            v->conv.new_stripe_version || v->conv.orig_redundancy || v->conv.orig_k || v->conv.orig_m ||
+            v->conv.orig_replicas || v->conv.orig_min_isr)
+            return -1;
+    } else {
+        if (v->kind != META_VOL_REPLICATED || v->conv.target_redundancy > META_RED_EC ||
+            v->conv.orig_redundancy > META_RED_EC || v->conv.target_replicas < 1 ||
+            v->conv.target_replicas > META_REPLICAS_MAX || v->conv.orig_replicas < 1 ||
+            v->conv.orig_replicas > META_REPLICAS_MAX || v->conv.orig_min_isr < 1 ||
+            v->conv.orig_min_isr > v->conv.orig_replicas)
+            return -1;
+        if (v->conv.phase < META_CONV_REENCODE && v->conv.new_stripe_version != 0)
+            return -1;
+        if (v->conv.new_stripe_version > v->stripe_version)
+            return -1;
+    }
+    if (v->redundancy == META_RED_EC || v->nstripe > 0) {
         if (!v->stripe_version)
             return -1;
         for (uint32_t j = 0; j < v->nstripe; j++)
-            if (v->stripe_pos[j].set_ver < 1 || v->stripe_pos[j].set_ver > v->stripe_version)
+            if (v->stripe_pos[j].set_ver < 1 || v->stripe_pos[j].set_ver > v->stripe_version ||
+                v->stripe_pos[j].retired_ver > v->stripe_version)
                 return -1;
     }
     return 0;
@@ -2861,7 +3411,7 @@ static int decode_body(struct rd *r, struct meta_state *m)
             return -1;
         if (i && v->number <= m->volumes[i - 1].number)
             r->bad = 1;
-        if (v->redundancy == META_RED_EC)
+        if (v->redundancy == META_RED_EC || v->nstripe > 0)
             for (uint32_t j = 0; j < v->nstripe; j++)
                 if (v->stripe_pos[j].prev &&
                     (!meta_member(m, v->stripe_pos[j].prev) || v->stripe_pos[j].prev == v->stripe[j]))
@@ -3093,38 +3643,228 @@ static int check_volume_step(const struct meta_volume *a, const struct meta_volu
     unsigned va = a->number;
     if (a->kind != b->kind)
         FAIL("volume %u: its kind changed", va);
-    if (a->redundancy != b->redundancy || a->ec_k != b->ec_k || a->ec_m != b->ec_m || a->nstripe != b->nstripe)
-        FAIL("volume %u: its redundancy changed", va);
+    if (b->conv_cancel_gen < a->conv_cancel_gen)
+        FAIL("volume %u: conv_cancel_gen went back", va);
+    if (b->conv.phase > META_CONV_LAST)
+        FAIL("volume %u: invalid conversion phase %u", va, b->conv.phase);
+    int conv_started = a->conv.phase == META_CONV_NONE && b->conv.phase != META_CONV_NONE;
+    int conv_ended = a->conv.phase != META_CONV_NONE && b->conv.phase == META_CONV_NONE;
+    int conv_cancelled = conv_ended && b->conv_cancel_gen == a->conv_cancel_gen + 1;
+    int conv_recorded = a->conv.phase == META_CONV_RECORD && b->conv.phase == META_CONV_REENCODE;
+    int conv_reenc_cancel = a->conv.phase == META_CONV_REENCODE && conv_cancelled;
+    if (b->conv_cancel_gen > a->conv_cancel_gen && !conv_cancelled)
+        FAIL("volume %u: conv_cancel_gen rose without cancelling a conversion", va);
+    if (conv_started) {
+        if (b->conv.phase != META_CONV_GROW || b->conv.new_stripe_version != 0 ||
+            b->conv.orig_redundancy != a->redundancy || b->conv.orig_k != a->ec_k || b->conv.orig_m != a->ec_m ||
+            b->conv.orig_replicas != a->nrep || b->conv.orig_min_isr != a->min_isr ||
+            b->conv.target_replicas < 1 || b->conv.target_replicas > META_REPLICAS_MAX ||
+            a->mixed_redundancy != META_RED_REPLICAS)
+            FAIL("volume %u: conversion started in phase %s (new_stripe_version %llu)", va,
+                 meta_conv_phase_name(b->conv.phase), (unsigned long long)b->conv.new_stripe_version);
+    } else if (conv_ended) {
+        if (conv_cancelled) {
+            if (a->conv.phase >= META_CONV_DROP)
+                FAIL("volume %u: conversion cancelled in phase %s (only allowed before DROP)", va,
+                     meta_conv_phase_name(a->conv.phase));
+        } else if (a->conv.phase != META_CONV_SHRINK) {
+            FAIL("volume %u: conversion ended directly from phase %s without completing SHRINK or cancelling", va,
+                 meta_conv_phase_name(a->conv.phase));
+        }
+    } else if (a->conv.phase != META_CONV_NONE && b->conv.phase != a->conv.phase) {
+        if (b->conv.phase != a->conv.phase + 1)
+            FAIL("volume %u: conversion skipped phase (%s -> %s)", va, meta_conv_phase_name(a->conv.phase),
+                 meta_conv_phase_name(b->conv.phase));
+        if (b->conv.target_redundancy != a->conv.target_redundancy || b->conv.target_k != a->conv.target_k ||
+            b->conv.target_m != a->conv.target_m || b->conv.target_replicas != a->conv.target_replicas ||
+            b->conv.orig_redundancy != a->conv.orig_redundancy || b->conv.orig_k != a->conv.orig_k ||
+            b->conv.orig_m != a->conv.orig_m || b->conv.orig_replicas != a->conv.orig_replicas ||
+            b->conv.orig_min_isr != a->conv.orig_min_isr)
+            FAIL("volume %u: conversion target or orig changed mid-conversion", va);
+        if (a->conv.phase == META_CONV_GROW &&
+            (a->nrep < a->conv.target_replicas || a->nisr < a->conv.target_replicas))
+            FAIL("volume %u: left GROW with nrep %u, nisr %u (need %u)", va, a->nrep, a->nisr,
+                 a->conv.target_replicas);
+        if (a->conv.phase == META_CONV_REENCODE && !reencode_done(a))
+            FAIL("volume %u: left REENCODE with pre-conversion EC objects live or unknown (sv < %llu)", va,
+                 (unsigned long long)a->conv.new_stripe_version);
+        if (a->conv.phase == META_CONV_DROP && a->nstripe != vol_active_nstripe(a))
+            FAIL("volume %u: left DROP with %u stripe positions (active %u)", va, a->nstripe, vol_active_nstripe(a));
+    }
+    int red_chg = a->redundancy != b->redundancy || a->ec_k != b->ec_k || a->ec_m != b->ec_m;
+    if (red_chg) {
+        if (conv_recorded) {
+            if (b->redundancy != a->conv.target_redundancy || b->ec_k != a->conv.target_k ||
+                b->ec_m != a->conv.target_m)
+                FAIL("volume %u: RECORD did not apply conversion target redundancy", va);
+        } else if (conv_reenc_cancel) {
+            if (b->redundancy != a->conv.orig_redundancy || b->ec_k != a->conv.orig_k || b->ec_m != a->conv.orig_m)
+                FAIL("volume %u: REENCODE cancel did not restore original redundancy", va);
+        } else {
+            FAIL("volume %u: its redundancy changed outside RECORD or REENCODE cancel", va);
+        }
+    }
+    if (conv_recorded) {
+        if (b->redundancy == META_RED_EC) {
+            uint32_t want = b->ec_m < b->nrep ? b->ec_m : b->nrep;
+            if (b->min_isr != want)
+                FAIL("volume %u: min_isr %u after RECORD, expected %u (E24)", va, b->min_isr, want);
+        } else if (a->conv.orig_redundancy == META_RED_REPLICAS) {
+            uint32_t cap = a->conv.target_replicas < b->nrep ? a->conv.target_replicas : b->nrep;
+            uint32_t want = a->conv.orig_min_isr < cap ? a->conv.orig_min_isr : cap;
+            if (want < 1)
+                want = 1;
+            if (b->min_isr != want)
+                FAIL("volume %u: min_isr %u after replicas RECORD, expected %u", va, b->min_isr, want);
+        }
+    } else if (conv_reenc_cancel) {
+        uint32_t want = a->conv.orig_min_isr <= b->nrep ? a->conv.orig_min_isr : b->nrep;
+        if (want < 1)
+            want = 1;
+        if (b->redundancy == META_RED_EC) {
+            uint32_t ec_floor = b->ec_m < b->nrep ? b->ec_m : b->nrep;
+            if (want < ec_floor)
+                want = ec_floor;
+        }
+        if (b->min_isr != want)
+            FAIL("volume %u: min_isr %u after REENCODE cancel, expected orig %u", va, b->min_isr, want);
+    }
     if (b->stripe_version < a->stripe_version)
         FAIL("volume %u: stripe version went back from %llu to %llu", va, (unsigned long long)a->stripe_version,
              (unsigned long long)b->stripe_version);
     if (b->stripe_whole_gen < a->stripe_whole_gen)
         FAIL("volume %u: stripe whole generation went back", va);
-    uint32_t sdiff = 0, wdiff = 0;
-    for (uint32_t j = 0; j < a->nstripe && j < META_STRIPE_MAX; j++) {
-        int pos_chg = a->stripe[j] != b->stripe[j] || a->stripe_pos[j].prev != b->stripe_pos[j].prev ||
-                      a->stripe_pos[j].set_ver != b->stripe_pos[j].set_ver ||
-                      (a->stripe_pos[j].state == META_STRIPE_WHOLE && b->stripe_pos[j].state == META_STRIPE_FILLING);
-        int to_whole = a->stripe_pos[j].state == META_STRIPE_FILLING && b->stripe_pos[j].state == META_STRIPE_WHOLE;
-        sdiff += (uint32_t)pos_chg;
-        wdiff += (uint32_t)to_whole;
-        if (pos_chg && b->stripe_version > a->stripe_version && b->stripe_pos[j].set_ver != b->stripe_version)
-            FAIL("volume %u: stripe position %u changed with set_ver %llu, not %llu", va, j,
-                 (unsigned long long)b->stripe_pos[j].set_ver, (unsigned long long)b->stripe_version);
+    if (b->nstripe > a->nstripe) {
+        if (!conv_recorded || b->redundancy != META_RED_EC || b->nstripe != vol_active_nstripe(b) ||
+            b->stripe_version != a->stripe_version + 1 || b->conv.new_stripe_version != b->stripe_version)
+            FAIL("volume %u: nstripe grew %u -> %u outside RECORD", va, a->nstripe, b->nstripe);
+        for (uint32_t j = 0; j < a->nstripe; j++)
+            if (a->stripe[j] != b->stripe[j] || a->stripe_pos[j].state != b->stripe_pos[j].state ||
+                a->stripe_pos[j].prev != b->stripe_pos[j].prev || a->stripe_pos[j].set_ver != b->stripe_pos[j].set_ver)
+                FAIL("volume %u: RECORD modified existing stripe position %u", va, j);
+        for (uint32_t j = a->nstripe; j < b->nstripe; j++)
+            if (b->stripe_pos[j].state != META_STRIPE_WHOLE || b->stripe_pos[j].prev != 0 ||
+                b->stripe_pos[j].set_ver != b->stripe_version || b->stripe_pos[j].retired_ver != 0)
+                FAIL("volume %u: RECORD added position %u not whole at new stripe_version", va, j);
+    } else if (b->nstripe < a->nstripe) {
+        if (b->stripe_version != a->stripe_version + 1 || b->stripe_whole_gen != a->stripe_whole_gen)
+            FAIL("volume %u: nstripe shrank %u -> %u without STRIPE_SET version bump", va, a->nstripe, b->nstripe);
+        if (a->conv.phase != META_CONV_NONE && a->conv.phase != META_CONV_DROP)
+            FAIL("volume %u: nstripe shrank in phase %s", va, meta_conv_phase_name(a->conv.phase));
+        if (b->nstripe < vol_active_nstripe(b))
+            FAIL("volume %u: nstripe shrank to %u below active geometry %u", va, b->nstripe, vol_active_nstripe(b));
+        if (a->mixed_redundancy == META_RED_EC && b->nstripe < (uint32_t)a->mixed_k + a->mixed_m)
+            FAIL("volume %u: nstripe shrank to %u below mixed geometry %u+%u", va, b->nstripe, a->mixed_k, a->mixed_m);
+        if (!stripe_drop_safe(a, b->nstripe))
+            FAIL("volume %u: STRIPE_SET dropped positions [%u..%u) with live or unknown objects (epoch %llu vs live %llu)",
+                 va, b->nstripe, a->nstripe, (unsigned long long)a->epoch, (unsigned long long)a->live_epoch);
+        for (uint32_t j = 0; j < b->nstripe; j++)
+            if (a->stripe[j] != b->stripe[j] || a->stripe_pos[j].state != b->stripe_pos[j].state ||
+                a->stripe_pos[j].prev != b->stripe_pos[j].prev ||
+                a->stripe_pos[j].set_ver != b->stripe_pos[j].set_ver ||
+                a->stripe_pos[j].retired_ver != b->stripe_pos[j].retired_ver)
+                FAIL("volume %u: STRIPE_SET drop modified kept position %u", va, j);
+    } else {
+        uint32_t sdiff = 0, wdiff = 0;
+        for (uint32_t j = 0; j < a->nstripe && j < META_STRIPE_MAX; j++) {
+            int pos_chg = a->stripe[j] != b->stripe[j] || a->stripe_pos[j].prev != b->stripe_pos[j].prev ||
+                          a->stripe_pos[j].set_ver != b->stripe_pos[j].set_ver ||
+                          (a->stripe_pos[j].state == META_STRIPE_WHOLE &&
+                           b->stripe_pos[j].state == META_STRIPE_FILLING);
+            int to_whole =
+                a->stripe_pos[j].state == META_STRIPE_FILLING && b->stripe_pos[j].state == META_STRIPE_WHOLE;
+            sdiff += (uint32_t)pos_chg;
+            wdiff += (uint32_t)to_whole;
+            if (pos_chg && b->stripe_version > a->stripe_version && b->stripe_pos[j].set_ver != b->stripe_version)
+                FAIL("volume %u: stripe position %u changed with set_ver %llu, not %llu", va, j,
+                     (unsigned long long)b->stripe_pos[j].set_ver, (unsigned long long)b->stripe_version);
+            if (b->stripe_pos[j].retired_ver != a->stripe_pos[j].retired_ver) {
+                if (!conv_recorded && !conv_reenc_cancel)
+                    FAIL("volume %u: stripe position %u retired_ver changed (%llu -> %llu) outside RECORD or REENCODE cancel",
+                         va, j, (unsigned long long)a->stripe_pos[j].retired_ver,
+                         (unsigned long long)b->stripe_pos[j].retired_ver);
+                uint32_t act_b = vol_active_nstripe(b);
+                if (j < act_b) {
+                    if (b->stripe_pos[j].retired_ver != 0)
+                        FAIL("volume %u: active position %u has retired_ver %llu", va, j,
+                             (unsigned long long)b->stripe_pos[j].retired_ver);
+                } else {
+                    if (a->stripe_pos[j].retired_ver != 0 || b->stripe_pos[j].retired_ver != b->stripe_version)
+                        FAIL("volume %u: retired position %u retired_ver moved %llu -> %llu (sv %llu)", va, j,
+                             (unsigned long long)a->stripe_pos[j].retired_ver,
+                             (unsigned long long)b->stripe_pos[j].retired_ver,
+                             (unsigned long long)b->stripe_version);
+                }
+            }
+        }
+        if (b->stripe_version == a->stripe_version && sdiff)
+            FAIL("volume %u: a stripe position changed without a version bump", va);
+        if (b->stripe_version > a->stripe_version &&
+            (b->stripe_version != a->stripe_version + 1 || sdiff > 1 || wdiff > 0 ||
+             b->stripe_whole_gen != a->stripe_whole_gen || (sdiff > 0 && (conv_recorded || conv_reenc_cancel))))
+            FAIL("volume %u: stripe version %llu -> %llu with %u positions moved, %u whole (one STRIPE_SET, one position)",
+                 va, (unsigned long long)a->stripe_version, (unsigned long long)b->stripe_version, sdiff, wdiff);
+        if (wdiff > 0 || b->stripe_whole_gen > a->stripe_whole_gen) {
+            if (wdiff != 1 || b->stripe_whole_gen != a->stripe_whole_gen + 1 ||
+                b->stripe_version != a->stripe_version || b->stripe_whole_ver != b->stripe_version)
+                FAIL("volume %u: position went whole wrongly (wdiff %u, gen %llu -> %llu, ver %llu, current %llu)", va,
+                     wdiff, (unsigned long long)a->stripe_whole_gen, (unsigned long long)b->stripe_whole_gen,
+                     (unsigned long long)b->stripe_whole_ver, (unsigned long long)b->stripe_version);
+        }
     }
-    if (b->stripe_version == a->stripe_version && sdiff)
-        FAIL("volume %u: a stripe position changed without a version bump", va);
-    if (b->stripe_version > a->stripe_version &&
-        (b->stripe_version != a->stripe_version + 1 || sdiff > 1 || wdiff > 0 ||
-         b->stripe_whole_gen != a->stripe_whole_gen))
-        FAIL("volume %u: stripe version %llu -> %llu with %u positions moved, %u whole (one STRIPE_SET, one position)",
-             va, (unsigned long long)a->stripe_version, (unsigned long long)b->stripe_version, sdiff, wdiff);
-    if (wdiff > 0 || b->stripe_whole_gen > a->stripe_whole_gen) {
-        if (wdiff != 1 || b->stripe_whole_gen != a->stripe_whole_gen + 1 || b->stripe_version != a->stripe_version ||
-            b->stripe_whole_ver != b->stripe_version)
-            FAIL("volume %u: position went whole wrongly (wdiff %u, gen %llu -> %llu, ver %llu, current %llu)", va,
-                 wdiff, (unsigned long long)a->stripe_whole_gen, (unsigned long long)b->stripe_whole_gen,
-                 (unsigned long long)b->stripe_whole_ver, (unsigned long long)b->stripe_version);
+    /* live_* fields may change only by VOLUME_LIVE_OBJS (at current epoch & stripe_version) or be cleared by RECORD /
+     * REENCODE cancel. */
+    {
+        int live_same = a->live_epoch == b->live_epoch && a->live_sv_at == b->live_sv_at &&
+                        a->live_overflow == b->live_overflow && a->nlive_sv == b->nlive_sv;
+        for (uint32_t j = 0; live_same && j < a->nlive_sv && j < META_LIVE_SV_MAX; j++)
+            if (a->live_sv[j].stripe_version != b->live_sv[j].stripe_version ||
+                a->live_sv[j].count != b->live_sv[j].count)
+                live_same = 0;
+        if (!live_same) {
+            int cleared = !b->live_epoch && !b->live_sv_at && !b->live_overflow && !b->nlive_sv;
+            if (cleared) {
+                if (!conv_recorded && !conv_reenc_cancel)
+                    FAIL("volume %u: live_sv cleared outside RECORD or REENCODE cancel", va);
+            } else {
+                if (b->live_epoch != b->epoch || b->epoch != a->epoch || b->stripe_version != a->stripe_version ||
+                    b->nstripe != a->nstripe || b->conv.phase != a->conv.phase ||
+                    b->live_sv_at != b->stripe_version || b->live_overflow > 1 || b->nlive_sv > META_LIVE_SV_MAX)
+                    FAIL("volume %u: live_sv changed illegally (epoch %llu/%llu, sv %llu/%llu)", va,
+                         (unsigned long long)b->live_epoch, (unsigned long long)b->epoch,
+                         (unsigned long long)b->live_sv_at, (unsigned long long)b->stripe_version);
+                for (uint32_t j = 0; j < b->nlive_sv; j++)
+                    if (b->live_sv[j].stripe_version < 1 || b->live_sv[j].stripe_version > b->stripe_version ||
+                        (j > 0 && b->live_sv[j].stripe_version <= b->live_sv[j - 1].stripe_version))
+                        FAIL("volume %u: live_sv[%u] out of range or unsorted", va, j);
+            }
+        }
+    }
+    /* mixed_* (leftover EC geometry from a cancelled REENCODE) may be set only on REENCODE cancel of an EC target,
+     * and cleared only by a current-epoch non-overflow VOLUME_LIVE_OBJS proving 0 live objects in [lo .. hi]. */
+    {
+        int mixed_same = a->mixed_redundancy == b->mixed_redundancy && a->mixed_k == b->mixed_k &&
+                         a->mixed_m == b->mixed_m && a->mixed_sv_lo == b->mixed_sv_lo &&
+                         a->mixed_sv_hi == b->mixed_sv_hi;
+        if (!mixed_same) {
+            if (a->mixed_redundancy == META_RED_REPLICAS && b->mixed_redundancy == META_RED_EC) {
+                if (!conv_reenc_cancel || a->redundancy != META_RED_EC || b->mixed_k != a->ec_k ||
+                    b->mixed_m != a->ec_m || b->mixed_sv_lo != a->conv.new_stripe_version ||
+                    b->mixed_sv_hi != a->stripe_version)
+                    FAIL("volume %u: mixed geometry set outside EC REENCODE cancel", va);
+            } else if (a->mixed_redundancy == META_RED_EC && b->mixed_redundancy == META_RED_REPLICAS) {
+                if (b->mixed_k || b->mixed_m || b->mixed_sv_lo || b->mixed_sv_hi || b->live_epoch != b->epoch ||
+                    b->live_overflow || b->live_sv_at < a->mixed_sv_hi)
+                    FAIL("volume %u: mixed geometry cleared without current-epoch live report", va);
+                for (uint32_t j = 0; j < b->nlive_sv; j++)
+                    if (b->live_sv[j].count > 0 && b->live_sv[j].stripe_version >= a->mixed_sv_lo &&
+                        b->live_sv[j].stripe_version <= a->mixed_sv_hi)
+                        FAIL("volume %u: mixed geometry cleared while live objects remain in [%llu..%llu]", va,
+                             (unsigned long long)a->mixed_sv_lo, (unsigned long long)a->mixed_sv_hi);
+            } else {
+                FAIL("volume %u: mixed geometry changed illegally", va);
+            }
+        }
     }
     if (b->gc_gen < a->gc_gen)
         FAIL("volume %u: gc_gen went back", va);
@@ -3255,46 +3995,97 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
         const struct meta_volume *b = &next->volumes[i];
         if (b->min_isr < 1 || b->min_isr > b->nrep)
             FAIL("volume %u: min_isr %u with %u replicas", b->number, b->min_isr, b->nrep);
+        const struct meta_volume *a = meta_volume(prev, b->number);
         if (b->redundancy == META_RED_EC) {
+            uint32_t active = (uint32_t)b->ec_k + b->ec_m;
             if (b->kind != META_VOL_REPLICATED || b->ec_k < 1 || b->ec_k > META_EC_K_MAX || b->ec_m < 1 ||
-                b->ec_m > META_EC_M_MAX || b->nstripe != (uint32_t)b->ec_k + b->ec_m || !b->stripe_version)
+                b->ec_m > META_EC_M_MAX || b->nstripe < active || b->nstripe > META_STRIPE_MAX || !b->stripe_version)
                 FAIL("volume %u: an EC volume of k %u, m %u with %u positions", b->number, b->ec_k, b->ec_m,
                      b->nstripe);
-            for (uint32_t j = 0; j < b->nstripe; j++) {
-                if (!meta_member(next, b->stripe[j]))
-                    FAIL("volume %u: stripe position %u names node %u, which is not a member", b->number, j,
-                         b->stripe[j]);
-                if (b->stripe_pos[j].state > META_STRIPE_FILLING || b->stripe_pos[j].set_ver < 1 ||
-                    b->stripe_pos[j].set_ver > b->stripe_version)
-                    FAIL("volume %u: stripe position %u has invalid state %u or set_ver %llu (stripe_version %llu)",
-                         b->number, j, b->stripe_pos[j].state, (unsigned long long)b->stripe_pos[j].set_ver,
-                         (unsigned long long)b->stripe_version);
-                if (b->stripe_pos[j].prev &&
-                    (!meta_member(next, b->stripe_pos[j].prev) || b->stripe_pos[j].prev == b->stripe[j]))
-                    FAIL("volume %u: stripe position %u names invalid prev node %u", b->number, j,
-                         b->stripe_pos[j].prev);
-                for (uint32_t k = 0; k < j; k++)
-                    if (b->stripe[k] == b->stripe[j])
-                        FAIL("volume %u: node %u holds stripe positions %u and %u", b->number, b->stripe[j], k, j);
-            }
-            const struct meta_volume *a = meta_volume(prev, b->number);
             if (!a) {
-                if (b->stripe_version != 1 || b->stripe_whole_gen || b->stripe_whole_ver || b->gc_gen ||
-                    b->min_isr < (b->ec_m < b->nrep ? b->ec_m : b->nrep))
+                if (b->nstripe != active || b->stripe_version != 1 || b->stripe_whole_gen || b->stripe_whole_ver ||
+                    b->gc_gen || b->min_isr < (b->ec_m < b->nrep ? b->ec_m : b->nrep))
                     FAIL("volume %u: a new EC volume with stripe version %llu, whole_gen %llu, gc_gen %llu, min_isr %u (m %u)",
                          b->number, (unsigned long long)b->stripe_version, (unsigned long long)b->stripe_whole_gen,
                          (unsigned long long)b->gc_gen, b->min_isr, b->ec_m);
                 for (uint32_t j = 0; j < b->nstripe; j++)
                     if (b->stripe_pos[j].state != META_STRIPE_WHOLE || b->stripe_pos[j].prev != 0 ||
-                        b->stripe_pos[j].set_ver != 1)
+                        b->stripe_pos[j].set_ver != 1 || b->stripe_pos[j].retired_ver != 0)
                         FAIL("volume %u: new EC position %u is not whole at version 1", b->number, j);
             }
-            if (a && next->restore_gen > prev->restore_gen && !b->gc_suspended && b->gc_gen == a->gc_gen)
-                FAIL("volume %u: a restore left orphan collection on", b->number);
-        } else if (b->redundancy != META_RED_REPLICAS || b->nstripe || b->stripe_version || b->stripe_whole_gen ||
-                   b->stripe_whole_ver || b->gc_suspended || b->gc_gen) {
-            FAIL("volume %u: a replicas volume with EC fields", b->number);
+        } else if (b->redundancy == META_RED_REPLICAS) {
+            if (b->ec_k || b->ec_m || b->nstripe > META_STRIPE_MAX)
+                FAIL("volume %u: a replicas volume with EC geometry", b->number);
+            if (!a && (b->nstripe || b->stripe_version || b->stripe_whole_gen || b->stripe_whole_ver ||
+                       b->gc_suspended || b->gc_gen))
+                FAIL("volume %u: a new replicas volume with EC fields", b->number);
+            if (!b->stripe_version && (b->nstripe || b->stripe_whole_gen || b->stripe_whole_ver || b->gc_suspended ||
+                                       b->gc_gen))
+                FAIL("volume %u: a replicas volume with EC fields", b->number);
+        } else {
+            FAIL("volume %u: unknown redundancy %u", b->number, b->redundancy);
         }
+        if (a && (a->redundancy == META_RED_EC || a->nstripe > 0) &&
+            (b->redundancy == META_RED_EC || b->nstripe > 0) && next->restore_gen > prev->restore_gen &&
+            !b->gc_suspended && b->gc_gen == a->gc_gen)
+            FAIL("volume %u: a restore left orphan collection on", b->number);
+        if (b->mixed_redundancy == META_RED_REPLICAS) {
+            if (b->mixed_k || b->mixed_m || b->mixed_sv_lo || b->mixed_sv_hi)
+                FAIL("volume %u: non-zero mixed fields while mixed_redundancy is 0", b->number);
+        } else if (b->mixed_redundancy == META_RED_EC) {
+            if (b->conv.phase != META_CONV_NONE || b->mixed_k < 1 || b->mixed_k > META_EC_K_MAX || b->mixed_m < 1 ||
+                b->mixed_m > META_EC_M_MAX || (uint32_t)b->mixed_k + b->mixed_m > b->nstripe ||
+                b->mixed_sv_lo < 1 || b->mixed_sv_lo > b->mixed_sv_hi || b->mixed_sv_hi >= b->stripe_version)
+                FAIL("volume %u: invalid mixed EC geometry (%u+%u, nstripe %u, sv %llu..%llu/%llu)", b->number,
+                     b->mixed_k, b->mixed_m, b->nstripe, (unsigned long long)b->mixed_sv_lo,
+                     (unsigned long long)b->mixed_sv_hi, (unsigned long long)b->stripe_version);
+        } else {
+            FAIL("volume %u: unknown mixed_redundancy %u", b->number, b->mixed_redundancy);
+        }
+        /* Validate all held stripe positions (both active EC and retired positions awaiting DROP). */
+        uint32_t active_ns = vol_active_nstripe(b);
+        for (uint32_t j = 0; j < b->nstripe; j++) {
+            if (!meta_member(next, b->stripe[j]))
+                FAIL("volume %u: stripe position %u names node %u, which is not a member", b->number, j, b->stripe[j]);
+            if (b->stripe_pos[j].state > META_STRIPE_FILLING || b->stripe_pos[j].set_ver < 1 ||
+                b->stripe_pos[j].set_ver > b->stripe_version || b->stripe_pos[j].retired_ver > b->stripe_version)
+                FAIL("volume %u: stripe position %u has invalid state %u, set_ver %llu or retired_ver %llu (sv %llu)",
+                     b->number, j, b->stripe_pos[j].state, (unsigned long long)b->stripe_pos[j].set_ver,
+                     (unsigned long long)b->stripe_pos[j].retired_ver, (unsigned long long)b->stripe_version);
+            if (j < active_ns && b->stripe_pos[j].retired_ver != 0)
+                FAIL("volume %u: active stripe position %u marked retired", b->number, j);
+            if (j >= active_ns && b->stripe_pos[j].retired_ver == 0)
+                FAIL("volume %u: trailing stripe position %u lacks retired_ver", b->number, j);
+            if (b->stripe_pos[j].prev &&
+                (!meta_member(next, b->stripe_pos[j].prev) || b->stripe_pos[j].prev == b->stripe[j]))
+                FAIL("volume %u: stripe position %u names invalid prev node %u", b->number, j, b->stripe_pos[j].prev);
+            for (uint32_t k = 0; k < j; k++)
+                if (b->stripe[k] == b->stripe[j])
+                    FAIL("volume %u: node %u holds stripe positions %u and %u", b->number, b->stripe[j], k, j);
+        }
+        /* Conversion state and lower-geometry position floor (D26, E24). */
+        if (b->conv.phase != META_CONV_NONE) {
+            if (b->kind != META_VOL_REPLICATED || b->conv.phase > META_CONV_LAST)
+                FAIL("volume %u: invalid conversion phase %u", b->number, b->conv.phase);
+            uint32_t orig_ns = b->conv.orig_redundancy == META_RED_EC ? (uint32_t)b->conv.orig_k + b->conv.orig_m : 0;
+            uint32_t targ_ns =
+                b->conv.target_redundancy == META_RED_EC ? (uint32_t)b->conv.target_k + b->conv.target_m : 0;
+            uint32_t lower_ns = orig_ns < targ_ns ? orig_ns : targ_ns;
+            if (b->nstripe < lower_ns)
+                FAIL("volume %u: %u stripe positions below lower geometry %u during conversion", b->number, b->nstripe,
+                     lower_ns);
+            if (b->conv.phase < META_CONV_REENCODE && b->conv.new_stripe_version != 0)
+                FAIL("volume %u: new_stripe_version set before REENCODE", b->number);
+            if (b->conv.new_stripe_version > b->stripe_version)
+                FAIL("volume %u: new_stripe_version past stripe_version", b->number);
+        }
+        if (b->live_epoch > b->epoch || b->live_sv_at > b->stripe_version || b->nlive_sv > META_LIVE_SV_MAX ||
+            b->live_overflow > 1)
+            FAIL("volume %u: invalid live-object report state", b->number);
+        for (uint32_t j = 0; j < b->nlive_sv; j++)
+            if (b->live_sv[j].stripe_version < 1 || b->live_sv[j].stripe_version > b->stripe_version ||
+                (j > 0 && b->live_sv[j].stripe_version <= b->live_sv[j - 1].stripe_version))
+                FAIL("volume %u: invalid live_sv entry %u", b->number, j);
         if (!meta_volume_in_isr(b, b->leader))
             FAIL("volume %u: leader %u is not in its ISR", b->number, b->leader);
         for (uint32_t j = 0; j < b->nisr; j++)

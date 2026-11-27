@@ -855,7 +855,7 @@ static void test_replica_set(void)
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 8);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 9);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -881,7 +881,7 @@ static void test_replica_set(void)
     {
         meta_op_replica_reset(&e, 2, 3, 3, 7200);
         meta_entry_finish(&e);
-        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME5", 4) == 0);
+        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME6", 4) == 0);
         uint64_t h = meta_hash(&m);
         memcpy(e.buf, "TME1", 4);
         CHECK(meta_entry_older(e.buf, e.len) && !meta_entry_older(e.buf, 3));
@@ -1177,6 +1177,9 @@ static void test_ec(void)
         CHECK(meta_entry_older(e.buf, e.len));
         CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
         memcpy(e.buf, "TME4", 4);
+        CHECK(meta_entry_older(e.buf, e.len));
+        CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
+        memcpy(e.buf, "TME5", 4);
         CHECK(meta_entry_older(e.buf, e.len));
         CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
         meta_entry_free(&e);
@@ -1476,7 +1479,7 @@ static void test_r9_meta(void)
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == 8);
+        CHECK(meta_snapshot_version(img, len) == 9);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -1583,6 +1586,906 @@ static void test_r9_meta(void)
         ((struct meta_member *)meta_member(&bad, 9))->replaced_by = 1;
         CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
         meta_free(&bad);
+    }
+
+    meta_entry_free(&e);
+    meta_free(&m);
+}
+
+/* ================================================================ R10 metadata (snapshot version 9) */
+
+static void test_r10_meta(void)
+{
+    struct meta_state m, prev;
+    struct meta_entry e;
+    int res[16];
+    char why[256];
+    meta_entry_init(&e);
+    init_cluster(&m, &e, META_MODE_REPLICATED, 12);
+
+    /* Phase names */
+    CHECK(!strcmp(meta_conv_phase_name(META_CONV_NONE), "none") &&
+          !strcmp(meta_conv_phase_name(META_CONV_GROW), "grow") &&
+          !strcmp(meta_conv_phase_name(META_CONV_RECORD), "record") &&
+          !strcmp(meta_conv_phase_name(META_CONV_REENCODE), "reencode") &&
+          !strcmp(meta_conv_phase_name(META_CONV_DROP), "drop") &&
+          !strcmp(meta_conv_phase_name(META_CONV_SHRINK), "shrink") && !strcmp(meta_conv_phase_name(9), "?"));
+
+    uint32_t log3[3] = {1, 2, 3}, g6[6] = {1, 2, 3, 4, 5, 6};
+    vol_add(&e, META_VOL_REPLICATED, 0, "r0", 1, log3, 3);
+    ec_add(&e, 1, "e1", 2, log3, 3, META_VOL_REPLICATED, 4, 2, g6, 6);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+
+    /* 1. VOLUME_REDUNDANCY refusals: unknown vol, stale epoch, invalid targets, active move/learner/filling */
+    struct meta_redundancy_target t_ec42 = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 2, .replicas = 3};
+    struct meta_redundancy_target t_ec43 = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 3, .replicas = 0};
+    struct meta_redundancy_target t_ec21 = {.redundancy = META_RED_EC, .ec_k = 2, .ec_m = 1, .replicas = 2};
+    struct meta_redundancy_target t_rep3 = {.redundancy = META_RED_REPLICAS, .ec_k = 0, .ec_m = 0, .replicas = 3};
+    struct meta_redundancy_target t_bad1 = {.redundancy = 9, .ec_k = 4, .ec_m = 2, .replicas = 3};
+    struct meta_redundancy_target t_bad2 = {.redundancy = META_RED_EC, .ec_k = 0, .ec_m = 2, .replicas = 3};
+    struct meta_redundancy_target t_bad3 = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 5, .replicas = 6};
+    struct meta_redundancy_target t_bad4 = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 2, .replicas = 5};
+    struct meta_redundancy_target t_bad5 = {.redundancy = META_RED_REPLICAS, .ec_k = 2, .ec_m = 0, .replicas = 3};
+    struct meta_redundancy_target t_bad6 = {.redundancy = META_RED_REPLICAS, .ec_k = 0, .ec_m = 0, .replicas = 9};
+
+    meta_op_volume_redundancy(&e, 99, &t_ec42, 1); /* unknown volume */
+    meta_op_volume_redundancy(&e, 0, &t_ec42, 9);  /* stale epoch */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_NOTFOUND && res[1] == META_ERR_STALE);
+
+    const struct meta_redundancy_target *bads[] = {&t_bad1, &t_bad2, &t_bad3, &t_bad4, &t_bad5, &t_bad6, &t_rep3};
+    for (size_t i = 0; i < sizeof bads / sizeof bads[0]; i++) {
+        meta_op_volume_redundancy(&e, 0, bads[i], 1);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    }
+    meta_op_volume_redundancy(&e, 1, &t_ec42, 1); /* already ec=4+2 */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+
+    /* Refused on shared mode */
+    {
+        struct meta_state sm;
+        init_cluster(&sm, &e, META_MODE_SHARED, 4);
+        vol_add(&e, META_VOL_SHARED, 0, "s0", 1, log3, 3);
+        CHECK(apply1(&sm, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_volume_redundancy(&e, 0, &t_ec42, 1);
+        CHECK(apply1(&sm, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        meta_free(&sm);
+    }
+
+    /* Refused while a move (`replaces`), plain learner, or filling stripe pos runs */
+    meta_op_replica_add(&e, 0, 1, 4, 8001, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_redundancy(&e, 0, &t_ec42, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_replica_remove(&e, 0, 1, 4);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+
+    meta_op_replica_add(&e, 0, 1, 4, 8002, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_redundancy(&e, 0, &t_ec42, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_replica_remove(&e, 0, 1, 4);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+
+    meta_op_stripe_set(&e, 1, 5, 7, META_STRIPE_FILLING, 6, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_redundancy(&e, 1, &t_ec43, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_stripe_whole(&e, 1, 5, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+
+    /* 2. Full conversion replicas=3 -> ec=4+2 on volume 0, plus convskip & cancel refusals */
+    meta_copy(&prev, &m);
+    meta_op_volume_redundancy(&e, 0, &t_ec42, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    const struct meta_volume *v0 = meta_volume(&m, 0);
+    CHECK(v0->conv.phase == META_CONV_GROW && v0->conv.target_redundancy == META_RED_EC && v0->conv.target_k == 4 &&
+          v0->conv.target_m == 2 && v0->conv.target_replicas == 3 && v0->conv.new_stripe_version == 0);
+
+    /* Second conversion and concurrent move refused while converting */
+    meta_op_volume_redundancy(&e, 0, &t_ec43, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS);
+    meta_op_replica_add(&e, 0, 1, 4, 8003, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+
+    /* Stale from_phase and skipped phases refused (catches MUT(63) convskip) */
+    meta_op_volume_conv_step(&e, 0, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_REENCODE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_NONE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+
+    /* GROW -> RECORD -> REENCODE (sets redundancy=EC, min_isr=2 per E24, stripe[0..5], new_stripe_version=1) */
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    meta_op_volume_conv_step(&e, 0, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    uint32_t dup6[6] = {1, 2, 3, 4, 5, 1};
+    meta_op_volume_conv_step(&e, 0, META_CONV_RECORD, META_CONV_REENCODE, dup6, 6);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_step(&e, 0, META_CONV_RECORD, META_CONV_REENCODE, g6, 6);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    v0 = meta_volume(&m, 0);
+    CHECK(v0->redundancy == META_RED_EC && v0->ec_k == 4 && v0->ec_m == 2 && v0->min_isr == 2 && v0->nstripe == 6 &&
+          v0->stripe_version == 1 && v0->conv.phase == META_CONV_REENCODE && v0->conv.new_stripe_version == 1);
+
+    /* REENCODE -> DROP -> SHRINK -> NONE */
+    meta_op_volume_conv_step(&e, 0, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_cancel(&e, 0); /* refused in DROP */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_volume_conv_step(&e, 0, META_CONV_DROP, META_CONV_SHRINK, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_cancel(&e, 0); /* refused in SHRINK */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_step(&e, 0, META_CONV_SHRINK, META_CONV_NONE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    CHECK(meta_volume(&m, 0)->conv.phase == META_CONV_NONE);
+
+    /* 3. Grow ec=4+2 -> ec=4+3 on volume 0 (log group 3 -> 4, min_isr 2 -> 3, nstripe 6 -> 7) */
+    meta_op_volume_redundancy(&e, 0, &t_ec43, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_replica_add(&e, 0, 1, 4, 8010, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    uint32_t log4[4] = {1, 2, 3, 4};
+    v0 = meta_volume(&m, 0);
+    isr_chg(&e, v0, v0->epoch, v0->isr_version, log4, 4, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    uint32_t bad_prefix[7] = {9, 2, 3, 4, 5, 6, 7};
+    meta_op_volume_conv_step(&e, 0, META_CONV_RECORD, META_CONV_REENCODE, bad_prefix, 7);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    uint32_t g7[7] = {1, 2, 3, 4, 5, 6, 7};
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_step(&e, 0, META_CONV_RECORD, META_CONV_REENCODE, g7, 7);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    v0 = meta_volume(&m, 0);
+    CHECK(v0->ec_k == 4 && v0->ec_m == 3 && v0->min_isr == 3 && v0->nstripe == 7 && v0->stripe_version == 2 &&
+          v0->conv.new_stripe_version == 2);
+    /* Grow 4+2 -> 4+3 has no retired positions, so REENCODE -> DROP MUST still require a current-epoch live report
+     * proving 0 live objects at sv < 2 (otherwise settled margin would jump from 2 to 3 while 4+2 objects exist;
+     * catches MUT(66) reencskip). */
+    {
+        int yg_g = 0, sd_g = 0;
+        meta_vol_margins(&m, v0, NULL, &yg_g, &sd_g);
+        CHECK(sd_g == 2); /* capped at lower (4+2) margin until REENCODE finishes */
+    }
+    meta_op_volume_conv_step(&e, 0, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    struct meta_live_sv lv_g1[1] = {{1, 4}};
+    meta_op_volume_live_objs(&e, 0, 1, 2, 0, lv_g1, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    struct meta_live_sv lv_g2[1] = {{2, 7}};
+    meta_op_volume_live_objs(&e, 0, 1, 2, 0, lv_g2, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_step(&e, 0, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    meta_op_volume_conv_step(&e, 0, META_CONV_DROP, META_CONV_SHRINK, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_SHRINK, META_CONV_NONE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->conv.phase == META_CONV_NONE);
+    {
+        int yg_g = 0, sd_g = 0;
+        meta_vol_margins(&m, meta_volume(&m, 0), NULL, &yg_g, &sd_g);
+        CHECK(sd_g == 3);
+    }
+
+    /* 4. Shrink ec=4+3 (7 pos, 4 log) -> ec=2+1 (3 pos, 2 log): STRIPE_SET live-object refusal (D28, MUT(62)) */
+    meta_op_volume_redundancy(&e, 0, &t_ec21, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_step(&e, 0, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    v0 = meta_volume(&m, 0);
+    CHECK(v0->ec_k == 2 && v0->ec_m == 1 && v0->min_isr == 1 && v0->nstripe == 7 && v0->stripe_version == 3 &&
+          v0->conv.new_stripe_version == 3 && v0->stripe_pos[2].retired_ver == 0 &&
+          v0->stripe_pos[3].retired_ver == 3 && v0->stripe_pos[6].retired_ver == 3);
+    int yg = 0, sd = 0;
+    meta_vol_margins(&m, v0, NULL, &yg, &sd);
+    CHECK(yg == 3 && sd == 1);
+    /* Log replica shrink before SHRINK is refused (§6.4 step 5) */
+    isr_chg(&e, v0, v0->epoch, v0->isr_version, log3, 3, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_replica_remove(&e, 0, 1, 4);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    /* STRIPE_SET drop refused in REENCODE; REENCODE -> DROP refused until 0 live objects at sv < 3 */
+    meta_op_stripe_drop(&e, 0, 3, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_volume_conv_step(&e, 0, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    /* VOLUME_LIVE_OBJS stale epoch/sv and invalid vector refused */
+    struct meta_live_sv lv_old[2] = {{2, 5}, {3, 10}};
+    struct meta_live_sv lv_bad[2] = {{3, 1}, {2, 1}};
+    meta_op_volume_live_objs(&e, 0, 99, 3, 0, lv_old, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
+    meta_op_volume_live_objs(&e, 0, 1, 2, 0, lv_old, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
+    meta_op_volume_live_objs(&e, 0, 1, 3, 0, lv_bad, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    /* Report 0 live objects at sv < 3 to leave REENCODE -> DROP */
+    struct meta_live_sv lv_new[1] = {{3, 15}};
+    meta_op_volume_live_objs(&e, 0, 1, 3, 0, lv_new, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    /* DROP -> SHRINK refused while retired positions remain */
+    meta_op_volume_conv_step(&e, 0, META_CONV_DROP, META_CONV_SHRINK, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    /* Report live objects at sv=2 (count 5 > 0) and sv=3 (count 10): drop MUST be refused (catches MUT(62)) */
+    meta_op_volume_live_objs(&e, 0, 1, 3, 0, lv_old, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_stripe_drop(&e, 0, 3, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE && meta_volume(&m, 0)->nstripe == 7);
+    /* Overflow flag refuses drop even with empty vector */
+    meta_op_volume_live_objs(&e, 0, 1, 3, 1, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_stripe_drop(&e, 0, 3, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    /* Report 0 live objects at sv < 3 (only new objects at sv == 3): snapshot v9 round-trip + v8 refusal */
+    meta_op_volume_live_objs(&e, 0, 1, 3, 0, lv_new, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    {
+        uint8_t *img;
+        size_t len;
+        meta_snapshot_encode(&m, &img, &len);
+        CHECK(meta_snapshot_version(img, len) == 9);
+        struct meta_state back;
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
+        const struct meta_volume *bv = meta_volume(&back, 0);
+        CHECK(bv->conv.phase == META_CONV_DROP && bv->conv.new_stripe_version == 3 &&
+              bv->stripe_pos[3].retired_ver == 3 && bv->live_epoch == 1 && bv->live_sv_at == 3 && bv->nlive_sv == 1 &&
+              bv->live_sv[0].stripe_version == 3 && bv->live_sv[0].count == 15);
+        uint32_t eight = 8, crc;
+        memcpy(img + 4, &eight, 4);
+        crc = iso_crc32c(0, img, len - 4);
+        memcpy(img + len - 4, &crc, 4);
+        CHECK(meta_snapshot_version(img, len) == 8 && meta_snapshot_decode(&back, img, len) == META_ERR_FORMAT);
+        meta_free(&back);
+        free(img);
+    }
+    /* Promote volume 0 to epoch 2: previous epoch's live report is no longer under current epoch -> drop refused! */
+    v0 = meta_volume(&m, 0);
+    {
+        uint32_t f3[3] = {1, 2, 3};
+        promo(&e, v0, v0->epoch, 3, f3, 3, f3, 3, 10);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->epoch == 2);
+    }
+    meta_op_stripe_drop(&e, 0, 3, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE && meta_volume(&m, 0)->nstripe == 7);
+    /* New leader under epoch 2 reports only sv=3 live -> pos=2 < active refused; pos=3 succeeds! */
+    meta_op_volume_live_objs(&e, 0, 2, 3, 0, lv_new, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_stripe_drop(&e, 0, 2, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    meta_copy(&prev, &m);
+    meta_op_stripe_drop(&e, 0, 3, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    CHECK(meta_volume(&m, 0)->nstripe == 3 && meta_volume(&m, 0)->stripe_version == 4);
+    /* DROP -> SHRINK -> remove excess replicas 4 and 2 -> SHRINK -> NONE */
+    meta_op_volume_conv_step(&e, 0, META_CONV_DROP, META_CONV_SHRINK, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_SHRINK, META_CONV_NONE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_replica_remove(&e, 0, 2, 4);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v0 = meta_volume(&m, 0);
+    uint32_t log2[2] = {1, 3};
+    isr_chg(&e, v0, v0->epoch, v0->isr_version, log2, 2, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_replica_remove(&e, 0, 2, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    uint32_t lead3[1] = {3};
+    v0 = meta_volume(&m, 0);
+    isr_chg(&e, v0, v0->epoch, v0->isr_version, lead3, 1, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_replica_remove(&e, 0, 2, 1); /* cannot shrink below target_replicas (2) */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_volume_conv_step(&e, 0, META_CONV_SHRINK, META_CONV_NONE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->conv.phase == META_CONV_NONE);
+
+    /* 5. ec=2+1 -> replicas=3: GROW 2 -> 3, RECORD sets REPLICAS + min_isr, DROP empties nstripe to 0 */
+    meta_op_volume_redundancy(&e, 0, &t_rep3, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_replica_add(&e, 0, 2, 2, 8020, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v0 = meta_volume(&m, 0);
+    isr_chg(&e, v0, v0->epoch, v0->isr_version, log3, 3, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_step(&e, 0, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    v0 = meta_volume(&m, 0);
+    CHECK(v0->redundancy == META_RED_REPLICAS && v0->ec_k == 0 && v0->ec_m == 0 && v0->min_isr == 1 &&
+          v0->nstripe == 3 && v0->stripe_version == 5 && v0->stripe_pos[0].retired_ver == 5);
+    struct meta_live_sv lv4[1] = {{4, 1}};
+    meta_op_volume_live_objs(&e, 0, 2, 5, 0, lv4, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_volume_live_objs(&e, 0, 2, 5, 0, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_live_objs(&e, 0, 2, 5, 0, lv4, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_stripe_drop(&e, 0, 0, 5);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_volume_live_objs(&e, 0, 2, 5, 0, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_copy(&prev, &m);
+    meta_op_stripe_drop(&e, 0, 0, 5);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    CHECK(meta_volume(&m, 0)->nstripe == 0 && meta_volume(&m, 0)->stripe_version == 6);
+    meta_op_volume_conv_step(&e, 0, META_CONV_DROP, META_CONV_SHRINK, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 0, META_CONV_SHRINK, META_CONV_NONE, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->conv.phase == META_CONV_NONE);
+
+    /* 6. --cancel in GROW, RECORD, and REENCODE (on volume 1: ec=4+2 -> ec=4+3) */
+    meta_op_volume_conv_cancel(&e, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_volume_redundancy(&e, 1, &t_ec43, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_cancel(&e, 1); /* cancel in GROW */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 1)->conv.phase == META_CONV_NONE &&
+          meta_volume(&m, 1)->conv_cancel_gen == 1);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    meta_op_volume_redundancy(&e, 1, &t_ec43, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_replica_add(&e, 1, 1, 4, 8030, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    const struct meta_volume *v1 = meta_volume(&m, 1);
+    isr_chg(&e, v1, v1->epoch, v1->isr_version, log4, 4, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_conv_step(&e, 1, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    uint32_t g7b[7] = {1, 2, 3, 4, 5, 7, 8}; /* v1 had pos 5 moved to 7 earlier */
+    meta_op_volume_conv_step(&e, 1, META_CONV_RECORD, META_CONV_REENCODE, g7b, 7);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_volume(&m, 1)->ec_m == 3 && meta_volume(&m, 1)->min_isr == 3 && meta_volume(&m, 1)->nstripe == 7);
+    meta_copy(&prev, &m);
+    meta_op_volume_conv_cancel(&e, 1); /* cancel in REENCODE */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    v1 = meta_volume(&m, 1);
+    CHECK(v1->conv.phase == META_CONV_NONE && v1->redundancy == META_RED_EC && v1->ec_k == 4 && v1->ec_m == 2 &&
+          v1->min_isr == 2 && v1->nstripe == 7 && v1->stripe_pos[6].retired_ver == v1->stripe_version);
+    uint64_t v1_ep = v1->epoch, v1_sv = v1->stripe_version;
+    meta_op_stripe_drop(&e, 1, 6, v1_sv);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+    meta_op_volume_live_objs(&e, 1, v1_ep, v1_sv, 0, NULL, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_stripe_drop(&e, 1, 6, v1_sv);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 1)->nstripe == 6);
+
+    /* 7. Direct meta_check_step invariant tests */
+    {
+        struct meta_state bad;
+        meta_op_volume_redundancy(&e, 1, &t_ec21, 1);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_copy(&bad, &m);
+        ((struct meta_volume *)meta_volume(&bad, 1))->conv.phase = META_CONV_DROP;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        ((struct meta_volume *)meta_volume(&bad, 1))->conv.phase = META_CONV_NONE;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+        meta_copy(&bad, &m);
+        struct meta_volume *bv = (struct meta_volume *)meta_volume(&bad, 1);
+        bv->nstripe = 5;
+        bv->stripe_version++;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+    }
+
+    /* 8. Regression: RESTORE and RECORD (replicas -> ec) in the same entry must pass meta_check_step */
+    {
+        vol_add(&e, META_VOL_REPLICATED, 2, "r2", 1, log3, 3);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_volume_redundancy(&e, 2, &t_ec42, 1);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_volume_conv_step(&e, 2, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_copy(&prev, &m);
+        meta_op_restore(&e, m.restore_gen + 1);
+        meta_op_volume_conv_step(&e, 2, META_CONV_RECORD, META_CONV_REENCODE, g6, 6);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+        CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+        meta_free(&prev);
+    }
+
+    /* 9. orig_min_isr preservation:
+     *    (a) replicas=3 with operator min_isr=2 -> ec 2+1, RECORD sets min_isr=1, cancel in REENCODE restores min_isr=2;
+     *    (b) ec 4+2 (nrep=3, min_isr=3) -> replicas=3, RECORD sets min_isr=2, cancel in REENCODE restores min_isr=3;
+     *    (c) replicas=3 (min_isr=2) -> replicas=4 preserves min_isr=2 at RECORD (never silently raised to 3). */
+    {
+        struct meta_state mr, pr;
+        init_cluster(&mr, &e, META_MODE_REPLICATED, 7);
+        uint32_t r3[3] = {1, 2, 3}, g6[6] = {1, 2, 3, 4, 5, 6}, g3[3] = {1, 2, 3};
+        vol_add(&e, META_VOL_REPLICATED, 1, "r_min2", 2, r3, 3);
+        ec_add(&e, 2, "ec_min3", 3, r3, 3, META_VOL_REPLICATED, 4, 2, g6, 6);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+        CHECK(meta_volume(&mr, 1)->min_isr == 2 && meta_volume(&mr, 2)->min_isr == 3);
+
+        /* (a) replicas(3, min_isr=2) -> ec 2+1 (min_isr becomes 1 at RECORD) -> cancel in REENCODE restores min_isr=2 */
+        struct meta_redundancy_target t21 = {.redundancy = META_RED_EC, .ec_k = 2, .ec_m = 1, .replicas = 2};
+        meta_op_volume_redundancy(&e, 1, &t21, meta_volume(&mr, 1)->epoch);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mr, 1)->conv.orig_min_isr == 2);
+        meta_op_volume_conv_step(&e, 1, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_copy(&pr, &mr);
+        meta_op_volume_conv_step(&e, 1, META_CONV_RECORD, META_CONV_REENCODE, g3, 3);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mr, 1)->min_isr == 1 && meta_check_step(&pr, &mr, why, sizeof why) == 0);
+        meta_free(&pr);
+        meta_copy(&pr, &mr);
+        meta_op_volume_conv_cancel(&e, 1);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mr, 1)->redundancy == META_RED_REPLICAS && meta_volume(&mr, 1)->min_isr == 2 &&
+              meta_volume(&mr, 1)->mixed_redundancy == META_RED_EC && meta_volume(&mr, 1)->mixed_k == 2 &&
+              meta_volume(&mr, 1)->mixed_m == 1);
+        CHECK(meta_check_step(&pr, &mr, why, sizeof why) == 0);
+        meta_free(&pr);
+        /* While mixed_redundancy is active (leftover 2+1 EC objects), settled margin reflects 2+1 (not 0),
+         * STRIPE_SET drop is refused, and a new conversion is refused until VOLUME_LIVE_OBJS proves 0 live. */
+        {
+            int yg = 0, sd = 0;
+            meta_vol_margins(&mr, meta_volume(&mr, 1), NULL, &yg, &sd);
+            CHECK(sd == 1);
+            struct meta_redundancy_target tr4_try = {.redundancy = META_RED_REPLICAS, .replicas = 4};
+            meta_op_volume_redundancy(&e, 1, &tr4_try, meta_volume(&mr, 1)->epoch);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+            meta_op_stripe_drop(&e, 1, 0, meta_volume(&mr, 1)->stripe_version);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+            meta_copy(&pr, &mr);
+            meta_op_volume_live_objs(&e, 1, meta_volume(&mr, 1)->epoch, meta_volume(&mr, 1)->stripe_version, 0, NULL,
+                                     0);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+            CHECK(meta_volume(&mr, 1)->mixed_redundancy == META_RED_REPLICAS);
+            CHECK(meta_check_step(&pr, &mr, why, sizeof why) == 0);
+            meta_free(&pr);
+            meta_vol_margins(&mr, meta_volume(&mr, 1), NULL, &yg, &sd);
+            CHECK(sd == 0);
+            /* Regression: [STRIPE_SET drop -> nstripe 0, RESTORE] in one entry must pass meta_check_step */
+            meta_copy(&pr, &mr);
+            meta_op_stripe_drop(&e, 1, 0, meta_volume(&mr, 1)->stripe_version);
+            meta_op_restore(&e, mr.restore_gen + 1);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+            CHECK(meta_volume(&mr, 1)->nstripe == 0 && meta_volume(&mr, 1)->gc_suspended == 0);
+            CHECK(meta_check_step(&pr, &mr, why, sizeof why) == 0);
+            meta_free(&pr);
+        }
+
+        /* (b) ec 4+2 (nrep=3, min_isr=3) -> replicas=3 (RECORD sets min_isr=2) -> cancel in REENCODE restores min_isr=3 */
+        struct meta_redundancy_target tr3 = {.redundancy = META_RED_REPLICAS, .replicas = 3};
+        meta_op_volume_redundancy(&e, 2, &tr3, meta_volume(&mr, 2)->epoch);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mr, 2)->conv.orig_min_isr == 3);
+        meta_op_volume_conv_step(&e, 2, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_copy(&pr, &mr);
+        meta_op_volume_conv_step(&e, 2, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mr, 2)->redundancy == META_RED_REPLICAS && meta_volume(&mr, 2)->min_isr == mr.set.min_isr);
+        CHECK(meta_check_step(&pr, &mr, why, sizeof why) == 0);
+        meta_free(&pr);
+
+        /* 11. meta_op_volume_force must emit GC_SUSPEND while ec -> replicas REENCODE still has nstripe > 0 */
+        {
+            const struct meta_volume *v2 = meta_volume(&mr, 2);
+            uint32_t i2[2] = {1, 3};
+            isr_chg(&e, v2, 1, v2->epoch, i2, 2, 0);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+            meta_copy(&pr, &mr);
+            meta_op_volume_force(&e, meta_volume(&mr, 2), 2);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+            CHECK(meta_volume(&mr, 2)->gc_suspended == 1 && meta_volume(&mr, 2)->nstripe == 6 &&
+                  meta_volume(&mr, 2)->nisr == 3);
+            CHECK(meta_check_step(&pr, &mr, why, sizeof why) == 0);
+            meta_free(&pr);
+        }
+
+        meta_copy(&pr, &mr);
+        meta_op_volume_conv_cancel(&e, 2);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mr, 2)->redundancy == META_RED_EC && meta_volume(&mr, 2)->min_isr == 3);
+        CHECK(meta_check_step(&pr, &mr, why, sizeof why) == 0);
+        meta_free(&pr);
+
+        /* (c) replicas=3 (min_isr=2) -> replicas=4 preserves min_isr=2 at RECORD (not raised to 3) */
+        struct meta_redundancy_target tr4 = {.redundancy = META_RED_REPLICAS, .replicas = 4};
+        meta_op_volume_redundancy(&e, 1, &tr4, meta_volume(&mr, 1)->epoch);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_replica_add(&e, 1, meta_volume(&mr, 1)->epoch, 4, 8010, 0);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        {
+            const struct meta_volume *vr = meta_volume(&mr, 1);
+            uint32_t i4[4] = {1, 2, 3, 4};
+            isr_chg(&e, vr, 1, vr->epoch, i4, 4, 0);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        }
+        meta_op_volume_conv_step(&e, 1, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_copy(&pr, &mr);
+        meta_op_volume_conv_step(&e, 1, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+        CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mr, 1)->min_isr == 2 && meta_check_step(&pr, &mr, why, sizeof why) == 0);
+        meta_free(&pr);
+
+        /* 10. One-touch-per-volume rule prevents multi-op entries on the same volume:
+         *     [VOLUME_LIVE_OBJS, STRIPE_SET drop] and [CONV_STEP(RECORD->REENCODE), CONV_CANCEL] */
+        {
+            const struct meta_volume *ve = meta_volume(&mr, 2);
+            struct meta_live_sv lv = {.stripe_version = ve->stripe_version, .count = 0};
+            meta_op_volume_live_objs(&e, 2, ve->epoch, ve->stripe_version, 0, &lv, 1);
+            meta_op_stripe_drop(&e, 2, 5, ve->stripe_version);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_INVALID);
+            CHECK(meta_volume(&mr, 2)->nstripe == 6);
+
+            /* Second op on same volume in one entry (RECORD->REENCODE + CONV_CANCEL) is rejected */
+            meta_op_volume_conv_cancel(&e, 1);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+            meta_op_volume_redundancy(&e, 1, &t21, meta_volume(&mr, 1)->epoch);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+            meta_op_volume_conv_step(&e, 1, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK);
+            meta_op_volume_conv_step(&e, 1, META_CONV_RECORD, META_CONV_REENCODE, g3, 3);
+            meta_op_volume_conv_cancel(&e, 1);
+            CHECK(apply1(&mr, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_INVALID);
+            CHECK(meta_volume(&mr, 1)->conv.phase == META_CONV_REENCODE);
+        }
+        meta_free(&mr);
+    }
+
+    /* 12. Snapshot v9 decoder negative tests: every corrupt conv / live_sv field fails with META_ERR_FORMAT */
+    {
+        struct meta_state ms, back;
+        init_cluster(&ms, &e, META_MODE_REPLICATED, 7);
+        uint32_t r2[2] = {1, 2}, g6[6] = {1, 2, 3, 4, 5, 6};
+        ec_add(&e, 1, "ec_snap", 2, r2, 2, META_VOL_REPLICATED, 4, 2, g6, 6);
+        CHECK(apply1(&ms, &e, res, 8) == META_OK && res[0] == META_OK);
+        /* bump stripe_version to 2 so we can record 2 sorted live_sv entries */
+        meta_op_stripe_set(&e, 1, 5, 7, META_STRIPE_FILLING, 6, 1);
+        CHECK(apply1(&ms, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_stripe_whole(&e, 1, 5, 2);
+        CHECK(apply1(&ms, &e, res, 8) == META_OK && res[0] == META_OK);
+        struct meta_live_sv lv2[2] = {{1, 5}, {2, 3}};
+        meta_op_volume_live_objs(&e, 1, meta_volume(&ms, 1)->epoch, meta_volume(&ms, 1)->stripe_version, 0, lv2, 2);
+        CHECK(apply1(&ms, &e, res, 8) == META_OK && res[0] == META_OK);
+
+        /* Snapshot with conv.phase == NONE and 2 live_sv entries */
+        uint8_t *img = NULL;
+        size_t len = 0;
+        CHECK(meta_snapshot_encode(&ms, &img, &len) == META_OK);
+        /* Locate conv_off relative to trailer (44B) + conv/mixed/live fixed tail (75B) + 2*16B live_sv,
+         * and assert surrounding known fields so any layout shift fails loudly here. */
+        size_t conv_off = len - 44 - (75 + 2 * 16);
+        uint64_t f_sv = 0, f_wgen = 0, f_wver = 0, f_gcgen = 0, f_lep = 0, f_lsv = 0;
+        uint32_t f_nlv = 0;
+        memcpy(&f_sv, img + conv_off - 33, 8);
+        memcpy(&f_wgen, img + conv_off - 25, 8);
+        memcpy(&f_wver, img + conv_off - 17, 8);
+        memcpy(&f_gcgen, img + conv_off - 8, 8);
+        memcpy(&f_lep, img + conv_off + 54, 8);
+        memcpy(&f_lsv, img + conv_off + 62, 8);
+        memcpy(&f_nlv, img + conv_off + 71, 4);
+        CHECK(f_sv == 2 && f_wgen == 1 && f_wver == 2 && f_gcgen == 0 && img[conv_off] == META_CONV_NONE &&
+              img[conv_off + 35] == META_RED_REPLICAS && f_lep == 1 && f_lsv == 2 && f_nlv == 2);
+
+        /* helper: patch a copy, recompute CRC, assert META_ERR_FORMAT */
+        uint8_t *bad = malloc(len);
+        /* (a) invalid conv.phase > META_CONV_LAST */
+        memcpy(bad, img, len);
+        bad[conv_off + 0] = 9;
+        uint32_t crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        /* (b) conv.phase == NONE with nonzero target_k */
+        memcpy(bad, img, len);
+        bad[conv_off + 2] = 4;
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        /* (c) nlive_sv > META_LIVE_SV_MAX */
+        memcpy(bad, img, len);
+        bad[conv_off + 71] = META_LIVE_SV_MAX + 1;
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        /* (d) unsorted live_sv: {2, 5}, {1, 3} */
+        memcpy(bad, img, len);
+        uint64_t sv2 = 2, sv1 = 1;
+        memcpy(bad + conv_off + 75, &sv2, 8);
+        memcpy(bad + conv_off + 75 + 16, &sv1, 8);
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        /* (e) live_epoch == 0 while nlive_sv == 2 */
+        memcpy(bad, img, len);
+        uint64_t z64 = 0;
+        memcpy(bad + conv_off + 54, &z64, 8);
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        /* (f) live_epoch > v->epoch */
+        memcpy(bad, img, len);
+        uint64_t hi_ep = meta_volume(&ms, 1)->epoch + 1;
+        memcpy(bad + conv_off + 54, &hi_ep, 8);
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        /* (f2) mixed_redundancy == 0 with nonzero mixed_k, and mixed_redundancy == EC with mixed_sv_hi >= sv */
+        memcpy(bad, img, len);
+        bad[conv_off + 36] = 2;
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        memcpy(bad, img, len);
+        bad[conv_off + 35] = META_RED_EC;
+        bad[conv_off + 36] = 2;
+        bad[conv_off + 37] = 1;
+        memcpy(bad + conv_off + 38, &sv1, 8);
+        memcpy(bad + conv_off + 46, &sv2, 8); /* mixed_sv_hi == v->stripe_version (must be <) */
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+        free(bad);
+        free(img);
+
+        /* Active conversion in GROW: test nonzero new_stripe_version and orig_min_isr == 0 */
+        struct meta_redundancy_target tr3 = {.redundancy = META_RED_REPLICAS, .replicas = 3};
+        meta_op_volume_redundancy(&e, 1, &tr3, meta_volume(&ms, 1)->epoch);
+        CHECK(apply1(&ms, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_snapshot_encode(&ms, &img, &len) == META_OK);
+        conv_off = len - 44 - (75 + 2 * 16);
+        CHECK(img[conv_off] == META_CONV_GROW);
+        bad = malloc(len);
+
+        /* (g) conv.phase == GROW with nonzero new_stripe_version */
+        memcpy(bad, img, len);
+        uint64_t bad_nsv = 1;
+        memcpy(bad + conv_off + 8, &bad_nsv, 8);
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        /* (h) active conv with orig_min_isr == 0 */
+        memcpy(bad, img, len);
+        uint32_t z32 = 0;
+        memcpy(bad + conv_off + 23, &z32, 4);
+        crc = iso_crc32c(0, bad, len - 4);
+        memcpy(bad + len - 4, &crc, 4);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, bad, len) == META_ERR_FORMAT);
+        meta_free(&back);
+
+        free(bad);
+        free(img);
+        meta_free(&ms);
+    }
+
+    /* 13. Cancel shrink 4+3 -> 2+1 in REENCODE preserves 2+1 margin until VOLUME_LIVE_OBJS proves 0 live objects;
+     *     STRIPE_SET on a retired position preserves retired_ver (MUT(64) retireclear);
+     *     VOLUME_LIVE_OBJS with stale epoch is refused (MUT(65) livestale);
+     *     RECORD refuses FILLING positions, OUT reused members, and nisr < new_min_isr. */
+    {
+        struct meta_state mc, pr, back;
+        init_cluster(&mc, &e, META_MODE_REPLICATED, 9);
+        uint32_t r4[4] = {1, 2, 3, 4}, g7[7] = {1, 2, 3, 4, 5, 6, 7};
+        ec_add(&e, 1, "ec43", 3, r4, 4, META_VOL_REPLICATED, 4, 3, g7, 7);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+
+        /* Bump epoch to 2 so epoch 1 is stale (catches MUT(65) livestale in unit tests) */
+        {
+            const struct meta_volume *v = meta_volume(&mc, 1);
+            uint32_t f4[4] = {1, 2, 3, 4};
+            struct meta_grant g = promo_grant(v, 1, 4, f4, 4, f4, 4, 10, 0);
+            meta_op_volume_leader(&e, &g);
+            CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&mc, 1)->epoch == 2);
+            meta_op_volume_live_objs(&e, 1, 1, meta_volume(&mc, 1)->stripe_version, 0, NULL, 0);
+            CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
+            CHECK(meta_volume(&mc, 1)->live_epoch == 0);
+        }
+
+        /* Start shrink 4+3 -> 2+1; test RECORD refusals first (FILLING pos, OUT member, nisr < new_min_isr) */
+        struct meta_redundancy_target t21 = {.redundancy = META_RED_EC, .ec_k = 2, .ec_m = 1, .replicas = 2};
+        meta_op_volume_redundancy(&e, 1, &t21, meta_volume(&mc, 1)->epoch);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_volume_conv_step(&e, 1, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+
+        /* (a) FILLING stripe pos during RECORD -> META_ERR_STATE */
+        meta_op_stripe_set(&e, 1, 6, 8, META_STRIPE_FILLING, 7, meta_volume(&mc, 1)->stripe_version);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_volume_conv_step(&e, 1, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+        meta_op_stripe_whole(&e, 1, 6, meta_volume(&mc, 1)->stripe_version);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+
+        /* (b) OUT member in reused position 0..2 -> META_ERR_INVALID (on a copy so MUT(55) outfinal stays clean) */
+        {
+            struct meta_state mc_out;
+            meta_copy(&mc_out, &mc);
+            meta_op_member_state(&e, 3, META_OUT, 1, META_DOWN_NONE, 0, 0);
+            CHECK(apply1(&mc_out, &e, res, 8) == META_OK && res[0] == META_OK);
+            meta_op_volume_conv_step(&e, 1, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+            CHECK(apply1(&mc_out, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+            meta_free(&mc_out);
+        }
+
+        /* Now RECORD succeeds -> REENCODE */
+        meta_copy(&pr, &mc);
+        meta_op_volume_conv_step(&e, 1, META_CONV_RECORD, META_CONV_REENCODE, NULL, 0);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_check_step(&pr, &mc, why, sizeof why) == 0);
+        meta_free(&pr);
+        /* Verify STRIPE_SET replacement on retired position 6 preserves retired_ver (catches MUT(64) retireclear) */
+        {
+            const struct meta_volume *v = meta_volume(&mc, 1);
+            uint64_t rver = v->stripe_pos[6].retired_ver;
+            CHECK(rver == v->stripe_version);
+            meta_copy(&pr, &mc);
+            meta_op_stripe_set(&e, 1, 6, 9, META_STRIPE_FILLING, 8, v->stripe_version);
+            CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+            CHECK(meta_volume(&mc, 1)->stripe_pos[6].retired_ver == rver);
+            CHECK(meta_check_step(&pr, &mc, why, sizeof why) == 0);
+            meta_free(&pr);
+            meta_op_stripe_whole(&e, 1, 6, meta_volume(&mc, 1)->stripe_version);
+            CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+        }
+
+        /* Cancel in REENCODE: geometry reverts to 4+3, but leftover 2+1 objects exist in [lo..hi] so settled
+         * margin must stay capped at 2+1's margin (1, NOT 3!) until VOLUME_LIVE_OBJS proves 0 live in [lo..hi]. */
+        meta_copy(&pr, &mc);
+        meta_op_volume_conv_cancel(&e, 1);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_check_step(&pr, &mc, why, sizeof why) == 0);
+        meta_free(&pr);
+        const struct meta_volume *vc = meta_volume(&mc, 1);
+        CHECK(vc->redundancy == META_RED_EC && vc->ec_k == 4 && vc->ec_m == 3 && vc->min_isr == 3 &&
+              vc->mixed_redundancy == META_RED_EC && vc->mixed_k == 2 && vc->mixed_m == 1 &&
+              vc->mixed_sv_lo >= 1 && vc->mixed_sv_lo <= vc->mixed_sv_hi && vc->mixed_sv_hi < vc->stripe_version);
+        int yg = 0, sd = 0;
+        meta_vol_margins(&mc, vc, NULL, &yg, &sd);
+        CHECK(sd == 1); /* MUST NOT exceed 2+1 margin (1), even though active geometry is 4+3 (margin 3) */
+
+        /* Snapshot round-trip preserves mixed_* */
+        uint8_t *img = NULL;
+        size_t len = 0;
+        CHECK(meta_snapshot_encode(&mc, &img, &len) == META_OK);
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&mc));
+        meta_vol_margins(&back, meta_volume(&back, 1), NULL, &yg, &sd);
+        CHECK(sd == 1);
+        meta_free(&back);
+        free(img);
+
+        /* Report live object at mixed_sv_lo -> mixed stays, sd remains 1 */
+        struct meta_live_sv lv1 = {.stripe_version = vc->mixed_sv_lo, .count = 2};
+        meta_copy(&pr, &mc);
+        meta_op_volume_live_objs(&e, 1, vc->epoch, vc->stripe_version, 0, &lv1, 1);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mc, 1)->mixed_redundancy == META_RED_EC);
+        CHECK(meta_check_step(&pr, &mc, why, sizeof why) == 0);
+        meta_free(&pr);
+        meta_vol_margins(&mc, meta_volume(&mc, 1), NULL, &yg, &sd);
+        CHECK(sd == 1);
+
+        /* Report 0 live objects in [mixed_sv_lo..mixed_sv_hi] -> mixed clears, sd returns to 3 */
+        vc = meta_volume(&mc, 1);
+        struct meta_live_sv lv_cur = {.stripe_version = vc->stripe_version, .count = 9};
+        meta_copy(&pr, &mc);
+        meta_op_volume_live_objs(&e, 1, vc->epoch, vc->stripe_version, 0, &lv_cur, 1);
+        CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(meta_volume(&mc, 1)->mixed_redundancy == META_RED_REPLICAS);
+        CHECK(meta_check_step(&pr, &mc, why, sizeof why) == 0);
+        meta_free(&pr);
+        meta_vol_margins(&mc, meta_volume(&mc, 1), NULL, &yg, &sd);
+        CHECK(sd == 3);
+
+        /* Direct checker tests: mutated retired_ver, mutated live_epoch, and illegal mixed clear are rejected */
+        {
+            struct meta_state bent;
+            meta_copy(&bent, &mc);
+            ((struct meta_volume *)meta_volume(&bent, 1))->stripe_pos[0].retired_ver = 1;
+            CHECK(meta_check_step(&mc, &bent, why, sizeof why) != 0);
+            meta_free(&bent);
+
+            meta_copy(&bent, &mc);
+            ((struct meta_volume *)meta_volume(&bent, 1))->live_epoch = 1;
+            CHECK(meta_check_step(&mc, &bent, why, sizeof why) != 0);
+            meta_free(&bent);
+        }
+
+        /* Also test RECORD nisr < new_min_isr refusal on replicas -> ec 4+3 */
+        {
+            uint32_t r4b[4] = {1, 2, 3, 4};
+            vol_add(&e, META_VOL_REPLICATED, 2, "r_isr", 1, r4b, 4);
+            CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+            struct meta_redundancy_target t43 = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 3, .replicas = 4};
+            meta_op_volume_redundancy(&e, 2, &t43, 1);
+            CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+            meta_op_volume_conv_step(&e, 2, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+            CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+            /* Shrink ISR to 2 (below new ec_m = 3) while in RECORD -> RECORD -> REENCODE must refuse */
+            const struct meta_volume *v2 = meta_volume(&mc, 2);
+            CHECK(v2 != NULL);
+            if (v2) {
+                uint32_t i2[2] = {1, 2};
+                isr_chg(&e, v2, 1, v2->epoch, i2, 2, 0);
+                CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_OK);
+                meta_op_volume_conv_step(&e, 2, META_CONV_RECORD, META_CONV_REENCODE, g7, 7);
+                CHECK(apply1(&mc, &e, res, 8) == META_OK && res[0] == META_ERR_STATE);
+            }
+        }
+
+        meta_free(&mc);
     }
 
     meta_entry_free(&e);
@@ -2919,13 +3822,29 @@ static void check_one_op(struct msim *s, struct snode *nd, uint64_t index, uint3
         uint32_t pos = rd32(b + 4), node = rd32(b + 8), prev = rd32(b + 13);
         uint8_t st = b[12];
         uint64_t sv = rd64(b + 17);
-        if (!a || !v || a->stripe_version != sv || v->stripe_version != a->stripe_version + 1 ||
-            pos >= v->nstripe || v->stripe[pos] != node || v->stripe_pos[pos].state != st ||
-            v->stripe_pos[pos].set_ver != v->stripe_version ||
-            (st == META_STRIPE_FILLING && v->stripe_pos[pos].prev != prev))
+        if (node == 0) {
+            if (!a || !v || a->stripe_version != sv || v->stripe_version != a->stripe_version + 1 ||
+                pos >= a->nstripe || v->nstripe != pos || a->live_epoch != a->epoch || a->live_overflow)
+                sim_fail(s, "node %u, index %" PRIu64 ": STRIPE_SET drop on volume %u applied wrongly", nd->id, index,
+                         number);
+            for (uint32_t p = pos; a && p < a->nstripe; p++) {
+                uint64_t rv = a->stripe_pos[p].retired_ver;
+                if (!rv || a->live_sv_at < rv)
+                    sim_fail(s, "node %u, index %" PRIu64 ": STRIPE_SET dropped pos %u without retired_ver/live_sv_at",
+                             nd->id, index, p);
+                for (uint32_t i = 0; i < a->nlive_sv; i++)
+                    if (a->live_sv[i].count > 0 && a->live_sv[i].stripe_version < rv)
+                        sim_fail(s, "node %u, index %" PRIu64 ": STRIPE_SET dropped pos %u with live objects", nd->id,
+                                 index, p);
+            }
+        } else if (!a || !v || a->stripe_version != sv || v->stripe_version != a->stripe_version + 1 ||
+                   pos >= v->nstripe || v->stripe[pos] != node || v->stripe_pos[pos].state != st ||
+                   v->stripe_pos[pos].set_ver != v->stripe_version ||
+                   (st == META_STRIPE_FILLING && v->stripe_pos[pos].prev != prev)) {
             sim_fail(s, "node %u, index %" PRIu64 ": STRIPE_SET of volume %u named stripe version %" PRIu64
                      " (the volume's: %" PRIu64 ") and was applied wrongly", nd->id, index, number, sv,
                      a ? a->stripe_version : 0);
+        }
     }
     if (kind == META_OP_STRIPE_WHOLE && n >= 16) {
         const struct meta_volume *a = meta_volume(pre, number), *v = meta_volume(at, number);
@@ -2945,7 +3864,8 @@ static void check_one_op(struct msim *s, struct snode *nd, uint64_t index, uint3
     if ((setop || kind == META_OP_VOLUME_LEADER || kind == META_OP_ISR_CHANGE || kind == META_OP_VOLUME_ADD ||
          kind == META_OP_STRIPE_SET || kind == META_OP_STRIPE_WHOLE || kind == META_OP_GC_SUSPEND ||
          kind == META_OP_GC_RESUME || kind == META_OP_RESTORE || kind == META_OP_MEMBER_STATE ||
-         kind == META_OP_NODE_HOLD || kind == META_OP_NODE_REPLACE) &&
+         kind == META_OP_NODE_HOLD || kind == META_OP_NODE_REPLACE || kind == META_OP_VOLUME_REDUNDANCY ||
+         kind == META_OP_VOLUME_CONV_STEP || kind == META_OP_VOLUME_CONV_CANCEL || kind == META_OP_VOLUME_LIVE_OBJS) &&
         meta_check_step(pre, at, why, sizeof why))
         sim_fail(s, "node %u, index %" PRIu64 ", op %u (kind %u) on its own: %s", nd->id, index, k, kind, why);
 }
@@ -3647,15 +4567,23 @@ static void propose(struct msim *s, struct snode *nd)
                 meta_op_domain_state(&e, name, (int)rnd(s, 0, 2));
             else
                 meta_op_restore(&e, m->restore_gen + rnd(s, 0, 1));
-        } else if (what == 12 && v && v->redundancy == META_RED_EC) {
+        } else if (what == 12 && v && (v->redundancy == META_RED_EC || v->nstripe > 0)) {
             unsigned how = (unsigned)rnd(s, 0, 7);
-            if (how <= 2) { /* STRIPE_SET: mostly filling with prev, sometimes whole; sometimes stale version */
-                uint32_t pos = (uint32_t)rnd(s, 0, v->nstripe);
-                uint32_t node = m->members[rnd(s, 0, m->nmembers - 1)].id;
-                uint8_t st = rnd(s, 0, 3) ? META_STRIPE_FILLING : META_STRIPE_WHOLE;
-                uint32_t prev = (st == META_STRIPE_FILLING && pos < v->nstripe && rnd(s, 0, 2)) ? v->stripe[pos] : 0;
-                meta_op_stripe_set(&e, v->number, pos, node, st, prev, v->stripe_version - (rnd(s, 0, 7) == 0));
-            } else if (how <= 4) { /* STRIPE_WHOLE: pick a filling pos when one exists; sometimes stale version */
+            if (how <= 2 && v->nstripe > 0) { /* STRIPE_SET: mostly filling with prev, sometimes whole; sometimes drop */
+                uint32_t active = v->redundancy == META_RED_EC ? (uint32_t)v->ec_k + v->ec_m : 0;
+                if (v->nstripe > active && rnd(s, 0, 1) == 0) {
+                    meta_op_stripe_drop(&e, v->number, active, v->stripe_version - (rnd(s, 0, 7) == 0));
+                } else {
+                    /* Bias toward retired positions when any exist so MUT(64) retireclear triggers quickly */
+                    uint32_t pos = (v->nstripe > active && rnd(s, 0, 1) == 0)
+                                       ? (uint32_t)rnd(s, active, v->nstripe - 1)
+                                       : (uint32_t)rnd(s, 0, v->nstripe);
+                    uint32_t node = m->members[rnd(s, 0, m->nmembers - 1)].id;
+                    uint8_t st = rnd(s, 0, 3) ? META_STRIPE_FILLING : META_STRIPE_WHOLE;
+                    uint32_t prev = (st == META_STRIPE_FILLING && pos < v->nstripe && rnd(s, 0, 2)) ? v->stripe[pos] : 0;
+                    meta_op_stripe_set(&e, v->number, pos, node, st, prev, v->stripe_version - (rnd(s, 0, 7) == 0));
+                }
+            } else if (how <= 4 && v->nstripe > 0) { /* STRIPE_WHOLE */
                 uint32_t pos = (uint32_t)rnd(s, 0, v->nstripe - 1);
                 for (uint32_t j = 0; j < v->nstripe; j++)
                     if (v->stripe_pos[j].state == META_STRIPE_FILLING) {
@@ -3664,12 +4592,141 @@ static void propose(struct msim *s, struct snode *nd)
                     }
                 uint64_t ver = v->stripe_version - (rnd(s, 0, 3) == 0 && v->stripe_version > 1);
                 meta_op_stripe_whole(&e, v->number, pos, ver);
-            } else if (how == 5) { /* force-leader: a replica outside the ISR into it, orphan collection off */
+            } else if (how == 5 && v->redundancy == META_RED_EC) {
                 meta_op_volume_force(&e, v, v->rep[rnd(s, 0, v->nrep - 1)].node);
-            } else if (how == 6) {
+            } else if (how == 6 && v->redundancy == META_RED_EC) {
                 meta_op_gc_resume(&e, v->number);
-            } else {
+            } else if (v->redundancy == META_RED_EC) {
                 meta_op_gc_suspend(&e, v->number);
+            }
+        } else if (what == 13 && v && !shared) {
+            /* R10: redundancy conversions, phase steps (including illegal skips to catch convskip),
+             * live-object reports, and STRIPE_SET drops (including with live/unknown objects to catch stripelive). */
+            if (v->conv.phase == META_CONV_NONE) {
+                /* If leftover mixed geometry from a cancelled REENCODE exists, report 0 live objects so it clears;
+                 * also occasionally send a stale-epoch VOLUME_LIVE_OBJS to catch MUT(65) livestale in --sim-only. */
+                if (v->mixed_redundancy == META_RED_EC) {
+                    uint64_t ep = (v->epoch > 1 && rnd(s, 0, 3) == 0) ? v->epoch - 1 : v->epoch;
+                    meta_op_volume_live_objs(&e, v->number, ep, v->stripe_version, 0, NULL, 0);
+                    continue;
+                }
+                if (v->epoch > 1 && (v->redundancy == META_RED_EC || v->nstripe > 0) && rnd(s, 0, 5) == 0) {
+                    meta_op_volume_live_objs(&e, v->number, v->epoch - 1, v->stripe_version, 0, NULL, 0);
+                    continue;
+                }
+                /* Start a conversion occasionally so volumes also stay free for replica moves (44/46). */
+                if (rnd(s, 0, 3) != 0)
+                    continue;
+                struct meta_redundancy_target t = {0};
+                if (v->redundancy == META_RED_EC && rnd(s, 0, 2) == 0) {
+                    t.redundancy = META_RED_REPLICAS;
+                    t.replicas = 3;
+                } else {
+                    uint32_t alive = 0;
+                    for (uint32_t j = 0; j < m->nmembers; j++)
+                        alive += m->members[j].state < META_OUT;
+                    t.redundancy = META_RED_EC;
+                    t.ec_m = (uint8_t)rnd(s, 1, 2);
+                    uint32_t kmax = alive > (uint32_t)t.ec_m + 1 ? alive - t.ec_m : 1;
+                    if (kmax > 4)
+                        kmax = 4;
+                    t.ec_k = (uint8_t)rnd(s, 1, kmax);
+                    t.replicas = (uint32_t)t.ec_m + 1;
+                }
+                meta_op_volume_redundancy(&e, v->number, &t, v->epoch - (stale && v->epoch > 1));
+            } else {
+                unsigned act = (unsigned)rnd(s, 0, 7);
+                if (act == 0) {
+                    /* Try a skipped phase (catches MUT(63) convskip in --sim-only!) */
+                    uint8_t bad_to = v->conv.phase <= META_CONV_RECORD ? META_CONV_DROP : META_CONV_NONE;
+                    meta_op_volume_conv_step(&e, v->number, v->conv.phase, bad_to, NULL, 0);
+                } else if (act == 1) {
+                    meta_op_volume_conv_cancel(&e, v->number);
+                } else if (v->conv.phase == META_CONV_GROW) {
+                    if (v->nrep < v->conv.target_replicas) {
+                        for (uint32_t j = 0; j < m->nmembers; j++) {
+                            uint32_t nid = m->members[j].id;
+                            if (m->members[j].state < META_OUT && (m->members[j].flags & META_MF_VOLUMES_OK) &&
+                                !meta_replica(v, nid)) {
+                                meta_op_replica_add(&e, v->number, v->epoch, nid, 9000 + ++s->resets, 0);
+                                break;
+                            }
+                        }
+                    } else if (v->nisr < v->conv.target_replicas) {
+                        uint32_t ids[META_REPLICAS_MAX];
+                        uint64_t rids[META_REPLICAS_MAX];
+                        for (uint32_t j = 0; j < v->nrep; j++) {
+                            ids[j] = v->rep[j].node;
+                            rids[j] = v->rep[j].rid;
+                        }
+                        meta_op_isr_change(&e, v->number, v->epoch, v->isr_version, ids, rids, v->nrep, 0);
+                    } else {
+                        meta_op_volume_conv_step(&e, v->number, META_CONV_GROW, META_CONV_RECORD, NULL, 0);
+                    }
+                } else if (v->conv.phase == META_CONV_RECORD) {
+                    uint32_t stripe[META_STRIPE_MAX], ns = 0;
+                    if (v->conv.target_redundancy == META_RED_EC) {
+                        uint32_t need = (uint32_t)v->conv.target_k + v->conv.target_m;
+                        if (need > v->nstripe) {
+                            for (uint32_t j = 0; j < v->nstripe; j++)
+                                stripe[ns++] = v->stripe[j];
+                            for (uint32_t j = 0; j < m->nmembers && ns < need; j++) {
+                                uint32_t nid = m->members[j].id;
+                                if (m->members[j].state < META_OUT && !has_id_local(stripe, ns, nid))
+                                    stripe[ns++] = nid;
+                            }
+                        }
+                    }
+                    meta_op_volume_conv_step(&e, v->number, META_CONV_RECORD, META_CONV_REENCODE, ns ? stripe : NULL,
+                                             ns);
+                } else if (v->conv.phase == META_CONV_REENCODE) {
+                    if (v->conv.orig_redundancy == META_RED_EC && act >= 4) {
+                        if (act == 4 && v->conv.new_stripe_version > 1) {
+                            struct meta_live_sv lv[1] = {{v->conv.new_stripe_version - 1, 2}};
+                            meta_op_volume_live_objs(&e, v->number, v->epoch, v->stripe_version, 0, lv, 1);
+                        } else {
+                            meta_op_volume_live_objs(&e, v->number, v->epoch, v->stripe_version, 0, NULL, 0);
+                        }
+                    } else {
+                        /* Also tries REENCODE -> DROP before live_objs clears old EC objects (catches MUT(66) reencskip) */
+                        meta_op_volume_conv_step(&e, v->number, META_CONV_REENCODE, META_CONV_DROP, NULL, 0);
+                    }
+                } else if (v->conv.phase == META_CONV_DROP) {
+                    uint32_t active = v->redundancy == META_RED_EC ? (uint32_t)v->ec_k + v->ec_m : 0;
+                    if (v->nstripe > active) {
+                        if (act <= 3) {
+                            /* Try STRIPE_SET drop (both before and after live_objs: catches MUT(62) stripelive!) */
+                            meta_op_stripe_drop(&e, v->number, active, v->stripe_version);
+                        } else if (act == 4 && v->stripe_version > 1) {
+                            /* Report live objects at an older stripe_version (> 0): next drop must be refused */
+                            struct meta_live_sv lv[1] = {{v->stripe_version - 1, 3}};
+                            meta_op_volume_live_objs(&e, v->number, v->epoch, v->stripe_version, 0, lv, 1);
+                        } else {
+                            /* Report 0 live objects at old versions so drop can legally proceed */
+                            meta_op_volume_live_objs(&e, v->number, v->epoch, v->stripe_version, 0, NULL, 0);
+                        }
+                    } else {
+                        meta_op_volume_conv_step(&e, v->number, META_CONV_DROP, META_CONV_SHRINK, NULL, 0);
+                    }
+                } else if (v->conv.phase == META_CONV_SHRINK) {
+                    if (v->nrep > v->conv.target_replicas) {
+                        uint32_t drop = 0;
+                        for (uint32_t j = 0; j < v->nrep; j++)
+                            if (v->rep[j].node != v->leader && !meta_volume_in_isr(v, v->rep[j].node)) {
+                                drop = v->rep[j].node;
+                                break;
+                            }
+                        if (drop) {
+                            meta_op_replica_remove(&e, v->number, v->epoch, drop);
+                        } else {
+                            uint32_t ids[1] = {v->leader};
+                            uint64_t rids[1] = {meta_replica(v, v->leader)->rid};
+                            meta_op_isr_change(&e, v->number, v->epoch, v->isr_version, ids, rids, 1, 0);
+                        }
+                    } else {
+                        meta_op_volume_conv_step(&e, v->number, META_CONV_SHRINK, META_CONV_NONE, NULL, 0);
+                    }
+                }
             }
         } else if (what == 11 && rnd(s, 0, 5) == 0) {
             meta_op_name_group(&e);
@@ -3958,9 +5015,21 @@ int main(int argc, char **argv)
             first = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
             seconds = strtod(argv[++i], NULL);
-        else if (!strcmp(argv[i], "--mutant") && i + 1 < argc)
-            mutant = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--sim-only")) /* the simulator's checker alone, to see it catch a planted bug */
+        else if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
+            const char *mn = argv[++i];
+            if (!strcmp(mn, "stripelive"))
+                mutant = 62;
+            else if (!strcmp(mn, "convskip"))
+                mutant = 63;
+            else if (!strcmp(mn, "retireclear"))
+                mutant = 64;
+            else if (!strcmp(mn, "livestale"))
+                mutant = 65;
+            else if (!strcmp(mn, "reencskip"))
+                mutant = 66;
+            else
+                mutant = atoi(mn);
+        } else if (!strcmp(argv[i], "--sim-only")) /* the simulator's checker alone, to see it catch a planted bug */
             sim_only = 1;
         else if (argv[i][0] != '-' && *argv[i])
             dir = argv[i];
@@ -3976,8 +5045,8 @@ int main(int argc, char **argv)
         return 2;
     }
 #ifdef META_MUTANTS
-    extern uint64_t meta_mutants;
-    meta_mutants = mutant ? 1ull << mutant : 0;
+    extern int meta_mutant;
+    meta_mutant = mutant;
 #else
     if (mutant) {
         fprintf(stderr, "test_meta: --mutant needs the build with -DMETA_MUTANTS (make test_meta_mut)\n");
@@ -3989,6 +5058,7 @@ int main(int argc, char **argv)
         test_replica_set();
         test_ec();
         test_r9_meta();
+        test_r10_meta();
         test_shared();
         test_users();
         test_users_limits();

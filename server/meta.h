@@ -247,9 +247,50 @@ enum meta_stripe_state { META_STRIPE_WHOLE = 0, META_STRIPE_FILLING = 1 };
 const char *meta_stripe_state_name(int s);
 
 struct meta_stripe_pos {
-    uint8_t state;    /* enum meta_stripe_state: WHOLE or FILLING */
-    uint32_t prev;    /* previous holder node id (0: none; copy source / return candidate while filling, D9/D13) */
-    uint64_t set_ver; /* stripe_version that set this position (1 at VOLUME_ADD, new stripe_version on STRIPE_SET) */
+    uint8_t state;        /* enum meta_stripe_state: WHOLE or FILLING */
+    uint32_t prev;        /* previous holder node id (0: none; copy source / return candidate while filling, D9/D13) */
+    uint64_t set_ver;     /* stripe_version that set this position (1 at VOLUME_ADD, new stripe_version on STRIPE_SET) */
+    uint64_t retired_ver; /* R10 (D26, D28): 0 while active; else first stripe_version that no longer names this pos */
+};
+
+/* Redundancy conversion phases on a replicated volume (R10, E2, §6.4, D26). */
+enum meta_conv_phase {
+    META_CONV_NONE = 0,     /* no conversion running */
+    META_CONV_GROW = 1,     /* step 1: grow log group to target_replicas in ISR */
+    META_CONV_RECORD = 2,   /* step 2: record target redundancy, min_isr (E24), and new stripe group */
+    META_CONV_REENCODE = 3, /* step 3: re-encode old objects (or MK_UNSETTLE for ec -> replicas) */
+    META_CONV_DROP = 4,     /* step 4: drop retired stripe positions via STRIPE_SET once live count == 0 */
+    META_CONV_SHRINK = 5,   /* step 5: drop excess log replicas down to target_replicas */
+    META_CONV_LAST = META_CONV_SHRINK,
+};
+const char *meta_conv_phase_name(int phase);
+
+/* Target redundancy of META_OP_VOLUME_REDUNDANCY (E1, E2, D26). */
+struct meta_redundancy_target {
+    uint8_t redundancy; /* enum meta_redundancy */
+    uint8_t ec_k;       /* EC: 1..META_EC_K_MAX; REPLICAS: 0 */
+    uint8_t ec_m;       /* EC: 1..META_EC_M_MAX; REPLICAS: 0 */
+    uint32_t replicas;  /* REPLICAS: 1..META_REPLICAS_MAX (0 -> cluster replication); EC: ec_m + 1 (0 -> ec_m + 1) */
+};
+
+/* Active conversion state persisted on a volume (snapshot version 9; D26). */
+struct meta_conv {
+    uint8_t phase;               /* enum meta_conv_phase (0: none) */
+    uint8_t target_redundancy;   /* enum meta_redundancy */
+    uint8_t target_k, target_m;  /* EC target geometry (0 for REPLICAS) */
+    uint32_t target_replicas;    /* target log group size (m + 1 for EC, replicas for REPLICAS) */
+    uint64_t new_stripe_version; /* 0 until RECORD -> REENCODE, then the stripe_version of the new geometry */
+    uint8_t orig_redundancy;     /* redundancy before RECORD (for --cancel during REENCODE, margins, shrink floor) */
+    uint8_t orig_k, orig_m;
+    uint32_t orig_replicas;
+    uint32_t orig_min_isr;       /* operator's min_isr before RECORD (restored verbatim on --cancel in REENCODE) */
+};
+
+/* Bounded vector of live EC object counts per stripe_version reported by a volume leader (D26, D28). */
+#define META_LIVE_SV_MAX 8
+struct meta_live_sv {
+    uint64_t stripe_version;
+    uint64_t count;
 };
 
 struct meta_volume {
@@ -290,6 +331,19 @@ struct meta_volume {
     uint64_t stripe_whole_ver;                  /* EC (R9): version named by the last STRIPE_WHOLE (checker witness) */
     uint8_t gc_suspended;                       /* EC: orphan collection is off until GC_RESUME (E14) */
     uint64_t gc_gen;                            /* EC: + 1 by every applied GC_RESUME (the checker's witness of a resume) */
+    /* R10 (snapshot version 9; E2, §6.4, D26, D28): redundancy conversion record and live-object counts */
+    struct meta_conv conv;
+    uint64_t conv_cancel_gen;                     /* + 1 by every applied VOLUME_CONV_CANCEL (checker witness) */
+    /* Leftover EC geometry from a cancelled REENCODE (D29): meta_vol_margins keeps taking the minimum over this
+     * geometry until a current-epoch VOLUME_LIVE_OBJS proves 0 live objects in [mixed_sv_lo .. mixed_sv_hi]. */
+    uint8_t mixed_redundancy;                     /* META_RED_EC while leftover objects may exist, else 0 */
+    uint8_t mixed_k, mixed_m;
+    uint64_t mixed_sv_lo, mixed_sv_hi;
+    uint64_t live_epoch;                          /* volume epoch the live_sv report was made under (0: unknown) */
+    uint64_t live_sv_at;                          /* volume stripe_version when live_sv was reported (0: unknown) */
+    uint8_t live_overflow;                        /* 1: leader had > META_LIVE_SV_MAX nonzero versions (drop refused) */
+    uint32_t nlive_sv;                            /* 0..META_LIVE_SV_MAX, ascending by stripe_version */
+    struct meta_live_sv live_sv[META_LIVE_SV_MAX];
 };
 
 struct meta_slot_move {
@@ -421,7 +475,12 @@ enum meta_op_kind {
     META_OP_NODE_HOLD,        /* hold member id against automatic OUT until until_ms (0: release), bounded by op_clock_ms */
     META_OP_STRIPE_WHOLE,     /* EC: if stripe_version == v and pos is filling: mark pos whole (D10) */
     META_OP_NODE_REPLACE,     /* set/clear member replaced_by (new_node; 0 clears), persisted for Raft failover (D22) */
-    META_OP_LAST = META_OP_NODE_REPLACE,
+    /* R10 (snapshot version 9; E2, §6.4, D26, D28): redundancy conversion record and live-object counts */
+    META_OP_VOLUME_REDUNDANCY,  /* if epoch == e: start conversion to target (phase GROW, new_stripe_version 0) */
+    META_OP_VOLUME_CONV_STEP,   /* conditional on conv.phase == from_phase: step to to_phase (RECORD sets target+min_isr) */
+    META_OP_VOLUME_CONV_CANCEL, /* cancel conversion before DROP (GROW, RECORD or REENCODE) */
+    META_OP_VOLUME_LIVE_OBJS,   /* if epoch == e and stripe_version == sv: leader's live object counts per stripe_version */
+    META_OP_LAST = META_OP_VOLUME_LIVE_OBJS,
 };
 
 /* Why a volume got a new leader (grant reasons of §5.5, in its order; 7 is the replicated mode's RESIGN). */
@@ -581,9 +640,23 @@ void meta_op_restore(struct meta_entry *e, uint64_t gen);
 void meta_op_name_group(struct meta_entry *e); /* reserved: an empty body; applies as INVALID */
 void meta_op_stripe_set(struct meta_entry *e, uint32_t number, uint32_t pos, uint32_t node, uint8_t state,
                         uint32_t prev, uint64_t stripe_version);
+/* Convenience wrapper for STRIPE_SET dropping retired positions [new_nstripe .. v->nstripe - 1] (node == 0; D28). */
+static inline void meta_op_stripe_drop(struct meta_entry *e, uint32_t number, uint32_t new_nstripe,
+                                       uint64_t stripe_version)
+{
+    meta_op_stripe_set(e, number, new_nstripe, 0, META_STRIPE_WHOLE, 0, stripe_version);
+}
 void meta_op_stripe_whole(struct meta_entry *e, uint32_t number, uint32_t pos, uint64_t stripe_version);
 void meta_op_gc_suspend(struct meta_entry *e, uint32_t number);
 void meta_op_gc_resume(struct meta_entry *e, uint32_t number);
+/* R10 (E2, §6.4, D26, D28): redundancy conversion ops and leader live-object reports */
+void meta_op_volume_redundancy(struct meta_entry *e, uint32_t number, const struct meta_redundancy_target *target,
+                               uint64_t epoch);
+void meta_op_volume_conv_step(struct meta_entry *e, uint32_t number, uint8_t from_phase, uint8_t to_phase,
+                              const uint32_t *stripe, uint32_t nstripe);
+void meta_op_volume_conv_cancel(struct meta_entry *e, uint32_t number);
+void meta_op_volume_live_objs(struct meta_entry *e, uint32_t number, uint64_t epoch, uint64_t stripe_version,
+                              uint8_t overflow, const struct meta_live_sv *sv, uint32_t nsv);
 /* force-leader's operations for replicated volume v (design-cluster.md 6.2, design-cluster-data.md §5.7): for an EC
  * volume GC_SUSPEND first, then the ISR_CHANGE of v's basis that adds `node` (with its instance) to the ISR. */
 void meta_op_volume_force(struct meta_entry *e, const struct meta_volume *v, uint32_t node);
@@ -602,8 +675,8 @@ void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const
 int meta_snapshot_encode(const struct meta_state *m, uint8_t **out, size_t *len);
 /* The snapshot format (meta.c has its history). Until 1.0 a change of the state's layout bumps it, and an image of
  * another version is refused (a preview cluster is initialised again, never upgraded). */
-#define META_SNAP_VERSION 8
-/* 1 when the entry is one of a build of metadata snapshot version 7 or older (its magic): meta_apply says
+#define META_SNAP_VERSION 9
+/* 1 when the entry is one of a build of metadata snapshot version 8 or older (its magic): meta_apply says
  * META_ERR_FORMAT for it, and the caller names both versions (the cluster is initialised again, never upgraded). */
 int meta_entry_older(const void *data, size_t len);
 /* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not META_SNAP_VERSION,

@@ -18,8 +18,8 @@
 
 /* ---- 1. Heartbeat section registry ---- */
 
-#define CREPORT_SEC_BUILTIN_MAX 8 /* HBS_NODE(1) .. HBS_FILL(8) stay inline in cluster.c */
-#define HBS_PROGRESS 9            /* R14 (r14-progress, D23): rebuild/snapshot, settle backlog, scrub & drain progress */
+#define CREPORT_SEC_BUILTIN_MAX 9 /* HBS_NODE(1) .. HBS_LIVE_OBJS(9) stay inline in cluster.c */
+#define HBS_PROGRESS 10           /* R14 (r14-progress, D23): rebuild/snapshot, settle backlog, scrub & drain progress */
 #define CREPORT_SEC_MAX 32
 #define CREPORT_SEC_PAYLOAD_MAX 65536
 #define CREPORT_PROGRESS_VOLS_MAX 256   /* matches CLUSTER_REPORT_VOLS */

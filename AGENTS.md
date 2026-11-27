@@ -265,8 +265,8 @@ cgroup, so `nice` does not keep your work out of its way.
   ops STRIPE_SET, GC_SUSPEND, GC_RESUME (`test_cluster ecadd`; an EC add is admin op VOLUME_ADD_EC, so an older server
   refuses it); `cluster_copy_caught_up_at(copy)` (D9: the copy has applied the leader's commit index heard last and that
   heartbeat's lease still holds, read on the caller's clock; `test_cluster copycaught`, mutants `copynodeadline
-  copynofloor` in `make copy-mutants`); snapshot version 8 and
-  entry magic "TME5": a state directory or log of another version is refused naming both, never upgraded);
+  copynofloor` in `make copy-mutants`); snapshot version 9 and
+  entry magic "TME6": a state directory or log of another version is refused naming both, never upgraded);
   R9 operator ops (`server/cnode.c`: Raft leader handlers for `node hold|out|drain|replace|destroyed` and
   `volume move --pos`, answered after commit, plus `cnode_duty` DRAINING->OUT, replace completion/abandon, and live
   OUT leader handoff; `test_cluster nodehold nodeout nodedrain nodereplace nodedestroyed posmove`; `make ops-mutants`

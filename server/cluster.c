@@ -188,7 +188,7 @@ enum {
 
 /* the sections of a heartbeat (after its address fields) */
 enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3, HBS_LEASE = 4, HBS_UNREACH = 5, HBS_ISR = 6, HBS_STORES = 7,
-       HBS_FILL = 8 };
+       HBS_FILL = 8, HBS_LIVE_OBJS = 9 };
 #define FREE_MIN_DEFAULT (1ull << 30) /* a state directory below this is not voter_ok (M11) */
 
 /* ------------------------------------------------------------------ bytes */
@@ -529,6 +529,7 @@ void cluster_status_free(struct cluster_status *st)
         free(st->heard[i].fills);
         free(st->heard[i].progress_vols);
         free(st->heard[i].progress_stores);
+        free(st->heard[i].live_objs);
     }
     free(st->heard);
     st->heard = NULL;
@@ -654,6 +655,34 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
                 h->fills[j].done = get64(&r);
                 h->fills[j].total = get64(&r);
                 h->fills[j].whole = get8(&r);
+            }
+        }
+        h->nlive_objs = get32(&r);
+        if (r.bad || h->nlive_objs > CLUSTER_REPORT_LIVE_VOLS) {
+            r.bad = 1;
+            break;
+        }
+        if (h->nlive_objs) {
+            h->live_objs = calloc(h->nlive_objs, sizeof *h->live_objs);
+            if (!h->live_objs) {
+                r.bad = 1;
+                break;
+            }
+            for (uint32_t j = 0; j < h->nlive_objs && !r.bad; j++) {
+                struct cluster_live_objs_report *lo = &h->live_objs[j];
+                lo->volume = get32(&r);
+                lo->epoch = get64(&r);
+                lo->stripe_version = get64(&r);
+                lo->overflow = get8(&r);
+                lo->nsv = get32(&r);
+                if (r.bad || lo->overflow > 1 || lo->nsv > META_LIVE_SV_MAX) {
+                    r.bad = 1;
+                    break;
+                }
+                for (uint32_t k = 0; k < lo->nsv; k++) {
+                    lo->sv[k].stripe_version = get64(&r);
+                    lo->sv[k].count = get64(&r);
+                }
             }
         }
     }
@@ -1126,6 +1155,9 @@ struct heard {
     uint8_t fill_pct; /* 0..100 data-dir fill percentage (0xff: unknown) */
     uint32_t nfills;
     struct cluster_fill_report *fills;
+    /* R10 (D26, D28): HBS_LIVE_OBJS per-led-volume live EC object counts per stripe_version */
+    uint32_t nlive_objs;
+    struct cluster_live_objs_report *live_objs;
     /* R14: custom registered heartbeat sections decoded via server/creport.h */
     struct creport_heard_secs ext;
 };
@@ -1344,6 +1376,7 @@ static struct {
     char nodeholdfile[1100];
     int stripe_whole_file; /* TSDB_CLUSTER_TEST stripe_whole_file=1: leader proposes STRIPE_WHOLE lines in <state-dir>/stripewhole */
     char stripewholefile[1100];
+    int live_objs_test; /* TSDB_CLUSTER_TEST live_objs_test=1: publish test HBS_LIVE_OBJS entries and self-check cl_heard_live_objs */
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1743,6 +1776,8 @@ static void test_knobs(void)
             C.fill_pct_file = v != 0;
         else if (sscanf(p, "nogasp=%llu", &v) == 1)
             C.nogasp = v != 0;
+        else if (sscanf(p, "live_objs_test=%llu", &v) == 1)
+            C.live_objs_test = v != 0;
         p = strchr(p, ',');
         if (p)
             p++;
@@ -2447,6 +2482,12 @@ static void copy_publish(void)
         memcpy(o->stripe, v->stripe, o->nstripe * sizeof o->stripe[0]);
         memcpy(o->stripe_pos, v->stripe_pos, o->nstripe * sizeof o->stripe_pos[0]);
         o->stripe_version = v->stripe_version;
+        o->conv = v->conv;
+        o->mixed_redundancy = v->mixed_redundancy;
+        o->mixed_k = v->mixed_k;
+        o->mixed_m = v->mixed_m;
+        o->mixed_sv_lo = v->mixed_sv_lo;
+        o->mixed_sv_hi = v->mixed_sv_hi;
     }
     for (uint32_t i = 0; i < nm; i++) {
         const struct meta_member *m = &C.sm.members[i];
@@ -2787,6 +2828,32 @@ void cluster_set_fills(const struct cluster_fill_report *fills, uint32_t nfills)
     pthread_mutex_unlock(&g_hb_fills_mu);
 }
 
+/* R10 (D26, D28): HBS_LIVE_OBJS entries published by volume leaders for the heartbeat path */
+static pthread_mutex_t g_hb_live_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct cluster_live_objs_report g_hb_live[CLUSTER_REPORT_LIVE_VOLS];
+static uint32_t g_hb_nlive;
+
+void cluster_set_live_objs(const struct cluster_live_objs_report *live, uint32_t nlive)
+{
+    if (!live)
+        nlive = 0;
+    if (nlive > CLUSTER_REPORT_LIVE_VOLS)
+        nlive = CLUSTER_REPORT_LIVE_VOLS;
+    pthread_mutex_lock(&g_hb_live_mu);
+    if (nlive > 0) {
+        memcpy(g_hb_live, live, nlive * sizeof g_hb_live[0]);
+        for (uint32_t i = 0; i < nlive; i++) {
+            g_hb_live[i].overflow = g_hb_live[i].overflow ? 1 : 0;
+            if (g_hb_live[i].nsv > META_LIVE_SV_MAX) {
+                g_hb_live[i].nsv = META_LIVE_SV_MAX;
+                g_hb_live[i].overflow = 1;
+            }
+        }
+    }
+    g_hb_nlive = nlive;
+    pthread_mutex_unlock(&g_hb_live_mu);
+}
+
 /* R9 (D4, r9-out): count of times automatic OUT proceeded past the mass-OUT guard bound (for metrics). */
 static _Atomic uint64_t g_out_guard_passed;
 uint64_t cluster_out_guard_passed(void) { return atomic_load_explicit(&g_out_guard_passed, memory_order_relaxed); }
@@ -2933,6 +3000,9 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
     free(h->fills);     /* a beat without HBS_FILL reports no active fills (never retain stale entries) */
     h->fills = NULL;
     h->nfills = 0;
+    free(h->live_objs); /* a beat without HBS_LIVE_OBJS reports no live-object vector */
+    h->live_objs = NULL;
+    h->nlive_objs = 0;
     creport_heard_clear(&h->ext); /* replace & free prior registered custom sections on each beat */
     while (!r->bad && r->off < r->len) {
         uint32_t type = get8(r);
@@ -3048,6 +3118,38 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
             free(h->fills);
             h->fills = nf;
             h->nfills = n;
+        } else if (type == HBS_LIVE_OBJS) {
+            uint32_t n = get32(&s);
+            if (s.bad || n > CLUSTER_REPORT_LIVE_VOLS || (size_t)n * 25 > len) {
+                r->bad = 1;
+                return;
+            }
+            struct cluster_live_objs_report *nl = n ? calloc(n, sizeof *nl) : NULL;
+            if (n && !nl)
+                oom();
+            for (uint32_t i = 0; i < n && !s.bad; i++) {
+                nl[i].volume = get32(&s);
+                nl[i].epoch = get64(&s);
+                nl[i].stripe_version = get64(&s);
+                nl[i].overflow = get8(&s);
+                nl[i].nsv = get32(&s);
+                if (s.bad || nl[i].overflow > 1 || nl[i].nsv > META_LIVE_SV_MAX) {
+                    s.bad = 1;
+                    break;
+                }
+                for (uint32_t k = 0; k < nl[i].nsv; k++) {
+                    nl[i].sv[k].stripe_version = get64(&s);
+                    nl[i].sv[k].count = get64(&s);
+                }
+            }
+            if (s.bad) {
+                free(nl);
+                r->bad = 1;
+                return;
+            }
+            free(h->live_objs);
+            h->live_objs = nl;
+            h->nlive_objs = n;
         } else if (type == HBS_VOLUMES) {
             uint32_t n = get32(&s);
             if (s.bad || n > CLUSTER_REPORT_VOLS || (size_t)n * 62 > len) {
@@ -4544,6 +4646,20 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
         put64(b, f->done);
         put64(b, f->total);
         put8(b, f->whole);
+    }
+    put32(b, h ? h->nlive_objs : 0);
+    for (uint32_t i = 0; h && i < h->nlive_objs; i++) {
+        const struct cluster_live_objs_report *lo = &h->live_objs[i];
+        uint32_t nsv = lo->nsv <= META_LIVE_SV_MAX ? lo->nsv : META_LIVE_SV_MAX;
+        put32(b, lo->volume);
+        put64(b, lo->epoch);
+        put64(b, lo->stripe_version);
+        put8(b, lo->overflow ? 1 : 0);
+        put32(b, nsv);
+        for (uint32_t k = 0; k < nsv; k++) {
+            put64(b, lo->sv[k].stripe_version);
+            put64(b, lo->sv[k].count);
+        }
     }
 }
 
@@ -6576,6 +6692,34 @@ static void put_sections(struct buf *b, uint64_t now)
         put8(b, f->whole);
     }
     sec_end(b, at);
+    {
+        /* cluster-thread-only scratch buffer (put_sections runs exclusively on the cluster thread) */
+        static struct cluster_live_objs_report live_buf[CLUSTER_REPORT_LIVE_VOLS];
+        uint32_t nl = 0;
+        pthread_mutex_lock(&g_hb_live_mu);
+        nl = g_hb_nlive <= CLUSTER_REPORT_LIVE_VOLS ? g_hb_nlive : CLUSTER_REPORT_LIVE_VOLS;
+        if (nl > 0)
+            memcpy(live_buf, g_hb_live, nl * sizeof live_buf[0]);
+        pthread_mutex_unlock(&g_hb_live_mu);
+        if (nl > 0) {
+            at = sec_begin(b, HBS_LIVE_OBJS);
+            put32(b, nl);
+            for (uint32_t i = 0; i < nl; i++) {
+                const struct cluster_live_objs_report *lo = &live_buf[i];
+                uint32_t nsv = lo->nsv <= META_LIVE_SV_MAX ? lo->nsv : META_LIVE_SV_MAX;
+                put32(b, lo->volume);
+                put64(b, lo->epoch);
+                put64(b, lo->stripe_version);
+                put8(b, lo->overflow ? 1 : 0);
+                put32(b, nsv);
+                for (uint32_t k = 0; k < nsv; k++) {
+                    put64(b, lo->sv[k].stripe_version);
+                    put64(b, lo->sv[k].count);
+                }
+            }
+            sec_end(b, at);
+        }
+    }
     creport_sec_encode_all(emit_reg_section, b);
 }
 
@@ -6603,6 +6747,28 @@ static void heartbeat(uint64_t now)
     put64(&C.fb, C.sm.applied);
     putstr(&C.fb, C.adv);
     putstr(&C.fb, C.padv); /* a restart may have moved it (another port, another host) */
+#ifdef TSDB_TEST_HOOKS
+    if (C.live_objs_test == 1) {
+        struct cluster_live_objs_report lo[2];
+        memset(lo, 0, sizeof lo);
+        lo[0].volume = 1;
+        lo[0].epoch = 1;
+        lo[0].stripe_version = 9;
+        lo[0].overflow = 0;
+        lo[0].nsv = META_LIVE_SV_MAX;
+        for (uint32_t k = 0; k < META_LIVE_SV_MAX; k++) {
+            lo[0].sv[k].stripe_version = k + 1;
+            lo[0].sv[k].count = (uint64_t)(k + 1) * 10;
+        }
+        lo[1].volume = 2;
+        lo[1].epoch = 2;
+        lo[1].stripe_version = 3;
+        lo[1].overflow = 1;
+        lo[1].nsv = 0;
+        cluster_set_live_objs(lo, 2);
+        C.live_objs_test = 2;
+    }
+#endif
     put_sections(&C.fb, now);
     {
         /* this server's own record of itself: the same sections, read back as a peer would */
@@ -6613,6 +6779,22 @@ static void heartbeat(uint64_t now)
         getstr(&me, skip, sizeof skip);
         heard_sections(heard_get(C.id), &me, now);
     }
+#ifdef TSDB_TEST_HOOKS
+    if (C.live_objs_test == 2) {
+        struct cluster_live_objs_report chk;
+        if (!cl_heard_live_objs(C.id, 1, &chk) || chk.epoch != 1 || chk.stripe_version != 9 || chk.overflow != 0 ||
+            chk.nsv != META_LIVE_SV_MAX || chk.sv[0].stripe_version != 1 || chk.sv[0].count != 10 ||
+            chk.sv[META_LIVE_SV_MAX - 1].stripe_version != META_LIVE_SV_MAX ||
+            chk.sv[META_LIVE_SV_MAX - 1].count != (uint64_t)META_LIVE_SV_MAX * 10)
+            fail_stop("live_objs_test self-check failed for volume 1");
+        if (!cl_heard_live_objs(C.id, 2, &chk) || chk.epoch != 2 || chk.stripe_version != 3 || chk.overflow != 1 ||
+            chk.nsv != 0)
+            fail_stop("live_objs_test self-check failed for volume 2");
+        if (cl_heard_live_objs(C.id, 999, &chk))
+            fail_stop("live_objs_test self-check found absent volume 999");
+        C.live_objs_test = 3;
+    }
+#endif
     frame_end(&C.fb);
     /* A core booted by a leader's message holds an empty configuration until its first install arrives; it must
      * still be heard, or the leader marks it down and removes it as a learner before the image reaches it, and a
@@ -8873,6 +9055,7 @@ void cluster_stop(void)
         free(C.heard[i].vols);
         free(C.heard[i].doms);
         free(C.heard[i].fills);
+        free(C.heard[i].live_objs);
         creport_heard_clear(&C.heard[i].ext);
     }
     free(C.heard);
@@ -8964,6 +9147,21 @@ uint32_t cl_member_chunk_stores(uint32_t id)
         return atomic_load_explicit(&g_chunk_stores, memory_order_relaxed);
     struct heard *h = heard_get(id);
     return h && h->have_stores ? h->chunk_stores : 0;
+}
+
+int cl_heard_live_objs(uint32_t node, uint32_t volume, struct cluster_live_objs_report *out)
+{
+    struct heard *h = heard_get(node);
+    if (!h)
+        return 0;
+    for (uint32_t i = 0; i < h->nlive_objs; i++) {
+        if (h->live_objs[i].volume == volume) {
+            if (out)
+                *out = h->live_objs[i];
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void cl_admin_reply(uint64_t conn, uint32_t reqid, int32_t rc, const void *body, size_t len)

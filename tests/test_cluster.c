@@ -4984,8 +4984,8 @@ static void snapv_write(const char *path, const uint8_t *img, size_t n)
     if (!f || fwrite(img, 1, n, f) != n || fclose(f) != 0)
         die("rewriting %s", path);
 }
-/* `path` rewritten as version 4: the start must fail naming it and both versions, and leave NODE as it was */
-static void snapv_refused(const char *dir, const char *name)
+/* `path` rewritten as version `oldv`: the start must fail naming it and both versions, and leave NODE as it was */
+static void snapv_refused_ver(const char *dir, const char *name, uint32_t oldv)
 {
     static uint8_t img[1 << 20], keep[1 << 20], node0[4096], node1[4096];
     char path[PATH_MAX + 300], nodef[PATH_MAX + 300];
@@ -4995,28 +4995,39 @@ static void snapv_refused(const char *dir, const char *name)
     memcpy(keep, img, n);
     if (n < 28 || meta_snapshot_version(img, n) != META_SNAP_VERSION)
         die("%s is no image of version %d (%zu bytes)", path, META_SNAP_VERSION, n);
-    uint32_t four = 4, crc;
-    memcpy(img + 4, &four, 4);
+    uint32_t crc;
+    memcpy(img + 4, &oldv, 4);
     crc = iso_crc32c(0, img, n - 4);
     memcpy(img + n - 4, &crc, 4);
     snapv_write(path, img, n);
     size_t nn0 = snapv_read(nodef, node0, sizeof node0);
     int rc = start_try(0);
     char want[PATH_MAX + 400];
-    snprintf(want, sizeof want, "%s holds metadata of snapshot version 4 and this build reads version %d", path,
-             META_SNAP_VERSION);
+    snprintf(want, sizeof want, "%s holds metadata of snapshot version %" PRIu32 " and this build reads version %d",
+             path, oldv, META_SNAP_VERSION);
     if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) == 0 || !log_has(0, want))
-        die("a %s of snapshot version 4 was not refused naming both versions (%d, 0x%x)", name, rc, th_status);
+        die("a %s of snapshot version %" PRIu32 " was not refused naming both versions (%d, 0x%x)", name, oldv, rc,
+            th_status);
     size_t nn1 = snapv_read(nodef, node1, sizeof node1);
     if (nn1 != nn0 || memcmp(node0, node1, nn0) != 0)
-        die("the start refused for %s of version 4 wrote NODE again", name);
+        die("the start refused for %s of version %" PRIu32 " wrote NODE again", name, oldv);
     snapv_write(path, keep, n);
-    printf("  a %s of snapshot version 4 is refused at start, NODE untouched: \"... %s holds metadata of snapshot "
-           "version 4 and this build reads version %d\"\n", name, name, META_SNAP_VERSION);
+    printf("  a %s of snapshot version %" PRIu32
+           " is refused at start, NODE untouched: \"... %s holds metadata of snapshot "
+           "version %" PRIu32 " and this build reads version %d\"\n",
+           name, oldv, name, oldv, META_SNAP_VERSION);
+}
+static void snapv_refused(const char *dir, const char *name)
+{
+    snapv_refused_ver(dir, name, 4);
+    snapv_refused_ver(dir, name, META_SNAP_VERSION - 1);
 }
 static void scen_snapversion(void)
 {
     scenario("snapversion");
+#ifdef TSDB_TEST_HOOKS
+    envs[0] = "live_objs_test=1";
+#endif
     start(0);
     init_r4_set = 1;
     init_fast(0);
@@ -5029,12 +5040,52 @@ static void scen_snapversion(void)
             "(sent 300, 3, 2500, 60)", st->rebuild_mb_s, st->rebuild_max, st->transfer_wait_ms, st->leader_balance_s);
     view_free(&v);
     printf("  INIT's rebuild_mb_s, rebuild_max, transfer_wait_ms and leader_balance_s read back from STATUS\n");
+
+    /* R10 (D26, D28): verify HBS_LIVE_OBJS -> heard_sections -> cl_heard_live_objs -> STATUS round-trip
+     * (uses TSDB_TEST_HOOKS live_objs_test=1) */
+#ifdef TSDB_TEST_HOOKS
+    {
+        int got = 0;
+        uint64_t t0 = now_ms();
+        while (!got && now_ms() - t0 < 5000) {
+            view(0, &v);
+            if (v.st.nheard >= 1 && v.st.heard[0].nlive_objs == 2) {
+                const struct cluster_live_objs_report *a = &v.st.heard[0].live_objs[0];
+                const struct cluster_live_objs_report *b = &v.st.heard[0].live_objs[1];
+                if (a->volume != 1 || a->epoch != 1 || a->stripe_version != 9 || a->overflow != 0 ||
+                    a->nsv != META_LIVE_SV_MAX)
+                    die("STATUS live_objs[0] mismatch: vol %u ep %" PRIu64 " sv %" PRIu64 " ov %u nsv %u",
+                        a->volume, a->epoch, a->stripe_version, a->overflow, a->nsv);
+                for (uint32_t k = 0; k < META_LIVE_SV_MAX; k++)
+                    if (a->sv[k].stripe_version != k + 1 || a->sv[k].count != (uint64_t)(k + 1) * 10)
+                        die("STATUS live_objs[0].sv[%u] mismatch: (%" PRIu64 ", %" PRIu64 ")", k,
+                            a->sv[k].stripe_version, a->sv[k].count);
+                if (b->volume != 2 || b->epoch != 2 || b->stripe_version != 3 || b->overflow != 1 || b->nsv != 0)
+                    die("STATUS live_objs[1] mismatch: vol %u ep %" PRIu64 " sv %" PRIu64 " ov %u nsv %u",
+                        b->volume, b->epoch, b->stripe_version, b->overflow, b->nsv);
+                got = 1;
+            }
+            view_free(&v);
+            if (!got)
+                usleep(50000);
+        }
+        if (!got)
+            die("STATUS never returned HBS_LIVE_OBJS entries published via live_objs_test=1");
+        if (log_has(0, "live_objs_test self-check"))
+            die("server 0 failed cl_heard_live_objs self-check");
+        printf("  HBS_LIVE_OBJS (full 8-entry vector + overflow) round-tripped through heartbeat and STATUS\n");
+    }
+#else
+    printf("  HBS_LIVE_OBJS round-trip skipped (built without TSDB_TEST_HOOKS)\n");
+#endif
+
     char dir[PATH_MAX + 200], path[PATH_MAX + 300];
     snprintf(dir, sizeof dir, "%s/n0/state", base);
     snprintf(path, sizeof path, "%s/copy", dir);
     uint64_t t0 = now_ms();
     while (access(path, F_OK) != 0 && now_ms() - t0 < 10000)
         usleep(50000);
+    envs[0] = NULL;
     stop(0, SIGTERM);
     snapv_refused(dir, "snapshot");
     snapv_refused(dir, "copy");
@@ -23630,6 +23681,7 @@ static void progress_unit_checks(void)
     boff += 8 + 8; /* answered_ms, lease_left_ms */
     boff += 2; /* slen=0 */
     boff += 4; /* nfills=0 */
+    boff += 4; /* nlive_objs=0 */
     boff += 1; /* users_caught_up=0 */
     boff += 4; /* ntr=0 */
     boff += 2; /* moves="" */

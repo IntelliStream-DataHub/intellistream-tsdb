@@ -8,6 +8,15 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+- **Cluster metadata snapshot version 9 and R10 conversion metadata (`r10-meta`).** Bumps `META_SNAP_VERSION` from 8
+  to 9 (and entry magic from `"TME5"` to `"TME6"`; snapshot version 8 and `"TME5"` entries are refused by name — pre-1.0
+  preview clusters are re-initialised, not upgraded). Adds persisted redundancy conversion state (`META_OP_VOLUME_REDUNDANCY`,
+  `META_OP_VOLUME_CONV_STEP`, `META_OP_VOLUME_CONV_CANCEL`, phases `GROW -> RECORD -> REENCODE -> DROP -> SHRINK`,
+  `--cancel` before `DROP`, and E24 `min_isr` update at `RECORD`), per-position `retired_ver`, leader live-object count
+  reports (`META_OP_VOLUME_LIVE_OBJS`, skippable heartbeat section `HBS_LIVE_OBJS`, and `STATUS` heard records carrying
+  live-object vectors), and `STRIPE_SET`'s live-object refusal when dropping retired stripe positions (refused while
+  unknown or above 0 at any `stripe_version` below the position's `retired_ver` under the volume's current epoch).
+
 - **Cluster metadata snapshot version 8 and R9 operator CLI verbs (`r9-ops`).** Bumps `META_SNAP_VERSION` from 7 to 8
   (and entry magic from `"TME4"` to `"TME5"`; snapshot version 7 and `"TME4"` entries are refused by name — pre-1.0
   preview clusters are re-initialised, not upgraded). Persists `replaced_by` on `meta_member` (`META_OP_NODE_REPLACE`)
