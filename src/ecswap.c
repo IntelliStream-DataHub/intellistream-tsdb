@@ -56,10 +56,15 @@
  *   and a lookup that fails other than ENOENT (EIO, ESTALE on NFS: never read as "absent"). The directory is synced
  *   before ecswap_recover returns, so the intent is unlinked only after its renames are durable.
  *
- * Intent v5 (R8): a replica's apply of MK_COLD (src/ecapply.c) writes "tsdb-intent 5 <n>", lines "N <tmp_*.ec> <.ec>"
- * (its objects' .ec files under fresh block numbers), "Y <tmp_0_*.part> <part>" (the late parts above them),
- * "R <own part> <settled_own part>" (its own parts of the key at or below Z), and later R10's "X" lines (refused
- * until then), "end <xxh64>". Its rules are written above ecapply_recover.
+ * Intent v5 (R8 / R15):
+ *  - R8 replica apply of MK_COLD (src/ecapply.c): "tsdb-intent 5 <n>", lines "N <tmp_*.ec> <.ec>" (its objects' .ec
+ *    files under fresh block numbers), "Y <tmp_0_*.part> <part>" (the late parts above them), "R <own part>
+ *    <settled_own part>" (its own parts of the key at or below Z), "end <xxh64>".
+ *  - R15 reverse unsettle (src/ecunsettle.c, ec_swap_unsettle): "tsdb-intent 5 <2m>", m lines
+ *    "L <settled_P.part|tmp_*.part> <P.part>" and m lines "U <P.ec> retired_<P.ec>", "end <xxh64>". Serialized
+ *    against concurrent drops via db_pub_begin/db_pub_end (held past the post-rename directory fsync); intent write
+ *    and sync run before latest_rw > db->lock so only the 2m renameat calls run inside latest_rw and db->lock.
+ *    Its rules are written above unsettle_recover / ecapply_recover.
  *
  * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-put|after-ec-tmp|after-intent|between-renames|before-unlink[:n]
  * ends the process
@@ -77,6 +82,7 @@
 #include "eckeep.h"
 #include "ecgc.h"
 #include "ecpart.h"
+#include "ecunsettle.h"
 #include "settle.h"
 
 #include <errno.h>
@@ -335,6 +341,53 @@ static bool swap_renames(eng *db, part **in, part **ec, size_t n)
     return true;
 }
 
+/* R15 (eng_unsettle): true (>0) if any retired_<ps[i]->name> still exists in the graveyard or on disk, 0 if none,
+ * -1 on I/O error (does not fail-stop the engine; nothing has been committed yet). Keeps a re-settle from colliding
+ * with a retired_.ec from an earlier unsettle (which ecswap_recover would read as "the settle renamed") and keeps a
+ * second unsettle from clobbering a retired_.ec whose chunks ecgc has not finished deleting. Caller holds
+ * publish_lock, not db->lock. */
+static int retired_ec_busy(eng *db, part *const *ps, size_t n, const char **hit)
+{
+    char retired[sizeof ps[0]->name + 16];
+    pthread_mutex_lock(&db->lock);
+    const char *found = NULL;
+    for (size_t i = 0; i < n && !found; i++) {
+        retired_of(ps[i]->name, retired, sizeof retired);
+        for (size_t j = 0; j < db->ngraveyard; j++) {
+            if (db->graveyard[j].kind == GY_EC && strcmp(db->graveyard[j].name, retired) == 0) {
+                found = ps[i]->name;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (found) {
+        if (hit)
+            *hit = found;
+        return 1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        retired_of(ps[i]->name, retired, sizeof retired);
+        if (faccessat(db->dirfd, retired, F_OK, 0) == 0) {
+            if (hit)
+                *hit = ps[i]->name;
+            return 1;
+        }
+        if (errno != ENOENT)
+            return -1;
+    }
+    return 0;
+}
+
+static void settled_of_ec(const char *ec_name, char *dst, size_t cap)
+{
+    size_t len = strlen(ec_name);
+    if (len > 3)
+        snprintf(dst, cap, "settled_%.*s.part", (int)(len - 3), ec_name);
+    else
+        dst[0] = '\0';
+}
+
 int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
 {
     sm_init();
@@ -378,6 +431,21 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
         if (!at) {
             pthread_mutex_unlock(&db->publish_lock);
             return logged ? swap_refuse_logged(db, "out of memory") : TSDB_ERR_NOMEM;
+        }
+    }
+    if (rc == 0 && !logged) {
+        const char *hit = NULL;
+        int rbusy = retired_ec_busy(db, ec, n, &hit);
+        if (rbusy != 0) {
+            rc = rbusy < 0 ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
+            if (rbusy > 0)
+                fprintf(stderr, "tsdb: %s: settle of %s deferred while retired_%s is still awaiting GC\n", db->dir, hit,
+                        hit);
+            pthread_mutex_unlock(&db->publish_lock);
+            free(at);
+            if (rbusy > 0)
+                swap_discard(db, NULL, ec, n);
+            return rc;
         }
     }
     if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, n)) != 0) {
@@ -733,6 +801,318 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
     return ecswap_mutant == SWAP_MUT_MANIFESTRC ? mrc : 0;
 }
 
+/* ------------------------------------------------------------ R15 reverse (unsettle) swap */
+
+static bool unsettle_args_valid(part **in, part **out, size_t n)
+{
+    if (!in || !out || n == 0 || n > (1u << 15))
+        return false;
+    bool rank_mut = ecunsettle_mut() == ECUNSETTLE_MUT_RANK;
+    int64_t key = 0;
+    for (size_t i = 0; i < n; i++) {
+        part *e = in[i], *p = out[i];
+        if (!e || !p || e == p || !atomic_load(&e->ec) || atomic_load(&p->ec) || !ec_file_name(e->name) ||
+            !part_file_name(p->name) || !p->pending)
+            return false;
+        bool is_tmp = part_tmp_name(p->pending);
+        bool is_settled = settled_part_name(p->pending);
+        if (!is_tmp && !is_settled)
+            return false;
+        if (!rank_mut) {
+            if (!same_stem(p->name, e->name) || p->partition != e->partition || p->min_block != e->min_block ||
+                p->max_block != e->max_block || p->level != e->level)
+                return false;
+            if (is_settled && strcmp(p->pending + 8, p->name) != 0)
+                return false;
+        } else {
+            if (p->partition != e->partition)
+                return false;
+            if (is_settled && !same_stem(p->pending + 8, e->name))
+                return false;
+        }
+        if (i == 0)
+            key = e->partition;
+        else if (e->partition != key)
+            return false;
+        for (size_t j = 0; j < i; j++)
+            if (in[j] == e || out[j] == p || strcmp(out[j]->pending, p->pending) == 0 ||
+                strcmp(out[j]->name, p->name) == 0)
+                return false;
+    }
+    return true;
+}
+
+static int intent_write_unsettle(eng *db, const char *intent, part **in, part **out, size_t n)
+{
+    size_t cap = 64, len = 0;
+    for (size_t i = 0; i < n; i++)
+        cap += 20 + strlen(out[i]->pending) + strlen(out[i]->name) + 2 * strlen(in[i]->name);
+    char *buf = malloc(cap);
+    if (!buf)
+        return TSDB_ERR_NOMEM;
+    sn_add(&len, cap, snprintf(buf + len, cap - len, INTENT_V5_HEAD "%zu\n", 2 * n));
+    for (size_t i = 0; i < n; i++)
+        sn_add(&len, cap, snprintf(buf + len, cap - len, "L %s %s\n", out[i]->pending, out[i]->name));
+    for (size_t i = 0; i < n; i++)
+        sn_add(&len, cap, snprintf(buf + len, cap - len, "U %s retired_%s\n", in[i]->name, in[i]->name));
+    sn_add(&len, cap, snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0)));
+    int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int rc = fd < 0 || write_full(fd, buf, len) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+    if (fd >= 0 && close(fd) != 0 && rc == 0)
+        rc = TSDB_ERR_IO;
+    free(buf);
+    if (rc)
+        unlinkat(db->dirfd, intent, 0);
+    return rc;
+}
+
+/* L renames (src -> P.part), then U renames (P.ec -> retired_P.ec). Caller holds publish_lock, db_pub_begin,
+ * latest_rw and db->lock: only the 2n renameat calls run under latest_rw > db->lock (no fsync/fdatasync under them). */
+static bool swap_renames_unsettle(eng *db, part **in, part **out, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (i > 0)
+            settle_crash(SC_BETWEEN_RENAMES);
+        if (renameat(db->dirfd, out[i]->pending, db->dirfd, out[i]->name) != 0) {
+            eng_fail(db, "rename of an unsettled part into place", errno);
+            return false;
+        }
+    }
+    char retired[sizeof in[0]->name + 16];
+    for (size_t i = 0; i < n; i++) {
+        settle_crash(SC_BETWEEN_RENAMES);
+        retired_of(in[i]->name, retired, sizeof retired);
+        if (renameat(db->dirfd, in[i]->name, db->dirfd, retired) != 0) {
+            eng_fail(db, "rename of an unsettled .ec part to retired_", errno);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Cleans up refused unsettle temporaries (ONLY tmp_*.part, never settled_*.part), syncs the directory, then unlinks
+ * the intent (if written) and syncs the directory again so a power cut cannot resurrect a rolled-back intent. */
+static void unsettle_discard(eng *db, const char *intent, part **out, size_t n)
+{
+    if (eng_check(db))
+        return;
+    for (size_t i = 0; i < n; i++)
+        if (out[i]->pending && part_tmp_name(out[i]->pending))
+            unlinkat(db->dirfd, out[i]->pending, 0);
+    if (intent) {
+        if (eng_sync_dir(db, "fsync of the directory after removing a refused unsettle's files") != 0)
+            return;
+        if (unlinkat(db->dirfd, intent, 0) == 0 || errno == ENOENT)
+            (void)eng_sync_dir(db, "fsync of the directory after removing a refused unsettle's intent");
+    }
+}
+
+int ec_swap_unsettle(eng *db, part **in, part **out, size_t n)
+{
+    sm_init();
+    if (n == 0)
+        return 0;
+    if (db->opt.read_only || db->opt.follow)
+        return TSDB_ERR_READONLY;
+    if (!unsettle_args_valid(in, out, n))
+        return TSDB_ERR_INVALID;
+    size_t *at = malloc(n * sizeof *at);
+    bool *was_settled = calloc(n, sizeof *was_settled);
+    if (!at || !was_settled) {
+        free(at);
+        free(was_settled);
+        return TSDB_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < n; i++)
+        was_settled[i] = settled_part_name(out[i]->pending);
+    char intent[64];
+    snprintf(intent, sizeof intent, "txn_%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
+
+    pthread_mutex_lock(&db->publish_lock);
+    int rc = eng_check(db) ? TSDB_ERR_IO : 0;
+    if (rc) {
+        pthread_mutex_unlock(&db->publish_lock);
+        free(at);
+        free(was_settled);
+        return rc;
+    }
+    if (ec_swap_hook)
+        ec_swap_hook(db);
+
+    /* Serialize against concurrent drops (tsdb_drop_before and ttl_select_locked): waits for any settled drop touching
+     * this key, then holds pub_active past the post-rename directory fsync so neither drop path can retire P.ec while
+     * we are renaming P.ec -> retired_P.ec and listing P.part. */
+    db_pub_begin(db, in, n);
+
+    /* Pre-check under db->lock FIRST (no I/O, no latest_rw): if a drop already retired the key before db_pub_begin,
+     * refuse with TSDB_ERR_STOPPED before checking retired_ or writing any intent on disk. Because pub_active stays
+     * held, no drop can start after this check. */
+    pthread_mutex_lock(&db->lock);
+    bool pre_ok = eng_check(db) == 0;
+    for (size_t i = 0; i < n && pre_ok; i++) {
+        size_t j = 0;
+        while (j < db->nparts && db->parts[j] != in[i])
+            j++;
+        pre_ok = j < db->nparts && !in[i]->dropped && !in[i]->merging && !in[i]->reencoding;
+    }
+    if (!pre_ok) {
+        rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
+        db_pub_end_locked(db);
+        pthread_mutex_unlock(&db->lock);
+        unsettle_discard(db, NULL, out, n);
+        pthread_mutex_unlock(&db->publish_lock);
+        free(at);
+        free(was_settled);
+        return rc;
+    }
+    pthread_mutex_unlock(&db->lock);
+
+    /* Refuse if any retired_<P>.ec from a previous unsettle is still awaiting GC (never clobber an active retired_). */
+    const char *hit = NULL;
+    int rbusy = retired_ec_busy(db, in, n, &hit);
+    if (rbusy != 0) {
+        rc = rbusy < 0 ? TSDB_ERR_IO : TSDB_ERR_LOCKED;
+        if (rbusy > 0)
+            fprintf(stderr, "tsdb: %s: unsettle of %s refused while retired_%s is still awaiting GC\n", db->dir, hit,
+                    hit);
+        unsettle_discard(db, NULL, out, n);
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        free(at);
+        free(was_settled);
+        return rc;
+    }
+
+    /* Check source files exist BEFORE writing the intent (outside latest_rw and db->lock; eckeep_purge_entry never
+     * unlinks settled_P.part while P.ec has settling set). */
+    for (size_t i = 0; i < n; i++) {
+        if (faccessat(db->dirfd, out[i]->pending, F_OK, 0) != 0) {
+            if (errno == ENOENT)
+                rc = TSDB_ERR_NOTFOUND;
+            else {
+                eng_fail(db, "stat of an unsettle source file", errno);
+                rc = TSDB_ERR_IO;
+            }
+            unsettle_discard(db, NULL, out, n);
+            db_pub_end(db);
+            pthread_mutex_unlock(&db->publish_lock);
+            free(at);
+            free(was_settled);
+            return rc;
+        }
+    }
+
+    /* Write and sync the v5 intent OUTSIDE latest_rw and db->lock (matching ec_swap_commit's lock rules). */
+    rc = intent_write_unsettle(db, intent, in, out, n);
+    if (rc == 0 && eng_sync_dir(db, "fsync of the directory after writing an unsettle's intent") != 0)
+        rc = TSDB_ERR_IO;
+    if (rc != 0) {
+        unsettle_discard(db, NULL, out, n);
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        free(at);
+        free(was_settled);
+        return rc;
+    }
+    settle_crash(SC_AFTER_INTENT);
+
+    bool rank_mut = ecunsettle_mut() == ECUNSETTLE_MUT_RANK;
+    bool ok = true, renamed = false;
+
+    /* Only the 2n renameat calls, graveyard/eckeep updates and part-list swap run under latest_rw > db->lock. */
+    lt_sec lsec;
+    lt_begin(db, &lsec);
+    pthread_mutex_lock(&db->lock);
+    ok = eng_check(db) == 0;
+    for (size_t i = 0; i < n && ok; i++) {
+        size_t j = 0;
+        while (j < db->nparts && db->parts[j] != in[i])
+            j++;
+        at[i] = j;
+        ok = j < db->nparts && !in[i]->dropped && !in[i]->merging && !in[i]->reencoding;
+    }
+    if (ok)
+        renamed = swap_renames_unsettle(db, in, out, n);
+    if (renamed) {
+        for (size_t i = 0; i < n; i++) {
+            /* Clear any GY_SETTLED / eckeep state for this stem on BOTH fast path and decode path so a corrupt
+             * settled_P.part's ROT/ORPHAN entry never poisons a future re-settle of P. */
+            char settled[sizeof in[0]->name + 16];
+            settled_of_ec(in[i]->name, settled, sizeof settled);
+            if (settled[0])
+                eckeep_unsettle_locked(db, settled);
+            ecgc_retire_locked(db, in[i]);
+            if (db->opt.obsolete_part_lifetime_s <= 0) {
+                in[i]->retired = true;
+                atomic_store(&in[i]->obsolete, true);
+            } else {
+                char retired[sizeof in[i]->name + 16];
+                retired_of(in[i]->name, retired, sizeof retired);
+                (void)graveyard_add(db, retired, GY_EC,
+                                    eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000);
+            }
+            part_ref(out[i]);
+            part_clear_pending(out[i]);
+            if (!rank_mut && at[i] < db->nparts && db->parts[at[i]] == in[i]) {
+                db->parts[at[i]] = out[i]; /* exact same key and block range: same place in the order */
+                stats_ev_remove(db, in[i]);
+                stats_ev_add(db, out[i]);
+                part_unref(in[i]); /* the list's reference; caller holds its own */
+            } else {
+                db_parts_remove_locked(db, in[i]); /* removes from list and drops the list's reference */
+                db_parts_insert_locked(db, out[i]);
+            }
+        }
+        pthread_cond_signal(&db->merge_cv);
+    }
+    pthread_mutex_unlock(&db->lock);
+    lt_end(db, &lsec);
+    free(at);
+
+    if (!ok) {
+        rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
+        unsettle_discard(db, intent, out, n);
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        free(was_settled);
+        return rc;
+    }
+    if (!renamed) {
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        free(was_settled);
+        return TSDB_ERR_IO;
+    }
+    if ((rc = eng_sync_dir(db, "fsync of the directory after retiring unsettled .ec parts")) != 0) {
+        db_pub_end(db);
+        pthread_mutex_unlock(&db->publish_lock);
+        free(was_settled);
+        return rc;
+    }
+    settle_crash(SC_BEFORE_UNLINK);
+    if (unlinkat(db->dirfd, intent, 0) != 0)
+        fprintf(stderr, "tsdb: unlink of unsettle intent %s after its swap: %s (the next open rolls it forward)\n",
+                intent, strerror(errno));
+    /* Decode path: if a corrupt settled_P.part was left beside P.ec, remove it and sync the directory now that P.part
+     * is durable so a power loss cannot resurrect the corrupt settled_ copy into ECKEEP_ORPHAN. */
+    bool unlinked_settled = false;
+    for (size_t i = 0; i < n; i++) {
+        if (!was_settled[i]) {
+            char settled[sizeof in[0]->name + 16];
+            settled_of_ec(in[i]->name, settled, sizeof settled);
+            if (settled[0] && unlinkat(db->dirfd, settled, 0) == 0)
+                unlinked_settled = true;
+        }
+    }
+    if (unlinked_settled)
+        (void)eng_sync_dir(db, "fsync of the directory after removing a corrupt settled_ copy");
+    free(was_settled);
+    db_pub_end(db);
+    pthread_mutex_unlock(&db->publish_lock);
+    (void)ec_swap_publish(db);
+    return 0;
+}
+
 /* ------------------------------------------------------------ recovery */
 
 typedef struct {
@@ -1014,19 +1394,20 @@ int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
     return rc;
 }
 
-/* ------------------------------------------------------------ intent v5: a replica's cold apply (src/ecapply.c) */
+/* ------------------------------------------------------------ intent v5: cold apply & reverse unsettle */
 
 typedef struct {
-    char kind;          /* N (an .ec part), Y (a late part), R (an own part retired) */
+    char kind; /* N (.ec), Y (late part), R (own part retired); or unsettle: L (local .part), U (.ec retired) */
     char from[128], to[160];
 } v5_line;
 
-/* Parses an unsealed v5 intent: 1; 0 when a line breaks the rules (only the names an apply writes, one key);
- * TSDB_ERR_NOMEM */
-static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key)
+/* Parses an unsealed v5 intent: 1; 0 when a line breaks the rules (only the names a cold apply or reverse unsettle
+ * writes, one key, never mixed); TSDB_ERR_NOMEM. */
+static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key, bool *is_unsettle)
 {
     *out = NULL;
     *nout = 0;
+    *is_unsettle = false;
     char *line = buf, *next = strchr(line, '\n'), extra;
     size_t n;
     if (!next)
@@ -1037,6 +1418,8 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key)
     v5_line *s = calloc(n, sizeof *s);
     if (!s)
         return TSDB_ERR_NOMEM;
+    bool rank_mut = ecunsettle_mut() == ECUNSETTLE_MUT_RANK;
+    bool unsettle = false;
     size_t got = 0;
     for (line = next + 1; got < n; line = next + 1) {
         next = strchr(line, '\n');
@@ -1045,7 +1428,38 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key)
         v5_line *x = &s[got];
         bool good = sscanf(line, "%c %127s %159s%c", &x->kind, x->from, x->to, &extra) == 3;
         int64_t k = 0;
-        if (good && x->kind == 'N')
+        if (good && got == 0 && (x->kind == 'L' || x->kind == 'U')) {
+            unsettle = true;
+            if ((n & 1u) != 0)
+                good = false;
+        }
+        if (good && unsettle) {
+            size_t half = n / 2;
+            if (got < half) {
+                bool is_tmp = part_tmp_name(x->from);
+                bool is_set = settled_part_name(x->from);
+                good = x->kind == 'L' && (is_tmp || is_set) && part_file_name(x->to) && name_key(x->to, &k);
+                if (good && is_set && !rank_mut)
+                    good = strcmp(x->from + 8, x->to) == 0;
+                for (size_t j = 0; good && j < got; j++)
+                    if (strcmp(s[j].to, x->to) == 0 || strcmp(s[j].from, x->from) == 0)
+                        good = false;
+            } else {
+                size_t idx = got - half;
+                char want[sizeof x->to];
+                retired_of(x->from, want, sizeof want);
+                good = x->kind == 'U' && ec_file_name(x->from) && strcmp(want, x->to) == 0 && name_key(x->from, &k);
+                if (good) {
+                    if (!rank_mut)
+                        good = same_stem(s[idx].to, x->from);
+                    else if (settled_part_name(s[idx].from))
+                        good = same_stem(s[idx].from + 8, x->from);
+                }
+                for (size_t j = half; good && j < got; j++)
+                    if (strcmp(s[j].from, x->from) == 0)
+                        good = false;
+            }
+        } else if (good && x->kind == 'N')
             good = ec_tmp_name(x->from) && ec_file_name(x->to) && name_key(x->to, &k);
         else if (good && x->kind == 'Y')
             good = part_tmp_name(x->from) && part_file_name(x->to) && name_key(x->to, &k);
@@ -1054,7 +1468,7 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key)
             settled_of(x->from, want, sizeof want);
             good = part_file_name(x->from) && strcmp(want, x->to) == 0 && name_key(x->from, &k);
         } else
-            good = false; /* X (R10's retired .ec parts) is not written in R8 */
+            good = false; /* X (R15 salvage) is not written here */
         if (good && got == 0)
             *key = k;
         if (!good || k != *key) {
@@ -1071,7 +1485,117 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key)
     }
     *out = s;
     *nout = n;
+    *is_unsettle = unsettle;
     return 1;
+}
+
+/* Recovery of a v5 reverse (unsettle) intent at open (before load_parts removes temporaries).
+ * The swap checked every P.ec is listed under db_pub_begin (blocking drops until after the post-rename dir fsync),
+ * wrote and synced the intent, then renamed all L (src -> P.part) and all U (P.ec -> retired_P.ec) under db->lock.
+ * Because drops are blocked from the pre-check through the post-rename directory fsync, a sealed intent means no drop
+ * retired P.ec before this swap. So:
+ *   - swap started (`renamed`): any P.part on disk, OR any retired_P.part whose P.ec is gone (a stale leftover
+ *     retired_P.part beside a live P.ec does NOT count), OR any retired_P.ec with P.ec gone and L.from still present
+ *     (filesystem reordered U before L before the post-rename dir fsync). Roll forward (remaining L -> dir fsync -> U).
+ *     An L part missing under all its names while its P.ec is still live is damage (TSDB_ERR_CORRUPT).
+ *   - nothing renamed, every L.from and every U.from (P.ec) present: cut before renames -> roll forward.
+ *   - nothing renamed, a source or P.ec missing (e.g. settled_ purged before renames, or already dropped+cleaned):
+ *     roll back — unlink ONLY tmp_*.part (NEVER settled_*.part!).
+ * The directory is synced before returning so the intent is unlinked only after its renames are durable. */
+static int unsettle_recover(eng *db, const char *name, const v5_line *s, size_t n)
+{
+    size_t m = n / 2;
+    const v5_line *ls = s, *us = s + m;
+    unsigned char (*on_l)[3] = calloc(m, sizeof *on_l); /* 0: from, 1: to (P.part), 2: retired_<P.part> */
+    unsigned char (*on_u)[2] = calloc(m, sizeof *on_u); /* 0: from (P.ec), 1: to (retired_P.ec) */
+    if (!on_l || !on_u) {
+        free(on_l);
+        free(on_u);
+        return TSDB_ERR_NOMEM;
+    }
+    int rc = 0;
+    bool renamed = false, l_from_missing = false, u_src_missing = false;
+    char nm[200];
+    for (size_t i = 0; i < m && rc == 0; i++) {
+        int r0 = name_at(db, name, ls[i].from);
+        int r1 = r0 < 0 ? r0 : name_at(db, name, ls[i].to);
+        snprintf(nm, sizeof nm, "retired_%s", ls[i].to);
+        int r2 = r1 < 0 ? r1 : name_at(db, name, nm);
+        if (r0 < 0 || r1 < 0 || r2 < 0) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        on_l[i][0] = (unsigned char)r0, on_l[i][1] = (unsigned char)r1, on_l[i][2] = (unsigned char)r2;
+        l_from_missing |= !r0;
+    }
+    for (size_t i = 0; i < m && rc == 0; i++) {
+        int r0 = name_at(db, name, us[i].from);
+        int r1 = r0 < 0 ? r0 : name_at(db, name, us[i].to);
+        if (r0 < 0 || r1 < 0) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        on_u[i][0] = (unsigned char)r0, on_u[i][1] = (unsigned char)r1;
+        u_src_missing |= !r0;
+    }
+    for (size_t i = 0; i < m && rc == 0; i++) {
+        /* P.part present; or retired_P.part present with P.ec gone (not a stale leftover retired_P.part beside a live
+         * P.ec); or U persisted before L (retired_P.ec present, P.ec gone, L.from still on disk). */
+        if (on_l[i][1] || (on_l[i][2] && !on_u[i][0]) || (on_u[i][1] && !on_u[i][0] && on_l[i][0]))
+            renamed = true;
+    }
+    if (rc == 0 && renamed) {
+        for (size_t i = 0; i < m && rc == 0; i++) {
+            if (!on_l[i][0] && !on_l[i][1] && !on_l[i][2] && on_u[i][0]) {
+                fprintf(stderr,
+                        "tsdb: unsettle intent %s: %s is under none of its names while %s is still live: damage, "
+                        "the open fails\n",
+                        name, ls[i].to, us[i].from);
+                rc = TSDB_ERR_CORRUPT;
+            }
+        }
+    }
+    if (rc == 0 && !renamed && (l_from_missing || u_src_missing)) {
+        fprintf(stderr, "tsdb: unsettle intent %s: nothing was renamed and %s: it is rolled back\n", name,
+                u_src_missing ? "an .ec source is gone" : "an unsettle source is gone");
+        for (size_t i = 0; i < m && rc == 0; i++) {
+            /* Never unlink settled_*.part on rollback: it is a kept source copy, not a temporary. */
+            if (part_tmp_name(ls[i].from) && on_l[i][0] && unlinkat(db->dirfd, ls[i].from, 0) != 0 && errno != ENOENT) {
+                fprintf(stderr, "tsdb: rolling unsettle intent %s back: %s: %s\n", name, ls[i].from, strerror(errno));
+                rc = TSDB_ERR_IO;
+            }
+        }
+    } else if (rc == 0) {
+        bool did_l = false;
+        for (size_t i = 0; i < m && rc == 0; i++) {
+            if (on_l[i][0] && !on_l[i][1]) {
+                if (renameat(db->dirfd, ls[i].from, db->dirfd, ls[i].to) != 0) {
+                    fprintf(stderr, "tsdb: rolling unsettle intent %s forward: rename of %s: %s\n", name, ls[i].from,
+                            strerror(errno));
+                    rc = TSDB_ERR_IO;
+                }
+                did_l = true;
+            }
+        }
+        if (rc == 0 && did_l && db->opt.fsync && tsdb_fsync(db->dirfd) != 0) {
+            fprintf(stderr, "tsdb: rolling unsettle intent %s forward: fsync after L: %s\n", name, strerror(errno));
+            rc = TSDB_ERR_IO;
+        }
+        for (size_t i = 0; i < m && rc == 0; i++) {
+            if (on_u[i][0] && renameat(db->dirfd, us[i].from, db->dirfd, us[i].to) != 0) {
+                fprintf(stderr, "tsdb: rolling unsettle intent %s forward: rename of %s: %s\n", name, us[i].from,
+                        strerror(errno));
+                rc = TSDB_ERR_IO;
+            }
+        }
+    }
+    free(on_l);
+    free(on_u);
+    if (rc == 0 && db->opt.fsync && tsdb_fsync(db->dirfd) != 0) {
+        fprintf(stderr, "tsdb: unsettle intent %s: fsync of the directory: %s\n", name, strerror(errno));
+        rc = TSDB_ERR_IO;
+    }
+    return rc;
 }
 
 /* Recovery of a v5 intent at open (before load_parts removes the temporaries). The apply wrote it with db->lock held
@@ -1087,22 +1611,29 @@ static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key)
  *     when a source is gone, the volume is DIVERGED (ec_diverge, durable): this member no longer holds the rows the
  *     COLD replaced. RSTATE's `doing` then makes the replay decide (nothing listed) and apply the COLD again.
  *   Damage that fails the open (the intent kept): a sealed intent whose lines break the rules, a lookup that fails
- *   other than ENOENT. The directory is synced before returning: the intent is unlinked only after its renames. */
+ *   other than ENOENT. The directory is synced before returning: the intent is unlinked only after its renames.
+ *   Reverse (unsettle) v5 intents (L and U lines) are dispatched to unsettle_recover above. */
 int ecapply_recover(eng *db, const char *name, char *buf, size_t len)
 {
     if (!intent_unseal(buf, len)) {
-        fprintf(stderr, "tsdb: cold apply intent %s is torn: the apply is rolled back\n", name);
+        fprintf(stderr, "tsdb: v5 intent %s is torn: rolled back\n", name);
         return 0;
     }
     v5_line *s = NULL;
     size_t n = 0;
     int64_t key = 0;
-    int rc = v5_parse(buf, &s, &n, &key);
+    bool is_unsettle = false;
+    int rc = v5_parse(buf, &s, &n, &key, &is_unsettle);
     if (rc <= 0) {
         if (rc == 0)
-            fprintf(stderr, "tsdb: cold apply intent %s: its checksum holds but a line breaks the rules of an apply's "
+            fprintf(stderr, "tsdb: intent %s: its checksum holds but a line breaks the rules of a v5 intent's "
                             "names: damage, the open fails\n", name);
         return rc < 0 ? rc : TSDB_ERR_CORRUPT;
+    }
+    if (is_unsettle) {
+        rc = unsettle_recover(db, name, s, n);
+        free(s);
+        return rc;
     }
     rc = 0;
     unsigned char (*on)[3] = calloc(n, sizeof *on); /* 0: from, 1: to, 2: retired_ of to (N, Y) */

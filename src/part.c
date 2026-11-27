@@ -1535,6 +1535,21 @@ static int drop_name_recover(eng *db, const char *file, const char *name, size_t
         return 0;
     }
     if (r == 0 && (r = drop_name_at(db, retired)) == 1) {
+        if (ec_file_name(name)) {
+            /* R15: if P.ec was unsettled back to P.part (retiring P.ec -> retired_P.ec) while this drop intent
+             * named P.ec, retire the same-stem P.part too so the drop never leaves a half-dropped partition. */
+            size_t l = strlen(name) - (sizeof ".ec" - 1);
+            char part_nm[200];
+            snprintf(part_nm, sizeof part_nm, "%.*s.part", (int)l, name);
+            int pr = drop_name_at(db, part_nm);
+            if (pr == 1) {
+                fprintf(stderr, "tsdb: %s: drop intent %s: %s was unsettled: its part %s goes in its place\n",
+                        db->dir, file, name, part_nm);
+                return drop_name_recover(db, file, part_nm, cnt);
+            }
+            if (pr < 0)
+                return pr;
+        }
         cnt[1]++;
         return 0;
     }
@@ -1546,6 +1561,16 @@ static int drop_name_recover(eng *db, const char *file, const char *name, size_t
             fprintf(stderr, "tsdb: %s: drop intent %s: %s was settled: its .ec %s goes in its place\n", db->dir,
                     file, name, ec);
             return drop_name_recover(db, file, ec, cnt);
+        }
+    }
+    if (r == 0 && ec_file_name(name)) {
+        size_t l = strlen(name) - (sizeof ".ec" - 1);
+        char part_nm[200];
+        snprintf(part_nm, sizeof part_nm, "%.*s.part", (int)l, name);
+        if ((r = drop_name_at(db, part_nm)) == 1) {
+            fprintf(stderr, "tsdb: %s: drop intent %s: %s was unsettled: its part %s goes in its place\n",
+                    db->dir, file, name, part_nm);
+            return drop_name_recover(db, file, part_nm, cnt);
         }
     }
     if (r == 0) {

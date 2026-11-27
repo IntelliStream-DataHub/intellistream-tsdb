@@ -153,7 +153,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
+R7_HDR := src/ecpart.h src/tier.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/ecunsettle.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -457,7 +457,7 @@ META_GROUPS := test-meta-1 test-meta-2 test-cluster-1 test-cluster-2 test-cluste
 TEST_GROUPS ?= $(UNITS_GROUPS) test-units-b $(UNITS_B_GROUPS) $(META_GROUPS) test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-groups $(BT_TARGETS) test-units-b $(UNITS_GROUPS) $(UNITS_B_GROUPS) test-meta $(META_GROUPS) test-meta-mutants-1 test-meta-mutants-2 test-net
-TEST_B_BINS_1 := $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunkpeer $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
+TEST_B_BINS_1 := $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunkpeer $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_ecunsettle $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
 TEST_B_BINS_2 := $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 $(UNITS_B_GROUPS) test-groups $(BT_TARGETS): $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
 $(UNITS_B_GROUPS) test-groups $(BT_TARGETS): $(TEST_B_BINS_1) $(TEST_B_BINS_2)
@@ -577,6 +577,8 @@ test-units-b2:
 test-units-b3:
 	./$(B)/test_ecswap $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecswap --list "swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled swaploggedgc" -- ./$(B)/test_ecswap --quick --mutant @M@ @D@) # each planted bug must fail it
+	./$(B)/test_ecunsettle $(SCRATCH)
+	$(if $(EC_OBJ),$(MUT) --name test_ecunsettle --list "unsettlenodecodecheck unsettlerank" -- ./$(B)/test_ecunsettle --quick --mutant @M@ @D@) # R15 r15-reverse: each planted bug must fail it
 	./$(B)/test_ecgc $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecgc --list "gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer gcuncommitted gcnamedorphan gcsuspendignored holdatretire gcreplicanoop" -- ./$(B)/test_ecgc --quick --mutant @M@ @D@) # each planted bug must fail it
 test-units-b4:
@@ -1573,6 +1575,15 @@ oracle-soak: $(B)/test_settle_oracle
 # points and power loss (crashfs) at every step; readers across swaps; mutants must fail it
 $(B)/test_ecswap: tests/test_ecswap.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# the reverse intent and eng_unsettle (R15 r15-reverse, D14): both sources (settled_ fast path & decode fallback),
+# flipped settled_ fallback, crashfs power loss at every step, oracle twin equality, volume diverged --clear, mutants
+$(B)/test_ecunsettle: tests/test_ecunsettle.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_SO) $(B)/tsdb
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+.PHONY: ecunsettle-mutants
+ecunsettle-mutants: $(B)/test_ecunsettle
+	$(if $(EC_OBJ),$(MUT) --name test_ecunsettle --list "unsettlenodecodecheck unsettlerank" -- ./$(B)/test_ecunsettle --quick --mutant @M@ @D@)
 
 # the settle (r7-settle, src/settle.c, src/ecpolicy.c): queries equal an oracle that never settled, damage aborts, the
 # policy's ages and limits, close during an encode, 8 writers with merges and a drop, crash points and power loss

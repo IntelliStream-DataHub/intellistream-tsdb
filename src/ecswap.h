@@ -33,6 +33,18 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n);
  * Same return contract and lock order (publish_lock > latest_rw > db->lock) as ec_swap_commit. */
 int ec_swap_reencode(eng *db, part **in, size_t nin, part *out);
 
+/* R15 (r15-reverse, D14): swaps each listed .ec part in[i] for its local .part out[i] (all or nothing, one partition
+ * key). out[i]->pending names either settled_<P.part> (fast path) or tmp_<pid>_<n>.part (decode path, fsynced).
+ * Serializes against concurrent drops via db_pub_begin/db_pub_end, verifies inputs, retired_<P>.ec absence and source
+ * files before writing and syncing intent v5 ("tsdb-intent 5 <2n>", n lines `L <src> <P.part>` and n lines
+ * `U <P.ec> retired_<P.ec>`, "end <xxh64>") outside latest_rw/db->lock, then under latest_rw > db->lock performs only
+ * the 2n renames (L then U), eckeep/r7-gc updates and in-place list swap, followed by a post-rename directory fsync,
+ * intent unlink (and corrupt settled_ cleanup + dir fsync on the decode path), db_pub_end, and MANIFEST publish.
+ * (Crash recovery in unsettle_recover syncs between L and U.) Returns TSDB_ERR_NOTFOUND if a source disappeared before
+ * writing the intent (caller may retry via decode), TSDB_ERR_LOCKED if retired_<P>.ec is still awaiting GC,
+ * TSDB_ERR_STOPPED if an input was dropped/merged/unlisted. Lock order: publish_lock > latest_rw > db->lock. */
+int ec_swap_unsettle(eng *db, part **in, part **out, size_t n);
+
 /* The open's recovery of the v4 intent `name` (its whole text in buf[0 .. len), which may be changed). 0: done, and
  * intents_recover unlinks the intent (and syncs the directory); else the open fails with it. */
 int ecswap_recover(eng *db, const char *name, char *buf, size_t len);

@@ -948,7 +948,19 @@ cgroup, so `nice` does not keep your work out of its way.
     triggers durable `DIVERGED` (`ec_diverge`, `src/ecdiverge.[ch]`): `DIVERGED` file is synced before `db->diverged` is
     set, read at every open so restarts keep refusing the volume (`TSDB_ERR_UNAVAILABLE`, `LOCAL_FAULT` in cluster
     heartbeats, `tsdb_volume_diverged` = 1), until `tsdb DIR volume diverged --clear` (refused on cluster volumes, D23;
-    use `tsdb cluster replica reset` to rebuild the replica instead). `tests/test_ecdigest.c` (mutants `digestbytes digestnotomb
+    use `tsdb cluster replica reset` to rebuild the replica instead). On a single server (`src/ecunsettle.[ch]`, R15
+    `r15-reverse`, D14), `volume diverged --clear` calls `ec_unsettle_diverged_cli` -> `eng_unsettle(db, key)` to restore
+    every `.ec` part `P` of each diverged key to its exact local `P.part` (preserving block range and level; Source 1:
+    verified `settled_P.part`; Source 2: decoded from the tier with cell-sum, `object_xxh64` byte digest, and full part
+    granule/footer verification into `tmp_*.part`) and retire `P.ec -> retired_P.ec` through **intent v5** reverse lines
+    (`L <settled_P.part|tmp_*.part> <P.part>`, `U <P.ec> <retired_P.ec>`, `ec_swap_unsettle` / `unsettle_recover` in
+    `src/ecswap.c`), clearing durable `DIVERGED` only after every unsettle swap is durable. `ec_swap_unsettle` serializes
+    with `tsdb_drop_before` via `db_pub_begin`/`db_pub_end` (and `ttl_select_locked` in `src/merge.c` skips keys with a
+    `settling` `.ec` part), `drop_name_recover` in `src/part.c` maps a drop intent naming an
+    unsettled `P.ec` onto `P.part`, `eckeep_unsettle_locked` clears keep/graveyard state on both fast and decode paths,
+    and both `ec_swap_commit` and `eng_unsettle` refuse a part whose `retired_<P>.ec` is still awaiting GC.
+    `tests/test_ecunsettle.c` (crashfs power-loss sweeps on both sources, `make ecunsettle-mutants`:
+    `unsettlenodecodecheck`, `unsettlerank`), `tests/test_ecdigest.c` (mutants `digestbytes digestnotomb
     digestnoretention digestbelowtrue digestnots digestfreezerows digestlocalbelow`), `test_ecapply --case digest|digestpower`
     (mutants `digestnocompare digestanyz digestnosupersede digestnocrcwalk digestrotmatches digestnojobremove
     digestjobnosync`), `test_keep` (mutants `divergemem clearcluster releasenosync rotdiverges`).

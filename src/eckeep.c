@@ -49,7 +49,9 @@ typedef struct kent {
     char name[256];   /* settled_<source> */
     int status;       /* ECKEEP_* */
     bool busy;        /* the thread is digesting it: never removed meanwhile */
+    bool stale;       /* unsettled while busy: drop on completion unless re-settled */
     bool logged;      /* a wait was reported once */
+    uint64_t gen;     /* bumped on unsettle/re-add so a stale in-flight digest result is discarded */
     int64_t deadline; /* MATCHED, ORPHAN: eng_now_ms from which it may go */
     int64_t next_try; /* PENDING: eng_mono_ms of the next try */
     int64_t backoff;
@@ -200,10 +202,23 @@ static kent *find(struct eckeep_eng *k, const char *name)
     return NULL;
 }
 
-static int add(struct eckeep_eng *k, const char *name)
+static int add_entry(struct eckeep_eng *k, const char *name, bool reset_existing)
 {
-    if (find(k, name))
+    kent *existing = find(k, name);
+    if (existing) {
+        if (existing->stale || (reset_existing && !existing->busy)) {
+            existing->gen++;
+            existing->stale = false;
+            existing->status = ECKEEP_PENDING;
+            existing->deadline = 0;
+            existing->next_try = 0;
+            existing->backoff = RETRY_MIN_MS;
+            existing->logged = false;
+            existing->bound = false;
+            existing->job[0] = '\0';
+        }
         return 0;
+    }
     if (k->n == k->cap) {
         size_t cap = k->cap ? k->cap * 2 : 16;
         kent *e = realloc(k->e, cap * sizeof *e);
@@ -219,6 +234,8 @@ static int add(struct eckeep_eng *k, const char *name)
     e->backoff = RETRY_MIN_MS;
     return 0;
 }
+
+static int add(struct eckeep_eng *k, const char *name) { return add_entry(k, name, false); }
 
 static void drop_entry(struct eckeep_eng *k, kent *e)
 {
@@ -669,6 +686,7 @@ static void *keep_main(void *arg)
             continue;
         }
         pick->busy = true;
+        uint64_t gen = pick->gen;
         k->tries++;
         char name[256];
         memcpy(name, pick->name, sizeof name);
@@ -682,6 +700,12 @@ static void *keep_main(void *arg)
         if (!e)
             continue;
         e->busy = false;
+        if (e->gen != gen) {
+            if (e->stale)
+                drop_entry(k, e);
+            pthread_cond_broadcast(&k->cv);
+            continue;
+        }
         switch (res) {
         case R_MATCH:
             e->status = ECKEEP_MATCHED;
@@ -746,6 +770,34 @@ int eckeep_load_settled(eng *db, const char *name, bool read_only)
     return rc;
 }
 
+/* R15 (eng_unsettle): true if the .ec part matching settled_P.part is pinned (settling) in db->parts (db->lock held).
+ * Binary-searches db->parts by partition key (O(log nparts)) and is only called when an entry is due to release. */
+static bool ec_part_settling_locked(eng *db, const char *settled_name)
+{
+    size_t nlen = strlen(settled_name);
+    if (nlen <= 8 + 5 || strncmp(settled_name, "settled_", 8) != 0 || strcmp(settled_name + nlen - 5, ".part") != 0)
+        return false;
+    int64_t key = 0;
+    if (sscanf(settled_name + 8, "p%" SCNd64 "_", &key) != 1)
+        return false;
+    char ec_name[128];
+    if (nlen - 8 - 5 + 3 >= sizeof ec_name)
+        return false;
+    snprintf(ec_name, sizeof ec_name, "%.*s.ec", (int)(nlen - 8 - 5), settled_name + 8);
+    size_t lo = 0, hi = db->nparts;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (db->parts[mid]->partition < key)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    for (size_t i = lo; i < db->nparts && db->parts[i]->partition == key; i++)
+        if (db->parts[i]->settling && strcmp(db->parts[i]->name, ec_name) == 0)
+            return true;
+    return false;
+}
+
 bool eckeep_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now)
 {
     EC_CALLED(EC_CALL_KEEP_PURGE);
@@ -761,7 +813,8 @@ bool eckeep_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now
     kent *x = find(k, e->name);
     if (x && !x->busy && wall >= x->deadline &&
         (x->status == ECKEEP_MATCHED || x->status == ECKEEP_ORPHAN || x->status == ECKEEP_ROT ||
-         (x->status == ECKEEP_DIVERGED && eckeep_mutant == ECKEEP_MUT_DIGESTNOHOLD))) {
+         (x->status == ECKEEP_DIVERGED && eckeep_mutant == ECKEEP_MUT_DIGESTNOHOLD)) &&
+        !ec_part_settling_locked(db, e->name)) {
         drop_entry(k, x);
         release = true;
     }
@@ -786,6 +839,31 @@ bool eckeep_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now
 static void held(eng *db, part *const *in, size_t n, bool bound, int64_t key, uint64_t z);
 
 void eckeep_swapped(eng *db, part *const *in, size_t n) { held(db, in, n, false, 0, 0); }
+
+void eckeep_unsettle_locked(eng *db, const char *settled_name)
+{
+    for (size_t i = 0; i < db->ngraveyard; i++) {
+        if (db->graveyard[i].kind == GY_SETTLED && strcmp(db->graveyard[i].name, settled_name) == 0) {
+            db->graveyard[i] = db->graveyard[--db->ngraveyard];
+            break;
+        }
+    }
+    struct eckeep_eng *k = keep_of(db);
+    if (!k)
+        return;
+    pthread_mutex_lock(&k->mu);
+    kent *e = find(k, settled_name);
+    if (e) {
+        if (e->busy) {
+            e->gen++;
+            e->stale = true;
+        } else {
+            drop_entry(k, e);
+        }
+        pthread_cond_broadcast(&k->cv);
+    }
+    pthread_mutex_unlock(&k->mu);
+}
 
 void eckeep_retired(eng *db, part *const *own, size_t n, int64_t key, uint64_t z) { held(db, own, n, true, key, z); }
 
@@ -997,7 +1075,8 @@ static void held(eng *db, part *const *in, size_t n, bool bound, int64_t key, ui
         if (!known && graveyard_add(db, name, GY_SETTLED, INT64_MAX) != 0)
             continue; /* out of memory: the file stays, unreleased, until the next open digests it */
         pthread_mutex_lock(&k->mu);
-        if (add(k, name) == 0 && bound) {
+        /* A fresh swap owns this settled_ name: reset any leftover non-busy ORPHAN/ROT entry back to PENDING. */
+        if (add_entry(k, name, true) == 0 && bound) {
             kent *e = find(k, name);
             e->bound = true;
             e->key = key;

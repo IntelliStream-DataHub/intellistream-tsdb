@@ -8,6 +8,7 @@
 #include "../src/chunk.h"
 #include "../src/disk.h"
 #include "../src/ecdiverge.h"
+#include "../src/ecunsettle.h"
 #include "tsdb_calendar.h"
 
 #include <errno.h>
@@ -1817,7 +1818,7 @@ int main(int argc, char **argv)
                 return 1;
             drop_root(path);
         }
-        int rc = ecdiverge_cli(path, clear, stdout);
+        int rc = clear ? ec_unsettle_diverged_cli(dir, path, stdout) : ecdiverge_cli(path, false, stdout);
         if (rc < 0)
             die(path, rc);
         return 0;

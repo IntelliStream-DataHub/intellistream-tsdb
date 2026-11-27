@@ -808,8 +808,11 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal, cha
             part *p = db->parts[b];
             busy |= p->merging;
             /* a cluster ec volume (R8): a settle between its gate and its swap has the key pinned, and its MK_COLD names
-             * the key's parts; a TTL rewrite or drop of them would retire rows the replicas then settle (r8g-cut) */
-            busy |= p->settling && db->ec_cluster && eccold_mutant != ECCOLD_MUT_TTLSETTLING;
+             * the key's parts; a TTL rewrite or drop of them would retire rows the replicas then settle (r8g-cut).
+             * R15 (eng_unsettle): an .ec part with settling set is being unsettled; block TTL drops so a retention drop
+             * cannot retire P.ec under a reverse intent and let recovery resurrect the part. */
+            busy |= p->settling && (atomic_load(&p->ec) != NULL ||
+                                    (db->ec_cluster && eccold_mutant != ECCOLD_MUT_TTLSETTLING));
             if (!p->ng && !p->nt) {
                 if (p->wal_seq > db->wal_removed_synced) {
                     all = INT64_MAX;
