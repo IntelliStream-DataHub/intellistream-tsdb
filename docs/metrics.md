@@ -87,6 +87,19 @@ directory) and `path`.
 | `tsdb_chunk_reads_total{peer}`, `tsdb_chunk_read_hedges_total{peer}`, `tsdb_chunk_read_avoids_total{peer}`, `tsdb_chunk_decoded_cells_total{peer}`, `tsdb_chunk_read_avoid{peer}` | counter, counter, counter, counter, gauge | cluster only, per storage peer (design-cluster-data.md E31): chunk cell read requests sent, hedged reads launched when a peer exceeded its hedge timer (`2 * p99` clamped to `[20, 500]` ms, capped at 5% of reads per peer), cell reads decoded around a peer while it was in `read-avoid` (8 timeouts in 10 s -> 30 s avoid), cells decoded from other stripe positions in place of that peer, and 1 while that peer is in `read-avoid` |
 | `tsdb_pace_rate_bytes_per_second{dir}`, `tsdb_pace_halved`, `tsdb_pace_bytes_total{dir,class}` | gauge, gauge, counter | cluster only (design-cluster-data.md E13, design-cluster.md §8.4): current effective rebuild/balance pace rate in bytes/s by direction (`send`, `recv`; 0 when unlimited at margin 0), 1 while non-emergency pacing is halved because 1-minute query p99 or WAL sync p99 exceeds twice its 1-hour median, and total bytes paced by direction and margin class (`margin0`, `margin1`, `margin2plus`, `balance`) |
 
+### Local tier metrics (single server, R15)
+
+When a standalone server opens a database with a local settled tier (`TIERS`), `/metrics` also emits four tier families (omitted on standalone servers without a tier, and in cluster mode):
+
+| metric | type | meaning |
+|---|---|---|
+| `tsdb_tier_bytes{store,use}` | gauge | filesystem bytes of each open local tier store (`store` is the 0-based store index; `use` is `used`, `free` (unprivileged available), or `total`; omitted for DOWN stores). Regular chunk puts stop when integer fill percent (floor of `used * 100 / total`) exceeds 95%; `dist/alerts/tsdb.rules.yml` (`TsdbTierFull7d`) alerts when the 1-day growth slope projects reaching 95% within 7 days |
+| `tsdb_tier_settles_waiting` | gauge | number of tiered volumes currently waiting to settle because a tier store is down, above 95% full, or the tier is halted |
+| `tsdb_tier_store_state{store}` | gauge | local tier store state (0-based store index): `0` up, `1` missing, `2` other_id, `3` damaged, `4` ioerr, `5` replacing, `6` stalled; `TsdbTierStoreDown` alerts on any DOWN state (`!= 0` and `!= 5`) |
+| `tsdb_volume_full{volume}` | gauge | `1` while the tiered volume is FULL (volume filesystem integer fill percent `>= young_high_pct`, 90% default; clears below `young_high_pct - 2`), refusing inserts, appends, and non-empty replaces with `UNAVAILABLE` (`TSDB_WHY_FULL`) while deletes and drops pass; `TsdbInsertsRefusedFull` alerts on `== 1` |
+
+Alert rules for these metrics ship in `dist/alerts/tsdb.rules.yml`.
+
 ### Cluster metrics (R14, P4 alerts)
 
 In cluster mode (`tsdbd --cluster`), `server/creport.[ch]` exposes cluster health, Raft, member, per-held-volume, and chunk-store metrics from immutable snapshots taken without holding cluster locks across rendering. Standalone servers (`!cluster_on`) omit all of these families.

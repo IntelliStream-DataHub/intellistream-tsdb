@@ -26,6 +26,7 @@
 #define TSDB_TIER_H
 
 #include "internal.h"
+#include "tierfill.h"
 #include "tiers.h"
 
 #define TIER_DIRS_MAX 64
@@ -273,6 +274,7 @@ struct ecstate {
     struct eckeep_eng *keep;     /* r7-keep: settled_* digests (src/eckeep.c) */
     struct ecsettle_eng *settle; /* r7-settle: policy state (src/settle.c) */
     struct ecswap_eng *swap;     /* r7-swap (src/ecswap.c) */
+    tierfill_state fill;         /* r15-full: atomic FULL hysteresis flag & refusal count (src/tierfill.c) */
     uint8_t vuuid[16];           /* r7-tier: META's vuuid= (tier_vuuid) */
     struct coldvol *cold;        /* r8b-coldops: the volume's ops, epoch provider and settings (a reference) */
     struct chunk_backend *mut_be; /* r7-tier: the backend of the tierperengine mutant only */

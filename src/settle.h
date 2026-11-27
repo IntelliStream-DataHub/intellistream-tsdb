@@ -81,16 +81,26 @@ eccold_deg_wait *ecsettle_deg_wait(eng *db);
  * into sel[0 .. return value) (at most cap; the caller passes them to eng_settle and unrefs them). 0: nothing is due.
  * now_ms: eng_now_ms. */
 size_t ecpolicy_pick_locked(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
-/* R15 (D6, E55): sample db's volume filesystem used % via fstatvfs(db->dirfd) at most once per second per engine.
- * Called ONLY from the settle thread (never on the append path), outside db->lock. Returns 0..100. */
+/* R15 (D6, E55): sample db's volume filesystem integer used % (floor of used * 100 / total, using f_bavail) via
+ * fstatvfs(db->dirfd) at most once per second per engine. Called outside db->lock (never on the append path). */
 uint32_t ecpolicy_sample_fill(eng *db);
+/* Record an externally sampled fill % (from tierfill's per-volume sampler) into db's cached fill_pct (and
+ * fill_sample_ms when real_sample is true, so real statvfs stays <= 1/s across both settle and sampler threads). */
+void ecpolicy_record_fill(eng *db, uint32_t pct, bool real_sample);
+/* True if at least ECPOLICY_FILL_SAMPLE_MS (1 s) has elapsed since db's last real statvfs/fstatvfs sample. */
+bool ecpolicy_fill_due(const eng *db);
+/* Active test override for volume fill % (0..100), or -1 when real statvfs/fstatvfs should be used. */
+int ecpolicy_test_fill_override(void);
 /* Last sampled (or test-overridden) used % of db's volume filesystem (0..100). Lock-free, no syscall. */
 uint32_t ecpolicy_fill_pct(const eng *db);
 /* R15 (D6, E55): monotonic counter of settle-thread rounds in which a due settle was deferred on a single-server tier
- * because not all directory stores (always >= k'+m; placement hashes across every store) were UP (DOWN or REPLACING)
- * or the tier was halted/unwritable. Exported by r15-full as tsdb_tier_settles_waiting. */
+ * because not all directory stores (always >= k'+m; placement hashes across every store) were UP (DOWN or REPLACING),
+ * a store exceeded the 95% regular-put cap, or the tier was halted/unwritable. */
 uint64_t eng_tier_settles_waiting(const eng *db);
 uint64_t ecsettle_tier_waiting(const struct tier *t);
+/* R15 r15-full: current number of tiered volumes on `t` with a due settle waiting (stores down, full, or halted).
+ * Exported as the Prometheus gauge tsdb_tier_settles_waiting. */
+uint64_t ecsettle_tier_waiting_now(const struct tier *t);
 /* True while db's most recent settle round on a single-server tier found a due settle blocked by store availability
  * or a halted/unwritable tier. */
 bool eng_tier_settle_is_waiting(const eng *db);

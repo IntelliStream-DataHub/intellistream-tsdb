@@ -505,6 +505,8 @@ static int tier_be_open(tier *t, const char *dir)
         t->be = NULL;
         fprintf(stderr, "tsdb: %s: the tier's chunk stores do not open (%s; %d of %d must be up): the open fails\n",
                 dir, tsdb_strerror(rc), o.min_up, n);
+    } else {
+        chunk_be_set_put_cap(t->be, CHUNK_STORE_PUT_MAX_PCT);
     }
     return rc;
 }
@@ -589,6 +591,7 @@ static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up)
             }
         }
     }
+    chunk_be_set_put_cap(t->be, CHUNK_STORE_PUT_MAX_PCT);
     return 0;
 }
 
@@ -1463,6 +1466,10 @@ void tier_engine_ready(eng *db)
 {
     if (!db || !db->tier || !db->ecstate)
         return;
+    /* Seed FULL state synchronously before eng_open returns so a volume opened/reopened at >= young_high_pct
+     * refuses inserts immediately, then start the per-volume 1 s sampler thread (isolated per volume). */
+    tierfill_eng_seed(db);
+    (void)tierfill_eng_start(db);
     tier *t = db->tier;
     pthread_mutex_lock(&t->cmu);
     if (db->ecstate->tier_opening) {
@@ -1482,6 +1489,7 @@ void tier_engine_unreg(eng *db)
 {
     if (!db || !db->tier || !db->ecstate)
         return;
+    tierfill_eng_stop(db);
     tier *t = db->tier;
     pthread_mutex_lock(&t->cmu);
     if (db->ecstate->tier_opening) {

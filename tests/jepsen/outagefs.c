@@ -51,6 +51,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -113,6 +114,8 @@ REAL(int, fstat, (int, struct stat *));
 REAL(int, stat, (const char *, struct stat *));
 REAL(int, lstat, (const char *, struct stat *));
 REAL(int, fstatat, (int, const char *, struct stat *, int));
+REAL(int, statvfs, (const char *, struct statvfs *));
+REAL(int, fstatvfs, (int, struct statvfs *));
 REAL(struct dirent *, readdir, (DIR *));
 REAL(int, fallocate, (int, int, off_t, off_t));
 REAL(int, posix_fallocate, (int, off_t, off_t));
@@ -150,6 +153,8 @@ static void resolve(void)
     LOAD(stat);
     LOAD(lstat);
     LOAD(fstatat);
+    LOAD(statvfs);
+    LOAD(fstatvfs);
     LOAD(readdir);
     LOAD(fallocate);
     LOAD(posix_fallocate);
@@ -576,6 +581,20 @@ int fstatat64(int d, const char *p, struct stat64 *st, int flags)
 {
     return fstatat(d, p, (struct stat *)st, flags);
 }
+int statvfs(const char *p, struct statvfs *sv)
+{
+    resolve();
+    GATE(root_of_path(p), false);
+    return real_statvfs(p, sv);
+}
+int statvfs64(const char *p, struct statvfs64 *sv) { return statvfs(p, (struct statvfs *)sv); }
+int fstatvfs(int fd, struct statvfs *sv)
+{
+    resolve();
+    GATE(root_of_fd(fd), false);
+    return real_fstatvfs(fd, sv);
+}
+int fstatvfs64(int fd, struct statvfs64 *sv) { return fstatvfs(fd, (struct statvfs *)sv); }
 
 /* getdents is not a symbol glibc's readdir goes through; readdir itself is. A failure is end of directory with
  * errno set, which is what tsdb's scans must not take for a complete listing. */

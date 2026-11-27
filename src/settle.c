@@ -44,6 +44,7 @@
 #define _GNU_SOURCE
 #include "settle.h"
 #include "chunk.h"
+#include "chunk_priv.h"
 #include "eccache.h"
 #include "eccold.h"
 #include "ecdigest.h"
@@ -54,6 +55,7 @@
 #include "marker.h"
 #include "coldops.h"
 #include "tier.h"
+#include "tierfill.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -269,9 +271,10 @@ struct ecsettle_tier {
 
 enum {
     SETTLE_WAIT_NONE = 0,
-    SETTLE_WAIT_STORES = 1, /* fewer than k'+m (or not all) directory stores are UP */
-    SETTLE_WAIT_HALTED = 2, /* tier->halted latched until reopen */
+    SETTLE_WAIT_STORES = 1,     /* fewer than k'+m (or not all) directory stores are UP */
+    SETTLE_WAIT_HALTED = 2,     /* tier->halted latched until reopen */
     SETTLE_WAIT_UNWRITABLE = 3, /* cold backend ops->writable() returned false */
+    SETTLE_WAIT_FULL = 4,       /* R15 D7: at least one store exceeds CHUNK_STORE_PUT_MAX_PCT (95%) */
 };
 
 struct ecsettle_eng {
@@ -293,6 +296,33 @@ ecpolicy_state *ecpolicy_of(eng *db)
 eccold_deg_wait *ecsettle_deg_wait(eng *db)
 {
     return db->ecstate && db->ecstate->settle ? &db->ecstate->settle->deg : NULL;
+}
+
+int ecpolicy_test_fill_override(void) { return fill_test_override(); }
+
+bool ecpolicy_fill_due(const eng *db)
+{
+    if (!db || !db->ecstate || !db->ecstate->settle)
+        return false;
+    int64_t last = atomic_load_explicit(&db->ecstate->settle->fill_sample_ms, memory_order_relaxed);
+    if (last == 0)
+        return true;
+    int64_t mono = eng_mono_ms();
+    return mono < last || mono - last >= ECPOLICY_FILL_SAMPLE_MS;
+}
+
+void ecpolicy_record_fill(eng *db, uint32_t pct, bool real_sample)
+{
+    if (!db || !db->ecstate || !db->ecstate->settle)
+        return;
+    struct ecsettle_eng *se = db->ecstate->settle;
+    if (pct > 100u)
+        pct = 100u;
+    atomic_store_explicit(&se->fill_pct, pct, memory_order_relaxed);
+    if (real_sample) {
+        int64_t mono = eng_mono_ms();
+        atomic_store_explicit(&se->fill_sample_ms, mono ? mono : 1, memory_order_relaxed);
+    }
 }
 
 uint32_t ecpolicy_sample_fill(eng *db)
@@ -350,6 +380,20 @@ uint64_t ecsettle_tier_waiting(const struct tier *t)
     if (!t || !t->settle)
         return 0;
     return atomic_load_explicit(&t->settle->settles_waiting, memory_order_relaxed);
+}
+
+uint64_t ecsettle_tier_waiting_now(const struct tier *t)
+{
+    if (!t || !t->settle)
+        return 0;
+    struct ecsettle_tier *st = t->settle;
+    uint64_t n = 0;
+    pthread_mutex_lock(&st->mu);
+    for (size_t i = 0; i < st->neng; i++)
+        if (eng_tier_settle_is_waiting(st->engs[i]))
+            n++;
+    pthread_mutex_unlock(&st->mu);
+    return n;
 }
 
 bool eng_tier_settle_is_waiting(const eng *db)
@@ -665,6 +709,12 @@ static int fail_take_of(int a, int b)
 }
 static int fail_take(void) { return fail_take_of(0, 0); }
 
+static bool settle_hit_store_cap(const eng *db)
+{
+    return !db->ec_cluster && db->tier && tier_backend(db->tier) &&
+           chunk_be_any_store_full(tier_backend(db->tier));
+}
+
 static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, uint32_t posmask,
                          uint32_t *written_mask_out, int fail_at)
 {
@@ -732,7 +782,8 @@ static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, ui
         rc = TSDB_ERR_IO;
     if (rc) {
         if (!f.aborted) {
-            fprintf(stderr, "tsdb: %s: settle of part %s: the put failed (%d)\n", db->dir, p->name, rc);
+            if (rc != CHUNK_ERR_FULL || !settle_hit_store_cap(db))
+                fprintf(stderr, "tsdb: %s: settle of part %s: the put failed (%d)\n", db->dir, p->name, rc);
             if (settle_mutant != SETTLE_MUT_GCSKIPPUT)
                 ecsettle_gc_object(db, r); /* a failure while committing leaves the positions committed before it */
         }
@@ -921,7 +972,7 @@ unpin:
                 np == 1 ? "" : "s", (long long)partition);
     } else if (rc == TSDB_ERR_STOPPED) {
         atomic_fetch_add(&settle_abandoned, 1);
-    } else if (rc != TSDB_ERR_NOTFOUND) {
+    } else if (rc != TSDB_ERR_NOTFOUND && !(rc == CHUNK_ERR_FULL && settle_hit_store_cap(db))) {
         atomic_fetch_add(&settle_failed, 1);
     }
     return rc;
@@ -1127,7 +1178,7 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
         fprintf(stderr, "tsdb: %s: re-encoded %zu parts of partition %lld into 1\n", db->dir, np, (long long)partition);
     } else if (rc == TSDB_ERR_STOPPED) {
         atomic_fetch_add(&reencode_abandoned, 1);
-    } else if (rc != TSDB_ERR_NOTFOUND) {
+    } else if (rc != TSDB_ERR_NOTFOUND && !(rc == CHUNK_ERR_FULL && settle_hit_store_cap(db))) {
         atomic_fetch_add(&reencode_failed, 1);
     }
     return rc;
@@ -1217,6 +1268,22 @@ static bool settle_test_held(void)
 #endif
 }
 
+static void settle_mark_store_full(eng *db)
+{
+    struct ecsettle_eng *se = db->ecstate ? db->ecstate->settle : NULL;
+    if (se) {
+        if (se->wait_state != SETTLE_WAIT_FULL) {
+            se->wait_state = SETTLE_WAIT_FULL;
+            fprintf(stderr, "tsdb: %s: settle waiting: tier store above %u%% full\n", db->dir,
+                    CHUNK_STORE_PUT_MAX_PCT);
+        }
+        atomic_store_explicit(&se->is_waiting, true, memory_order_relaxed);
+        atomic_fetch_add_explicit(&se->settles_waiting, 1, memory_order_relaxed);
+    }
+    if (db->tier && db->tier->settle)
+        atomic_fetch_add_explicit(&db->tier->settle->settles_waiting, 1, memory_order_relaxed);
+}
+
 /* one settle or re-encode of db, if the policy has one due: whether it completed one */
 static bool settle_engine(eng *db)
 {
@@ -1246,24 +1313,32 @@ static bool settle_engine(eng *db)
         if (!tier_cold_writable(db))
             return false;
     } else {
-        /* R15 (D6): sample volume filesystem fill at most once per second on the settle thread (never on the append
-         * path), and only for single-server TIERS volumes with a tier_high_pct policy active (avoiding extra statvfs
-         * syscalls on NFS or non-TIERS engines). */
+        /* R15 (D6, D7): sample volume filesystem fill at most once per second on the settle thread (never on the append
+         * path), for single-server TIERS volumes with a tier_high_pct or young_high_pct policy active, and update the
+         * volume's atomic FULL hysteresis flag. */
         const tier_settings *cfg = db->tier ? tier_eng_settings(db) : NULL;
-        if (cfg && cfg->from_tiers && cfg->tier_high_pct > 0 && !cfg->eager)
-            (void)ecpolicy_sample_fill(db);
+        if (cfg && cfg->from_tiers && ((cfg->tier_high_pct > 0 && !cfg->eager) || cfg->young_high_pct > 0)) {
+            uint32_t pct = ecpolicy_sample_fill(db);
+            tierfill_update(db, pct);
+        }
         int n_up = 0, n_total = 0, n_need = 0;
         stores_ready = stores_ready_for_settle(db, &n_up, &n_total, &n_need);
         /* Only ask tier_cold_writable when stores_ready is true so a transient DOWN/REPLACING store does not cause
          * tier_writable() to permanently latch tier->halted. If tier->halted was already set (e.g. store DOWN at open
          * or tripped by ecgc), writable is false and we keep reporting the wait rather than claiming resume. */
         bool writable = stores_ready ? tier_cold_writable(db) : false;
+        /* Conservative wait: pause settles whenever any open store exceeds the 95% regular-put cap (even if
+         * nstores > k'+m, placement hashes uniformly across all stores so most objects would hit the full store). */
+        bool stores_full = stores_ready && writable && db->tier && tier_backend(db->tier) &&
+                           chunk_be_any_store_full(tier_backend(db->tier));
         struct ecsettle_eng *se = db->ecstate ? db->ecstate->settle : NULL;
-        if ((!stores_ready || !writable) && settle_mut() != SETTLE_MUT_SETTLEDEGRADED) {
+        bool wait_avail = (!stores_ready || !writable) && settle_mut() != SETTLE_MUT_SETTLEDEGRADED;
+        if (wait_avail || stores_full) {
             int want_state = !stores_ready
                                  ? SETTLE_WAIT_STORES
-                                 : (db->tier && atomic_load(&db->tier->halted) ? SETTLE_WAIT_HALTED
-                                                                               : SETTLE_WAIT_UNWRITABLE);
+                                 : !writable ? (db->tier && atomic_load(&db->tier->halted) ? SETTLE_WAIT_HALTED
+                                                                                           : SETTLE_WAIT_UNWRITABLE)
+                                             : SETTLE_WAIT_FULL;
             part *sel64[64];
             pthread_mutex_lock(&db->lock);
             size_t n = ecpolicy_pick_locked(db, now, &key, sel64, 64);
@@ -1279,6 +1354,9 @@ static bool settle_engine(eng *db)
                                     n_up, n_total, n_need);
                         else if (want_state == SETTLE_WAIT_HALTED)
                             fprintf(stderr, "tsdb: %s: settle waiting: tier halted until reopen\n", db->dir);
+                        else if (want_state == SETTLE_WAIT_FULL)
+                            fprintf(stderr, "tsdb: %s: settle waiting: tier store above %u%% full\n", db->dir,
+                                    CHUNK_STORE_PUT_MAX_PCT);
                         else
                             fprintf(stderr, "tsdb: %s: settle waiting: cold backend not writable\n", db->dir);
                     }
@@ -1314,6 +1392,8 @@ static bool settle_engine(eng *db)
                 part_unref(rsel[i]);
             if (rc == 0)
                 ecpolicy_reencoded(db, now);
+            else if (rc == CHUNK_ERR_FULL && settle_hit_store_cap(db))
+                settle_mark_store_full(db);
             else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND)
                 ecpolicy_reencode_failed(db, key, now);
             return rc == 0;
@@ -1340,9 +1420,16 @@ static bool settle_engine(eng *db)
         free(sel);
     if (!n)
         return false;
-    if (rc == 0)
+    if (rc == 0) {
         ecpolicy_settled(db, now);
-    else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND) {
+        if (!db->ec_cluster) {
+            const tier_settings *cfg = db->tier ? tier_eng_settings(db) : NULL;
+            if (cfg && cfg->from_tiers && cfg->young_high_pct > 0)
+                tierfill_update(db, ecpolicy_sample_fill(db));
+        }
+    } else if (rc == CHUNK_ERR_FULL && settle_hit_store_cap(db)) {
+        settle_mark_store_full(db);
+    } else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND) {
         if (!dw || !dw->waiting)
             ecpolicy_failed(db, key, now);
     }

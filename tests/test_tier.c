@@ -37,6 +37,7 @@
 #include "outagefs_ctl.h"
 #include "settle.h"
 #include "tier.h"
+#include "tierfill.h"
 #include "tiers.h"
 #include "tsdb.h"
 
@@ -1977,6 +1978,8 @@ static void t_runtime_health(void)
 
 /* ----------------------------------------------------------------------------------------------- power, eio: child */
 
+static int child_full_hang(int argc, char **argv);
+
 static int child(int argc, char **argv)
 {
     /* --child MODE DIR STORES ACK */
@@ -1987,6 +1990,8 @@ static int child(int argc, char **argv)
         return child_health(argc, argv);
     if (strcmp(mode, "health_power") == 0)
         return child_health_power(dir, atoi(ack));
+    if (strcmp(mode, "full_hang") == 0)
+        return child_full_hang(argc, argv);
     tier_env(stores, 3, 2, 1);
     if (strcmp(mode, "power") == 0) {
         tsdb *db;
@@ -2573,6 +2578,526 @@ static void t_tiers_settings(void)
     printf("  tiers_settings: per-volume SETTINGS, cache_bytes, TSDB_TEST_TIER rules, ro/follow refusal\n");
 }
 
+/* ---------------------------------------------------------------------------------------------------------- r15-full */
+
+static atomic_int full_relieve_hits;
+static atomic_bool full_pause_entered;
+static atomic_bool full_pause_release;
+
+static void full_relieve_hook(eng *db, const part *p, uint64_t stripe)
+{
+    (void)db;
+    (void)p;
+    if (stripe == SETTLE_HOOK_PREPARED && atomic_fetch_add(&full_relieve_hits, 1) == 0)
+        ecpolicy_set_test_fill_pct(85); /* simulate settle freeing fast disk below young_high_pct - 2 (88%) */
+}
+
+static void full_pause_hook(eng *db, const part *p, uint64_t stripe)
+{
+    (void)db;
+    (void)p;
+    if (stripe == SETTLE_HOOK_PREPARED) {
+        atomic_store_explicit(&full_pause_entered, true, memory_order_release);
+        while (!atomic_load_explicit(&full_pause_release, memory_order_acquire))
+            rh_sleep_ms(10);
+    }
+}
+
+/* Child under liboutagefs.so: opens two tiered volumes (vol0, vol1) on separate prefixes sharing one tier, hangs
+ * vol0's directory so vol0's tierfill sampler blocks inside statvfs(vol0), and verifies:
+ *   1. vol1's eng_close completes immediately (< 1 s) while vol0's sampler is hung (zero t->eng_active held across I/O);
+ *   2. vol0's eng_close completes within the 500 ms detach deadline (< 1.5 s) instead of hanging pthread_join;
+ *   3. tier_quiesce + tier_put complete cleanly and healing vol0 lets the detached sampler unref/free cleanly. */
+static int child_full_hang(int argc, char **argv)
+{
+    if (argc < 6)
+        return 2;
+    const char *v0dir = argv[3], *v1dir = argv[4], *st0dir = argv[5];
+    const char *ctl = getenv("OUTAGEFS_CTL");
+    if (!ctl || !*ctl)
+        return 3;
+    no_tier_env();
+    tier_health_test_opts(0, -1, 0, 0); /* isolate tierfill sampler I/O */
+    ecpolicy_set_test_fill_pct(-1);     /* force real statvfs so outagefs hang blocks vol0's sampler */
+    int prev_poll = atomic_exchange(&settle_poll_ms, 20);
+
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    tier *t = NULL;
+    if (tier_open(v0dir, &o, &t) != 0 || !t)
+        return 4;
+    eng *e0 = NULL, *e1 = NULL;
+    tier_want(t, 0);
+    int rc0 = eng_open(v0dir, &o, &e0);
+    tier_want(NULL, 0);
+    tier_want(t, 1);
+    int rc1 = eng_open(v1dir, &o, &e1);
+    tier_want(NULL, 0);
+    if (rc0 != 0 || !e0 || rc1 != 0 || !e1) {
+        if (e1)
+            eng_close(e1);
+        if (e0)
+            eng_close(e0);
+        tier_quiesce(t);
+        tier_put(t);
+        return 5;
+    }
+
+    /* Hang vol0's directory: vol0's tierfill sampler enters statvfs(v0dir) and blocks inside liboutagefs.so. */
+    if (rh_of_cmd(ctl, "hang", v0dir) != 0)
+        return 6;
+    bool hung_seen = false;
+    int64_t dl = rh_now_ms() + 3000;
+    while (rh_now_ms() < dl) {
+        char out[1024];
+        if (outagefs_cmd(ctl, "state", out, sizeof out) == 0) {
+            const char *p = strstr(out, v0dir);
+            const char *nl = p ? strchr(p, '\n') : NULL;
+            const char *h = p ? strstr(p, "hung=") : NULL;
+            if (h && (!nl || h < nl) && strtoul(h + 5, NULL, 10) > 0) {
+                hung_seen = true;
+                break;
+            }
+        }
+        rh_sleep_ms(15);
+    }
+    if (!hung_seen) {
+        (void)rh_of_cmd(ctl, "heal", v0dir);
+        return 7;
+    }
+
+    /* 1. Close vol1 while vol0's sampler is STILL stuck in statvfs(v0dir): MUST complete fast (no eng_active held). */
+    int64_t c1_t0 = rh_now_ms();
+    int c1_rc = eng_close(e1);
+    int64_t c1_ms = rh_now_ms() - c1_t0;
+    if (c1_rc != 0 || c1_ms > 10000) {
+        fprintf(stderr, "child_full_hang: eng_close(vol1) rc=%d ms=%lld (limit 10000)\n", c1_rc, (long long)c1_ms);
+        (void)rh_of_cmd(ctl, "heal", v0dir);
+        return 8;
+    }
+
+    /* 2. Stop vol0's sampler while v0dir is STILL hung: tierfill_eng_stop must detach after ~500 ms instead of
+     *    hanging pthread_join, then heal v0dir and close vol0/tier cleanly (detached worker drops its ref safely). */
+    int64_t s0_t0 = rh_now_ms();
+    tierfill_eng_stop(e0);
+    int64_t s0_ms = rh_now_ms() - s0_t0;
+    (void)rh_of_cmd(ctl, "heal", v0dir);
+    tier_quiesce(t);
+    int c0_rc = eng_close(e0);
+    tier_put(t);
+    rh_sleep_ms(100); /* let detached sampler wake from statvfs and drop its final worker_unref cleanly */
+    if (c0_rc != 0 || s0_ms > 10000) {
+        atomic_store(&settle_poll_ms, prev_poll);
+        tier_health_test_opts(0, 0, 0, 0);
+        fprintf(stderr, "child_full_hang: tierfill_eng_stop(vol0) ms=%lld (limit 10000) close_rc=%d\n",
+                (long long)s0_ms, c0_rc);
+        return 9;
+    }
+
+    /* 3. Regression: hang a tier store root (st0dir) after the 1 s fill-sample interval has elapsed; an idle tiered
+     *    volume's settle thread must NOT call fstatvfs() on stores (reads cached fill_pct only), so settle rounds
+     *    keep advancing and tsdb_close() finishes promptly while st0dir is still hung. */
+    tsdb *sdb = NULL;
+    if (open_db(v0dir, &sdb, 0) != 0 || !sdb) {
+        atomic_store(&settle_poll_ms, prev_poll);
+        tier_health_test_opts(0, 0, 0, 0);
+        return 10;
+    }
+    rh_sleep_ms(1150); /* expire any 1 s store fill_sample_ms cache from open */
+    if (rh_of_cmd(ctl, "hang", st0dir) != 0) {
+        tsdb_close(sdb);
+        atomic_store(&settle_poll_ms, prev_poll);
+        tier_health_test_opts(0, 0, 0, 0);
+        return 11;
+    }
+    uint64_t r0 = atomic_load(&settle_rounds);
+    int64_t rdl = rh_now_ms() + 10000;
+    while (atomic_load(&settle_rounds) < r0 + 3 && rh_now_ms() < rdl)
+        rh_sleep_ms(15);
+    bool rounds_ok = atomic_load(&settle_rounds) >= r0 + 3;
+    int64_t sc_t0 = rh_now_ms();
+    int sc_rc = tsdb_close(sdb);
+    int64_t sc_ms = rh_now_ms() - sc_t0;
+    (void)rh_of_cmd(ctl, "heal", st0dir);
+    atomic_store(&settle_poll_ms, prev_poll);
+    tier_health_test_opts(0, 0, 0, 0);
+    if (!rounds_ok || sc_rc != 0 || sc_ms > 10000) {
+        fprintf(stderr, "child_full_hang: hung-store close rounds_ok=%d rc=%d ms=%lld (limit 10000)\n",
+                (int)rounds_ok, sc_rc, (long long)sc_ms);
+        return 12;
+    }
+    return 0;
+}
+
+static void sleep_ms_tier(int ms)
+{
+    struct timespec d = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    nanosleep(&d, NULL);
+}
+
+static void wait_settle_rounds_tier(uint64_t delta)
+{
+    uint64_t target = atomic_load(&settle_rounds) + delta;
+    for (int i = 0; i < 400 && atomic_load(&settle_rounds) < target; i++)
+        sleep_ms_tier(10);
+}
+
+/* R15 r15-full: FULL hysteresis before ENOSPC (inserts/appends/replaces refused at >= 90%, hysteresis at 88..89%,
+ * deletes/drops/queries pass, settle relieves FULL -> inserts resume); store 95% put cap (96% refuses regular puts and
+ * defers settles, rebuild put passes, real fstatvfs sampled <= 1/s). Kills mutants fullnoflag and storeput96. */
+static void t_full(void)
+{
+    char base[PATH_MAX + 32], dbdir[PATH_MAX + 48], stdir[3][PATH_MAX + 64];
+    snprintf(base, sizeof base, "%s/r15full", S);
+    fresh(base);
+    snprintf(dbdir, sizeof dbdir, "%s/db", base);
+    no_tier_env();
+
+    /* Part A: volume FULL before ENOSPC, hysteresis, deletes/drops pass, store 96% defers settle, settle relieves FULL */
+    init_empty_db(dbdir);
+    for (int i = 0; i < 3; i++) {
+        snprintf(stdir[i], sizeof stdir[i], "%s/st%d", base, i);
+        CHECK(tsdb_tier_add_dir(dbdir, stdir[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+    }
+
+    int prev_poll = atomic_exchange(&settle_poll_ms, 20);
+    ecpolicy_set_test_fill_pct(50); /* below tier_high_pct (80) and young_high_pct (90) */
+    chunk_store_set_test_fill_pct(-1);
+    chunk_store_set_test_fill_path(NULL, -1);
+
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    tsdb *db = NULL;
+    CHECK(tsdb_open(dbdir, &o, &db) == 0 && db != NULL);
+    if (db) {
+        tsdb_sid s1 = 0;
+        CHECK(tsdb_series_create(db, "full.s1", TSDB_FLOAT32, NULL, &s1) == 0);
+
+        const int64_t DAY = 86400000LL;
+        int64_t now_ms = (int64_t)time(NULL) * 1000LL;
+        int64_t yday_ts = (now_ms / DAY - 1) * DAY + 1000; /* finished key (< 7d old): settles only at >= tier_high_pct */
+        int64_t today_ts = (now_ms / DAY) * DAY + 1000;    /* active key (phi > now): never settles */
+
+        int64_t yts[8];
+        float yv[8];
+        for (int i = 0; i < 8; i++)
+            yts[i] = yday_ts + i * 1000, yv[i] = (float)(10 + i);
+        CHECK(tsdb_insert_series(db, s1, yts, yv, 8) == 0);
+        CHECK(tsdb_append(db, s1, today_ts, 1.0f) == 0);
+        CHECK(tsdb_append(db, s1, today_ts + 1000, 2.0f) == 0);
+        CHECK(tsdb_flush(db) == 0);
+
+        wait_settle_rounds_tier(3);
+        CHECK(!tierfill_vol_full(db, 0, NULL));
+
+        /* Hold store 0 at 96% while raising volume fill to 90% so the settle waits (counted) and volume stays FULL. */
+        chunk_store_set_test_fill_path(stdir[0], 96);
+        uint64_t sdone0 = atomic_load(&settle_done);
+        ecpolicy_set_test_fill_pct(90);
+
+        bool became_full = false;
+        int64_t full_since = 0;
+        for (int i = 0; i < 200; i++) {
+            if (tierfill_vol_full(db, 0, &full_since)) {
+                became_full = true;
+                break;
+            }
+            sleep_ms_tier(10);
+        }
+        /* Note: under --mutant fullnoflag, tierfill_vol_full returns false and writes below succeed (killing it). */
+        CHECK(became_full && full_since > 0);
+
+        /* Settle must be waiting because store 0 is at 96% (> 95% cap). Kills --mutant storeput96. */
+        eng *e0 = tsdb_test_engine(db, 0);
+        CHECK(e0 != NULL && e0->tier != NULL);
+        if (e0 && e0->tier) {
+            bool saw_wait = false;
+            for (int i = 0; i < 200; i++) {
+                if (eng_tier_settle_is_waiting(e0) && eng_tier_settles_waiting(e0) > 0 &&
+                    ecsettle_tier_waiting_now(e0->tier) >= 1) {
+                    saw_wait = true;
+                    break;
+                }
+                sleep_ms_tier(10);
+            }
+            CHECK(saw_wait);
+            CHECK(atomic_load(&settle_done) == sdone0);
+        }
+
+        /* Every insert, append, and replace route must return TSDB_ERR_UNAVAILABLE before touching the engine. */
+        int64_t t1 = today_ts + 5000;
+        float v1 = 99.0f;
+        tsdb_values tv1 = {.type = TSDB_FLOAT32, .values = &v1, .valid = NULL};
+        uint32_t fv = 99;
+        CHECK(tsdb_append(db, s1, t1, v1) == TSDB_ERR_UNAVAILABLE);
+        CHECK(tierfill_take_last_refused(&fv) && fv == 0);
+        CHECK(tsdb_insert_series(db, s1, &t1, &v1, 1) == TSDB_ERR_UNAVAILABLE);
+        CHECK(tsdb_insert(db, &s1, &t1, &v1, 1) == TSDB_ERR_UNAVAILABLE);
+        CHECK(tsdb_insert_values(db, &s1, &t1, &tv1, 1) == TSDB_ERR_UNAVAILABLE);
+        CHECK(tsdb_insert_series_values(db, s1, &t1, &tv1, 1) == TSDB_ERR_UNAVAILABLE);
+        CHECK(tsdb_replace_range(db, s1, today_ts, today_ts + 2000, &t1, &tv1, 1) == TSDB_ERR_UNAVAILABLE);
+        CHECK(tierfill_vol_refusals(db, 0) >= 6);
+
+        /* Unknown series ID on a FULL volume must still get TSDB_ERR_INVALID, not TSDB_ERR_UNAVAILABLE. */
+        tsdb_sid bogus = TSDB_SID(0, 99999u);
+        CHECK(tsdb_append(db, bogus, t1, v1) == TSDB_ERR_INVALID);
+
+        /* Verify none of the refused writes reached the engine. */
+        tsdb_bucket *b = NULL;
+        size_t nb = 0;
+        CHECK(tsdb_query_agg(db, s1, today_ts + 4000, today_ts + 10000, 0, &b, &nb) == 0 && nb == 0);
+        free(b);
+
+        /* Hysteresis: 89% and 88% stay FULL (must drop below young_high_pct - 2 = 88%, i.e. <= 87%). */
+        ecpolicy_set_test_fill_pct(89);
+        wait_settle_rounds_tier(4);
+        CHECK(tierfill_vol_full(db, 0, NULL));
+        CHECK(tsdb_append(db, s1, t1, v1) == TSDB_ERR_UNAVAILABLE);
+
+        ecpolicy_set_test_fill_pct(88);
+        wait_settle_rounds_tier(4);
+        CHECK(tierfill_vol_full(db, 0, NULL));
+        CHECK(tsdb_append(db, s1, t1, v1) == TSDB_ERR_UNAVAILABLE);
+
+        /* Deletes (including replace_range with n == 0) and drops MUST pass while FULL (D7). */
+        CHECK(tsdb_delete_range(db, s1, today_ts, today_ts + 500) == 0);
+        CHECK(tsdb_replace_range(db, s1, today_ts + 2000, today_ts + 2500, NULL, NULL, 0) == 0);
+        CHECK(tsdb_drop_before(db, yday_ts - 10 * DAY) == 0);
+        /* Queries still pass while FULL (1 row left in today's range after deleting today_ts). */
+        b = NULL;
+        nb = 0;
+        CHECK(tsdb_query_agg(db, s1, today_ts, today_ts + 3000, 0, &b, &nb) == 0 && nb == 1 && b[0].count == 1);
+        free(b);
+
+        /* Lift the store 96% cap: yesterday's key settles, hook drops fill to 85% -> FULL clears -> inserts resume! */
+        atomic_store(&full_relieve_hits, 0);
+        atomic_store(&settle_fill_hook, full_relieve_hook);
+        chunk_store_set_test_fill_path(NULL, -1);
+
+        bool settled = false;
+        for (int i = 0; i < 400; i++) {
+            if (atomic_load(&settle_done) > sdone0 && !tierfill_vol_full(db, 0, NULL)) {
+                settled = true;
+                break;
+            }
+            sleep_ms_tier(10);
+        }
+        atomic_store(&settle_fill_hook, NULL);
+        CHECK(settled && atomic_load(&full_relieve_hits) >= 1);
+        if (e0 && e0->tier)
+            CHECK(!eng_tier_settle_is_waiting(e0) && ecsettle_tier_waiting_now(e0->tier) == 0);
+
+        CHECK(tsdb_append(db, s1, today_ts + 5000, 42.0f) == 0);
+        b = NULL;
+        nb = 0;
+        CHECK(tsdb_query_agg(db, s1, today_ts + 4000, today_ts + 6000, 0, &b, &nb) == 0 && nb == 1 && b[0].count == 1);
+        free(b);
+
+        CHECK(tsdb_close(db) == 0);
+
+        /* Reopening on a volume already >= young_high_pct must seed FULL synchronously before any background tick. */
+        ecpolicy_set_test_fill_pct(92);
+        tsdb *db2 = NULL;
+        CHECK(tsdb_open(dbdir, &o, &db2) == 0 && db2 != NULL);
+        if (db2) {
+            CHECK(tierfill_vol_full(db2, 0, NULL));
+            CHECK(tsdb_append(db2, s1, today_ts + 6000, 43.0f) == TSDB_ERR_UNAVAILABLE);
+            CHECK(tsdb_close(db2) == 0);
+        }
+        ecpolicy_set_test_fill_pct(50);
+    }
+
+    /* Part B: Store 95% put cap (scoped to single-server tiers via chunk_be_set_put_cap) — unscoped backend is not
+     * capped; capped backend passes at 95%, refuses regular puts (CHUNK_ERR_FULL) at 96%, allows rebuild puts at 96%,
+     * cached fs bytes does zero statvfs syscalls, and real fstatvfs is rate-limited to <= 1/s per store. */
+    {
+        char sbase[PATH_MAX + 48], sp[3][PATH_MAX + 64];
+        snprintf(sbase, sizeof sbase, "%s/cap", base);
+        fresh(sbase);
+        const char *paths[3];
+        for (int i = 0; i < 3; i++) {
+            snprintf(sp[i], sizeof sp[i], "%s/s%d", sbase, i);
+            uint8_t id[16];
+            CHECK(chunk_store_init(sp[i], NULL, id) == 0);
+            paths[i] = sp[i];
+        }
+        chunk_backend *be = NULL;
+        CHECK(chunk_be_open(&be, paths, 3, NULL) == 0 && be != NULL);
+        if (be) {
+            CHECK(chunk_be_see_epoch(be, 0, 1) == 0);
+            uint8_t vuuid[16] = {0xaa, 0xbb, 0xcc, 1};
+            uint8_t oid0[16] = {0x10, 0x20, 0x30, 0};
+            uint8_t oid1[16] = {0x10, 0x20, 0x30, 1};
+            uint8_t oid2[16] = {0x10, 0x20, 0x30, 2};
+            chunk_geom g;
+            CHECK(chunk_geom_make(&g, 2, 1, 512, sizeof OBJ) == 0);
+
+            /* Before enabling the single-server tier cap, a plain chunk backend (e.g. cluster chunksrv) is uncapped. */
+            chunk_store_set_test_fill_path(sp[0], 96);
+            CHECK(chunk_be_put_object(be, 0, vuuid, oid0, &g, 1, OBJ, ~0u, NULL) == 0);
+
+            /* Enable single-server 95% cap. */
+            chunk_be_set_put_cap(be, CHUNK_STORE_PUT_MAX_PCT);
+
+            /* At 95%: regular put succeeds. */
+            chunk_store_set_test_fill_path(sp[0], 95);
+            CHECK(chunk_be_put_object(be, 0, vuuid, oid1, &g, 1, OBJ, ~0u, NULL) == 0);
+
+            /* At 96%: regular put targeting store 0 MUST be refused with CHUNK_ERR_FULL (kills storeput96). */
+            chunk_store_set_test_fill_path(sp[0], 96);
+            CHECK(chunk_be_put_object(be, 0, vuuid, oid2, &g, 1, OBJ, ~0u, NULL) == CHUNK_ERR_FULL);
+            CHECK(chunk_be_any_store_full(be));
+
+            /* Remove oid1's chunk on store 0 while store 0 is STILL at 96%, then rebuild via chunk_be_heal:
+             * rebuild puts use chunk_wr_open_heal (heal=true) and MUST pass above 95%! */
+            unsigned pos_on_0 = 0;
+            for (unsigned p = 0; p < 3; p++)
+                if (chunk_be_place(be, oid1, p) == 0)
+                    pos_on_0 = p;
+            char hex[33], cpath[PATH_MAX + 128];
+            chunk_oid_hex(oid1, hex);
+            snprintf(cpath, sizeof cpath, "%s/s0/o%s.%u.chunk", sp[0], hex, pos_on_0);
+            CHECK(unlink(cpath) == 0);
+
+            chunk_heal_opts ho = {.epoch = 1, .scrub = false};
+            chunk_heal_report rep;
+            memset(&rep, 0, sizeof rep);
+            CHECK(chunk_be_heal(be, 0, 0, &ho, &rep) == 0);
+            CHECK(rep.rebuilt_missing == 1 && rep.failed == 0);
+            struct stat sb;
+            CHECK(stat(cpath, &sb) == 0 && sb.st_size > 0);
+
+            /* Cached fs bytes snapshot (used by metrics) must read cached values with zero fstatvfs syscalls, and
+             * real fstatvfs on the put path must be rate-limited to <= 1/s per store. */
+            chunk_store_set_test_fill_path(NULL, -1);
+            chunk_store_set_test_fill_pct(-1);
+            uint64_t u = 0, fr = 0, tot = 0;
+            chunk_store *st0 = chunk_be_store(be, 0);
+            uint64_t sc_before = atomic_load(&chunk_store_fill_samples);
+            CHECK(st0 != NULL && chunk_store_fs_bytes_cached(st0, &u, &fr, &tot) == 0 && tot > 0);
+            CHECK(atomic_load(&chunk_store_fill_samples) == sc_before);
+
+            int64_t t_start = rh_now_ms();
+            uint64_t s0_samples = atomic_load(&chunk_store_fill_samples);
+            for (int i = 0; i < 20; i++) {
+                uint8_t oidn[16] = {0x55, (uint8_t)i, 0, 1};
+                CHECK(chunk_be_put_object(be, 0, vuuid, oidn, &g, 1, OBJ, ~0u, NULL) == 0);
+            }
+            uint64_t s1_samples = atomic_load(&chunk_store_fill_samples);
+            int64_t elapsed_ms = rh_now_ms() - t_start;
+            uint64_t max_allowed = (uint64_t)(3 * ((elapsed_ms / 1000) + 2));
+            CHECK(s1_samples - s0_samples <= max_allowed && s1_samples - s0_samples < 60);
+
+            chunk_be_close(be);
+        }
+    }
+
+    /* Part C: Dedicated sampler thread flips FULL within ~1 s even while the settle thread is blocked encoding a part. */
+    {
+        char sbase[PATH_MAX + 48], sdb[PATH_MAX + 64], sst[3][PATH_MAX + 80];
+        snprintf(sbase, sizeof sbase, "%s/sampler_blocked", base);
+        fresh(sbase);
+        snprintf(sdb, sizeof sdb, "%s/db", sbase);
+        init_empty_db(sdb);
+        for (int i = 0; i < 3; i++) {
+            snprintf(sst[i], sizeof sst[i], "%s/st%d", sbase, i);
+            CHECK(tsdb_tier_add_dir(sdb, sst[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        }
+        ecpolicy_set_test_fill_pct(50);
+        tsdb *db = NULL;
+        CHECK(tsdb_open(sdb, &o, &db) == 0 && db != NULL);
+        if (db) {
+            tsdb_sid s1 = 0;
+            CHECK(tsdb_series_create(db, "blk.s1", TSDB_FLOAT32, NULL, &s1) == 0);
+            const int64_t DAY = 86400000LL;
+            int64_t now_ms = (int64_t)time(NULL) * 1000LL;
+            int64_t old_ts = (now_ms / DAY - 10) * DAY + 1000; /* > 7d old: due for settle immediately */
+            int64_t ots[8];
+            float ov[8];
+            for (int i = 0; i < 8; i++)
+                ots[i] = old_ts + i * 1000, ov[i] = (float)i;
+            atomic_store_explicit(&full_pause_entered, false, memory_order_release);
+            atomic_store_explicit(&full_pause_release, false, memory_order_release);
+            atomic_store_explicit(&settle_fill_hook, full_pause_hook, memory_order_release);
+            CHECK(tsdb_insert_series(db, s1, ots, ov, 8) == 0);
+            CHECK(tsdb_flush(db) == 0);
+            /* Wait until the settle thread is blocked inside full_pause_hook (cannot call tierfill_update). */
+            int64_t dl = rh_now_ms() + 5000;
+            while (!atomic_load_explicit(&full_pause_entered, memory_order_acquire) && rh_now_ms() < dl)
+                sleep_ms_tier(10);
+            CHECK(atomic_load_explicit(&full_pause_entered, memory_order_acquire));
+            CHECK(!tierfill_vol_full(db, 0, NULL));
+
+            /* Raise fill to 91% while settle thread is stuck: dedicated sampler thread MUST flip FULL within ~1 s! */
+            int64_t flip0 = rh_now_ms();
+            ecpolicy_set_test_fill_pct(91);
+            bool flipped = false;
+            while (rh_now_ms() - flip0 < 1500) {
+                if (tierfill_vol_full(db, 0, NULL)) {
+                    flipped = true;
+                    break;
+                }
+                sleep_ms_tier(10);
+            }
+            CHECK(flipped);
+            CHECK(tsdb_append(db, s1, now_ms, 1.0f) == TSDB_ERR_UNAVAILABLE);
+
+            atomic_store_explicit(&full_pause_release, true, memory_order_release);
+            atomic_store_explicit(&settle_fill_hook, NULL, memory_order_release);
+            CHECK(tsdb_close(db) == 0);
+        }
+        ecpolicy_set_test_fill_pct(50);
+    }
+
+    /* Part D: Regression for hung NFS volume isolation — under liboutagefs.so, hanging vol0's statvfs must NOT block
+     * eng_close of vol1 (no t->eng_active held across statvfs) nor hang eng_close of vol0 (detached on deadline). */
+    if (access(SHIM_OUTAGE, R_OK) == 0 && tierfill_mutant == TIERFILL_MUT_NONE && chunk_mutant == CHUNK_MUT_NONE) {
+        char hbase[PATH_MAX + 48], v0d[PATH_MAX + 64], v1d[PATH_MAX + 64], hst[3][PATH_MAX + 80];
+        char hctl[PATH_MAX + 64], hroots[3 * PATH_MAX + 240];
+        snprintf(hbase, sizeof hbase, "%s/hang_iso", base);
+        fresh(hbase);
+        snprintf(v0d, sizeof v0d, "%s/v0", hbase);
+        snprintf(v1d, sizeof v1d, "%s/v1", hbase);
+        init_empty_db(v0d);
+        init_empty_db(v1d);
+        for (int i = 0; i < 3; i++) {
+            snprintf(hst[i], sizeof hst[i], "%s/st%d", hbase, i);
+            CHECK(tsdb_tier_add_dir(v0d, hst[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+        }
+        snprintf(hctl, sizeof hctl, "%s/ctl", hbase);
+        snprintf(hroots, sizeof hroots, "%s:%s:%s", v0d, v1d, hst[0]);
+        pid_t pid = fork();
+        if (pid == 0) {
+            char asan[512];
+            snprintf(asan, sizeof asan, "verify_asan_link_order=0:detect_leaks=0%s%.400s",
+                     getenv("ASAN_OPTIONS") ? ":" : "", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+            setenv("LD_PRELOAD", SHIM_OUTAGE, 1);
+            setenv("OUTAGEFS_ROOTS", hroots, 1);
+            setenv("OUTAGEFS_CTL", hctl, 1);
+            execl(SELF, "test_tier", "--child", "full_hang", v0d, v1d, hst[0], (char *)NULL);
+            _exit(127);
+        }
+        int st_w = -1;
+        CHECK(pid > 0 && waitpid(pid, &st_w, 0) == pid && WIFEXITED(st_w) && WEXITSTATUS(st_w) == 0);
+        if (pid > 0 && (!WIFEXITED(st_w) || WEXITSTATUS(st_w) != 0))
+            fprintf(stderr, "  full: hang_iso child exited with status %d (sig %d)\n",
+                    WIFEXITED(st_w) ? WEXITSTATUS(st_w) : -1, WIFSIGNALED(st_w) ? WTERMSIG(st_w) : 0);
+    } else if (tierfill_mutant == TIERFILL_MUT_NONE && chunk_mutant == CHUNK_MUT_NONE) {
+        printf("  full: hang_iso skipped (%s not built)\n", SHIM_OUTAGE);
+    }
+
+    ecpolicy_set_test_fill_pct(-1);
+    chunk_store_set_test_fill_pct(-1);
+    chunk_store_set_test_fill_path(NULL, -1);
+    atomic_store(&settle_poll_ms, prev_poll);
+    printf("  full: FULL hysteresis (90%%/<88%%), deletes/drops pass, settle relieves, 95%% store cap & rebuild pass, "
+           "sampler isolation\n");
+}
+
 /* Helper for tests/test_config.sh: --mk-tier-db DBDIR STORE[:CLASS]... (creates DB and adds stores to TIERS). */
 static int mk_tier_db(int argc, char **argv)
 {
@@ -2732,6 +3257,10 @@ int main(int argc, char **argv)
         } else if (strcmp(mutant, "attachnoheal") == 0) {
             tier_mutant = TIER_MUT_ATTACHNOHEAL;
             chunk_mutant = CHUNK_MUT_ATTACHNOHEAL;
+        } else if (strcmp(mutant, "fullnoflag") == 0) {
+            tierfill_mutant = TIERFILL_MUT_FULLNOFLAG;
+        } else if (strcmp(mutant, "storeput96") == 0) {
+            chunk_mutant = CHUNK_MUT_STOREPUT96;
         } else {
             fprintf(stderr, "unknown mutant %s\n", mutant);
             return 2;
@@ -2764,9 +3293,10 @@ int main(int argc, char **argv)
     t_tiers_defaults();
     t_tiers_settings();
     t_runtime_health();
+    t_full();
 #else
     printf("  volumes, down, lost, fence, unsure, ops, refuse, reval, power, eio, tiers_open, tiers_defaults, "
-           "tiers_settings, runtime_health: skipped (no TSDB_EC in this build)\n");
+           "tiers_settings, runtime_health, full: skipped (no TSDB_EC in this build)\n");
 #endif
     t_follow();
     if (!fails)

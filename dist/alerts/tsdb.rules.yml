@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Prometheus alert rules for a single-server tsdb with a local settled tier
+# (docs/design-cluster-data.md E53, §15.7; docs/metrics.md).
+groups:
+  - name: tsdb-tier
+    rules:
+      - alert: TsdbTierFull7d
+        expr: |
+          (
+            deriv(tsdb_tier_bytes{use="used"}[1d]) > 0
+            and
+            predict_linear(tsdb_tier_bytes{use="used"}[1d], 7 * 86400)
+              >= ignoring(use) (0.95 * tsdb_tier_bytes{use="total"})
+          )
+          or
+          (
+            tsdb_tier_bytes{use="used"}
+              >= ignoring(use) (0.95 * tsdb_tier_bytes{use="total"})
+          )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "tsdb tier store {{ $labels.store }} projected to reach 95% put cap within 7 days"
+          description: >-
+            Tier store {{ $labels.store }} is projected from its 1-day growth slope to reach the 95%
+            chunk-put cap within 7 days (or is already at or above 95%). Settles wait above 95%,
+            causing young data on the fast disk to fill towards young_high_pct (FULL). Add tier
+            storage or adjust retention before inserts are refused.
+
+      - alert: TsdbTierStoreDown
+        expr: tsdb_tier_store_state != 0 and tsdb_tier_store_state != 5
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "tsdb tier store {{ $labels.store }} is DOWN (state={{ $value }})"
+          description: >-
+            Tier store {{ $labels.store }} is not UP (state 1=missing, 2=other_id, 3=damaged,
+            4=ioerr, 6=stalled). Reads decode around it while within redundancy margin, but settles
+            and chunk deletes are paused until the store recovers or is replaced via
+            `tsdb DIR tier lost`.
+
+      - alert: TsdbInsertsRefusedFull
+        expr: tsdb_volume_full == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "tsdb volume {{ $labels.volume }} is FULL and refusing inserts"
+          description: >-
+            Volume {{ $labels.volume }} filesystem fill reached young_high_pct (90% default).
+            Inserts, appends, and replaces are refused with UNAVAILABLE (TSDB_WHY_FULL) before the
+            WAL hits ENOSPC; deletes and drops remain allowed. Free space or restore tier settling
+            to clear FULL (below young_high_pct - 2).

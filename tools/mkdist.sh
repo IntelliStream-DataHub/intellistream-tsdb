@@ -13,7 +13,7 @@ name=tsdb-$version-x86_64-linux
 stage=$b/$name
 # One tarball per build dir: `make dist-test` and dist-check-almalinux10 find it by tsdb-*.
 rm -rf "$b"/tsdb-*-x86_64-linux "$b"/tsdb-*-x86_64-linux.tar.gz
-mkdir -p "$stage/bin" "$stage/bench" "$stage/lib" "$stage/include" "$stage/tests" "$stage/systemd"
+mkdir -p "$stage/bin" "$stage/bench" "$stage/lib" "$stage/include" "$stage/tests" "$stage/systemd" "$stage/alerts"
 cp "$b/tsdbd" "$b/tsdb" "$stage/bin/"
 for f in codec-bench type-bench tsdb-bench insert-bench tsdbc-bench scale-bench; do cp "$b/$f" "$stage/bench/"; done
 cp "$b/libtsdb.a" "$b/libtsdbclient.a" "$stage/lib/"
@@ -25,6 +25,7 @@ cp "$b/libcrashfs.so" "$stage/tests/" # the power-loss and EIO shim test_server 
 cp dist/run-tests.sh "$stage/tests/"
 cp tests/data/levels-golden.txt "$stage/tests/" # test_levels compares every level with these digests (found next to it)
 cp dist/tsdbd.service dist/tsdbd.properties "$stage/systemd/"
+cp dist/alerts/tsdb.rules.yml "$stage/alerts/"
 cp dist/README.dist "$stage/README.dist"
 # The binaries contain zstd and liburing (linked statically): their licenses require that their notices
 # travel with them (dist/THIRD-PARTY-NOTICES). The AGPL LICENSE, NOTICE and LICENSING.md travel with every copy, and so

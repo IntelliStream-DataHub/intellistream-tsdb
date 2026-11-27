@@ -45,6 +45,7 @@
 #define CHUNK_FTR_BYTES 16
 #define CHUNK_VERSION 1u
 #define CHUNK_STORE_VERSION 1
+#define CHUNK_STORE_PUT_MAX_PCT 95u /* R15 D7 / §15.7: regular puts refused above 95%; rebuild puts may use the rest */
 
 /* Errors: the TSDB_ERR_* codes where one fits (NOTFOUND: no such chunk or store; CORRUPT: damaged, or more than m
  * chunks unusable; IO; INVALID: a bad argument or an object that cannot be). Beside them: */
@@ -493,8 +494,15 @@ enum { CHUNK_MUT_NONE = 0, CHUNK_MUT_NOSUMS, CHUNK_MUT_NOFENCE, CHUNK_MUT_EOF, C
        CHUNK_MUT_M0_PARITY,        /* a reader calls chunk_rs_get for m = 0 (fails NOMEM instead of CORRUPT/UNAVAILABLE) */
        /* R15 r15-health mutants (tests/test_tier.c) */
        CHUNK_MUT_DOWNNOREAD,       /* reads are still sent to a DOWN store instead of decoding around it */
-       CHUNK_MUT_ATTACHNOHEAL      /* chunk_be_attach marks store UP without healing missing/damaged chunks */ };
+       CHUNK_MUT_ATTACHNOHEAL,     /* chunk_be_attach marks store UP without healing missing/damaged chunks */
+       /* R15 r15-full mutant (tests/test_tier.c) */
+       CHUNK_MUT_STOREPUT96        /* skips the 95% store fill cap on regular puts */ };
 extern int chunk_mutant;
+/* R15 r15-full test hooks (active only under TSDB_TEST_HOOKS): override store fs fill % (0..100; < 0 restores real
+ * fstatvfs), globally or for stores matching `path`. chunk_store_fill_samples counts real fstatvfs() calls. */
+void chunk_store_set_test_fill_pct(int pct);
+void chunk_store_set_test_fill_path(const char *path, int pct);
+extern _Atomic uint_fast64_t chunk_store_fill_samples;
 /* Non-zero: chunk_read_range and chunk_obj_open do not log (a fuzz harness provokes the refusal by the million). */
 extern int chunk_log_quiet;
 /* Fault injection for tests: the nth following pread of the chunk files / the nth readdir / the nth cell a chunk

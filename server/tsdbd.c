@@ -126,6 +126,7 @@
 #include "chunkpeer.h"
 #include "../src/tiers.h"
 #include "../src/tier.h"
+#include "../src/settle.h"
 #include "../src/chunk.h"
 #include "fwd.h"
 #include "peerlink.h" /* --peer-check, --peer-rdma, --peer-allow-ipoib */
@@ -866,39 +867,48 @@ static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *sinc
         return;
     }
     int d = dom_of(v);
-    if (d < 0 || !dom.health)
-        return;
-    *domain = (uint16_t)d;
-    tsdb_domain_info di;
-    if (tsdb_health_info(dom.health, d, &di) != 0)
-        return;
-    *since_ms = di.since_ms;
-    *outage_id = di.outage_id;
-    int64_t age = di.age_ms < 0 ? 0 : di.age_ms;
-    uint32_t after = (uint32_t)(age / 10 < 1000 ? 1000 : age / 10 > 60000 ? 60000 : age / 10);
-    switch (di.state) {
-    case TSDB_DOM_DOWN:
-        *health = TSDB_HEALTH_UNAVAILABLE;
-        *reason = TSDB_WHY_NFS_DOWN;
-        *retry_ms = after;
-        break;
-    case TSDB_DOM_RECOVERING:
-        *health = TSDB_HEALTH_UNAVAILABLE;
-        *reason = TSDB_WHY_RECOVERING;
-        *retry_ms = after;
-        break;
-    case TSDB_DOM_DEGRADED:
-        *health = TSDB_HEALTH_DEGRADED;
-        *reason = TSDB_WHY_BUSY;
-        *retry_ms = 200;
-        break;
-    default:
-        if (v < DOM_MAX_VOLS && atomic_load(&dom.vol[v].recovering)) {
-            *health = TSDB_HEALTH_UNAVAILABLE;
-            *reason = TSDB_WHY_RECOVERING;
-            *retry_ms = after;
+    if (d >= 0 && dom.health) {
+        *domain = (uint16_t)d;
+        tsdb_domain_info di;
+        if (tsdb_health_info(dom.health, d, &di) == 0) {
+            *since_ms = di.since_ms;
+            *outage_id = di.outage_id;
+            int64_t age = di.age_ms < 0 ? 0 : di.age_ms;
+            uint32_t after = (uint32_t)(age / 10 < 1000 ? 1000 : age / 10 > 60000 ? 60000 : age / 10);
+            switch (di.state) {
+            case TSDB_DOM_DOWN:
+                *health = TSDB_HEALTH_UNAVAILABLE;
+                *reason = TSDB_WHY_NFS_DOWN;
+                *retry_ms = after;
+                break;
+            case TSDB_DOM_RECOVERING:
+                *health = TSDB_HEALTH_UNAVAILABLE;
+                *reason = TSDB_WHY_RECOVERING;
+                *retry_ms = after;
+                break;
+            case TSDB_DOM_DEGRADED:
+                *health = TSDB_HEALTH_DEGRADED;
+                *reason = TSDB_WHY_BUSY;
+                *retry_ms = 200;
+                break;
+            default:
+                if (v < DOM_MAX_VOLS && atomic_load(&dom.vol[v].recovering)) {
+                    *health = TSDB_HEALTH_UNAVAILABLE;
+                    *reason = TSDB_WHY_RECOVERING;
+                    *retry_ms = after;
+                }
+                break;
+            }
         }
-        break;
+    }
+    if (*health == TSDB_HEALTH_AVAILABLE && dom.db && !cvol_active()) {
+        int64_t fsince = 0;
+        if (tierfill_vol_full(dom.db, (uint32_t)v, &fsince)) {
+            *health = TSDB_HEALTH_DEGRADED; /* R15 D7: reads and deletes go on; inserts refused */
+            *reason = TSDB_WHY_FULL;
+            *since_ms = fsince;
+            *retry_ms = 1000;
+        }
     }
 }
 
@@ -906,6 +916,42 @@ static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *sinc
 static int metrics_vol_diverged(uint32_t v)
 {
     return vol_diverged(v, NULL);
+}
+
+/* Single-server tier metrics snapshot (R15 r15-full; metrics thread, zero storage I/O). */
+static bool tsdbd_tier_metrics(metrics_tier *out)
+{
+    memset(out, 0, sizeof *out);
+    struct tier *t = dom_tier_ref(NULL);
+    if (!t)
+        return false;
+    int ns = tier_store_count(t);
+    if (ns > METRICS_TIER_STORES_MAX)
+        ns = METRICS_TIER_STORES_MAX;
+    out->nstores = ns;
+    for (int i = 0; i < ns; i++) {
+        out->stores[i].index = i;
+        out->stores[i].state = tier_store_state(t, i);
+        uint64_t used = 0, avail = 0, total = 0;
+        if (tierfill_store_bytes(t, i, &used, &avail, &total) == 0) {
+            out->stores[i].has_bytes = true;
+            out->stores[i].used_bytes = used;
+            out->stores[i].free_bytes = avail;
+            out->stores[i].total_bytes = total;
+        }
+    }
+    out->settles_waiting = ecsettle_tier_waiting_now(t);
+    uint32_t nv = db ? (uint32_t)tsdb_volume_count(db) : 0;
+    if (nv > 0) {
+        out->vol_full = calloc(nv, 1);
+        if (out->vol_full) {
+            out->nvols = nv;
+            for (uint32_t v = 0; v < nv; v++)
+                out->vol_full[v] = tierfill_vol_full(db, v, NULL) ? 1 : 0;
+        }
+    }
+    tier_put(t);
+    return true;
 }
 
 /* The one entry of an UNAVAILABLE reply: the named volume's health. A refusal whose volume is known to be fine
@@ -922,11 +968,16 @@ static tsdb_unavail unav_entry(uint16_t vol)
         return e;
     }
     if (vol == TSDB_VOL_ANY) { /* the first domain that is not UP, else nothing is known */
+        if (unav_full) {
+            e.reason = TSDB_WHY_FULL;
+            e.retry_after_ms = unav_jitter(1000);
+            return e;
+        }
         size_t nvol = dom.db ? tsdb_volume_count(dom.db) : 0;
         for (size_t v = 0; v < DOM_MAX_VOLS && v < nvol; v++) { /* the root has no domain, but may be DIVERGED */
 
             vol_health(v, &health, &reason, &e.since_ms, &e.outage_id, &retry, &dom_idx);
-            if (health != TSDB_HEALTH_AVAILABLE)
+            if (health != TSDB_HEALTH_AVAILABLE && reason != TSDB_WHY_FULL)
                 goto found;
         }
         e.retry_after_ms = unav_jitter(1000);
@@ -966,6 +1017,17 @@ static tsdb_unavail unav_entry(uint16_t vol)
         e.reason = TSDB_WHY_FULL; /* E30 (D17): leader or an ISR member >= young_high_pct */
         e.retry_after_ms = unav_jitter(1000);
         return e;
+    }
+    if (unav_full && !cvol_active()) {
+        e.reason = TSDB_WHY_FULL; /* R15 D7: standalone tiered volume >= young_high_pct */
+        e.retry_after_ms = unav_jitter(1000);
+        return e;
+    }
+    if (health == TSDB_HEALTH_DEGRADED && reason == TSDB_WHY_FULL) {
+        /* This UNAVAILABLE did not come from a FULL refusal (unav_full is false, and on cluster repld_full was already
+         * handled above): e.g. a read failed on a DOWN store or a write hit eng_refused/quiesce on a FULL volume. */
+        health = TSDB_HEALTH_AVAILABLE;
+        reason = TSDB_WHY_NONE;
     }
 found:
     e.reason = health == TSDB_HEALTH_AVAILABLE ? (dom_idx == 0xffff ? TSDB_WHY_NONE : TSDB_WHY_RECOVERING) : reason;
@@ -3413,6 +3475,9 @@ static void handle_status(req *r)
         ST_PUT("vol.%u.health=%s\nvol.%u.reason=%s\n", (unsigned)v,
                health == TSDB_HEALTH_AVAILABLE ? "available" : health == TSDB_HEALTH_DEGRADED ? "degraded" : "unavailable",
                (unsigned)v, why_name(reason));
+        if (!cp && dom.tier)
+            ST_PUT("vol.%u.full=%d\nvol.%u.full_refusals=%llu\n", (unsigned)v, tierfill_vol_full(db, v, NULL) ? 1 : 0,
+                   (unsigned)v, (unsigned long long)tierfill_vol_refusals(db, v));
     }
     for (int d = 0; dom.health && d < dom.ndoms; d++) {
         tsdb_domain_info di;
@@ -3424,7 +3489,8 @@ static void handle_status(req *r)
                (unsigned long long)di.outage_id, d, di.write_ms);
     }
     if (dom.tier && dom.nstores > 0) {
-        ST_PUT("tier.stores=%d\n", dom.nstores);
+        ST_PUT("tier.stores=%d\ntier.settles_waiting=%llu\n", dom.nstores,
+               (unsigned long long)ecsettle_tier_waiting_now(dom.tier));
         for (int s = 0; s < dom.nstores; s++) {
             int st = tier_store_state(dom.tier, s);
             char sp[PATH_MAX];
@@ -3468,10 +3534,12 @@ static void handle(req *r)
     lguard.ids = NULL;
     rmv.on = false; /* per request, as lguard: no answer carries another request's route body */
     unav_full = false;
+    tierfill_clear_last_refused();
     rt_req = r;
     rt_forwarded = false;
     handle_in(r);
     unav_full = false;
+    tierfill_clear_last_refused();
     rt_req = NULL;
     rt_forwarded = false;
     rmv.on = false; /* a handler's route_ids answer went out with its reply; lguard's below is its own */
@@ -4124,6 +4192,14 @@ static void handle_op(req *r)
     case TSDB_OP_TOPOLOGY: handle_topology(r); return;
     case TSDB_OP_STATUS: handle_status(r); return;
     default: rc = TSDB_ERR_INVALID; break;
+    }
+    if (rc == TSDB_ERR_UNAVAILABLE && !cvol_active()) {
+        uint32_t fv = 0;
+        if (tierfill_take_last_refused(&fv)) {
+            unav_full = true;
+            if (unav_vol == TSDB_VOL_ANY && fv < TSDB_VOL_ANY)
+                unav_vol = (uint16_t)fv;
+        }
     }
     if (rc == 0 && unav_vol != TSDB_VOL_ANY && is_full_refused_op(r->op) && cvol_active() &&
         repld_full_after_admit() && repld_full(unav_vol)) {
@@ -8128,7 +8204,8 @@ int main(int argc, char **argv)
                           .pace = cluster_on ? pace_metrics : NULL,
                           .on_p99_halved = cluster_on ? pace_set_p99_halved : NULL,
                           .cluster_snap = cluster_on ? creport_snap_take : NULL,
-                          .cluster_snap_free = cluster_on ? creport_snap_free : NULL};
+                          .cluster_snap_free = cluster_on ? creport_snap_free : NULL,
+                          .tier = (!cluster_on && dom.tier) ? tsdbd_tier_metrics : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));

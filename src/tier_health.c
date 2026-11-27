@@ -286,6 +286,23 @@ static void *probe_main(void *arg)
         pthread_mutex_unlock(&th->mu);
 
         int err = store_probe_io(path, ++seq);
+
+        /* Refresh cached store filesystem fill/byte counters while st->inflight_ms[slot] is still armed so an NFS hang
+         * in fstatvfs() is caught by the stall detector (R15 D8) instead of silently freezing this probe worker.
+         * Acquire a refcounted chunk_store under th->mu after checking !th->closing so a detached probe waking after
+         * tier_health_quiesce() timed out never touches freed `t` (chunk_store_unref frees cs safely without owner_be). */
+        if (err == 0) {
+            chunk_store *cs = NULL;
+            pthread_mutex_lock(&th->mu);
+            if (!th->closing && th->t && th->t->be)
+                cs = chunk_be_store_ref(th->t->be, idx);
+            pthread_mutex_unlock(&th->mu);
+            if (cs) {
+                chunk_store_fs_refresh(cs);
+                chunk_store_unref(cs);
+            }
+        }
+
         int64_t done = th_mono_ms();
         int ms = (int)(done - now);
 
@@ -300,6 +317,7 @@ static void *probe_main(void *arg)
             pthread_mutex_unlock(&th->mu);
             return NULL;
         }
+        /* Safe to use `t` below: !th->closing while st->running > 0 keeps tier_health_quiesce() waiting before tier_free. */
         tier *t = th->t;
         if (err != 0) {
             st->ok_streak = 0;

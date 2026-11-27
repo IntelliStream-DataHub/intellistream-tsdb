@@ -44,6 +44,8 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #define EPOCH_PAGE 4096
@@ -72,6 +74,12 @@ struct chunk_store {
     chunk_backend *owner_be; /* immutable once published into owner_be->st[owner_idx]; NULL for standalone stores */
     int owner_idx;
     struct chunk_store *next_pending; /* intrusive LIFO link while parked in be->pending_close[i] (guarded by st_mu) */
+    atomic_int_fast64_t fill_sample_ms;   /* R15 r15-full: monotonic ms of last fstatvfs sample (<= 1/s per store) */
+    atomic_uint_fast32_t fill_pct;        /* R15 r15-full: last sampled store filesystem used % (0..100) */
+    atomic_uint_fast64_t fill_used_bytes; /* R15 r15-full: cached fs used bytes */
+    atomic_uint_fast64_t fill_free_bytes; /* R15 r15-full: cached fs unprivileged available bytes */
+    atomic_uint_fast64_t fill_total_bytes;/* R15 r15-full: cached fs total bytes */
+    atomic_uint put_max_pct;              /* R15 r15-full: >0 caps regular puts at this % (0: off for cluster stores) */
 };
 
 /* ---------------------------------------------------------------- small helpers */
@@ -159,6 +167,9 @@ void chunk_store_bind_be(chunk_store *st, chunk_backend *be, int idx)
         return;
     st->owner_be = be;
     st->owner_idx = idx;
+    if (be)
+        atomic_store_explicit(&st->put_max_pct, atomic_load_explicit(&be->put_max_pct, memory_order_acquire),
+                              memory_order_release);
 }
 
 static int hex_val(int c)
@@ -705,6 +716,9 @@ static int store_open(const char *path, const uint8_t *expect_id, const uint8_t 
         chunk_store_close(st);
         return rc;
     }
+    /* Seed cached filesystem byte counts once while open already touches the store directory, so /metrics reads
+     * cached atomics only without ever issuing fstatvfs on a potentially hanging store. */
+    chunk_store_fs_refresh(st);
     *out = st;
     return 0;
 }
@@ -854,6 +868,184 @@ int chunk_store_volumes(chunk_store *st, uint32_t **vols, uint64_t **epochs, siz
     return 0;
 }
 
+/* ---------------------------------------------------------------- store fill cap (R15 D7, §15.7) */
+_Atomic uint_fast64_t chunk_store_fill_samples;
+
+static int64_t store_mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+#ifdef TSDB_TEST_HOOKS
+static pthread_mutex_t store_fill_test_mu = PTHREAD_MUTEX_INITIALIZER;
+static int store_fill_test_global = -1;
+static char store_fill_test_path[PATH_MAX];
+static int store_fill_test_path_pct = -1;
+static pthread_once_t store_fill_env_once = PTHREAD_ONCE_INIT;
+
+static void store_fill_env_init(void)
+{
+    const char *v = getenv("TSDB_TEST_STORE_FILL_PCT");
+    if (!v || !*v)
+        return;
+    char *end = NULL;
+    errno = 0;
+    long n = strtol(v, &end, 10);
+    if (errno == 0 && end != v && *end == '\0' && n >= 0 && n <= 100) {
+        pthread_mutex_lock(&store_fill_test_mu);
+        if (store_fill_test_global < 0)
+            store_fill_test_global = (int)n;
+        pthread_mutex_unlock(&store_fill_test_mu);
+    }
+}
+
+void chunk_store_set_test_fill_pct(int pct)
+{
+    pthread_once(&store_fill_env_once, store_fill_env_init);
+    pthread_mutex_lock(&store_fill_test_mu);
+    store_fill_test_global = pct < 0 ? -1 : pct > 100 ? 100 : pct;
+    pthread_mutex_unlock(&store_fill_test_mu);
+}
+
+void chunk_store_set_test_fill_path(const char *path, int pct)
+{
+    pthread_once(&store_fill_env_once, store_fill_env_init);
+    pthread_mutex_lock(&store_fill_test_mu);
+    if (!path || !*path || pct < 0) {
+        store_fill_test_path[0] = '\0';
+        store_fill_test_path_pct = -1;
+    } else {
+        snprintf(store_fill_test_path, sizeof store_fill_test_path, "%s", path);
+        store_fill_test_path_pct = pct > 100 ? 100 : pct;
+    }
+    pthread_mutex_unlock(&store_fill_test_mu);
+}
+
+static int store_test_fill_override(const char *path)
+{
+    pthread_once(&store_fill_env_once, store_fill_env_init);
+    pthread_mutex_lock(&store_fill_test_mu);
+    int ov = store_fill_test_global;
+    if (store_fill_test_path_pct >= 0 && path && strcmp(path, store_fill_test_path) == 0)
+        ov = store_fill_test_path_pct;
+    pthread_mutex_unlock(&store_fill_test_mu);
+    return ov;
+}
+
+static inline bool store_put_cap_active(void) { return chunk_mutant != CHUNK_MUT_STOREPUT96; }
+#else
+void chunk_store_set_test_fill_pct(int pct) { (void)pct; }
+void chunk_store_set_test_fill_path(const char *path, int pct) { (void)path, (void)pct; }
+static inline int store_test_fill_override(const char *path) { (void)path; return -1; }
+static inline bool store_put_cap_active(void) { return true; }
+#endif
+
+static uint32_t store_sample_fs(chunk_store *st)
+{
+    int ov = store_test_fill_override(st->path);
+    if (ov >= 0)
+        return (uint32_t)ov; /* never clobber the cached real fstatvfs reading with a test override */
+    int64_t mono = store_mono_ms();
+    int64_t last = atomic_load_explicit(&st->fill_sample_ms, memory_order_relaxed);
+    if (last != 0 && mono >= last && mono - last < 1000)
+        return atomic_load_explicit(&st->fill_pct, memory_order_relaxed);
+    uint32_t pct = atomic_load_explicit(&st->fill_pct, memory_order_relaxed);
+    struct statvfs sv;
+    if (st->dirfd >= 0 && fstatvfs(st->dirfd, &sv) == 0 && sv.f_blocks > 0) {
+        uint64_t total_blks = (uint64_t)sv.f_blocks;
+        uint64_t avail_blks = (uint64_t)sv.f_bavail < total_blks ? (uint64_t)sv.f_bavail : total_blks;
+        uint64_t used_blks = total_blks - avail_blks;
+        pct = used_blks > UINT64_MAX / 100u ? (uint32_t)(used_blks / (total_blks / 100u))
+                                            : (uint32_t)((used_blks * 100u) / total_blks);
+        if (pct > 100u)
+            pct = 100u;
+        uint64_t bsz = sv.f_frsize ? (uint64_t)sv.f_frsize : (uint64_t)sv.f_bsize;
+        atomic_store_explicit(&st->fill_total_bytes, total_blks * bsz, memory_order_relaxed);
+        atomic_store_explicit(&st->fill_used_bytes, used_blks * bsz, memory_order_relaxed);
+        atomic_store_explicit(&st->fill_free_bytes, avail_blks * bsz, memory_order_relaxed);
+        atomic_fetch_add_explicit(&chunk_store_fill_samples, 1, memory_order_relaxed);
+    }
+    atomic_store_explicit(&st->fill_pct, pct, memory_order_relaxed);
+    atomic_store_explicit(&st->fill_sample_ms, mono ? mono : 1, memory_order_relaxed);
+    return pct;
+}
+
+void chunk_store_fs_refresh(chunk_store *st)
+{
+    if (!st || st->dirfd < 0)
+        return;
+    (void)store_sample_fs(st);
+}
+
+int chunk_store_fs_bytes_cached(chunk_store *st, uint64_t *used_out, uint64_t *free_out, uint64_t *total_out)
+{
+    if (!st)
+        return -1;
+    uint64_t total = atomic_load_explicit(&st->fill_total_bytes, memory_order_relaxed);
+    uint64_t used = atomic_load_explicit(&st->fill_used_bytes, memory_order_relaxed);
+    uint64_t avail = atomic_load_explicit(&st->fill_free_bytes, memory_order_relaxed);
+    int ov = store_test_fill_override(st->path);
+    if (ov >= 0) {
+        if (total == 0)
+            total = 100ull << 30;
+        used = (uint64_t)(((__uint128_t)total * (uint32_t)ov) / 100u);
+        avail = total >= used ? total - used : 0;
+    }
+    if (total == 0)
+        return -1;
+    if (used_out)
+        *used_out = used;
+    if (free_out)
+        *free_out = avail;
+    if (total_out)
+        *total_out = total;
+    return 0;
+}
+
+void chunk_be_set_put_cap(chunk_backend *be, unsigned max_pct)
+{
+    if (!be)
+        return;
+    atomic_store_explicit(&be->put_max_pct, max_pct, memory_order_release);
+    for (int i = 0; i < be->n; i++) {
+        chunk_store *st = chunk_be_store_ref(be, i);
+        if (st) {
+            atomic_store_explicit(&st->put_max_pct, max_pct, memory_order_release);
+            chunk_store_unref(st);
+        }
+    }
+}
+
+static uint32_t store_cached_fill_pct(const chunk_store *st)
+{
+    int ov = store_test_fill_override(st->path);
+    if (ov >= 0)
+        return (uint32_t)ov;
+    return atomic_load_explicit(&st->fill_pct, memory_order_relaxed);
+}
+
+bool chunk_be_any_store_full(chunk_backend *be)
+{
+    if (!be || !store_put_cap_active())
+        return false;
+    unsigned cap = atomic_load_explicit(&be->put_max_pct, memory_order_acquire);
+    if (cap == 0)
+        return false;
+    /* Read-only cached fill % (zero syscalls): the detached per-store probe threads (tier_health.c) and real puts
+     * (wr_open) refresh fill_pct. Calling fstatvfs() here from the shared settle thread would hang eng_close/tsdb_close
+     * whenever a tier store on NFS stalls. */
+    for (int i = 0; i < be->n; i++) {
+        chunk_store *st = chunk_be_store_ref(be, i);
+        bool full = st && store_cached_fill_pct(st) > cap;
+        chunk_store_unref(st);
+        if (full)
+            return true;
+    }
+    return false;
+}
+
 /* ---------------------------------------------------------------- writing */
 struct chunk_wr {
     chunk_store *st;
@@ -875,6 +1067,12 @@ static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, 
 {
     if (!chunk_geom_valid(g) || id->pos >= chunk_npos(g))
         return TSDB_ERR_INVALID;
+    /* R15 D7 / §15.7: regular puts on single-server tiers (put_max_pct > 0) stop when integer filesystem fill %
+     * (floor of used * 100 / total, using f_bavail) exceeds 95%; rebuild/heal puts pass. Sample outside st->mu, then
+     * enforce after failed/fence/unsure checks inside st->mu so fenced or failed stores still report
+     * CHUNK_ERR_FENCED/IO rather than CHUNK_ERR_FULL. */
+    unsigned cap = atomic_load_explicit(&st->put_max_pct, memory_order_acquire);
+    bool cap_full = !heal && cap > 0 && store_put_cap_active() && store_sample_fs(st) > cap;
     pthread_mutex_lock(&st->mu);
     vol_state *v;
     int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, id->volume, true, &v);
@@ -882,6 +1080,8 @@ static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, 
         rc = CHUNK_ERR_FENCED;
     if (rc == 0 && v->unsure)
         rc = CHUNK_ERR_EPOCH_UNSURE; /* a slot of EPOCH was damaged: no epoch is trusted until the owner raises it */
+    if (rc == 0 && cap_full)
+        rc = CHUNK_ERR_FULL;
     if (rc == 0 && fence > v->epoch && !(heal && chunk_mutant == CHUNK_MUT_REPLACE_LATE)) /* planted: raised later */
         rc = epoch_store(st, v, fence); /* before it acts on a higher one (E14) */
     int vdirfd = rc == 0 ? v->dirfd : -1;

@@ -2939,6 +2939,11 @@ static void test_metrics(const char *dir)
     CHECK(mval(&m0, "tsdb_failed", NULL) == 0);
     CHECK(mval(&m0, "tsdb_rows", "volume=\"0\"") == 0);
     CHECK(mval(&m0, "tsdb_start_time_seconds", NULL) > 1e9);
+    /* Standalone without a tier must omit all R15 tier metrics. */
+    CHECK(isnan(mval(&m0, "tsdb_tier_bytes", NULL)));
+    CHECK(isnan(mval(&m0, "tsdb_tier_settles_waiting", NULL)));
+    CHECK(isnan(mval(&m0, "tsdb_tier_store_state", NULL)));
+    CHECK(isnan(mval(&m0, "tsdb_volume_full", NULL)));
     check_ops_named(&m0);
     mset_free(&m0);
     size_t len;
@@ -4690,6 +4695,128 @@ static void test_zerocopy_and_backpressure(const char *dir)
     CHECK(system(cmd) == 0);
 }
 
+#if defined(TSDB_EC) && defined(TSDB_TEST_HOOKS)
+/* R15 r15-full: UNAVAILABLE with TSDB_WHY_FULL + retry_after reaches the C client on a full standalone tiered volume,
+ * deletes still pass, STATUS & TOPOLOGY report FULL, and /metrics exports all four tier families cleanly. */
+static void test_tier_full(const char *base)
+{
+    char cmd[1200], dbdir[1024], st[3][1088];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", base, base);
+    if (system(cmd) != 0) {
+        failures++;
+        return;
+    }
+    snprintf(dbdir, sizeof dbdir, "%s/db", base);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    tsdb *ldb = NULL;
+    CHECK(tsdb_open(dbdir, &o, &ldb) == 0 && ldb != NULL);
+    if (!ldb)
+        return;
+    tsdb_sid s = 0;
+    CHECK(tsdb_series_create(ldb, "tier.full.s", TSDB_FLOAT32, NULL, &s) == 0);
+    CHECK(tsdb_append(ldb, s, 1000, 1.5f) == 0);
+    CHECK(tsdb_append(ldb, s, 2000, 2.5f) == 0);
+    CHECK(tsdb_flush(ldb) == 0);
+    tsdb_close(ldb);
+
+    for (int i = 0; i < 3; i++) {
+        snprintf(st[i], sizeof st[i], "%s/st%d", base, i);
+        CHECK(tsdb_tier_add_dir(dbdir, st[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+    }
+
+    setenv("TSDB_TEST_FILL_PCT", "92", 1);
+    const char *extra[] = {"--metrics-port", "auto", "--metrics-bind", "127.0.0.1", NULL};
+    pid_t srv = start_server_with(dbdir, extra);
+    unsetenv("TSDB_TEST_FILL_PCT");
+    mport = th_mport;
+    CHECK(mport > 0 && mport != port);
+
+    tsdbc *c = NULL;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    OK(tsdbc_set_retry(c, 0));
+
+    int64_t t1 = 5000;
+    float v1 = 3.5f;
+    int rc = 0;
+    /* Wait briefly for the settle thread's first fill sample to trip FULL. */
+    for (int i = 0; i < 100; i++) {
+        rc = tsdbc_insert_series(c, s, &t1, &v1, 1);
+        if (rc == TSDB_ERR_UNAVAILABLE)
+            break;
+        struct timespec d = {0, 30000000L};
+        nanosleep(&d, NULL);
+    }
+    CHECK(rc == TSDB_ERR_UNAVAILABLE);
+    tsdb_unavail u[4];
+    unsigned nu = 0;
+    CHECK(tsdbc_unavailable(c, u, 4, &nu) == 0 && nu >= 1);
+    if (nu >= 1) {
+        CHECK(u[0].vol == 0);
+        CHECK(u[0].reason == TSDB_WHY_FULL);
+        CHECK(u[0].retry_after_ms > 0);
+    }
+
+    /* Packed insert, multi-series insert, and replace_range all get UNAVAILABLE with TSDB_WHY_FULL. */
+    tsdb_values tv = {.type = TSDB_FLOAT32, .values = &v1, .valid = NULL};
+    OK(tsdbc_set_compression(c, 1));
+    CHECK(tsdbc_insert_values(c, &s, &t1, &tv, 1) == TSDB_ERR_UNAVAILABLE);
+    nu = 0;
+    CHECK(tsdbc_unavailable(c, u, 4, &nu) == 0 && nu >= 1 && u[0].vol == 0 && u[0].reason == TSDB_WHY_FULL);
+
+    CHECK(tsdbc_replace_range(c, s, 1000, 3000, &t1, &tv, 1) == TSDB_ERR_UNAVAILABLE);
+    nu = 0;
+    CHECK(tsdbc_unavailable(c, u, 4, &nu) == 0 && nu >= 1 && u[0].vol == 0 && u[0].reason == TSDB_WHY_FULL);
+
+    /* Deletes still pass while FULL (D7). */
+    OK(tsdbc_delete_range(c, s, 1000, 1500));
+
+    /* TOPOLOGY reports volume 0 DEGRADED with TSDB_WHY_FULL. */
+    tsdbc_topo *topo = NULL;
+    OK(tsdbc_topology(c, &topo));
+    if (topo) {
+        CHECK(topo->nvols >= 1 && topo->vols[0].vol == 0 && topo->vols[0].health == TSDB_HEALTH_DEGRADED &&
+              topo->vols[0].reason == TSDB_WHY_FULL);
+        tsdbc_topology_free(topo);
+    }
+
+    /* STATUS reports vol.0.health=degraded, vol.0.reason=full, vol.0.full=1, tier.stores=3. */
+    char *stxt = NULL;
+    OK(tsdbc_status(c, &stxt));
+    if (stxt) {
+        CHECK(strstr(stxt, "vol.0.health=degraded\n") != NULL);
+        CHECK(strstr(stxt, "vol.0.reason=full\n") != NULL);
+        CHECK(strstr(stxt, "vol.0.full=1\n") != NULL);
+        CHECK(strstr(stxt, "vol.0.full_refusals=") != NULL);
+        CHECK(strstr(stxt, "tier.stores=3\n") != NULL);
+        CHECK(strstr(stxt, "tier.settles_waiting=") != NULL);
+        free(stxt);
+    }
+
+    /* /metrics parses strictly and exposes all 4 tier families. */
+    mset m;
+    if (scrape(&m)) {
+        CHECK(mval(&m, "tsdb_tier_bytes", "store=\"0\",use=\"total\"") > 0);
+        CHECK(mval(&m, "tsdb_tier_bytes", "store=\"0\",use=\"used\"") >= 0);
+        CHECK(mval(&m, "tsdb_tier_bytes", "store=\"0\",use=\"free\"") >= 0);
+        CHECK(mval(&m, "tsdb_tier_bytes", "store=\"2\",use=\"total\"") > 0);
+        CHECK(mval(&m, "tsdb_tier_settles_waiting", NULL) >= 0);
+        CHECK(mval(&m, "tsdb_tier_store_state", "store=\"0\"") == 0);
+        CHECK(mval(&m, "tsdb_tier_store_state", "store=\"1\"") == 0);
+        CHECK(mval(&m, "tsdb_tier_store_state", "store=\"2\"") == 0);
+        CHECK(mval(&m, "tsdb_volume_full", "volume=\"0\"") == 1);
+        mset_free(&m);
+    }
+
+    tsdbc_close(c);
+    stop_server(srv);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", base);
+    if (system(cmd) != 0)
+        failures++;
+}
+#endif
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN); /* a check failing on a connection the server closed must not end the run */
@@ -4956,6 +5083,13 @@ int main(int argc, char **argv)
     printf("zero-copy large frames, backpressure wakeups, and short-request burst\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-zc-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_zerocopy_and_backpressure(dir);
+    printf("standalone tier FULL (WHY_FULL, STATUS, TOPOLOGY, metrics)\n");
+#if defined(TSDB_EC) && defined(TSDB_TEST_HOOKS)
+    snprintf(dir, sizeof dir, "%s/tsdbd-tierfull-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_tier_full(dir);
+#else
+    printf("  (skipped: requires TSDB_EC and TSDB_TEST_HOOKS)\n");
+#endif
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

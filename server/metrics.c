@@ -967,6 +967,39 @@ static void render(sb *b)
         }
     }
 
+    if (cfg.tier) { /* single-server tier metrics (R15 r15-full, E53, §15.7); omitted when no tier is configured */
+        metrics_tier *tm = calloc(1, sizeof *tm);
+        if (tm && cfg.tier(tm)) {
+            family(b, "tsdb_tier_bytes", "gauge",
+                   "Filesystem bytes of each open local tier store, by use (used, free, total).");
+            for (int i = 0; i < tm->nstores; i++) {
+                if (!tm->stores[i].has_bytes)
+                    continue;
+                int idx = tm->stores[i].index;
+                sb_add(b, "tsdb_tier_bytes{store=\"%d\",use=\"used\"} %llu\n", idx,
+                       (unsigned long long)tm->stores[i].used_bytes);
+                sb_add(b, "tsdb_tier_bytes{store=\"%d\",use=\"free\"} %llu\n", idx,
+                       (unsigned long long)tm->stores[i].free_bytes);
+                sb_add(b, "tsdb_tier_bytes{store=\"%d\",use=\"total\"} %llu\n", idx,
+                       (unsigned long long)tm->stores[i].total_bytes);
+            }
+            family(b, "tsdb_tier_settles_waiting", "gauge",
+                   "Tiered volumes currently waiting to settle because a store is down, full (>95%), or the tier is halted.");
+            sb_add(b, "tsdb_tier_settles_waiting %llu\n", (unsigned long long)tm->settles_waiting);
+            family(b, "tsdb_tier_store_state", "gauge",
+                   "Local tier store state (0=up, 1=missing, 2=other_id, 3=damaged, 4=ioerr, 5=replacing, 6=stalled).");
+            for (int i = 0; i < tm->nstores; i++)
+                sb_add(b, "tsdb_tier_store_state{store=\"%d\"} %d\n", tm->stores[i].index, tm->stores[i].state);
+            family(b, "tsdb_volume_full", "gauge",
+                   "1 while the tiered volume is FULL (>= young_high_pct, refusing inserts until < young_high_pct - 2), else 0.");
+            for (uint32_t i = 0; i < tm->nvols; i++)
+                sb_add(b, "tsdb_volume_full{volume=\"%u\"} %d\n", (unsigned)i, tm->vol_full[i] ? 1 : 0);
+        }
+        if (tm)
+            free(tm->vol_full);
+        free(tm);
+    }
+
     family(b, "tsdb_query_duration_seconds", "histogram",
            "Time a worker spent on a query request, from taking it to handing the reply to the kernel (a slow client can add to it).");
     for (unsigned o = 1; o < NOPS; o++) {

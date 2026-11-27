@@ -51,6 +51,7 @@
 #include "eckeep.h"
 #include "stats_priv.h"
 #include "tier.h"
+#include "tierfill.h"
 #include "tiers.h"
 #include "chunk.h"
 #include "settle.h"
@@ -1296,7 +1297,7 @@ static void eng_unref_meta(eng **ep)
 static __thread int route_rc;
 static int route_fail(int dflt) { return route_rc ? route_rc : dflt; }
 
-static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
+static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live, bool write)
 {
     int64_t v = sid_volume(id);
     if (v < 0)
@@ -1311,6 +1312,11 @@ static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
         ok = false;
     } else if (ok) {
         ok = TSDB_SID_LOCAL(id) < eng_series_count(t->vols[v]);
+        if (ok && live && write && tierfill_is_full(t->vols[v])) {
+            tierfill_note_refusal(t->vols[v], (uint32_t)v);
+            route_rc = TSDB_ERR_UNAVAILABLE;
+            ok = false;
+        }
     }
     if (ok) {
         *e = live ? eng_ref(t->vols[v]) : eng_ref_meta(t->vols[v]);
@@ -1353,10 +1359,11 @@ static eng *volume_at(tsdb *t, size_t v, bool reload)
 /* Routes an id: its volume and local id, by its bits. A follower may be asked about a series or a volume its
  * writer created a moment ago, with no rows yet (nothing in MANIFEST or the WAL names it): it reads VOLUMES or
  * that volume's SERIES again when the file grew, and then the volume's parts, which may hold the series' rows. */
-static bool route_opt(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
+static bool route_opt(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live, bool write)
 {
     route_rc = 0;
-    if (route_now(t, id, e, local, live))
+    tierfill_clear_last_refused();
+    if (route_now(t, id, e, local, live, write))
         return true;
     int64_t v = sid_volume(id);
     if (!t->opt.read_only || v < 0)
@@ -1367,17 +1374,19 @@ static bool route_opt(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
     /* An error is for the refresh to report (follow_refresh): the records before the one that failed are loaded,
      * and the id may be among them. */
     (void)eng_series_reload(ve);
-    if (!route_now(t, id, e, local, live))
+    if (!route_now(t, id, e, local, live, write))
         return false;
     eng_refresh(ve);
     return true;
 }
 
-/* The engine of a series for a call that reads or writes (refused while the volume is quiesced), `route_meta` for
- * the dictionaries (names, types, classes: stay available, from the engine in place), `route_q` for the queries,
- * which answer an unknown series with nothing but must not answer a quiesced one that way. */
-static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, true); }
-static bool route_meta(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, false); }
+/* The engine of a series for a call that reads or deletes (refused while quiesced/diverged), `route_write` for inserts,
+ * appends and replaces (also refused when a tiered volume is FULL before ENOSPC, D7), `route_meta` for the
+ * dictionaries (names, types, classes: stay available, from the engine in place), `route_q` for the queries, which
+ * answer an unknown series with nothing but must not answer a quiesced one that way. */
+static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, true, false); }
+static bool route_write(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, true, true); }
+static bool route_meta(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, false, false); }
 
 __thread route_cache *cur_route;
 
@@ -1428,7 +1437,7 @@ static bool route_q(tsdb *t, tsdb_sid id, eroute *er, uint32_t *local, int *rc)
             route_cache_release(cache);
     }
     eng *e = NULL;
-    bool ok = route_opt(t, id, &e, local, true);
+    bool ok = route_opt(t, id, &e, local, true, false);
     if (!ok) {
         if (route_rc)
             *rc = route_rc;
@@ -2505,6 +2514,35 @@ int tsdb_volume_diverged(tsdb *t, size_t vol)
     return rc;
 }
 
+bool tierfill_vol_full(tsdb *t, uint32_t vol, int64_t *since_ms_out)
+{
+    if (since_ms_out)
+        *since_ms_out = 0;
+    if (!t)
+        return false;
+    pthread_rwlock_rdlock(&t->lock);
+    bool full = false;
+    if (vol < t->nvols && t->vols[vol] && tierfill_is_full(t->vols[vol])) {
+        full = true;
+        if (since_ms_out && t->vols[vol]->ecstate)
+            *since_ms_out = atomic_load_explicit(&t->vols[vol]->ecstate->fill.since_ms, memory_order_acquire);
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return full;
+}
+
+uint64_t tierfill_vol_refusals(tsdb *t, uint32_t vol)
+{
+    if (!t)
+        return 0;
+    pthread_rwlock_rdlock(&t->lock);
+    uint64_t n = 0;
+    if (vol < t->nvols && t->vols[vol] && t->vols[vol]->ecstate)
+        n = atomic_load_explicit(&t->vols[vol]->ecstate->fill.refusals, memory_order_relaxed);
+    pthread_rwlock_unlock(&t->lock);
+    return n;
+}
+
 int tsdb_volume_idle(tsdb *t, size_t vol, int timeout_ms)
 {
     pthread_rwlock_rdlock(&t->lock);
@@ -3042,7 +3080,7 @@ static int insert_series_slots(tsdb *t, int type, tsdb_sid series, const int64_t
     uint32_t local;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
-    return route(t, series, &e, &local) ? eng_insert_series(e, type, local, ts, v, n) : route_fail(TSDB_ERR_INVALID);
+    return route_write(t, series, &e, &local) ? eng_insert_series(e, type, local, ts, v, n) : route_fail(TSDB_ERR_INVALID);
 }
 
 /* Rows of several series: split by volume, local ids, each volume written on
@@ -3051,6 +3089,7 @@ static int insert_series_slots(tsdb *t, int type, tsdb_sid series, const int64_t
  * malloc per batch made every large insert fault its pages in again. */
 static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t *ts, const void *values, size_t n)
 {
+    tierfill_clear_last_refused();
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
     if (n && (!series || !ts || !values))
@@ -3099,10 +3138,14 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
             pthread_rwlock_unlock(&t->lock);
             return 0;
         }
-        if (eng_refused(e))
+        if (eng_refused(e)) {
             e = NULL, route_rc = TSDB_ERR_UNAVAILABLE;
-        else
+        } else if (tierfill_is_full(e)) {
+            tierfill_note_refusal(e, (uint32_t)vi);
+            e = NULL, route_rc = TSDB_ERR_UNAVAILABLE;
+        } else {
             eng_ref(e);
+        }
         pthread_rwlock_unlock(&t->lock);
         return e ? eng_insert(e, type, ls, ts, values, n) : TSDB_ERR_UNAVAILABLE;
     }
@@ -3207,6 +3250,11 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
                     rc = TSDB_ERR_UNAVAILABLE;
                     break;
                 }
+                if (tierfill_is_full(e)) {
+                    tierfill_note_refusal(e, v);
+                    rc = TSDB_ERR_UNAVAILABLE;
+                    break;
+                }
                 vols[v] = eng_ref(e);
                 nrefd = ti + 1;
             }
@@ -3300,7 +3348,8 @@ int tsdb_replace_range(tsdb *t, tsdb_sid series, int64_t start, int64_t end, con
     uint32_t local;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
-    if (!route(t, series, &e, &local))
+    /* n == 0 is a pure delete (eng_delete_range): must pass while FULL (D7). */
+    if (!(n == 0 ? route(t, series, &e, &local) : route_write(t, series, &e, &local)))
         return route_fail(TSDB_ERR_INVALID);
     if (n == 0)
         return eng_delete_range(e, local, start, end);

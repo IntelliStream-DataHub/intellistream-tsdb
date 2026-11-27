@@ -72,6 +72,7 @@ struct chunk_backend {
     void *ioerr_ctx;
     unsigned ioerr_active;       /* in-flight on_ioerr calls; drained when clearing the callback */
     pthread_cond_t ioerr_cv;
+    atomic_uint put_max_pct;     /* R15 D7: >0 caps regular puts at this fs % (single-server tiers: 95; 0: off) */
 };
 /* Reference counting on chunk_store: chunk_store_open returns 1 ref; chunk_store_close is chunk_store_unref. */
 chunk_store *chunk_store_ref(chunk_store *st);
@@ -112,6 +113,14 @@ int chunk_store_list_names(chunk_store *st, uint32_t volume, chunk_list_fn fn, v
  * may be below the volume's), the fence is checked and raised at fence_epoch (the healer's). */
 int chunk_wr_open_heal(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t hdr_epoch,
                        uint64_t fence_epoch, chunk_wr **out);
+/* R15 r15-full: configure the single-server tier regular-put fs cap (0 = off; 95 = CHUNK_STORE_PUT_MAX_PCT). */
+void chunk_be_set_put_cap(chunk_backend *be, unsigned max_pct);
+/* R15 r15-full: true if be has a put cap and any open store exceeds it (sampled at most 1/s per store). */
+bool chunk_be_any_store_full(chunk_backend *be);
+/* R15 r15-full: refresh store filesystem byte counts via fstatvfs (<= 1/s; called from probe/put paths, never /metrics). */
+void chunk_store_fs_refresh(chunk_store *st);
+/* R15 r15-full: lock-free, syscall-free read of cached store filesystem byte counts (for /metrics). 0 or -1. */
+int chunk_store_fs_bytes_cached(chunk_store *st, uint64_t *used_out, uint64_t *free_out, uint64_t *total_out);
 /* Encodes stripe s of the object: `stripe` holds its data bytes (min(k * cell, len - s * k * cell) of them); the cells
  * of every position go to fn as chunk_encode gives them (idx = s). */
 int chunk_encode_stripe(const chunk_geom *g, uint64_t s, const uint8_t *stripe, chunk_cell_fn fn, void *ctx);

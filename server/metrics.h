@@ -83,6 +83,22 @@ typedef struct metrics_p99_win {
     int halved;
 } metrics_p99_win;
 
+/* single-server tier metrics (R15 r15-full, E53, §15.7; omitted when no tier is configured) */
+#define METRICS_TIER_STORES_MAX 64
+typedef struct metrics_tier_store {
+    int index;
+    int state; /* CHUNK_STORE_* (0=up, 1=missing, 2=other_id, 3=damaged, 4=ioerr, 5=replacing, 6=stalled) */
+    bool has_bytes;
+    uint64_t used_bytes, free_bytes, total_bytes;
+} metrics_tier_store;
+typedef struct metrics_tier {
+    int nstores;
+    metrics_tier_store stores[METRICS_TIER_STORES_MAX];
+    uint64_t settles_waiting;
+    uint32_t nvols;
+    uint8_t *vol_full; /* malloc'ed by cfg.tier callback (length nvols), freed by metrics.c */
+} metrics_tier;
+
 struct creport_snap;
 
 typedef struct metrics_cfg {
@@ -113,6 +129,8 @@ typedef struct metrics_cfg {
     /* cluster metrics registry snapshot (R14, server/creport.h); NULL: standalone (output unchanged) */
     struct creport_snap *(*cluster_snap)(void);
     void (*cluster_snap_free)(struct creport_snap *snap);
+    /* single-server tier metrics (R15 r15-full); NULL when no tier is configured (standalone output unchanged) */
+    bool (*tier)(metrics_tier *out);
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */

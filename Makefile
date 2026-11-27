@@ -153,7 +153,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/ecunsettle.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
+R7_HDR := src/ecpart.h src/tier.h src/tierfill.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/ecunsettle.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -618,7 +618,7 @@ test-units-b6:
 	./$(B)/test_ecskip $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecskip --list "mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec" -- ./$(B)/test_ecskip --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_tier $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_tier --list "tierperengine tierunsure tierstrict tierfresh tierfence selfepoch dbidskip lostopen downnoread attachnoheal" -- ./$(B)/test_tier --mutant @M@ @D@,$(MUT) --name test_tier --list "tiernoec" -- ./$(B)/test_tier --mutant @M@ @D@) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
+	$(if $(EC_OBJ),$(MUT) --name test_tier --list "tierperengine tierunsure tierstrict tierfresh tierfence selfepoch dbidskip lostopen downnoread attachnoheal fullnoflag storeput96" -- ./$(B)/test_tier --mutant @M@ @D@,$(MUT) --name test_tier --list "tiernoec" -- ./$(B)/test_tier --mutant @M@ @D@) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
 	$(if $(EC_OBJ),$(MUT) --name test_chunk_heal --list "heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always" -- ./$(B)/test_chunk_heal --quick --mutant @M@ @D@) # each planted bug must fail it
 test-units-b7:
@@ -635,6 +635,7 @@ test-units-b7:
 	B=$(B) tests/test_cli_diverged.sh
 	B=$(B) tests/test_cli_feed.sh
 	B=$(B) tests/test_cli_tier.sh
+	tests/test_alert_rules.sh
 	B=$(B) tests/test_cli_chunkstore.sh
 	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)
 	./$(B)/test_export $(SCRATCH)
@@ -1382,7 +1383,7 @@ R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h ser
 # r8f: the peer cold ops and their cluster instance (server/chunkpeer.h), compiled with tsdbd (g_ec_cfg is tsdbd.c's)
 CP_SRC := server/chunkpeer.c server/chunkpeer_cluster.c
 TSDBD_SRC := $(CP_SRC) server/chunkpeer.h server/sfill.h server/sreconcile.h $(R4_SRC) $(R4_HDR) server/scrubd.h server/creport.h server/fwd.h server/fwdreq.h server/plrdma.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/stbuf.h server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
-             server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h src/tiers.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
+             server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h src/tiers.h src/tier.h src/tierfill.h src/settle.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/scrubd.o $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) \
 	    $(B)/scrubd.o $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
@@ -1690,7 +1691,7 @@ $(B)/test_ecskip: tests/test_ecskip.c src/internal.h $(R7_HDR) $(LIB)
 
 # the tier of a handle (r7-tier): one backend for every volume, vuuid= and requires=tier in META (power loss at every
 # step), stores DOWN at open and failed in service, the unsure EPOCH, the refusals; mutants must fail it
-$(B)/test_tier: tests/test_tier.c tests/outagefs_ctl.h src/internal.h src/ecgc.h src/tier.h src/tiers.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
+$(B)/test_tier: tests/test_tier.c tests/outagefs_ctl.h src/internal.h src/ecgc.h src/tier.h src/tierfill.h src/tiers.h src/settle.h src/chunk.h src/chunk_priv.h src/feed.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # the chunk server through a fake link and two real peerlinks: puts, reads, fences, unsure stores, store binding, power
