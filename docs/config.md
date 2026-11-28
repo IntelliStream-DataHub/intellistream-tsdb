@@ -97,6 +97,14 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
   keys are then left out (tsdbd prints one line that names them), where they would otherwise be refused (cluster
   settings without the cluster). A cluster option on the command line next to `--cluster=false` is an error, as is a
   file that sets `cluster.*` keys and `cluster.enabled = false`: the message names the settings and where they are.
+- **Single-server tier keys (`storage.tiers`, `storage.tier.cache`):** `TIERS` in the database root is the source of
+  truth for a single-server settled tier ([tier.md](tier.md)); `tsdbd` opens it automatically without any key. When
+  `storage.tiers` (`--tier`) is set, `tsdbd` checks at startup that its list matches `TIERS`'s active (non-lost,
+  non-shrinking, non-removed) stores by path and class and refuses to start on any difference; it never creates or adds
+  a store, and is refused with `--cluster`. `storage.tier.cache` (`--tier-cache-mb`) sets this process's decoded
+  granule cache budget (default: a tenth of the RAM); persistent tier settings (`--redundancy`, `--after`,
+  `--high-pct`, `--young-high-pct`, `--rebuild-mb-s`, `--scrub-mb-s`, `--scrub-days`) live in `TIERS` via
+  `tsdb DIR tier set`.
 - **Reserved keys:** `storage.disks` is named for the device classes
   (`docs/design-cluster-data.md`) and not built. It is a row in the table with no option: a file that sets it is
   refused (`reserved and not implemented yet`), so a file written for a later version is never read as if the key did

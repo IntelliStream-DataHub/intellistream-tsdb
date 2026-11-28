@@ -444,8 +444,9 @@ cgroup, so `nice` does not keep your work out of its way.
   `--mutant coef|kernel|guard`; it also checks that the ladder picks the widest kernel the level allows),
   `tests/test_levels.c`, `build/ec-bench`; `tools/check-exports.sh` (libtsdb.so exports the public headers' names only:
   `tsdb_ec_*` are `local:` in the map) and `tools/check-ec-baseline.sh` (no SSSE3 outside its kernel in a generic build).
-  The embedded bindings' crates (`client/rust-sys` build.rs, `vendor.sh`) copy `src/*.c` only and build without `src/ec`
-  and without `TSDB_EC`: an engine caller of `iso_rs_*` needs an `#ifdef TSDB_EC` or those crates stop linking.
+  The embedded bindings' crates (`client/rust-sys/build.rs`, `vendor.sh`, Python/Java embedded) vendor `src/ec` and
+  build with `-DTSDB_EC` on x86-64 (unless `NO_EC=1`) so tiered databases open embedded (R15 D19); non-x86-64 and
+  `NO_EC=1` builds compile without `TSDB_EC`, so engine callers of `iso_rs_*` still need `#ifdef TSDB_EC`.
 - `src/chunk.h` (the API; internal, called by the engine only through R7's tier, below), `src/chunk.c` (the geometry of an object,
   the chunk file format, the encoder), `src/chunkstore.c` (chunk stores: META with the store id, `s<volume>/EPOCH`, the
   fences, the directory backend), `src/chunkread.c` (reads of any byte range with decode): design-cluster-data.md R6.
@@ -594,18 +595,44 @@ cgroup, so `nice` does not keep your work out of its way.
   settletwopass settlebusy coarsewhole`; the failure paths' handoffs `gcskip* gccommitted gcdouble` (gcpaths), `gcearly
   nullnosync syncfailgo` (gcpower, crashfs), `nohaltstop` (halt)); `tests/test_settle_oracle.c` against an unsettled
   twin (`tests/oracle_mutants.sh`: a mutant counts as caught only by its own line).
-- `src/tier.[ch]`, `src/ecpart.[ch]`, `src/eccache.[ch]`, `src/ecswap.[ch]`, `src/ecskip.h`, `src/eckeep.[ch]` (R7,
-  design-cluster-data.md §2.3-2.4, §15.7; the plan's decisions D1-D11): settled parts on ONE server, behind a switch that is
-  test-only until R15. A handle's `struct tier` (`src/tier.c`, one per `tsdb`, reference-counted: every engine of the handle,
-  retired ones included, holds one, and the last to let go closes it) owns the one chunk backend (`chunk_be_open2`, `min_up`
-  = stores - m: a store that is missing, damaged or EIO at open is DOWN and read around), the cache, the settle thread and
-  the gc worker. It is configured by `TSDB_TEST_TIER=k=2,m=1,dirs=/a:/b:/c[,grace_s=,keep_s=,coarse_s=,cache_mb=,eager=]`
-  (grammar in `src/tier.h`) and acts only with `TSDB_TEST_TIER_I_KNOW=1` beside it (D3: set alone the open fails with a line,
-  so a stray variable never writes `requires=tier` into META); there are no public options and no `TIERS` before R15. The
+- `src/tiers.[ch]`, `src/tier.[ch]`, `src/tierctl.[ch]`, `src/tiersalv.[ch]`, `src/tier_health.c`, `src/tierfill.[ch]`,
+  `src/tierscrub.[ch]`, `src/ecpart.[ch]`, `src/eccache.[ch]`, `src/ecswap.[ch]`, `src/ecskip.h`, `src/eckeep.[ch]`
+  (R7, R15; `docs/tier.md`, `docs/design-cluster-data.md` §2.3-2.4, §15.7; R15 D2-D20): settled parts on ONE server
+  (`requires=tier` is production in 0.11.0). **Catalog and lock (`src/tiers.[ch]`, `src/volumes.c`):** `<root>/TIERS`
+  (beside `VOLUMES`, append-only 8-byte-aligned records `[u32 plen][u8 type][payload][pad][u64 xxh64(off ^ seed)]` of
+  kinds `STORE`, `STATE` (`LOST`|`REPLACED_BY`|`SHRINKING`|`REMOVED`), `SETTINGS`; torn tail cut under `VOLUMES`'s OFD
+  write lock, damaged record before a valid one fails open; `tests/test_tiers.c`, `tests/fuzz/fuzz_tiers.c`, mutants
+  `tiersnosync`, `nodbid`, `samedev`). Every write to `TIERS` (`tsdb_tier_add`/`tsdb_tier_add_dir`, `cmd_tier_set`,
+  `tierctl_lost_impl`, shrink `REMOVED`) takes `VOLUMES`'s OFD write lock (`F_WRLCK`), cuts any torn tail, fdatasyncs
+  `TIERS` (plus root dir fsync on creation), and releases the lock before any store I/O on the tier worker. **Store
+  binding:** the first `tier add` writes a random 16-byte `db_id=` into root `META` (tmp, fsync, rename, dir fsync)
+  before initializing the store; `chunk_store_init2` (`src/chunkstore.c`) writes `db=<hex>` into each store's `META`
+  and `tier_be_open_from_tiers` (`src/tier.c`) checks `id` and `db_id` on every non-`LOST` store at open (mutants
+  `dbidskip`, `lostopen`), refusing foreign/missing stores and never creating stores at open (E58); `tsdb_tier_add`
+  checks path nesting and `st_dev` isolation against `/`, root, volumes, and existing stores unless
+  `TSDB_TIER_ALLOW_SHARED_DEV` (`--allow-shared-device`); `storage.tiers` (`--tier`, `server/tsdbd.c`
+  `check_storage_tiers`) verifies path and class against `TIERS`'s active stores and never adds one. **Handle and
+  geometry (`src/tier.c`):** one reference-counted `struct tier` per `tsdb` owns the chunk backend (opened from `TIERS`
+  with strict non-`LOST` presence, or `min_up = stores - m` under legacy `TSDB_TEST_TIER`), the cache
+  (`storage.tier.cache` / `tsdb_tier_set_cache_bytes`, default 10% RAM), the settle thread, the gc worker,
+  `tier_health`, `tierctl`, and `tierscrub`; default geometry (`tier_default_geom`) is `1+0` (`k'=1`, `m=0` in
+  `src/chunk.c`) when all active stores are `--single-copy`, `1+1` at 2 stores, `(n-1)+1` at 3–5, `4+2` at 6+.
+  `TSDB_TEST_TIER` (with `TSDB_TEST_TIER_I_KNOW=1`) is a test-only hook: beside `TIERS`, `dirs=`/`k=`/`m=` are refused
+  and only timing/cache/reencode-threshold test overrides apply. **Tier worker (`src/tierctl.[ch]`):** one nice-19
+  background thread per writer handle polls `TIERS` every second (brief `VOLUMES` OFD `F_RDLCK`, no chunk I/O under it),
+  applies live store adds/settings/state changes, runs `tier_health` queued attaches, drives paced replacement rebuilds
+  (`chunk_be_replace_open` at `rebuild_mb_s` with durable `<store>/REBUILDING` crash-resume marker), drives `--shrink`
+  re-encodes (`eng_reencode`) onto remaining active stores until marking `REMOVED`, and runs `tierscrub_step` when idle
+  (mutants `lostnoreplace`, `rebuildfast`, `shrinkearly`). **Salvage (`src/tiersalv.[ch]`, `src/ecswap.c`):** past `m`
+  `LOST` stores, reads answer `TSDB_ERR_IO` naming the partition while statistics still answer; `tier salvage`
+  (`tiersalv_eng`/`tiersalv_cli`, refused while any non-`LOST` store is `DOWN` unless `--force`, mutant `salvagedown`)
+  first restores any lost `.ec` part with an intact local `settled_*.part` copy (0 rows lost), then retires truly
+  unrecoverable `.ec` parts via `ec_swap_salvage_at` (intent v5 `X <pX.ec> <retired_pX.ec>`), invalidating the latest
+  table (`lt_salvage_marks` + `lgen` bump, mutant `salvagelatest`) and keeping all young parts. The
   open of a volume writes `vuuid=` and `requires=tier` to META (tmp, fsync, rename) and raises every store's epoch to the
   constant 1 (D4); it refuses `TSDB_TEST_TIER` on a read-only open or a follower when no `TIERS` file is present (with `TIERS`, writer timing overrides are ignored and only `cache_mb` applies), a `requires=cluster|replica` volume (D1, D7) and a
   build without `TSDB_EC`; read-only opens and followers of a `TIERS` database open a read-only tier (R15 D13, `CHUNK_OPEN_RDONLY`: no flock, no `EPOCH` write, no `tmp_*` cleanup, no write/delete/heal; every non-`LOST` store is required with `store_id` and `db_id` checked, `.ec` parts are read through the follower's own `eccache`, the store set from open is kept until reopen without a health/attach worker, and `ecgc` keeps retired chunks for `obsolete_part_lifetime_s`); a store without META is a lost disk (DOWN, never remade) once any volume exists. `tier_writable`
-  turns false, with one line, once a store is not UP, failed in service or did not take the volume's epoch at open (mutant `tierfence`): settles and chunk deletes pause while any store is DOWN (`DOWN_IOERR` / `DOWN_STALLED`) and resume once all stores recover to UP (a fence halt stays sticky until reopen); reads go on. `src/tier_health.c` (R15 D8): per-store detached `O_DIRECT` probe threads (`<store>/PROBE.tier`, default 10 s stall bound), runtime `chunk_be_set_down(be, i, reason)` on refcounted `chunk_store`s, a dedicated attach/heal worker (never on the probe thread: verifies META `id`/`db_id`, runs `chunk_be_attach`, sweeps missed-delete orphan chunks, reopens cached handles, resumes settles/GC), `--health-domain` prefix matching over tier stores in `tsdbd` without quiescing volumes (`STATUS` reports `tier.stores` and `tier.store.<i>.{state,path,domain}`), abandon-flag checks in `src/chunkread.c` and `src/eccache.c` returning `TSDB_ERR_UNAVAILABLE`, and mutants `downnoread` and `attachnoheal` in `test_tier`. `src/tierfill.[ch]` (R15 r15-full, E53, §15.7, D7): per-engine atomic `full` flag (enters at integer fill % >= `young_high_pct`, clears at `< young_high_pct - 2`), seeded synchronously at `tier_engine_ready` and kept fresh every 1 s by a per-volume detached-capable sampler thread (never holds `t->eng_active` across `statvfs` I/O, never blocks other volumes or close on an NFS hang); `src/volumes.c` `route_write` / `insert_slots` refuse inserts, appends, and non-empty replaces with `TSDB_ERR_UNAVAILABLE` (deletes including `tsdb_replace_range` with `n == 0` and drops pass; mutant `fullnoflag`); `src/chunkstore.c` 95% regular-put cap scoped to single-server tiers via `chunk_be_set_put_cap` (`CHUNK_ERR_FULL`, rebuild/heal puts pass, cached store bytes for `/metrics` without syscalls; mutant `storeput96`); `server/metrics.c` tier metrics (`tsdb_tier_bytes`, `tsdb_tier_settles_waiting`, `tsdb_tier_store_state`, `tsdb_volume_full`, `tsdb_tier_scrub_*`), `server/tsdbd.c` standalone `TSDB_WHY_FULL` / `STATUS` / `TOPOLOGY`, and `dist/alerts/tsdb.rules.yml` checked by `tests/test_alert_rules.sh`. `src/tierscrub.[ch]` (R15 r15-scrub, E25, §15.7, D12, D20): background chunk scrubber on `tierctl`'s nice-19 worker (skipped on read-only followers and opt-in for non-`TIERS` `TSDB_TEST_TIER` harnesses via `TSDB_TEST_TIER_SCRUB=enable=1`); scrubs active UP stores oldest-first every `scrub_days` (default 14) paced at `scrub_mb_s` (default 50 MB/s) via `chunk_be_heal(scrub=true)` against live `.ec` records (never repairing non-live objects), immediately reopens cached handles on repair (`eccache_reopen`), reports single-copy (`m=0`) damage without modifying chunks, pauses/yields for active rebuilds or shrinks, skips unready/quiesced volumes without re-listing finished ones, persists progress atomically in `<store>/SCRUB` (`tsdb-tier-scrub 1` + `xxh64` checksum via tmp + fsync + rename + dir fsync) for mid-pass restart resume, and exposes counters/ages in `tsdb DIR tier status` and `/metrics`; `tests/test_tierscrub.c` and `make tierscrub-mutants` (`scrubnorepair`, `scrubnopace`). `src/ecpart.c`: the `.ec` file (`p<K>_<A>_<B>_<L>.ec`, the name and block range of its source,
+  turns false, with one line, once a store is not UP, failed in service or did not take the volume's epoch at open (mutant `tierfence`): settles and chunk deletes pause while any store is DOWN (`DOWN_IOERR` / `DOWN_STALLED`) and resume once all stores recover to UP (a fence halt stays sticky until reopen); reads go on. `src/tier_health.c` (R15 D8): per-store detached `O_DIRECT` probe threads (`<store>/PROBE.tier`, default 10 s stall bound), runtime `chunk_be_set_down(be, i, reason)` on refcounted `chunk_store`s, a dedicated attach/heal worker (never on the probe thread: verifies META `id`/`db_id`, runs `chunk_be_attach`, sweeps missed-delete orphan chunks, reopens cached handles, resumes settles/GC), `--health-domain` prefix matching over tier stores in `tsdbd` without quiescing volumes (`STATUS` reports `tier.stores` and `tier.store.<i>.{state,path,domain}`), abandon-flag checks in `src/chunkread.c` and `src/eccache.c` returning `TSDB_ERR_UNAVAILABLE`, and mutants `downnoread` and `attachnoheal` in `test_tier`. `src/tierfill.[ch]` (R15 r15-full, E53, §15.7, D7): per-engine atomic `full` flag (enters at integer fill % >= `young_high_pct`, clears at `< young_high_pct - 2`), seeded synchronously at `tier_engine_ready` and kept fresh every 1 s by a per-volume detached-capable sampler thread (never holds `t->eng_active` across `statvfs` I/O, never blocks other volumes or close on an NFS hang); `src/volumes.c` `route_now` / `tsdb_insert` refuse inserts, appends, and non-empty replaces with `TSDB_ERR_UNAVAILABLE` (deletes including `tsdb_replace_range` with `n == 0` and drops pass; mutant `fullnoflag`); `src/chunkstore.c` 95% regular-put cap scoped to single-server tiers via `chunk_be_set_put_cap` (`CHUNK_ERR_FULL`, rebuild/heal puts pass, cached store bytes for `/metrics` without syscalls; mutant `storeput96`); `server/metrics.c` tier metrics (`tsdb_tier_bytes`, `tsdb_tier_settles_waiting`, `tsdb_tier_store_state`, `tsdb_volume_full`, `tsdb_tier_salvaged_*`, `tsdb_tier_scrub_*`), `server/tsdbd.c` standalone `TSDB_WHY_FULL` / `STATUS` / `TOPOLOGY`, and `dist/alerts/tsdb.rules.yml` checked by `tests/test_alert_rules.sh`. `src/tierscrub.[ch]` (R15 r15-scrub, E25, §15.7, D12, D20): background chunk scrubber on `tierctl`'s nice-19 worker (skipped on read-only followers and opt-in for non-`TIERS` `TSDB_TEST_TIER` harnesses via `TSDB_TEST_TIER_SCRUB=enable=1`); scrubs active UP stores oldest-first every `scrub_days` (default 14) paced at `scrub_mb_s` (default 50 MB/s) via `chunk_be_heal(scrub=true)` against live `.ec` records (never repairing non-live objects), immediately reopens cached handles on repair (`eccache_reopen`), reports single-copy (`m=0`) damage without modifying chunks, pauses/yields for active rebuilds or shrinks, skips unready/quiesced volumes without re-listing finished ones, persists progress atomically in `<store>/SCRUB` (`tsdb-tier-scrub 1` + `xxh64` checksum via tmp + fsync + rename + dir fsync) for mid-pass restart resume, and exposes counters/ages in `tsdb DIR tier status` and `/metrics`; `tests/test_tierscrub.c` and `make tierscrub-mutants` (`scrubnorepair`, `scrubnopace`). `src/ecpart.c`: the `.ec` file (`p<K>_<A>_<B>_<L>.ec`, the name and block range of its source,
   D2): the source's header, granule index, tombstones and footer verbatim (so `gx_*` read the index in place, unchanged),
   then the object record (oid, geometry, `object_len`, `object_xxh64`, the source's per-cell sums, `writer_epoch`,
   `settle_ms`, the class check, `positions` (R9 E10: 0 everywhere, or on cluster EC volumes all `k'+m` bits or, when `m >= 2`, `k'+m-1` bits for a degraded settle; single-server tiers still refuse non-zero), `ppos` and `stripe_version` (R8, cluster EC only)) and a
@@ -1225,12 +1252,13 @@ cgroup, so `nice` does not keep your work out of its way.
     follower or read-only open (R15 D13: followers of a `TIERS` database open a read-only tier and read `.ec` parts
     through their own `eccache`; a follower without a tier that meets an `.ec` name still stops with one line per D7),
     a build without `TSDB_EC` and a
-    tier with a store that is not UP settle nothing. `TSDB_TEST_TIER` needs `TSDB_TEST_TIER_I_KNOW=1` and is test-only
-    for single servers until R15; cluster EC volumes require no test variable and attach `coldops_peer` via
-    `chunkpeer_cluster_prepare` (`requires=cluster,tier,ec` in META). From `requires=tier` on, every open with no tier
-    configured (including a read-only or follower open without `TIERS`) and every build without
-    `TSDB_EC` fails. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says
-    `requires=tier` is then refused at open.
+    tier with a store that is not UP settle nothing. Single-server tiers from `TIERS` (`requires=tier`) and cluster EC
+    volumes (`requires=cluster,tier,ec` via `chunkpeer_cluster_prepare`) are production in 0.11.0; `TSDB_TEST_TIER`
+    (with `TSDB_TEST_TIER_I_KNOW=1`) is a test-only override (refusing `dirs=`/`k=`/`m=` beside `TIERS`). From
+    `requires=tier` on, every open with no tier configured (including a read-only or follower open without `TIERS`) and
+    every build without `TSDB_EC` fails. On x86-64 (unless `NO_EC=1`), the embedded bindings (`client/rust-sys/build.rs`,
+    `vendor.sh`, Python/Java embedded) compile `src/ec` with `TSDB_EC` so tiered databases open embedded; non-x86-64
+    and `NO_EC=1` builds refuse `requires=tier` at open.
   - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); `eng_reencode` /
     `ecpolicy_pick_reencode` (R10) combines them (`> ecpolicy_objects_max` or `> 10%` tombstones) on both single-server
     tiers and cluster EC leaders (`r10-crepl`, D24). On a cluster EC leader (`eccold_reencode`), re-encode enforces the
@@ -1464,7 +1492,19 @@ cgroup, so `nice` does not keep your work out of its way.
   another lock: a fill waits on its entry, not on the mutex), the digest's (`src/eckeep.c`), the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O), the tier's registry of
   cold volumes (`t->cmu`, `src/tier.c`: only around the array and `eng_active`/`eng_cv` drain; the last put, which frees a context, and any store I/O stay outside it), the chunk backend's `be->st_mu` (`src/chunkstore.c`: pure leaf under `be->mu`, also taken briefly from `store_fail` and `chunk_be_set_ioerr_cb`/`ioerr_cv` drain), the tier health mutex `th->mu` (`src/tier_health.c`: pure leaf, never held across I/O or engine locks), the tier scrub mutex `sc->mu` (`src/tierscrub.c`: pure leaf, never held across filesystem or chunk I/O),
   and the statistics' `es->mu` (`stats.c`: never held across I/O or an allocation of a part; the
-  sweeper takes `db->lock` only with it released). R7's settle: the policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
+  sweeper takes `db->lock` only with it released). R7/R15 tier and settle lock rules: `TIERS` (`src/tiers.c`) shares
+  `VOLUMES`'s OFD lock (`F_WRLCK` for appends and torn-tail cuts, brief `F_RDLCK` in `tierctl`'s 1 s re-read; never
+  held under an engine lock or across chunk I/O, and `tsdb_tier_lost` does not hold `create_lock` across
+  `tierctl_lost_impl`); the tier worker (`src/tierctl.c`) holds no engine lock across chunk I/O (`chunk_be_replace_open`,
+  `chunk_be_attach`, `chunk_be_heal`, `tierscrub_step`) and never holds `ctl->mu` across I/O (to pin an engine for
+  `--shrink` re-encode, `ctl_shrink_pin_eng` takes `t->cmu` > `ctl->mu` and releases both before `db->lock` and
+  `eng_reencode`); salvage's write section (`src/ecswap.c` `ec_swap_salvage_at`, `src/tiersalv.c`) matches a drop's
+  (`publish_lock` > `latest_rw` via `lt_begin`/`lt_salvage_marks`/`lt_end` bumping `lgen` > `db->lock`, with
+  `db_pub_begin`/`db_pub_end` serializing against concurrent drops and the intent write/fsync running under
+  `publish_lock` outside `latest_rw` and `db->lock`); FULL at the route (`src/tierfill.[ch]`, `src/volumes.c`
+  `route_now`/`tsdb_insert`) is a lock-free, syscall-free atomic read (`tierfill_is_full`) under `t->lock` read lock,
+  and the per-volume 1 s `statvfs` sampler holds no engine lock or `t->eng_active` across `statvfs`. The settle
+  policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
   `db->lock` while the settle thread picks) is a leaf; the tier's settle mutex `st->mu` (`src/settle.c`) is never held
   across an engine call (the thread lets go of it around a settle), and `eng_halt`/`eng_close` wait on its cv with no
   engine lock held; no engine lock is held across a single-server settle's encode or put, a chunk delete, a cache fill or a digest read (they

@@ -106,7 +106,9 @@ When a standalone server opens a database with a local settled tier (`TIERS`), `
 | `tsdb_tier_scrub_age_seconds{store}` | gauge | seconds since the start of the last completed scrub pass (or first pass start) for each local tier store (E25, §15.7) |
 | `tsdb_tier_scrub_oldest_age_seconds` | gauge | maximum scrub pass age in seconds across all active UP local tier stores (oldest unscrubbed object/pass) (E25, §15.7) |
 
-Alert rules for these metrics ship in `dist/alerts/tsdb.rules.yml`.
+Alert rules for these metrics (`TsdbTierFull7d`, `TsdbTierStoreDown`, `TsdbInsertsRefusedFull`,
+`TsdbTierScrubUnrepairable`, `TsdbTierScrubOverdue`) ship in `dist/alerts/tsdb.rules.yml`; see [tier.md](tier.md) for
+setup and runbooks.
 
 ### Cluster metrics (R14, P4 alerts)
 

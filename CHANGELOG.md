@@ -8,6 +8,38 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+- **Single-server local settled tier (`R15`, production in 0.11.0; `docs/tier.md`).** Single-server databases can now
+  settle older partitions onto local erasure-coded chunk stores (or `--single-copy` `1+0` ZFS/RAID/NFS stores) while
+  keeping recent partitions, WAL, and `.ec` granule indexes on fast storage. `requires=tier` is now production (no
+  test variable required; `TSDB_TEST_TIER` with `TSDB_TEST_TIER_I_KNOW=1` remains a test-only timing/cache hook and
+  refuses `dirs=`/`k=`/`m=` beside `TIERS`).
+  - **Catalog, store binding, and CLI (`src/tiers.[ch]`, `src/volumes.c`, `tools/tsdb-cli.c`).** Adds append-only
+    checksummed `<root>/TIERS` (under `VOLUMES`'s OFD lock) with `db_id=` in root `META` and `db=<hex>` in each store's
+    `META`, `tsdb DIR tier add PATH[:CLASS] [--single-copy] [--allow-shared-device]`, `tier set`, `tier lost STORE
+    (--replace PATH | --shrink)`, `tier salvage [--partition P] [--force]`, and `tier status [--json]`, plus C API
+    `tsdb_tier_add`, `tsdb_tier_add_dir`, `tsdb_tier_lost`, `tsdb_tier_salvage`, and `tsdb_tier_set_cache_bytes`.
+    `storage.tiers` (`--tier`) verifies active stores against `TIERS` at start (never adding a store);
+    `storage.tier.cache` (`--tier-cache-mb`) sets the decoded granule cache budget (default 10% of RAM).
+  - **Defaults, FULL backpressure, and alerts (`src/tier.c`, `src/ecpolicy.c`, `src/tierfill.[ch]`, `server/metrics.c`,
+    `dist/alerts/tsdb.rules.yml`).** Default redundancy follows store count (`1+0` when all `--single-copy`, `1+1` at
+    2 stores, `(n-1)+1` at 3–5, `4+2` at 6+), settling after `tier_after_s` (`7d`) or early above `tier_high_pct`
+    (`80%`). Regular chunk puts stop above 95% store fill; volume filesystem fill `>= young_high_pct` (`90%`, clears
+    below `88%`) refuses inserts/appends/non-empty replaces with `TSDB_ERR_UNAVAILABLE` (`TSDB_WHY_FULL`) while deletes
+    and drops continue. Exports 12 `tsdb_tier_*` / `tsdb_volume_full` metric families and ships 5 Prometheus alert
+    rules in `dist/alerts/tsdb.rules.yml`.
+  - **Runtime store health, rebuild, shrink, salvage, scrub, followers, unsettle, and embedded bindings
+    (`src/tier_health.c`, `src/tierctl.[ch]`, `src/tiersalv.[ch]`, `src/tierscrub.[ch]`, `src/ecunsettle.[ch]`).**
+    Per-store `O_DIRECT` probes (`10s` stall bound) and `--health-domain` routing drive failing stores `DOWN` without
+    quiescing volumes; returning stores heal via `chunk_be_attach`. A single nice-19 tier worker polls `TIERS` every
+    second and drives paced replacement rebuilds (resumable via `REBUILDING`), `--shrink` re-encodes to `REMOVED`, and
+    background chunk scrub (persisted in `<store>/SCRUB`, report-only on `--single-copy`). Salvage past `m` `LOST`
+    stores restores intact `settled_*.part` copies or retires lost `.ec` parts via intent v5 `X` lines while
+    invalidating the latest table. Read-only opens and `--follow` followers open `TIERS` read-only (`CHUNK_OPEN_RDONLY`)
+    while the writer keeps retired chunks for `obsolete_part_lifetime_s`. `tsdb DIR volume diverged --clear` uses
+    reverse intent (`eng_unsettle`, intent v5 `U` lines) to restore local `.part` files before clearing `DIVERGED`.
+    Embedded Rust, Python, and Java bindings on x86-64 now compile `src/ec` with `TSDB_EC` so tiered databases open
+    embedded (non-x86-64 and `NO_EC=1` builds refuse `requires=tier`).
+
 - **Cluster disk flags, start checks, binding, and `HBS_DISKS` (`r13-start`).** Replaces `--chunk-dir`
   (`cluster.chunk.dir`) and `tsdb chunk-store init` with `--disk PATH[:CLASS]` (`storage.disks`, initialised with
   `tsdb disk init`), `--role compute|storage|both` (`cluster.role`), and `--allow-shared-device`

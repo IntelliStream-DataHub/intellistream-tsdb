@@ -1375,6 +1375,26 @@ the event loop that sends heartbeats.
 
 ### 15.7 One server: the local tier (E55)
 
+> **Status: as built in 0.11.0 (R15).** Operator guide: [tier.md](tier.md). Implemented across `src/tiers.[ch]`
+> (`TIERS` catalog + root `META` `db_id`), `src/volumes.c` (`tier_add_impl:1908`, `tsdb_tier_add:2120`,
+> `tsdb_tier_add_dir:2155`, `tsdb_tier_lost:2187`, `tsdb_tier_salvage:2216`, FULL route checks at `:1317,2594,3212,3322`),
+> `src/chunk.c` (`m=0`/`k'=1` single-copy at `:43,63,410`), `src/chunkstore.c` (store `META` `db=` binding at `:214,278`,
+> `CHUNK_OPEN_RDONLY` at `:779`, 95% regular-put cap at `:1055,1136`), `src/tier.[ch]` (`tier_default_geom:96`,
+> `tier_be_open_from_tiers:595`, `tier_open_impl:869`, `tier_engine_attach:1540`), `src/ecpolicy.c` (`tier_after_s` and
+> `tier_high_pct` at `:256-290`), `src/tierfill.[ch]` (FULL hysteresis and per-volume 1 s sampler), `src/tier_health.c`
+> (`O_DIRECT` `PROBE.tier` 10 s stall probe, queued attach/heal, `--health-domain` routing in `server/domains.h:428-471`),
+> `src/tierctl.[ch]` (single nice-19 tier worker, 1 s `TIERS` re-read, paced replacement rebuild with `REBUILDING` marker,
+> `--shrink` re-encode to `REMOVED`), `src/tiersalv.[ch]` + `src/ecswap.c` (`ec_swap_salvage_at:1396`, intent v5 `X` lines),
+> `src/tierscrub.[ch]` (paced scrub, `<store>/SCRUB` persistence, single-copy report-only), `src/ecunsettle.[ch]` +
+> `src/ecswap.c` (`ec_swap_unsettle_at:1016`, intent v5 `U` lines for `volume diverged --clear`), `tools/tsdb-cli.c`
+> (`cmd_tier_add:2103`, `cmd_tier_set:2152`, `cmd_tier_lost:2349`, `cmd_tier_salvage:2426`, `cmd_tier_status:2473`),
+> `server/tsdbd.c` (`check_storage_tiers:7371`, `TSDB_WHY_FULL:1049`, `STATUS` `tier.*:3574`), `server/metrics.c:981-1053`,
+> `dist/alerts/tsdb.rules.yml`, `client/rust-sys/build.rs:58-118`, and `tests/jepsen/jepsen.c` (`JEPSEN_TIER_R15`).
+> Notes where built details refine the original design below: `tier add` records the stated `:CLASS` (automatic `/sys`
+> detection belongs to R13's cluster `--disk`), `tier status` prints `days_to_full: unknown` offline while Prometheus
+> `TsdbTierFull7d` computes the 1-day growth slope, `FORMAT_VERSION` is now 10, and `tsdb_tier_set`/`tsdb_tier_status`
+> are CLI-only (`tsdb DIR tier set|status`; C API stubs remain in `src/volumes.c:2179,2272`).
+
 A single tsdbd (no cluster) with NVMe and hard drives can keep recent partitions on the NVMe and older ones on the hard
 drives, erasure coded across them. Today a single server can already put a **volume** on a hard drive (`tsdb DIR
 volume add /hdd/v1`), but that is not tiering: a series stays in its volume for life, so all its data, today's

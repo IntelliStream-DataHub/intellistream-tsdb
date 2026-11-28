@@ -1,21 +1,26 @@
 # R8 takes what R7 left out
 
-**R8-1 done (2026-11-26); remaining items split across R8-2, R9, R10, R11, R13, R15 ([design-cluster-data.md](../design-cluster-data.md) §11).**
+**R8-1 and R15 done (2026-11-28); remaining items split across R8-2, R9, R10, R11, R13 ([design-cluster-data.md](../design-cluster-data.md) §11).**
 R7 was built as the settle of ONE server with a directory backend (D1-D11, 2026-11-17). R8-1 implemented the replicated
 cluster half: `PPOS`, the settle gate and cut, `Y`, `MK_COLD`, `MK_DIGEST` with E26's logical digest and D25 rot
 handling, replica apply with intent v5, durable `DIVERGED`, epoch-fenced chunk servers/clients (`chunksrv`/`chunkpeer`),
 and `MK_GC`/`GCMK` garbage collection. R8-2 tracks `r8p-prefetch` (done), `r8o-margins` (STATUS/metrics done; TOPOLOGY
-waits for protocol 16), `r8q-geom` (done), and `r8n-hedge` (remaining). D24 moved degraded settles, per-part cluster
-settles, and `eccache_reopen` after a heal to **R9**, server roles (`compute`/`storage`/`both`) to **R13**, and reverse
-intent (`settled_` back), tier store `db_id`, and followers over a tier to **R15**. `AGENTS.md` "Settled parts"
-describes what is now built; below is the status of each R8 item.
+waits for protocol 16), `r8q-geom` (done), and `r8n-hedge` (remaining). R15 closed the single-server tier items moved
+here by D24: production `TIERS` + `db_id` store binding, read-only followers over a tier (D7), reverse intent /
+`eng_unsettle` for `volume diverged --clear` (item 7), `storage.tier.cache`, and R15 D15's NFS swap lock decision
+(see [tier.md](../tier.md)). D24 moved degraded settles, per-part cluster settles, and `eccache_reopen` after a heal to
+**R9**, and server roles (`compute`/`storage`/`both`) to **R13**. `AGENTS.md` "Settled parts" describes what is now
+built; below is the status of each R8 item.
 
 ## What R7 refused today (D1, D7)
 
 - **Done (R8-1):** cluster EC volumes (`requires=cluster,tier,ec`) open and settle via `eccold_settle` (`src/eccold.c`),
   `ecapply_*` (`src/ecapply.c`), `src/db.c`, `src/replica.c`, `server/chunkpeer_cluster.c`, and `server/repld.c`.
-- **Remaining:** read-only opens, followers (`D7` -> **R15**), single-server tiers without `TSDB_TEST_TIER` (**R15**),
-  and builds with `NO_EC=1` still refuse tiers and `.ec` parts.
+- **Done (R15):** production single-server tiers from `TIERS` without `TSDB_TEST_TIER` (`src/tiers.[ch]`, `src/tier.c`,
+  `tools/tsdb-cli.c`), and read-only opens / followers over a `TIERS` database (`D7`, `CHUNK_OPEN_RDONLY` in
+  `src/chunkstore.c`, `src/tier.c`, `src/ecpart.c`, `src/ecgc.c`).
+- **Expected refusal:** builds with `NO_EC=1` (and non-x86-64 builds without `TSDB_EC`) still refuse tiers and `.ec`
+  parts, and followers without `TIERS` still refuse `.ec` names.
 
 ## D1: the replicated half
 
@@ -38,12 +43,14 @@ describes what is now built; below is the status of each R8 item.
    `(series, ts)` order + clipped canonical tombstone union when `MKD_TOMBS` is set) compared against committed
    `MK_DIGEST`; D25 distinguishes checksum rot (`ECKEEP_ROT`: `eckeep_copies_lost++`, serve `.ec`) from logical mismatch
    (durable `DIVERGED`). Single-server and leader `settled_` files keep R7's byte digest.
-7. **Done (R8-1, `src/ecdiverge.[ch]`, `src/ecapply.c`, `server/tsdbd.c`, `server/repld.c`, `server/cvol.c`):** a replica
-   part above `Z` (or missing `PPOS`) stops apply and writes durable `DIVERGED`, causing `tsdbd`/`repld` to fail the
-   replica (`vol_fail`, leave ISR, `LOCAL_FAULT` heartbeat, `TSDB_WHY_DIVERGED`, `tsdb_volume_diverged`). `tsdb DIR
-   volume diverged --clear` is refused on cluster volumes (D23; use `tsdb cluster replica reset` to rebuild the replica
-   instead). Reverse intent (D5:
-   swapping `settled_` back) moved to **R15** (D24).
+7. **Done (R8-1 + R15 `r15-reverse`, `src/ecdiverge.[ch]`, `src/ecapply.c`, `src/ecunsettle.[ch]`, `src/ecswap.c`,
+   `server/tsdbd.c`, `server/repld.c`, `server/cvol.c`):** a replica part above `Z` (or missing `PPOS`) stops apply and
+   writes durable `DIVERGED`, causing `tsdbd`/`repld` to fail the replica (`vol_fail`, leave ISR, `LOCAL_FAULT`
+   heartbeat, `TSDB_WHY_DIVERGED`, `tsdb_volume_diverged`). `tsdb DIR volume diverged --clear` is refused on cluster
+   volumes (D23; use `tsdb cluster replica reset` to rebuild the replica instead). On single-server volumes, reverse
+   intent (D5 / R15 D14: `eng_unsettle` restoring `P.part` from verified `settled_P.part` or decoded chunks and retiring
+   `P.ec` via intent v5 `U` lines before clearing `DIVERGED`) is built and tested (`tests/test_ecunsettle.c`,
+   `make ecunsettle-mutants`).
 8. **Done (R8-1, `server/chunksrv.[ch]`, `server/chunkpeer.[ch]`):** leader writes stripe chunks to all positions over
    `PL_KIND_CHUNK`/`CHUNKB` and commits `MK_COLD`; members read through `coldops_peer` (`k' + 200 ms` grace). Degraded
    settles (E10) moved to **R9** (D24).
@@ -59,8 +66,11 @@ describes what is now built; below is the status of each R8 item.
 
 ## D7: followers
 
-**Moved to R15 (D24):** followers over a tier (`chunk_store_open` read-only and `ecpart_follower_open`, shared storage)
-remain unbuilt (`server/tsdbd.c` / engine still fail a follower that opens a tier or meets an `.ec` name).
+**Done (R15 `r15-follow`, D13):** followers and read-only opens of a `TIERS` database open a read-only tier
+(`CHUNK_OPEN_RDONLY` in `src/chunkstore.c`: no `flock`, no `EPOCH` write, no `tmp_*` cleanup, no chunk deletes; every
+non-`LOST` store required with `store_id` and `db_id` checked; `.ec` parts read through the follower's own `eccache`,
+and `ecgc` retains retired chunks on the writer for `obsolete_part_lifetime_s`). A follower without a tier that meets
+an `.ec` name still stops with one line (`tier_follower_ec`).
 
 ## D8: prefetch
 
@@ -83,11 +93,12 @@ runs `ycold`, `ecabovey`, `cutnogate`).
   dropped in `ecgc_last_unref`, stored in O(1) open-addressing hash tables keyed by `const part *` and `(volume, oid)`.
 - **Open (design choice):** `ecgc` still runs its own tier worker thread (calling `ecgc_tier_work`, which also drives
   `ecgcmk_work`), rather than piggybacking on the settle thread.
-- **Moved to R15:** `src/ecswap.c` holds `latest_rw` and `db->lock` across `2n` renames (r7-swap M2): decide when NFS
-  tiers arrive in R15.
-- **Done for cluster / moved to R15 for single server (D24):** cluster `chunksrv` stores bind to cluster UUID + node ID
-  at `tsdb chunk-store init` and verify META at open (`server/chunksrv_cluster.c`); single-server tier store META with
-  `db_id` moves to **R15**.
+- **Done (R15 D15):** `src/ecswap.c` keeps `latest_rw` and `db->lock` across the `2n` renames on NFS too (they touch
+  the volume directory, not the tier stores; intent writes and syncs stay outside `latest_rw` and `db->lock`).
+- **Done (R8-1 cluster + R15 single server):** cluster `chunksrv` stores bind to cluster UUID + node ID at
+  `tsdb disk init` / bind (`server/disks.c`, `server/chunksrv_cluster.c`); single-server tier stores bind to root
+  `META` `db_id=` via `db=<hex>` in store `META` at `tsdb DIR tier add` and verify on every open (`src/tiers.c`,
+  `src/volumes.c`, `src/chunkstore.c`, `src/tier.c`).
 - **Moved to R9 (D24):** `eccache_reopen` call after a heal in `tsdbd` (`r7-seam #3`).
 - **Done (R8-1 / `r8p-prefetch`):** `route_decide` with a diverged volume is covered by `test_cluster diverged` and
   `jepsen-cluster-ec`; `tsdb_query_multi` over settled parts has a standalone seam test (`tests/test_seam.c` `case_multi`,
@@ -123,8 +134,9 @@ Tests that were not written:
 - `tier`: the directory fsync of `meta_edit` is unobserved (the open's later directory fsyncs cover it); the reopen test
   is in-process, not under outagefs; META is read in 512-byte pieces; a read-only open is refused rather than served.
 - `ecpart`: `cell_bytes` is not capped below `CHUNK_CELL_LIMIT` (chunk.h: a recorded cell may be any size, E2).
-- The seam: `cache_mb` is a key of `TSDB_TEST_TIER` (cluster builds expose `ec.cache` in `docs/config.md`; single-server
-  tiers join `storage.` with **R15**); the byte columns of statistics use `eccache_part_bytes` for an `.ec` part.
+- The seam: `storage.tier.cache` (`--tier-cache-mb`, `tsdb_tier_set_cache_bytes`) configures the single-server tier's
+  decoded granule cache (and `ec.cache` / `--ec-cache-mb` in cluster builds; `cache_mb` in `TSDB_TEST_TIER` stays a
+  test hook); the byte columns of statistics use `eccache_part_bytes` for an `.ec` part.
 
 Harness and engine:
 - `settle-steps` does not judge a server's exit status (only power does): a transient exit 1 at start passes unnoticed;
