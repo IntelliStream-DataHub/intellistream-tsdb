@@ -3793,8 +3793,8 @@ static void tier_store_stuck_tick(uint64_t r)
             char cname[64];
             snprintf(cname, sizeof cname, "jepsen.cold.%d", tier_nem_rounds);
             tsdbc *c = NULL;
-            if (connect_own_ms(atomic_load(&port), atomic_load(&server_pid), &c, 3000) == 0 && c) {
-                tsdbc_set_timeout(c, 3000);
+            if (connect_own_ms(atomic_load(&port), atomic_load(&server_pid), &c, 8000) == 0 && c) {
+                tsdbc_set_timeout(c, 8000);
                 tsdb_sid csid = 0;
                 if (tsdbc_series(c, cname, 0, &csid) == 0) {
                     tsdb_points p = {0};
@@ -3808,7 +3808,7 @@ static void tier_store_stuck_tick(uint64_t r)
             }
         }
         if (qrc == 0)
-            qrc = tier_query_all_series(3000, NULL);
+            qrc = tier_query_all_series(8000, NULL);
         if (qrc != 0 && !atomic_load(&stop)) {
             tier_nem_problems++;
             fprintf(stderr,

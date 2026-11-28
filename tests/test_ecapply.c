@@ -2444,11 +2444,22 @@ static void test_unsettle(void)
     size_t ndue = 0;
     CHECK(ecgc_take_due_retired(L.db, INT64_MAX, &due, &ndue) == 0 && ndue == 0);
     free(due);
-    /* Once all log replicas have applied past MK_UNSETTLE, ecgc_take_due_retired releases the unsettled oids. */
+    /* Once all log replicas have applied past MK_UNSETTLE, ecgc_take_due_retired releases the unsettled oids.
+     * Under slow ASan runs a background settle/merge snapshot can briefly hold a ref on a retired .ec part. */
     eng_leader_applied_floor(L.db, last);
     due = NULL;
     ndue = 0;
-    CHECK(ecgc_take_due_retired(L.db, INT64_MAX, &due, &ndue) == 0 && ndue == objs);
+    int due_rc = 0;
+    for (int tries = 0; tries < 40; tries++) {
+        free(due);
+        due = NULL;
+        ndue = 0;
+        due_rc = ecgc_take_due_retired(L.db, INT64_MAX, &due, &ndue);
+        if (due_rc != 0 || ndue == objs)
+            break;
+        usleep(50000);
+    }
+    CHECK(due_rc == 0 && ndue == objs);
     free(due);
 
     lstop(&L);

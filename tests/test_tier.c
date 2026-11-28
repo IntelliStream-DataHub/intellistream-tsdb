@@ -2909,6 +2909,7 @@ static void t_follower(void)
         wo.create_volumes = 0;
 
         bool prev_gc_manual = atomic_exchange(&ecgc_test_manual, true);
+        tierscrub_set_test_pause(true);
         direct wd = {0}, fd = {0};
         CHECK(tier_open(db3, &wo, &wd.t) == 0 && wd.t != NULL);
         if (wd.t) {
@@ -2966,11 +2967,15 @@ static void t_follower(void)
             CHECK(tf_count_retired_ec(db3) == 1);
 
             /* Drive writer's graveyard purge + synchronous GC worker: within obsolete_part_lifetime_s (60 s), chunks
-             * MUST stay! (Planted mutant `followdel` ignores ge->deadline and deletes p0's chunks right here.) */
-            graveyard_purge(wd.db, false);
-            ecgc_tier_work(wd.t);
-            graveyard_purge(wd.db, false);
-            ecgc_tier_work(wd.t);
+             * MUST stay! (Planted mutant `followdel` ignores ge->deadline and deletes p0's chunks right here.)
+             * Loop briefly so any transient settle/background part_ref under slow ASan drops before followdel checks. */
+            for (int tries = 0; tries < 10; tries++) {
+                graveyard_purge(wd.db, false);
+                ecgc_tier_work(wd.t);
+                if (tf_count_retired_ec(db3) == 0)
+                    break;
+                rh_sleep_ms(30);
+            }
 
             /* Drop follower's eccache so it MUST fetch p0's chunks from disk (not from cache). */
             eccache_test_drop(fd.t);
@@ -3014,6 +3019,7 @@ static void t_follower(void)
         if (wd.t)
             tier_quiesce(wd.t);
         direct_close(&wd);
+        tierscrub_set_test_pause(false);
         atomic_store(&ecgc_test_manual, prev_gc_manual);
 
         /* Reopen writer with 1 s lifetime: verify retired_p0.ec is cleaned up once the lifetime expires.

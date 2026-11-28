@@ -2177,8 +2177,10 @@ int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info),
     return 0;
 }
 
+#ifdef TSDB_TEST_HOOKS
 static atomic_int g_disk_fill_no_release;
 static atomic_int g_disk_fill_merge_on;
+#endif
 
 void eng_set_disk_fill_mutants(int no_release, int merge_on)
 {

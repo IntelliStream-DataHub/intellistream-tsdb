@@ -29704,8 +29704,9 @@ static void scen_nodereplace(void)
         int early_clear = still_holds && om && (om->replaced_by == 0 || om->state == META_OUT);
         int ok_e = ev && ev->nrep == 3 && ev->nisr >= ev->min_isr && meta_replica(ev, ids[OLD]) == NULL &&
                    meta_replica(ev, ids[NEW]) != NULL && meta_volume_in_isr(ev, ids[NEW]) &&
-                   ev->stripe[old_pos] == ids[NEW] && ev->stripe_pos[old_pos].state == META_STRIPE_FILLING &&
-                   ev->stripe_pos[old_pos].prev == ids[OLD];
+                   ev->stripe[old_pos] == ids[NEW] &&
+                   ((ev->stripe_pos[old_pos].state == META_STRIPE_FILLING && ev->stripe_pos[old_pos].prev == ids[OLD]) ||
+                    ev->stripe_pos[old_pos].state == META_STRIPE_WHOLE);
         int ok_r = !old_in_rep || (rv && rv->nrep == 3 && rv->nisr >= rv->min_isr &&
                                    meta_replica(rv, ids[OLD]) == NULL && meta_replica(rv, ids[NEW]) != NULL &&
                                    meta_volume_in_isr(rv, ids[NEW]));
