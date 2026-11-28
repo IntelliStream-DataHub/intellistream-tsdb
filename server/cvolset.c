@@ -251,6 +251,13 @@ int cvolset_prepare(const char *root, uint32_t number, const struct cvolfs_rec *
         return 0;
     if (cvolfs_test_mutant == CVOLFS_MUT_STALEOPEN)
         return 0; /* planted: left in place (cvolfs refuses it as another instance) */
+#ifdef TSDB_TEST_HOOKS
+    {
+        const char *dm = getenv("TSDB_DISKS_MUTANT");
+        if (dm && strcmp(dm, "adoptlogdir") == 0 && !reset)
+            return 0; /* planted: carry over adopted v<N> without setting aside as .stale-<rid> */
+    }
+#endif
     const char *kind = reset && cvolfs_test_mutant != CVOLFS_MUT_LOSTASSTALE ? "lost" : "stale"; /* planted: stale */
     if (cvolset_setaside(root, number, kind, rid, to, sizeof to) != 0)
         return -1;

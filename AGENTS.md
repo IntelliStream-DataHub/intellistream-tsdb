@@ -726,6 +726,23 @@ cgroup, so `nice` does not keep your work out of its way.
   `CLUSTER_OP_DISK_CLASS=25` (`STORE_CLASS`, triggering drains/rebuilds) exposed as `tsdb cluster disk out|replace|class`
   in `tools/cluster-cli.c`. Tests: `test_cluster diskout`, `test_sreconcile` (`test_out_no_room_parking`),
   `test-cluster-cli`, `make diskout-mutants` (`TSDB_DISKS_MUTANT`: `devoutnohold rebuildtofast damagenoout`).
+  R13 `r13-adopt` (E54, `docs/design-cluster-data.md` §15.6, `PLAN.md` D20): `tsdbd --adopt OLD` (`cluster.adopt` in
+  `server/tsdbd_keys.h` and `docs/config.md`) accepts `OLD`'s disks at startup as pending adoption (holding their
+  exclusive `flock`, serving zero chunk stores or log replicas, never writing to them or pinning them as engine root —
+  pinning `<state-dir>/engine` via `primary state-engine` in `<state-dir>/DISKS` when all disks are pending — and
+  advertising `adopt_old`/`adopt_chunk_stores` in `HBS_DISKS` v4 while emitting v3 when `adopt_old == 0`); `cnode.c`
+  refuses `node replace OLD NEW` while `OLD` is still heard (`adoptheard`), `place.c` skips pending-adoption members,
+  and `cl_member_adopt_pending` blocks replace completion until `NEW` is heard fresh with `adopt_old == 0` and every
+  adopted `store_id` transferred via `META_OP_STORE_ADD` (`server/meta.c`, guarded by `MUT(73)` `storeadoptany` and
+  `meta_check_step`). Once `node replace OLD NEW` commits, `disks_try_adopt` atomically rebinds each `DISK` via
+  `disk_rebind_locked` (`src/disk.c`, `DISK.tmp -> fsync -> rename -> dir fsync`, crashfs-swept in `test_disks`),
+  sets aside `OLD`'s `v<N>`/`.old`/`.snap` log dirs as `v<N>.stale-<rid>` before `cvol` sees the disk (gap 14, also
+  recovered pre-`cvol_start` in `disks_start` after `TSDB_ADOPT_CRASH_AT=after_rebind`), attaches chunk stores raising
+  fences before install (`chunk_be_see_epoch_for_attach`, `src/chunkstore.c`/`src/chunkheal.c`, tested in
+  `test_chunk_heal`), and reconciles via `sfill`/`sreconcile` (`CHUNK_LIST`) with `< 1%` peer chunk copy.
+  Tests: `test_disks` (`disk_rebind` + crashfs), `test_chunk_heal` (`attach_cluster_all_null`), `test_meta` +
+  `meta_mutants.sh` (`67`/`73`), `test_cluster adopt`, `make adopt-mutants` (`TSDB_DISKS_MUTANT`: `adoptheard
+  adoptlogdir adoptnorebind`).
 - `server/chunkpeer.[ch]`, `server/chunkpeer_cluster.c` (R8 r8f/r8k): `coldops_peer`, the `cold_ops` implementation for
   cluster EC volumes (`requires=tier,ec` set by `chunkpeer_cluster_prepare` before `cvol` open). `put_stream` stages each
   position as an unlinked temporary (`mkstemp` + `unlink`, sums then cells), writes the leader's own position locally

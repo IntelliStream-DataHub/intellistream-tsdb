@@ -2756,7 +2756,7 @@ uint64_t chunk_be_epoch(chunk_backend *be, uint32_t volume)
     return e;
 }
 
-int chunk_be_see_epoch(chunk_backend *be, uint32_t volume, uint64_t e)
+static int see_epoch_impl(chunk_backend *be, uint32_t volume, uint64_t e, bool allow_zero_open)
 {
     if (be->read_only)
         return TSDB_ERR_READONLY;
@@ -2787,11 +2787,21 @@ int chunk_be_see_epoch(chunk_backend *be, uint32_t volume, uint64_t e)
             else if (rc == 0)
                 rc = r;
         }
-        if (ok == 0 && rc == 0)
+        if (ok == 0 && rc == 0 && !allow_zero_open)
             rc = TSDB_ERR_IO; /* every store has failed: nothing holds the epoch durably */
     }
     pthread_mutex_unlock(&be->mu);
     return rc;
+}
+
+int chunk_be_see_epoch(chunk_backend *be, uint32_t volume, uint64_t e)
+{
+    return see_epoch_impl(be, volume, e, false);
+}
+
+int chunk_be_see_epoch_for_attach(chunk_backend *be, uint32_t volume, uint64_t e)
+{
+    return see_epoch_impl(be, volume, e, true);
 }
 
 /* The fence before a put or delete at epoch e: refused below it, raised (in every store) above it. A store whose EPOCH

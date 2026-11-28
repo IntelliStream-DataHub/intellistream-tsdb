@@ -859,6 +859,53 @@ static void test_attach(void)
     printf("  attach: a store that was away (puts refused meanwhile) is filled before it is UP, wrong id refused\n");
 }
 
+/* R13 r13-adopt: attaching a store carrying durable volume epochs into an all-NULL (DOWN_MISSING) backend must raise
+ * the backend's in-memory fence BEFORE install (never silently dropping fence raises or failing with TSDB_ERR_IO when
+ * zero other stores are open), and attaching a second store carrying a higher epoch must raise the first store durably
+ * before install. */
+static void test_attach_cluster_all_null(void)
+{
+    char dir[PATH_MAX], p0[PATH_MAX + 32], p1[PATH_MAX + 32];
+    snprintf(dir, sizeof dir, "%s/attach_null", S);
+    CHECK(mkdir(dir, 0755) == 0);
+    snprintf(p0, sizeof p0, "%s/s0", dir);
+    snprintf(p1, sizeof p1, "%s/s1", dir);
+    uint8_t id0[16], id1[16];
+    CHECK(chunk_store_init(p0, NULL, id0) == 0);
+    CHECK(chunk_store_init(p1, NULL, id1) == 0);
+
+    /* Pre-seed durable volume epochs: s0 holds vol 7 epoch 5, s1 holds vol 7 epoch 9. */
+    chunk_store *s0 = NULL, *s1 = NULL;
+    CHECK(chunk_store_open(p0, id0, &s0) == 0);
+    CHECK(chunk_store_raise(s0, 7, 5) == 0);
+    chunk_store_close(s0);
+    CHECK(chunk_store_open(p1, id1, &s1) == 0);
+    CHECK(chunk_store_raise(s1, 7, 9) == 0);
+    chunk_store_close(s1);
+
+    /* Open a 2-slot backend with both slots NULL (DOWN_MISSING), mirroring r13-adopt startup. */
+    const char *nulls[2] = {NULL, NULL};
+    chunk_backend *be = NULL;
+    CHECK(chunk_be_open2(&be, nulls, 2, NULL, &(chunk_be_opts){.min_up = 0}) == 0);
+    CHECK(chunk_be_epoch(be, 7) == 0);
+
+    /* First attach (zero other open stores): must succeed and raise backend fence to 5 BEFORE install. */
+    CHECK(chunk_be_attach_cluster(be, 0, p0, id0, NULL, NULL, 0) == 0);
+    CHECK(chunk_be_epoch(be, 7) == 5);
+    CHECK(chunk_be_promote_up(be, 0) == 0);
+    CHECK(chunk_be_prepare(be, 7, 4) == CHUNK_ERR_FENCED);
+
+    /* Second attach (slot 0 open, s1 holds higher epoch 9): must raise slot 0 durably to 9 BEFORE install. */
+    CHECK(chunk_be_attach_cluster(be, 1, p1, id1, NULL, NULL, 0) == 0);
+    CHECK(chunk_be_epoch(be, 7) == 9);
+    CHECK(chunk_store_epoch(chunk_be_store(be, 0), 7) == 9);
+    CHECK(chunk_be_promote_up(be, 1) == 0);
+    CHECK(chunk_be_prepare(be, 7, 8) == CHUNK_ERR_FENCED);
+
+    chunk_be_close(be);
+    printf("  attach_cluster_all_null: fences raised before install into all-NULL backend and propagated across stores\n");
+}
+
 /* ---------------------------------------------------------------- review rounds: what a heal may not get wrong */
 static int live_twice_count;
 /* The first answer says "live", the second (asked just before a name is made) says a delete came in meanwhile. */
@@ -1965,6 +2012,7 @@ int main(int argc, char **argv)
     test_heal_refusals();
     test_replace();
     test_attach();
+    test_attach_cluster_all_null();
     test_review();
     test_single_copy_heal();
     test_threads();

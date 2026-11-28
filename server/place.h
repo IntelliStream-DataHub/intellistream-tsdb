@@ -71,6 +71,7 @@ struct place_member {
     struct place_vol_fault faults[PLACE_FAULTS_MAX];
     uint32_t ndisks;
     const struct place_disk_usage *disks; /* optional HBS_DISKS per-disk usage snapshot (NULL/0: unreported) */
+    uint32_t adopt_old; /* R13 r13-adopt: non-zero while member is pending adoption of old member (not generally placeable) */
 };
 
 /* Per-position fill report received via HBS_FILL (D10, D11). */

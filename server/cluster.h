@@ -370,6 +370,7 @@ void cluster_del_settings_watch(cluster_settings_watch_fn fn, void *arg);
  * new member may reuse an OUT member's peer address), so TOPOLOGY's nodes and STATUS's peers list them. */
 struct cluster_copy_member {
     uint32_t id;
+    uint32_t replaced_by;     /* R9/R13: non-zero while node replace OLD NEW is active on this member */
     uint8_t state;            /* enum meta_member_state */
     uint8_t role;             /* enum meta_role (R13, E20, E49) */
     uint8_t capability;       /* enum meta_cap bitmask (R13, E49) */

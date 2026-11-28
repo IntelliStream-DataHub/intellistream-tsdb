@@ -7493,6 +7493,7 @@ int main(int argc, char **argv)
                                    {"disk", required_argument, 0, 0x129},
                                    {"role", required_argument, 0, 0x12a},
                                    {"allow-shared-device", no_argument, 0, 0x12b},
+                                   {"adopt", required_argument, 0, 0x12c},
                                    {"chunk-rate-mb-s", required_argument, 0, 0x116},
                                    {"ec-settle-grace-s", required_argument, 0, 0x117},
                                    {"ec-settle-keep-s", required_argument, 0, 0x118},
@@ -7531,6 +7532,7 @@ int main(int argc, char **argv)
     int ndisks = 0;
     uint8_t cluster_role = META_ROLE_BOTH;
     int role_set = 0, allow_shared_device = 0;
+    uint32_t adopt_old = 0;
     struct tier_cfg_entry *tier_cfg_entries = NULL;
     int ntier_cfg = 0;
     uint64_t tier_cache_mb = 0;
@@ -7815,6 +7817,11 @@ int main(int argc, char **argv)
             allow_shared_device = 1;
             cluster_opts = 1;
             break;
+        case 0x12c:
+            adopt_old = (uint32_t)num_arg("adopt", optarg, 0, UINT32_MAX);
+            if (adopt_old > 0)
+                cluster_opts = 1;
+            break;
         case 0x116: chunk_rate = (uint64_t)num_arg("chunk-rate-mb-s", optarg, 1, 1 << 20) << 20; cluster_opts = 1; break;
         case 0x117: g_ec_cfg.settle_grace_s = (uint32_t)num_arg("ec-settle-grace-s", optarg, 0, 86400 * 365); break;
         case 0x118: g_ec_cfg.settle_keep_s = (uint32_t)num_arg("ec-settle-keep-s", optarg, 0, 86400 * 365); break;
@@ -7943,9 +7950,9 @@ int main(int argc, char **argv)
         free(tier_cfg_entries);
         return 2;
     }
-    if (witness && (!cluster_on || dir || ndisks || ntier_cfg || role_set || allow_shared_device)) {
+    if (witness && (!cluster_on || dir || ndisks || ntier_cfg || role_set || allow_shared_device || adopt_old)) {
         fprintf(stderr, "tsdbd: --witness is a cluster member without volumes: it needs --cluster, and takes no "
-                        "--dir, no --disk, no --role, no --allow-shared-device and no --tier\n");
+                        "--dir, no --disk, no --role, no --allow-shared-device, no --adopt and no --tier\n");
         free(disk_specs);
         free(tier_cfg_entries);
         return 2;
@@ -7987,7 +7994,7 @@ int main(int argc, char **argv)
                         "              [--peer-allow-ipoib]\n"
                         "              [--fwd-max-age-ms 1000] [--fwd-reply-ms 30000] [--fwd-workers 4]\n"
                         "              [--disk PATH[:CLASS]]... [--role both|compute|storage] [--allow-shared-device]\n"
-                        "              [--chunk-rate-mb-s 256]]\n"
+                        "              [--adopt OLD] [--chunk-rate-mb-s 256]]\n"
                         "             [--ec-settle-grace-s 3600] [--ec-settle-keep-s 86400] [--ec-settle-force-s 3600]\n"
                         "             [--ec-settle-wait-max-s 7200] [--ec-cache-mb MB]\n"
                         "             [--tier PATH[:CLASS]]... [--tier-cache-mb MB]\n"
@@ -8178,7 +8185,8 @@ int main(int argc, char **argv)
                                  .nspecs = nall,
                                  .state_dir = state_dir,
                                  .role = cluster_role,
-                                 .allow_shared_device = allow_shared_device};
+                                 .allow_shared_device = allow_shared_device,
+                                 .adopt_old = adopt_old};
         char derr[512];
         int drc = disks_prepare(&dcfg, derr, sizeof derr);
         free(all_specs);

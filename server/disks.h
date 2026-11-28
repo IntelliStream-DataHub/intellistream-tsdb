@@ -63,6 +63,7 @@ struct disks_cfg {
     const char *state_dir;
     uint8_t role;            /* enum meta_role */
     int allow_shared_device; /* --allow-shared-device */
+    uint32_t adopt_old;      /* --adopt OLD (R13 r13-adopt; 0: off) */
 };
 
 /* Decoded HBS_DISKS payload stored in heard->ext (read by cluster.c's propose_disks and build_place_members). */
@@ -92,6 +93,8 @@ struct hbs_disks {
     uint8_t allow_shared_device; /* 1 while --allow-shared-device is set */
     uint8_t drain_no_space;      /* 1 while any draining store stopped because no target store has room */
     uint32_t class_mismatches;   /* local /sys detection disagreements */
+    uint32_t adopt_old;          /* R13 r13-adopt: non-zero while waiting to adopt member adopt_old */
+    uint32_t adopt_chunk_stores; /* number of pending-adoption chunk stores waiting on adopt_old */
     uint32_t ndisks;
     struct hbs_disk_row disks[];
 };
@@ -205,6 +208,13 @@ int disks_pick_rebuild_store(int lost_slot);
 void disks_on_replacing_settled(uint64_t settled_mask);
 void disks_set_reconcile_kick(void (*fn)(void));
 
+/* R13 (r13-adopt): return pending adoption target OLD (0 if none) and optional pending chunk store count. */
+uint32_t disks_adopt_info(uint32_t *chunk_stores_out);
+/* R13 (r13-adopt): 1 if this server currently has store_id UP locally (lock-free-friendly helper for cnode_duty). */
+int disks_has_up_store(const uint8_t store_id[16]);
+/* R13 (r13-adopt): retry pending adoption against `c` without rerunning unrelated disks_sync_copy() work. */
+void disks_adopt_retry(const struct cluster_copy *c);
+
 /* Unregister HBS_DISKS / metrics and release disk locks. */
 void disks_stop(void);
 
@@ -223,6 +233,9 @@ enum {
     DISKS_MUT_DEVOUTNOHOLD = 10, /* devoutnohold: ignore member hold when marking a device OUT */
     DISKS_MUT_REBUILDTOFAST = 11,/* rebuildtofast: allow capacity-store OUT rebuild onto a fast (NVMe/SSD) disk */
     DISKS_MUT_DAMAGENOOUT = 12,  /* damagenoout: ignore r12-chunk damage > scrub_out_count instead of marking OUT */
+    DISKS_MUT_ADOPT_HEARD = 13,  /* adoptheard: accept --adopt / node replace adoption while OLD is still heard */
+    DISKS_MUT_ADOPT_LOGDIR = 14, /* adoptlogdir: carry over v<N> log dir on adopted fast disk instead of .stale-<rid> */
+    DISKS_MUT_ADOPT_NOREBIND = 15, /* adoptnorebind: skip atomic DISK rewrite to NEW during adoption */
 };
 int disks_mutant_parse(const char *name);
 int disks_mutant(void);

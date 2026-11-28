@@ -2660,11 +2660,83 @@ static void test_r13_meta(void)
     CHECK(meta_member_disk(meta_member(&m, 1), d_hdd1.store_id) != NULL &&
           meta_member_disk(meta_member(&m, 1), d_hdd3.store_id) == NULL);
 
-    /* Duplicate store_id refused on SAME member and on DIFFERENT member (catches MUT(67) storeaddtwice) */
+    /* Duplicate store_id refused on SAME member and on DIFFERENT member (catches MUT(67) storeaddtwice & MUT(73) storeadoptany) */
     meta_op_store_add(&e, 1, &d_nvme1); /* same member */
-    meta_op_store_add(&e, 2, &d_nvme1); /* moved disk on another member: not a new disk */
+    meta_op_store_add(&e, 2, &d_nvme1); /* moved disk on another member without active node replace: refused */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS && res[1] == META_ERR_EXISTS);
     CHECK(meta_member(&m, 1)->ndisks == 2 && meta_member(&m, 2)->ndisks == 1);
+
+    /* R13 r13-adopt: STORE_ADD transfer from OLD to NEW requires OLD->replaced_by == NEW, OLD != DESTROYED,
+     * and disk != DESTROYED; meta_check_step accepts valid transfer and rejects unauthorized disk removal. */
+    {
+        struct meta_state ma, mprev;
+        init_cluster(&ma, &e, META_MODE_REPLICATED, 4);
+        struct meta_disk d_a1 = make_disk(6001, META_DISK_NVME, META_DISK_USE_LOG);
+        struct meta_disk d_a2 = make_disk(6002, META_DISK_HDD, META_DISK_USE_CHUNK);
+        struct meta_disk d_a3 = make_disk(6003, META_DISK_HDD, META_DISK_USE_CHUNK);
+        meta_op_store_add(&e, 2, &d_a1);
+        meta_op_store_add(&e, 2, &d_a2);
+        meta_op_store_add(&e, 2, &d_a3);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK);
+        /* Mark d_a3 DOWN -> OUT -> DESTROYED on node 2. */
+        meta_op_store_state(&e, 2, d_a3.store_id, META_STORE_DOWN);
+        meta_op_store_state(&e, 2, d_a3.store_id, META_STORE_OUT);
+        meta_op_store_state(&e, 2, d_a3.store_id, META_STORE_DESTROYED);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK);
+
+        /* Start NODE_REPLACE(2, 3): transfer to 3 succeeds, transfer to 4 fails, DESTROYED disk fails. */
+        meta_op_node_replace(&e, 2, 3);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK);
+
+        /* Transfer to wrong target (node 4 != replaced_by 3): refused (catches MUT(73) storeadoptany). */
+        meta_op_store_add(&e, 4, &d_a1);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS);
+        CHECK(meta_member_disk(meta_member(&ma, 2), d_a1.store_id) != NULL &&
+              meta_member_disk(meta_member(&ma, 4), d_a1.store_id) == NULL);
+
+        /* Transfer of DESTROYED disk d_a3 to node 3: refused. */
+        struct meta_disk d_a3_up = d_a3;
+        d_a3_up.state = META_STORE_UP;
+        meta_op_store_add(&e, 3, &d_a3_up);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS);
+        CHECK(meta_member_disk(meta_member(&ma, 2), d_a3.store_id) != NULL &&
+              meta_member_disk(meta_member(&ma, 3), d_a3.store_id) == NULL);
+
+        /* Valid transfer of d_a1 and d_a2 to node 3 (replaced_by == 3): accepted and meta_check_step passes. */
+        meta_copy(&mprev, &ma);
+        meta_op_store_add(&e, 3, &d_a1);
+        meta_op_store_add(&e, 3, &d_a2);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+        CHECK(meta_check_step(&mprev, &ma, why, sizeof why) == 0);
+        CHECK(meta_member(&ma, 2)->ndisks == 1 && meta_member(&ma, 2)->capability == META_CAP_NONE);
+        CHECK(meta_member(&ma, 3)->ndisks == 2 && meta_member(&ma, 3)->capability == META_CAP_BOTH);
+        CHECK(meta_member_disk(meta_member(&ma, 3), d_a1.store_id) != NULL &&
+              meta_member_disk(meta_member(&ma, 3), d_a2.store_id) != NULL);
+
+        /* meta_check_step must reject a disk leaving node 2 to a member other than replaced_by (node 4). */
+        struct meta_state mbad;
+        meta_copy(&mbad, &mprev);
+        struct meta_member *m2 = (struct meta_member *)meta_member(&mbad, 2);
+        struct meta_member *m4 = (struct meta_member *)meta_member(&mbad, 4);
+        m4->disks[m4->ndisks++] = m2->disks[0];
+        for (uint32_t j = 1; j < m2->ndisks; j++)
+            m2->disks[j - 1] = m2->disks[j];
+        m2->ndisks--;
+        CHECK(meta_check_step(&mprev, &mbad, why, sizeof why) != 0);
+        meta_free(&mbad);
+        meta_free(&mprev);
+
+        /* Transfer from a DESTROYED member (UP -> OUT -> DESTROYED): refused. */
+        struct meta_disk d_a4 = make_disk(6004, META_DISK_NVME, META_DISK_USE_ALL);
+        meta_op_store_add(&e, 4, &d_a4);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_member_state(&e, 4, META_OUT, 1, META_DOWN_NONE, 0, 0);
+        meta_op_member_state(&e, 4, META_DESTROYED, 1, META_DOWN_NONE, 0, 0);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+        meta_op_store_add(&e, 3, &d_a4);
+        CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS);
+        meta_free(&ma);
+    }
 
     /* OUT member cannot register new disks */
     meta_op_member_state(&e, 8, META_OUT, 1, META_DOWN_NONE, 0, 0);
@@ -4736,9 +4808,15 @@ static void check_named(struct msim *s, struct snode *nd, const struct meta_stat
             uint32_t nid = rd32(b);
             const struct meta_member *mb = meta_member(&at, nid);
             int dup = 0;
-            for (uint32_t mi = 0; mi < at.nmembers && !dup; mi++)
-                if (meta_member_disk(&at.members[mi], b + 4) != NULL)
-                    dup = 1;
+            for (uint32_t mi = 0; mi < at.nmembers && !dup; mi++) {
+                const struct meta_disk *od = meta_member_disk(&at.members[mi], b + 4);
+                if (!od)
+                    continue;
+                if (at.members[mi].id != nid && at.members[mi].replaced_by == nid &&
+                    at.members[mi].state != META_DESTROYED && od->state != META_STORE_DESTROYED)
+                    continue;
+                dup = 1;
+            }
             if (!mb || mb->state >= META_OUT || mb->ndisks >= META_DISKS_MAX || dup)
                 sim_fail(s, "node %u, index %" PRIu64 ": STORE_ADD on member %u (dup %d) was applied illegally", nd->id,
                          e->index, nid, dup);
@@ -5932,6 +6010,8 @@ int main(int argc, char **argv)
                 mutant = 71;
             else if (!strcmp(mn, "settingsnocas"))
                 mutant = 72;
+            else if (!strcmp(mn, "storeadoptany"))
+                mutant = 73;
             else
                 mutant = atoi(mn);
         } else if (!strcmp(argv[i], "--sim-only")) /* the simulator's checker alone, to see it catch a planted bug */

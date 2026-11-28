@@ -45,6 +45,12 @@ uint64_t cl_wall_ms(void);
 int cl_pend_member(uint32_t id);
 /* number of chunk stores currently UP on member `id` as last reported in HBS_STORES (0 if none/unknown) */
 uint32_t cl_member_chunk_stores(uint32_t id);
+/* R13 (r13-adopt): return member `id`'s pending adoption target from HBS_DISKS (0 if not pending adoption),
+ * and optionally its count of pending-adoption chunk stores in `*chunk_stores_out`. */
+uint32_t cl_member_adopt_info(uint32_t id, uint32_t *chunk_stores_out);
+/* R13 (r13-adopt): 1 if `node replace old_node new_node` must not complete yet (new_node is not heard fresh yet,
+ * still reports pending adoption of old_node, or reports any UP store_id still owned non-DESTROYED by old_node in sm). */
+int cl_member_adopt_pending(const struct meta_state *sm, uint32_t old_node, uint32_t new_node, uint64_t now);
 /* R13 (r13-place; E49, E50, E51, E53): 1 if `node` passes log-replica / stripe-position capability, role and disk fill
  * rules under the current heartbeat view, else 0 with optional reason in *why_out. */
 int cl_member_log_ok(uint32_t node, uint64_t now, const char **why_out);

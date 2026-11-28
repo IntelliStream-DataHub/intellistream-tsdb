@@ -498,6 +498,43 @@ static void test_init_load_bind(void)
     CHECK(disk_load(d1, &loaded) == 0 && loaded.bound && loaded.node_id == 7 &&
           memcmp(loaded.cluster_uuid, cl1, 16) == 0);
 
+    /* disk_rebind: explicit adoption rewrite OLD -> NEW (same cluster only) */
+    {
+        char dunb[PATH_MAX + 32];
+        fresh_dir("rebind-unbound", dunb, sizeof dunb);
+        CHECK(disk_init(dunb, DISK_CLASS_NVME, NULL, &m) == 0);
+        cap_begin();
+        CHECK(disk_rebind(dunb, cl1, 7, 19) == TSDB_ERR_INVALID); /* unbound refused */
+        CHECK(disk_rebind(d1, zero16, 7, 19) == TSDB_ERR_INVALID);
+        CHECK(disk_rebind(d1, cl1, 0, 19) == TSDB_ERR_INVALID);
+        CHECK(disk_rebind(d1, cl1, 7, 0) == TSDB_ERR_INVALID);
+        CHECK(disk_rebind(d1, cl1, 7, 7) == TSDB_ERR_INVALID);
+        CHECK(disk_rebind(d1, cl2, 7, 19) == TSDB_ERR_INVALID);  /* foreign cluster refused */
+        CHECK(disk_rebind(d1, cl1, 99, 19) == TSDB_ERR_INVALID); /* wrong old_node refused */
+        cap_end(NULL, 0);
+        /* Busy lock returns TSDB_ERR_LOCKED */
+        int lfd = open(d1, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        CHECK(lfd >= 0 && flock(lfd, LOCK_EX | LOCK_NB) == 0);
+        cap_begin();
+        CHECK(disk_rebind(d1, cl1, 7, 19) == TSDB_ERR_LOCKED);
+        cap_end(NULL, 0);
+        close(lfd);
+        /* Valid rebind 7 -> 19 preserves store_id, class, sync_p50_us, cluster_uuid */
+        disk_meta before_rb;
+        CHECK(disk_load(d1, &before_rb) == 0);
+        CHECK(disk_rebind(d1, cl1, 7, 19) == 0);
+        CHECK(disk_load(d1, &loaded) == 0 && loaded.bound && loaded.node_id == 19 &&
+              memcmp(loaded.cluster_uuid, cl1, 16) == 0 &&
+              memcmp(loaded.store_id, before_rb.store_id, 16) == 0 &&
+              loaded.disk_class == before_rb.disk_class && loaded.sync_p50_us == before_rb.sync_p50_us);
+        /* Idempotent retry 7 -> 19 succeeds */
+        CHECK(disk_rebind(d1, cl1, 7, 19) == 0);
+        /* Subsequent rebind from stale old node 7 -> 25 is refused */
+        cap_begin();
+        CHECK(disk_rebind(d1, cl1, 7, 25) == TSDB_ERR_INVALID);
+        cap_end(NULL, 0);
+    }
+
     /* Corrupt DISK detection: bit flip, oversize (73 bytes), truncation -> TSDB_ERR_CORRUPT naming path */
     char dcor[PATH_MAX + 32], fpath[PATH_MAX + 64];
     fresh_dir("corrupt", dcor, sizeof dcor);
@@ -749,6 +786,39 @@ static void child_entry(const char *mode, const char *dir, const char *ackfile)
         write_ack(ackfile, "bound-idemp");
         exit(0);
     }
+    if (strcmp(mode, "rebind") == 0) {
+        uint8_t cl[16];
+        for (int i = 0; i < 16; i++)
+            cl[i] = (uint8_t)(0x70 + i);
+        if (disk_rebind(dir, cl, 42, 99) != 0)
+            _exit(4);
+        write_ack(ackfile, "rebound");
+        exit(0);
+    }
+    if (strcmp(mode, "rebind-idemp") == 0) {
+        uint8_t cl[16];
+        for (int i = 0; i < 16; i++)
+            cl[i] = (uint8_t)(0x70 + i);
+        disk_meta cur;
+        if (disk_load(dir, &cur) != 0)
+            _exit(4);
+        cur.node_id = 99;
+        uint8_t raw[DISK_META_BYTES];
+        if (disk_meta_encode(&cur, raw) != 0)
+            _exit(4);
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd < 0)
+            _exit(4);
+        int fd = openat(dfd, "DISK.tmp", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd < 0 || write(fd, raw, sizeof raw) != (ssize_t)sizeof raw || tsdb_fsync(fd) != 0 || close(fd) != 0 ||
+            renameat(dfd, "DISK.tmp", dfd, DISK_META_FILE) != 0)
+            _exit(4);
+        close(dfd); /* deliberately NO fsync(dfd): rename is in page cache only */
+        if (disk_rebind(dir, cl, 42, 99) != 0)
+            _exit(4);
+        write_ack(ackfile, "rebound-idemp");
+        exit(0);
+    }
     _exit(3);
 }
 
@@ -991,6 +1061,93 @@ static void test_bind_idemp_durability(void)
     CHECK(d.bound && d.node_id == 42 && memcmp(d.cluster_uuid, cl, 16) == 0);
 }
 
+static void sweep_rebind(void)
+{
+    char dir[PATH_MAX + 32], ackf[PATH_MAX + 32], ackbuf[128], msg[256];
+    snprintf(ackf, sizeof ackf, "%s/pl-rebind.ack", S);
+    uint8_t cl[16];
+    for (int i = 0; i < 16; i++)
+        cl[i] = (uint8_t)(0x70 + i);
+
+    int crashes = 0;
+    bool finished = false;
+    for (int k = 0; k < 200 && !finished; k++) {
+        fresh_dir("pl-rebind", dir, sizeof dir);
+        disk_meta orig;
+#ifdef TSDB_TEST_HOOKS
+        disk_test_sync_samples = 2;
+#endif
+        CHECK(disk_init(dir, DISK_CLASS_HDD, NULL, &orig) == 0);
+#ifdef TSDB_TEST_HOOKS
+        disk_test_sync_samples = 0;
+#endif
+        CHECK(disk_bind(dir, cl, 42) == 0);
+        unlink(ackf);
+
+        int code = run_child("rebind", dir, ackf, k, k + 301);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += (code == 99);
+        finished = (code == 0);
+
+        bool acked = read_ack(ackf, ackbuf, sizeof ackbuf);
+        disk_meta d;
+        cap_begin();
+        int rc = disk_load(dir, &d);
+        cap_end(NULL, 0);
+
+        if (rc != 0) {
+            snprintf(msg, sizeof msg, "rebind step %d: DISK missing or corrupt after power loss (rc=%d)", k, rc);
+            fail_at(__FILE__, __LINE__, msg);
+            continue;
+        }
+        CHECK(memcmp(d.store_id, orig.store_id, 16) == 0 && d.disk_class == orig.disk_class &&
+              d.sync_p50_us == orig.sync_p50_us && d.bound && memcmp(d.cluster_uuid, cl, 16) == 0);
+        if (acked) {
+            if (d.node_id != 99) {
+                snprintf(msg, sizeof msg, "rebind step %d: acknowledged rebind lost (node=%u)", k, d.node_id);
+                fail_at(__FILE__, __LINE__, msg);
+            }
+        } else {
+            CHECK(d.node_id == 42 || d.node_id == 99);
+        }
+        /* Retry after any crash must always leave DISK cleanly rebound to NEW (node 99) */
+        CHECK(disk_rebind(dir, cl, 42, 99) == 0);
+        CHECK(disk_load(dir, &d) == 0 && d.bound && d.node_id == 99 && memcmp(d.cluster_uuid, cl, 16) == 0);
+    }
+    CHECK(finished && crashes > 2);
+}
+
+static void test_rebind_idemp_durability(void)
+{
+    char dir[PATH_MAX + 32], ackf[PATH_MAX + 32], ackbuf[64];
+    snprintf(ackf, sizeof ackf, "%s/pl-rebind-idemp.ack", S);
+    fresh_dir("pl-rebind-idemp", dir, sizeof dir);
+    disk_meta orig;
+#ifdef TSDB_TEST_HOOKS
+    disk_test_sync_samples = 2;
+#endif
+    CHECK(disk_init(dir, DISK_CLASS_NVME, NULL, &orig) == 0);
+#ifdef TSDB_TEST_HOOKS
+    disk_test_sync_samples = 0;
+#endif
+    uint8_t cl[16];
+    for (int i = 0; i < 16; i++)
+        cl[i] = (uint8_t)(0x70 + i);
+    CHECK(disk_bind(dir, cl, 42) == 0);
+    unlink(ackf);
+
+    int code = run_child_ex("rebind-idemp", dir, dir, ackf, "0", 0, 888);
+    CHECK(code == 0);
+    CHECK(read_ack(ackf, ackbuf, sizeof ackbuf));
+
+    disk_meta d;
+    CHECK(disk_load(dir, &d) == 0);
+    CHECK(memcmp(d.store_id, orig.store_id, 16) == 0);
+    CHECK(d.bound && d.node_id == 99 && memcmp(d.cluster_uuid, cl, 16) == 0);
+}
+
 static void test_power_loss(void)
 {
     if (access(SHIM, R_OK) != 0) {
@@ -1006,8 +1163,10 @@ static void test_power_loss(void)
     sweep_init_mkdir();
     sweep_bind();
     test_bind_idemp_durability();
-    printf("  crashfs power loss (and retry) at every step of disk_init (hdd, nvme, mkdir), disk_bind, and "
-           "idempotent bind ok\n");
+    sweep_rebind();
+    test_rebind_idemp_durability();
+    printf("  crashfs power loss (and retry) at every step of disk_init (hdd, nvme, mkdir), disk_bind, "
+           "disk_rebind, and idempotent retries ok\n");
 }
 
 int main(int argc, char **argv)

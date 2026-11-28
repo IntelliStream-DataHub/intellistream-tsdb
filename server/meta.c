@@ -3461,10 +3461,32 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         struct meta_member *mb = &m->members[at];
         if (mb->state >= META_OUT)
             return META_ERR_STATE;
-        if (!MUT(67) && store_id_known(m, d.store_id)) /* storeaddtwice: a disk moved between members is not new */
-            return META_ERR_EXISTS;
-        if (mb->ndisks >= META_DISKS_MAX)
+        if (!MUT(67) && store_id_known(m, d.store_id)) {
+            /* R13 r13-adopt (E54): allow transferring an existing non-DESTROYED store_id from OLD to NEW when
+             * NODE_REPLACE(OLD, NEW) is active (old_mb->replaced_by == node). Any other duplicate is META_ERR_EXISTS. */
+            struct meta_member *old_mb = NULL;
+            int old_di = -1;
+            for (uint32_t i = 0; i < m->nmembers; i++) {
+                int di = member_disk_at(&m->members[i], d.store_id);
+                if (di >= 0) {
+                    old_mb = &m->members[i];
+                    old_di = di;
+                    break;
+                }
+            }
+            if (!old_mb || old_mb->id == node ||
+                (!MUT(73) && (old_mb->replaced_by != node || old_mb->state == META_DESTROYED ||
+                              old_mb->disks[old_di].state == META_STORE_DESTROYED)))
+                return META_ERR_EXISTS;
+            if (mb->ndisks >= META_DISKS_MAX)
+                return META_ERR_RANGE;
+            for (uint32_t j = (uint32_t)old_di + 1; j < old_mb->ndisks; j++)
+                old_mb->disks[j - 1] = old_mb->disks[j];
+            old_mb->ndisks--;
+            old_mb->capability = member_compute_cap(old_mb, m->set.log_on_hdd);
+        } else if (mb->ndisks >= META_DISKS_MAX) {
             return META_ERR_RANGE;
+        }
         mb->disks[mb->ndisks++] = d;
         mb->capability = member_compute_cap(mb, m->set.log_on_hdd);
         return META_OK;
@@ -4788,13 +4810,25 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
             FAIL("member %u: left OUT to %s without a new incarnation (%llu -> %llu)", a->id,
                  meta_member_state_name(b->state), (unsigned long long)a->incarnation,
                  (unsigned long long)b->incarnation);
-        if (b->ndisks < a->ndisks)
-            FAIL("member %u: disk count went down (%u -> %u)", a->id, a->ndisks, b->ndisks);
-        for (uint32_t j = 0; j < a->ndisks && j < META_DISKS_MAX; j++) {
-            if (memcmp(a->disks[j].store_id, b->disks[j].store_id, 16) != 0)
+        {
+            const struct meta_member *rep_mb = a->replaced_by ? meta_member(next, a->replaced_by) : NULL;
+            uint32_t bj = 0;
+            for (uint32_t j = 0; j < a->ndisks && j < META_DISKS_MAX; j++) {
+                if (bj < b->ndisks && memcmp(a->disks[j].store_id, b->disks[bj].store_id, 16) == 0) {
+                    if (a->disks[j].state == META_STORE_DESTROYED && b->disks[bj].state != META_STORE_DESTROYED)
+                        FAIL("member %u: disk %u left DESTROYED to %s", a->id, j,
+                             meta_store_state_name(b->disks[bj].state));
+                    bj++;
+                    continue;
+                }
+                /* R13 r13-adopt: a non-DESTROYED disk may leave member a ONLY if transferred to a->replaced_by. */
+                if (rep_mb && a->disks[j].state != META_STORE_DESTROYED &&
+                    meta_member_disk(rep_mb, a->disks[j].store_id) != NULL)
+                    continue;
+                if (b->ndisks < a->ndisks)
+                    FAIL("member %u: disk count went down (%u -> %u)", a->id, a->ndisks, b->ndisks);
                 FAIL("member %u: disk %u changed store_id", a->id, j);
-            if (a->disks[j].state == META_STORE_DESTROYED && b->disks[j].state != META_STORE_DESTROYED)
-                FAIL("member %u: disk %u left DESTROYED to %s", a->id, j, meta_store_state_name(b->disks[j].state));
+            }
         }
         if (a->role != b->role && b->ndisks > 0) {
             if (b->role == META_ROLE_COMPUTE && !(a->ndisks == 0 || (a->capability & META_CAP_COMPUTE)) &&

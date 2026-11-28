@@ -629,7 +629,11 @@ static void *cc_main(void *arg)
         }
         if (cs) {
             unsigned long b = cluster_copy_builds();
+            static uint64_t adopt_next_ns = 0;
+            static uint64_t adopt_backoff_ns = 500ULL * 1000000ULL;
             if (!have || b != seen) {
+                adopt_backoff_ns = 500ULL * 1000000ULL;
+                adopt_next_ns = 0;
                 const struct cluster_copy *c = cluster_copy_get();
                 if (c) {
                     set_peers(cs, c, self);
@@ -654,6 +658,20 @@ static void *cc_main(void *arg)
                     if (getenv("TSDB_CHUNKSRV_TEST") && !tested) /* on its own thread: peers keep moving */
                         tested = pthread_create(&st_thr, NULL, selftest_main, cs) == 0;
 #endif
+                }
+            } else if (disks_adopt_info(NULL) != 0) {
+                struct timespec ats;
+                clock_gettime(CLOCK_MONOTONIC, &ats);
+                uint64_t anow = (uint64_t)ats.tv_sec * 1000000000ULL + (uint64_t)ats.tv_nsec;
+                if (anow >= adopt_next_ns) {
+                    const struct cluster_copy *c = cluster_copy_get();
+                    if (c) {
+                        disks_adopt_retry(c);
+                        cluster_copy_put(c);
+                    }
+                    adopt_next_ns = anow + adopt_backoff_ns;
+                    if (adopt_backoff_ns < 5000ULL * 1000000ULL)
+                        adopt_backoff_ns *= 2;
                 }
             }
             report_up(cs);

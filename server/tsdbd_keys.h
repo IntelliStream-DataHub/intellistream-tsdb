@@ -162,6 +162,8 @@ static const struct cfg_key tsdbd_keys[] = {
     CK_B("cluster.allow.shared.device", "allow-shared-device", "false",
          "Allow a disk on the same file system as /, cluster.state.dir or another disk (for test harnesses and "
          "one-disk development hosts; health warns while set)."),
+    CK_I("cluster.adopt", "adopt", "0",
+         "Adopt disks belonging to replaced member id OLD after tsdb cluster node replace OLD NEW commits (0: off)."),
     CK_I("cluster.chunk.rate", "chunk-rate-mb-s", "256",
          "MB/s of chunk puts to other members, all links together: a cap of its own, apart from replication's."),
     /* the erasure-coded tier */

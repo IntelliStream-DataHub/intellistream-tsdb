@@ -177,6 +177,7 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `cluster.fwd.workers` | `--fwd-workers` | integer | 4 | Worker threads reserved for requests other members forward here (more start while all of them wait). |
 | `cluster.role` | `--role` | both,compute,storage | both | Declared role of this member: both (compute and storage as disks allow), compute (log replicas only), or storage (chunk stores only). |
 | `cluster.allow.shared.device` | `--allow-shared-device` | boolean | false | Allow a disk on the same file system as /, cluster.state.dir or another disk (for test harnesses and one-disk development hosts; health warns while set). |
+| `cluster.adopt` | `--adopt` | integer | 0 | Adopt disks belonging to replaced member id OLD after tsdb cluster node replace OLD NEW commits (0: off). |
 | `cluster.chunk.rate` | `--chunk-rate-mb-s` | integer | 256 | MB/s of chunk puts to other members, all links together: a cap of its own, apart from replication's. |
 | `ec.settle.grace` | `--ec-settle-grace-s` | duration (plain: s) | 1h | How long after a partition's end it is erasure-coded (settled). |
 | `ec.settle.keep` | `--ec-settle-keep-s` | duration (plain: s) | 1d | How long the parts a settle replaced are kept. |

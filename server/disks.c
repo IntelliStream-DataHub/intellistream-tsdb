@@ -29,11 +29,14 @@
 #include "../src/compat.h"
 #include "../src/cvol.h"
 #include "../src/internal.h"
+#include "../src/replfile.h"
 
-#define HBS_DISKS_VER      3u
+#define HBS_DISKS_VER      4u
+#define HBS_DISKS_VER_V3   3u
 #define HBS_DISKS_VER_V2   2u
 #define HBS_DISKS_VER_V1   1u
 #define HBS_DISKS_HDR      8u
+#define HBS_DISKS_HDR_V4   16u
 #define HBS_DISKS_ENTRY_V1 36u
 #define HBS_DISKS_ENTRY_V2 52u
 #define HBS_DISKS_ENTRY    96u
@@ -80,6 +83,9 @@ struct disk_entry {
     int attaching;         /* 1 while async return-before-OUT attach thread is running */
     int replacing;         /* 1 while chunk store is in CHUNK_STORE_REPLACING awaiting reconcile */
     int fast_only_rebuild; /* test mutant rebuildtofast only: fast disk slot open solely for rebuild */
+    /* R13 r13-adopt: pending adoption of OLD's disks until node replace OLD NEW commits. */
+    int pending_adopt; /* 1 while disk belongs to G.adopt_old awaiting commit (serves nothing) */
+    int adopted;       /* 1 once adopted from G.adopt_old */
     /* R13 r13-lmove: local chunk drain state. */
     int draining;                /* 1 while this chunk store is being drained locally (no new puts) */
     int drain_no_space;          /* 1 while drain stopped because no target store has room */
@@ -134,6 +140,7 @@ static struct {
     int nknown;
     struct known_disk known[DISKS_MAX];
     int have_primary_id;
+    int primary_in_state; /* 1 when engine root is pinned to <state-dir>/engine (all disks pending adoption) */
     uint8_t primary_id[16];
     /* R13 (r13-fault): per-disk health probe monitor (src/health.c). */
     tsdb_health *probe_h;
@@ -163,6 +170,12 @@ static struct {
     int attach_threads;
     int replace_thr_running;
     pthread_cond_t replace_cv;
+    /* R13 r13-adopt: --adopt OLD state. */
+    uint32_t adopt_old;
+    int adopt_done;
+    int adopt_heard_logged;
+    int adopt_destroyed_logged;
+    uint64_t adopt_err_log_ns;
 #ifdef TSDB_TEST_HOOKS
     int mutant;
 #endif
@@ -335,6 +348,7 @@ static void known_load(const char *state_dir)
 {
     G.nknown = 0;
     G.have_primary_id = 0;
+    G.primary_in_state = 0;
     memset(G.primary_id, 0, sizeof G.primary_id);
     char p[PATH_MAX + 32];
     if (snprintf(p, sizeof p, "%s/DISKS", state_dir) >= (int)sizeof p)
@@ -352,10 +366,16 @@ static void known_load(const char *state_dir)
         while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r'))
             line[--l] = '\0';
         if (strncmp(line, "primary ", 8) == 0) {
-            uint8_t pid[16];
-            if (parse_hex16(line + 8, pid) == 0) {
-                memcpy(G.primary_id, pid, 16);
-                G.have_primary_id = 1;
+            if (strcmp(line + 8, "state-engine") == 0) {
+                G.primary_in_state = 1;
+                G.have_primary_id = 0;
+            } else {
+                uint8_t pid[16];
+                if (parse_hex16(line + 8, pid) == 0) {
+                    memcpy(G.primary_id, pid, 16);
+                    G.have_primary_id = 1;
+                    G.primary_in_state = 0;
+                }
             }
             continue;
         }
@@ -393,8 +413,8 @@ static const struct known_disk *known_find_path(const char *path)
     return NULL;
 }
 
-static void known_save_snapshot(const char *state_dir, const struct known_disk *rows, int nrows, int have_primary,
-                                const uint8_t primary_id[16])
+static void known_save_snapshot(const char *state_dir, const struct known_disk *rows, int nrows, int primary_in_state,
+                                int have_primary, const uint8_t primary_id[16])
 {
     if (!state_dir || !*state_dir)
         return;
@@ -416,7 +436,10 @@ static void known_save_snapshot(const char *state_dir, const struct known_disk *
         return;
     }
     int werr = (fprintf(f, "tsdb disks 1\n") < 0);
-    if (!werr && have_primary) {
+    if (!werr && primary_in_state) {
+        if (fprintf(f, "primary state-engine\n") < 0)
+            werr = 1;
+    } else if (!werr && have_primary) {
         char phex[33];
         chunk_oid_hex(primary_id, phex);
         if (fprintf(f, "primary %s\n", phex) < 0)
@@ -458,10 +481,12 @@ static void persist_known_from_state(void)
     struct known_disk rows[DISKS_MAX];
     int nrows = 0;
     char sdir[PATH_MAX];
+    int primary_in_state = 0;
     int have_primary = 0;
     uint8_t primary_id[16] = {0};
     pthread_mutex_lock(&g_mu);
     snprintf(sdir, sizeof sdir, "%s", G.state_dir);
+    primary_in_state = G.primary_in_state;
     have_primary = G.have_primary_id;
     if (have_primary)
         memcpy(primary_id, G.primary_id, 16);
@@ -469,7 +494,7 @@ static void persist_known_from_state(void)
         const struct disk_entry *d = &G.disks[i];
         if (!d->path[0])
             continue;
-        if (d->present && !d->meta.bound)
+        if (d->present && (!d->meta.bound || d->pending_adopt))
             continue;
         struct known_disk *r = &rows[nrows++];
         memcpy(r->store_id, d->meta.store_id, 16);
@@ -496,7 +521,7 @@ static void persist_known_from_state(void)
     if (nrows > 0)
         memcpy(G.known, rows, (size_t)nrows * sizeof rows[0]);
     pthread_mutex_unlock(&g_mu);
-    known_save_snapshot(sdir, rows, nrows, have_primary, primary_id);
+    known_save_snapshot(sdir, rows, nrows, primary_in_state, have_primary, primary_id);
 }
 
 /* ---------------------------------------------------------------- parsing & mutants */
@@ -530,6 +555,12 @@ int disks_mutant_parse(const char *name)
         return DISKS_MUT_REBUILDTOFAST;
     if (strcmp(name, "damagenoout") == 0)
         return DISKS_MUT_DAMAGENOOUT;
+    if (strcmp(name, "adoptheard") == 0)
+        return DISKS_MUT_ADOPT_HEARD;
+    if (strcmp(name, "adoptlogdir") == 0)
+        return DISKS_MUT_ADOPT_LOGDIR;
+    if (strcmp(name, "adoptnorebind") == 0)
+        return DISKS_MUT_ADOPT_NOREBIND;
     return -1;
 }
 
@@ -784,6 +815,7 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
     uint64_t raw_size[DISKS_MAX] = {0}, raw_young[DISKS_MAX] = {0}, raw_chunks[DISKS_MAX] = {0};
 #endif
     uint32_t nrows = 0, mismatches = 0;
+    uint32_t adopt_old = 0, adopt_cs = 0;
     uint8_t role = META_ROLE_BOTH;
     int allow_shared = 0, drain_no_space = 0, started = 0;
 
@@ -793,8 +825,17 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
     allow_shared = G.allow_shared;
     drain_no_space = G.drain_no_space_any;
     mismatches = G.class_mismatches;
-    for (int i = 0; started && i < G.ndisks && nrows < DISKS_MAX; i++) {
+    int any_pending_adopt = 0;
+    for (int i = 0; started && i < G.ndisks; i++) {
         const struct disk_entry *d = &G.disks[i];
+        if (d->pending_adopt) {
+            any_pending_adopt = 1;
+            if (d->has_chunks)
+                adopt_cs++;
+            continue;
+        }
+        if (nrows >= DISKS_MAX)
+            continue;
         /* Never emit unbound disks: disk_bind must succeed before STORE_ADD can be proposed (§15.1). */
         if (d->present && !d->meta.bound)
             continue;
@@ -834,25 +875,36 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         raw_chunks[idx] = d->usage_raw_chunks;
 #endif
     }
+    if (any_pending_adopt && G.adopt_old != 0)
+        adopt_old = G.adopt_old;
+    else
+        adopt_cs = 0;
     pthread_mutex_unlock(&g_mu);
 
     if (!started)
         return 0;
-    if (nrows == 0 && role == META_ROLE_BOTH && !allow_shared && !drain_no_space && mismatches == 0)
+    if (nrows == 0 && role == META_ROLE_BOTH && !allow_shared && !drain_no_space && mismatches == 0 && adopt_old == 0)
         return 0;
 #ifdef TSDB_TEST_HOOKS
     apply_disk_usage_file(rows, nrows, raw_size, raw_young, raw_chunks);
 #endif
-    size_t need = HBS_DISKS_HDR + (size_t)nrows * HBS_DISKS_ENTRY;
+    /* Emit v3 (8-byte header) whenever not pending adoption so older peers accept HBS_DISKS during mixed versions;
+     * emit v4 (16-byte header) only while adopt_old != 0. */
+    size_t hdr = adopt_old != 0 ? HBS_DISKS_HDR_V4 : HBS_DISKS_HDR;
+    size_t need = hdr + (size_t)nrows * HBS_DISKS_ENTRY;
     if (need > cap)
         return -1;
-    buf[0] = HBS_DISKS_VER;
+    buf[0] = adopt_old != 0 ? HBS_DISKS_VER : HBS_DISKS_VER_V3;
     buf[1] = role;
     buf[2] = (uint8_t)((allow_shared ? 1u : 0u) | (drain_no_space ? 2u : 0u));
     buf[3] = (uint8_t)nrows;
     put_le32(buf + 4, mismatches);
+    if (adopt_old != 0) {
+        put_le32(buf + 8, adopt_old);
+        put_le32(buf + 12, adopt_cs);
+    }
     for (uint32_t i = 0; i < nrows; i++) {
-        uint8_t *e = buf + HBS_DISKS_HDR + (size_t)i * HBS_DISKS_ENTRY;
+        uint8_t *e = buf + hdr + (size_t)i * HBS_DISKS_ENTRY;
         memcpy(e, rows[i].store_id, 16);
         e[16] = rows[i].disk_class;
         e[17] = rows[i].uses;
@@ -881,21 +933,28 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
     if (!data || !out_val || len < HBS_DISKS_HDR)
         return -1;
     uint8_t ver = data[0];
+    size_t hdr = HBS_DISKS_HDR;
     size_t esz;
-    if (ver == HBS_DISKS_VER)
+    if (ver == HBS_DISKS_VER) {
+        hdr = HBS_DISKS_HDR_V4;
         esz = HBS_DISKS_ENTRY;
-    else if (ver == HBS_DISKS_VER_V2)
+    } else if (ver == HBS_DISKS_VER_V3) {
+        esz = HBS_DISKS_ENTRY;
+    } else if (ver == HBS_DISKS_VER_V2) {
         esz = HBS_DISKS_ENTRY_V2;
-    else if (ver == HBS_DISKS_VER_V1)
+    } else if (ver == HBS_DISKS_VER_V1) {
         esz = HBS_DISKS_ENTRY_V1;
-    else
+    } else {
+        return -1;
+    }
+    if (len < hdr)
         return -1;
     uint8_t role = data[1];
     uint8_t flags = data[2];
     uint32_t n = data[3];
     if (role > META_ROLE_LAST || (flags & ~3u) || n > DISKS_MAX)
         return -1;
-    if (len != HBS_DISKS_HDR + (size_t)n * esz)
+    if (len != hdr + (size_t)n * esz)
         return -1;
     struct hbs_disks *v = calloc(1, sizeof *v + (size_t)n * sizeof v->disks[0]);
     if (!v)
@@ -904,9 +963,13 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
     v->allow_shared_device = (uint8_t)(flags & 1u);
     v->drain_no_space = (uint8_t)((flags >> 1) & 1u);
     v->class_mismatches = get_le32(data + 4);
+    if (ver == HBS_DISKS_VER) {
+        v->adopt_old = get_le32(data + 8);
+        v->adopt_chunk_stores = get_le32(data + 12);
+    }
     v->ndisks = n;
     for (uint32_t i = 0; i < n; i++) {
-        const uint8_t *e = data + HBS_DISKS_HDR + (size_t)i * esz;
+        const uint8_t *e = data + hdr + (size_t)i * esz;
         struct hbs_disk_row *r = &v->disks[i];
         memcpy(r->store_id, e, 16);
         int nz = 0;
@@ -948,7 +1011,7 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
             r->young_bytes = get_le64(e + 36);
             r->chunk_bytes = get_le64(e + 44);
         }
-        if (ver == HBS_DISKS_VER) {
+        if (ver >= HBS_DISKS_VER_V3) {
             r->retained_bytes = get_le64(e + 52);
             r->retired_bytes = get_le64(e + 60);
             r->local_bytes = get_le64(e + 68);
@@ -989,6 +1052,12 @@ static size_t disks_sec_format(uint32_t member_id, const void *val, char *buf, s
     }
     if (v->drain_no_space && off + 1 < cap) {
         int n = snprintf(buf + off, cap - off, "disks node=%" PRIu32 " warn=drain_no_space\n", member_id);
+        if (n > 0)
+            off += (size_t)n < cap - off ? (size_t)n : cap - off - 1;
+    }
+    if (v->adopt_old && off + 1 < cap) {
+        int n = snprintf(buf + off, cap - off, "disks node=%" PRIu32 " adopt_old=%" PRIu32 " adopt_chunk_stores=%" PRIu32 "\n",
+                         member_id, v->adopt_old, v->adopt_chunk_stores);
         if (n > 0)
             off += (size_t)n < cap - off ? (size_t)n : cap - off - 1;
     }
@@ -1228,6 +1297,7 @@ int disks_prepare(const struct disks_cfg *cfg, char *err, size_t errlen)
     snprintf(G.state_dir, sizeof G.state_dir, "%s", cfg->state_dir);
     G.role = cfg->role;
     G.allow_shared = cfg->allow_shared_device ? 1 : 0;
+    G.adopt_old = cfg->adopt_old;
 
 #ifdef TSDB_TEST_HOOKS
     const char *mu = getenv("TSDB_DISKS_MUTANT");
@@ -1284,6 +1354,11 @@ int disks_prepare(const struct disks_cfg *cfg, char *err, size_t errlen)
     uint8_t peek_uuid[16] = {0};
     uint32_t peek_id = 0;
     int peek_have_node = cluster_peek_node(cfg->state_dir, peek_uuid, &peek_id);
+    if (G.adopt_old != 0 && peek_have_node && peek_id == G.adopt_old) {
+        snprintf(err, errlen, "--adopt %" PRIu32 ": cannot adopt own member id", G.adopt_old);
+        pthread_mutex_unlock(&g_mu);
+        return -1;
+    }
 
     for (int i = 0; i < ndedup; i++) {
         struct disk_entry *d = &G.disks[G.ndisks];
@@ -1361,7 +1436,12 @@ int disks_prepare(const struct disks_cfg *cfg, char *err, size_t errlen)
         }
         if (dm.bound) {
             if (peek_have_node) {
-                if (memcmp(dm.cluster_uuid, peek_uuid, 16) != 0 || dm.node_id != peek_id) {
+                if (memcmp(dm.cluster_uuid, peek_uuid, 16) == 0 && dm.node_id == peek_id) {
+                    /* already bound to this member */
+                } else if (G.adopt_old != 0 && memcmp(dm.cluster_uuid, peek_uuid, 16) == 0 &&
+                           dm.node_id == G.adopt_old) {
+                    d->pending_adopt = 1;
+                } else {
                     char have_hex[33], want_hex[33];
                     chunk_oid_hex(dm.cluster_uuid, have_hex);
                     chunk_oid_hex(peek_uuid, want_hex);
@@ -1371,6 +1451,9 @@ int disks_prepare(const struct disks_cfg *cfg, char *err, size_t errlen)
                     pthread_mutex_unlock(&g_mu);
                     return -1;
                 }
+            } else if (G.adopt_old != 0 && dm.node_id == G.adopt_old) {
+                /* Pending adoption: cluster UUID is verified once this server joins (disks_start/disks_bind_late). */
+                d->pending_adopt = 1;
             } else {
                 char have_hex[33];
                 chunk_oid_hex(dm.cluster_uuid, have_hex);
@@ -1382,8 +1465,23 @@ int disks_prepare(const struct disks_cfg *cfg, char *err, size_t errlen)
             }
         }
         /* Pin the engine directory's store_id on first start (or verify it matches the recorded primary in DISKS)
-         * so omitting --dir or switching --dir across restarts never opens a different disk as the engine root. */
+         * so omitting --dir or switching --dir across restarts never opens a different disk as the engine root.
+         * Never open or pin a pending-adoption disk as --dir (tsdb_open would write to OLD's disk before commit). */
         if (d->is_dir) {
+            if (d->pending_adopt) {
+                snprintf(err, errlen,
+                         "disk %s (--dir) belongs to node %" PRIu32
+                         " (pending adoption): pass it with --disk instead of --dir",
+                         d->path, dm.node_id);
+                pthread_mutex_unlock(&g_mu);
+                return -1;
+            }
+            if (G.primary_in_state) {
+                snprintf(err, errlen, "disk %s (--dir) disagrees with recorded primary engine root %s/engine", d->path,
+                         G.state_dir);
+                pthread_mutex_unlock(&g_mu);
+                return -1;
+            }
             if (G.have_primary_id) {
                 if (memcmp(dm.store_id, G.primary_id, 16) != 0) {
                     char have_hex[33], want_hex[33];
@@ -1416,7 +1514,7 @@ int disks_prepare(const struct disks_cfg *cfg, char *err, size_t errlen)
             return -1;
         }
         d->present = 1;
-        d->state = META_STORE_UP;
+        d->state = d->pending_adopt ? META_STORE_DOWN : META_STORE_UP;
         d->meta = dm;
         d->effective_class = dm.disk_class;
         d->sync_us = dm.sync_p50_us;
@@ -1481,11 +1579,21 @@ const char *disks_primary_dir(void)
     static char out[PATH_MAX];
     out[0] = '\0';
     pthread_mutex_lock(&g_mu);
+    /* If the engine root was pinned to <state-dir>/engine (started with all disks pending adoption), keep using it
+     * across every restart so the root never silently switches to an adopted disk later. */
+    if (G.primary_in_state) {
+        if (G.state_dir[0] && snprintf(out, sizeof out, "%s/engine", G.state_dir) < (int)sizeof out) {
+            if ((mkdir(G.state_dir, 0700) != 0 && errno != EEXIST) || (mkdir(out, 0700) != 0 && errno != EEXIST))
+                out[0] = '\0';
+        }
+        pthread_mutex_unlock(&g_mu);
+        return out[0] ? out : NULL;
+    }
     /* If a primary engine disk was already recorded in <state-dir>/DISKS, keep it pinned and refuse if missing. */
     if (G.have_primary_id) {
         for (int i = 0; i < G.ndisks; i++) {
             if (memcmp(G.disks[i].meta.store_id, G.primary_id, 16) == 0) {
-                if (G.disks[i].present && G.disks[i].path[0])
+                if (G.disks[i].present && !G.disks[i].pending_adopt && G.disks[i].path[0])
                     snprintf(out, sizeof out, "%s", G.disks[i].path);
                 break;
             }
@@ -1501,16 +1609,27 @@ const char *disks_primary_dir(void)
         pthread_mutex_unlock(&g_mu);
         return out[0] ? out : NULL;
     }
-    /* First start without --dir: pick present nvme, then present ssd, then present hdd; never a non-present disk. */
+    /* First start without --dir: pick present non-pending nvme, then ssd, then hdd; never a pending-adoption disk. */
     const int order[] = {DISK_CLASS_NVME, DISK_CLASS_SSD, DISK_CLASS_HDD};
     for (size_t k = 0; k < 3 && !out[0]; k++) {
         for (int i = 0; i < G.ndisks; i++) {
-            if (G.disks[i].present && G.disks[i].effective_class == order[k] && G.disks[i].path[0]) {
+            if (G.disks[i].present && !G.disks[i].pending_adopt && G.disks[i].effective_class == order[k] &&
+                G.disks[i].path[0]) {
                 snprintf(out, sizeof out, "%s", G.disks[i].path);
                 memcpy(G.primary_id, G.disks[i].meta.store_id, 16);
                 G.have_primary_id = 1;
                 break;
             }
+        }
+    }
+    /* All configured disks are pending adoption: place and pin the empty cluster engine root under <state-dir>/engine
+     * so nothing is written to OLD's disks before node replace commits AND the root stays pinned across restarts. */
+    if (!out[0] && G.adopt_old != 0 && G.state_dir[0]) {
+        if (snprintf(out, sizeof out, "%s/engine", G.state_dir) < (int)sizeof out &&
+            (mkdir(G.state_dir, 0700) == 0 || errno == EEXIST) && (mkdir(out, 0700) == 0 || errno == EEXIST)) {
+            G.primary_in_state = 1;
+        } else {
+            out[0] = '\0';
         }
     }
     pthread_mutex_unlock(&g_mu);
@@ -1630,6 +1749,8 @@ static int ensure_chunk_store(const struct disk_entry *d, const struct cluster_s
     return 0;
 }
 
+static void adopt_setaside_logdirs(const char *root, uint32_t old_node, int all_vdirs);
+
 int disks_start(char *err, size_t errlen)
 {
     struct cluster_self me;
@@ -1680,7 +1801,12 @@ int disks_start(char *err, size_t errlen)
         }
 
         if (have_rec) {
-            if (d->present && have_self && rec_node != me.id) {
+            const struct cluster_copy_member *rec_mb = c ? cluster_copy_member(c, rec_node) : NULL;
+            int adopt_ok = (G.adopt_old != 0 && rec_node == G.adopt_old &&
+                            (d->pending_adopt || (d->meta.bound && d->meta.node_id == me.id))) ||
+                           (!d->pending_adopt && d->meta.bound && d->meta.node_id == me.id && rec_mb &&
+                            rec_mb->replaced_by == me.id && rec_mb->state != META_DESTROYED);
+            if (d->present && have_self && rec_node != me.id && !adopt_ok) {
                 close(lfd);
                 char hex[33];
                 chunk_oid_hex(d->meta.store_id, hex);
@@ -1710,9 +1836,32 @@ int disks_start(char *err, size_t errlen)
         if (!d->present)
             continue;
 
-        /* Ownership check against DISK metadata (E58). */
+        /* Ownership check against DISK metadata (E58) and --adopt OLD pending adoption (E54). */
         if (have_self) {
-            if (d->meta.bound) {
+            if (d->pending_adopt) {
+                if (G.adopt_old == me.id) {
+                    close(lfd);
+                    snprintf(err, errlen, "--adopt %" PRIu32 ": cannot adopt own member id", G.adopt_old);
+                    goto fail;
+                }
+                if (memcmp(d->meta.cluster_uuid, me.uuid, 16) != 0 || d->meta.node_id != G.adopt_old) {
+                    close(lfd);
+                    char have_hex[33], want_hex[33];
+                    chunk_oid_hex(d->meta.cluster_uuid, have_hex);
+                    chunk_oid_hex(me.uuid, want_hex);
+                    snprintf(err, errlen,
+                             "disk %s belongs to cluster %s node %" PRIu32
+                             ", cannot adopt from node %" PRIu32 " in cluster %s",
+                             d->path, have_hex, d->meta.node_id, G.adopt_old, want_hex);
+                    goto fail;
+                }
+                d->lock_fd = lfd; /* keep exclusive flock while pending adoption so another tsdbd gets BUSY */
+                d->state = META_STORE_DOWN;
+                fprintf(stderr,
+                        "tsdbd: disks: %s (node %" PRIu32 ") accepted as pending adoption (serving nothing until "
+                        "node replace %" PRIu32 " %" PRIu32 " commits)\n",
+                        d->path, d->meta.node_id, G.adopt_old, me.id);
+            } else if (d->meta.bound) {
                 if (memcmp(d->meta.cluster_uuid, me.uuid, 16) != 0 || d->meta.node_id != me.id) {
                     close(lfd);
                     char have_hex[33], want_hex[33];
@@ -1728,14 +1877,23 @@ int disks_start(char *err, size_t errlen)
                 close(lfd); /* release briefly so disk_bind() can lock and atomically update DISK */
             }
         } else {
-            close(lfd);
-            if (d->meta.bound) {
+            if (d->pending_adopt) {
+                d->lock_fd = lfd; /* keep exclusive flock while pending adoption so another tsdbd gets BUSY */
+                d->state = META_STORE_DOWN;
+                fprintf(stderr,
+                        "tsdbd: disks: %s (node %" PRIu32 ") accepted as pending adoption (serving nothing until "
+                        "cluster join and node replace commit)\n",
+                        d->path, d->meta.node_id);
+            } else if (d->meta.bound) {
+                close(lfd);
                 char have_hex[33];
                 chunk_oid_hex(d->meta.cluster_uuid, have_hex);
                 snprintf(err, errlen,
                          "disk %s belongs to cluster %s node %" PRIu32 ", but this server is in no cluster yet",
                          d->path, have_hex, d->meta.node_id);
                 goto fail;
+            } else {
+                close(lfd);
             }
         }
 
@@ -1824,9 +1982,26 @@ int disks_start(char *err, size_t errlen)
 
     compute_uses_locked();
 
-    /* Ensure <disk>/chunks/ exists and matches DISK store_id for every present chunk-serving disk. */
+    /* Crash-recovery restart with --adopt OLD: if a disk was already rebound to this member in a prior run that
+     * crashed before set-aside, move any leftover OLD v<N> dirs to v<N>.stale-<rid> BEFORE cvol_start() scans it. */
+    if (have_self && G.adopt_old != 0) {
+        int skip_logdir = 0;
+#ifdef TSDB_TEST_HOOKS
+        skip_logdir = (G.mutant == DISKS_MUT_ADOPT_LOGDIR);
+#endif
+        if (!skip_logdir) {
+            for (int i = 0; i < G.ndisks; i++) {
+                struct disk_entry *d = &G.disks[i];
+                if (d->present && !d->pending_adopt && d->meta.bound && d->meta.node_id == me.id && d->path[0])
+                    adopt_setaside_logdirs(d->path, G.adopt_old, 0);
+            }
+        }
+    }
+
+    /* Ensure <disk>/chunks/ exists and matches DISK store_id for every present chunk-serving disk (skip writes for
+     * pending-adoption disks until node replace commits). */
     for (int i = 0; i < G.ndisks; i++) {
-        if (G.disks[i].has_chunks && G.disks[i].present) {
+        if (G.disks[i].has_chunks && G.disks[i].present && !G.disks[i].pending_adopt) {
             if (ensure_chunk_store(&G.disks[i], have_self ? &me : NULL, err, errlen) != 0)
                 goto fail;
         }
@@ -1894,6 +2069,26 @@ int disks_bind_late(const uint8_t cluster_uuid[16], uint32_t node_id, char *err,
         struct disk_entry *d = &G.disks[i];
         if (!d->present)
             continue;
+        if (d->pending_adopt) {
+            if (G.adopt_old == node_id) {
+                snprintf(err, errlen, "--adopt %" PRIu32 ": cannot adopt own member id", G.adopt_old);
+                pthread_mutex_unlock(&g_mu);
+                return -1;
+            }
+            if (memcmp(d->meta.cluster_uuid, cluster_uuid, 16) != 0 || d->meta.node_id != G.adopt_old) {
+                char have_hex[33], want_hex[33];
+                chunk_oid_hex(d->meta.cluster_uuid, have_hex);
+                chunk_oid_hex(cluster_uuid, want_hex);
+                snprintf(err, errlen,
+                         "disk %s belongs to cluster %s node %" PRIu32
+                         ", cannot adopt from node %" PRIu32 " in cluster %s",
+                         d->path, have_hex, d->meta.node_id, G.adopt_old, want_hex);
+                pthread_mutex_unlock(&g_mu);
+                return -1;
+            }
+            /* Pending adoption: leave DISK untouched until node replace OLD NEW commits. */
+            continue;
+        }
         if (d->meta.bound) {
             if (memcmp(d->meta.cluster_uuid, cluster_uuid, 16) != 0 || d->meta.node_id != node_id) {
                 char have_hex[33], want_hex[33];
@@ -2013,9 +2208,9 @@ void disks_chunk_layout(const char **paths, int *prefs, bool *draining, int cap,
         }
         if (draining)
             draining[out] = (d->draining != 0 || d->fast_only_rebuild != 0);
-        /* Known-missing configured chunk disk keeps a NULL DOWN_MISSING slot so hash%n placement stays stable and
-         * reads answer UNAVAILABLE instead of NOTFOUND. */
-        if (d->present && d->chunks_path[0])
+        /* Known-missing or pending-adoption chunk disk keeps a NULL DOWN_MISSING slot so hash%n placement stays stable
+         * and nothing is served before adoption commits. */
+        if (d->present && !d->pending_adopt && d->chunks_path[0])
             paths[out++] = d->chunks_path;
         else
             paths[out++] = NULL;
@@ -2045,8 +2240,8 @@ int disks_list(struct disk_info *out, int cap)
             memcpy(di->store_id, d->meta.store_id, 16);
             di->disk_class = d->effective_class;
             di->uses = d->uses;
-            di->state = d->state;
-            di->present = d->present;
+            di->state = d->pending_adopt ? META_STORE_DOWN : d->state;
+            di->present = d->pending_adopt ? 0 : d->present;
             di->recovering = d->probe_recovering;
             di->have_usage = d->usage_have;
             di->size_bytes = d->usage_have && d->usage_size > 0 ? d->usage_size : d->size_bytes;
@@ -2311,7 +2506,7 @@ int disk_probe_start(disk_probe_cb cb, void *ctx, char *err, size_t errlen)
     for (int i = 0; i < G.ndisks && ntodo < DISKS_MAX; i++) {
         struct disk_entry *d = &G.disks[i];
         d->dom_idx = -1;
-        if (!d->present || d->state == META_STORE_DESTROYED || !d->path[0])
+        if (!d->present || d->pending_adopt || d->state == META_STORE_DESTROYED || !d->path[0])
             continue;
         d->dom_idx = ntodo;
         todo[ntodo].disk_idx = i;
@@ -2405,6 +2600,29 @@ void disk_probe_set_up(int disk_idx)
         return;
     if (dom_idx >= 0)
         tsdb_health_set_up(h, dom_idx);
+    probe_release();
+}
+
+static void disk_probe_add_disk(int disk_idx)
+{
+    char path[PATH_MAX] = "";
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+    if (h && disk_idx >= 0 && disk_idx < G.ndisks && G.disks[disk_idx].dom_idx < 0 && G.disks[disk_idx].present &&
+        G.disks[disk_idx].path[0])
+        snprintf(path, sizeof path, "%s", G.disks[disk_idx].path);
+    pthread_mutex_unlock(&g_mu);
+    if (!h)
+        return;
+    if (path[0]) {
+        int idx = tsdb_health_add_domain(h, path, path);
+        if (idx >= 0) {
+            pthread_mutex_lock(&g_mu);
+            if (disk_idx >= 0 && disk_idx < G.ndisks && G.disks[disk_idx].dom_idx < 0)
+                G.disks[disk_idx].dom_idx = idx;
+            pthread_mutex_unlock(&g_mu);
+        }
+    }
     probe_release();
 }
 
@@ -4948,10 +5166,463 @@ static void disks_replace_ensure_locked(void)
     pthread_attr_destroy(&at);
 }
 
+/* ---------------------------------------------------------------- R13 r13-adopt: server disk adoption (§15.6, E54) */
+
+uint32_t disks_adopt_info(uint32_t *chunk_stores_out)
+{
+    if (chunk_stores_out)
+        *chunk_stores_out = 0;
+    if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return 0;
+    uint32_t old = 0, ncs = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.started && G.adopt_old != 0) {
+        int any = 0;
+        for (int i = 0; i < G.ndisks; i++) {
+            if (G.disks[i].pending_adopt) {
+                any = 1;
+                if (G.disks[i].has_chunks)
+                    ncs++;
+            }
+        }
+        if (any)
+            old = G.adopt_old;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (chunk_stores_out)
+        *chunk_stores_out = old ? ncs : 0;
+    return old;
+}
+
+int disks_has_up_store(const uint8_t store_id[16])
+{
+    if (!store_id || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.started) {
+        for (int i = 0; i < G.ndisks; i++) {
+            if (G.disks[i].state == META_STORE_UP && memcmp(G.disks[i].meta.store_id, store_id, 16) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return found;
+}
+
+static void adopt_rm_tree(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return;
+    if (!S_ISDIR(st.st_mode)) {
+        if (unlink(path) != 0 && errno != ENOENT)
+            fprintf(stderr, "tsdbd: disks: warning: adopt unlink %s failed: %s\n", path, strerror(errno));
+        return;
+    }
+    DIR *d = opendir(path);
+    if (d) {
+        for (struct dirent *de; (de = readdir(d)) != NULL;) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+            char sub[PATH_MAX];
+            if (snprintf(sub, sizeof sub, "%s/%s", path, de->d_name) < (int)sizeof sub)
+                adopt_rm_tree(sub);
+        }
+        int dfd = dirfd(d);
+        if (dfd >= 0)
+            (void)tsdb_fsync(dfd);
+        closedir(d);
+    }
+    if (rmdir(path) != 0 && errno != ENOENT)
+        fprintf(stderr, "tsdbd: disks: warning: adopt rmdir %s failed: %s\n", path, strerror(errno));
+}
+
+/* Parse "v<N>" (returns 1), "v<N>.tmp" (returns 2), or "v<N>.old"/"v<N>.snap" (returns 3); 0 otherwise. */
+static int adopt_parse_vdir(const char *name, uint32_t *num)
+{
+    if (!name || name[0] != 'v' || name[1] < '1' || name[1] > '9')
+        return 0;
+    char *end = NULL;
+    unsigned long v = strtoul(name + 1, &end, 10);
+    if (!end || v == 0 || v > UINT32_MAX)
+        return 0;
+    *num = (uint32_t)v;
+    if (*end == '\0')
+        return 1;
+    if (strcmp(end, ".tmp") == 0)
+        return 2;
+    if (strcmp(end, ".old") == 0 || strcmp(end, ".snap") == 0)
+        return 3;
+    return 0;
+}
+
+/* Gap 14: set aside v<N> (and leftover v<N>.old / v<N>.snap) log replica directories on an adopted disk as
+ * v<N>.stale-<rid> (never adopted directly). MUST ONLY be called before `cvol` can see `root` (either while the disk
+ * is still pending_adopt, or during disks_start() before cvol_start()), so deleting v<N>.tmp never races cvolfs. */
+static void adopt_setaside_logdirs(const char *root, uint32_t old_node, int all_vdirs)
+{
+    DIR *d = opendir(root);
+    if (!d)
+        return;
+    int synced = 0;
+    for (struct dirent *de; (de = readdir(d)) != NULL;) {
+        uint32_t vol = 0;
+        int kind = adopt_parse_vdir(de->d_name, &vol);
+        if (kind == 0)
+            continue;
+        char from[PATH_MAX];
+        if (snprintf(from, sizeof from, "%s/%s", root, de->d_name) >= (int)sizeof from)
+            continue;
+        if (kind == 2) {
+            adopt_rm_tree(from);
+            synced = 1;
+            continue;
+        }
+        int dfd = open(from, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd < 0)
+            continue;
+        uint64_t rid = 0;
+        uint32_t rep_node = 0;
+        struct replfile *rf = NULL;
+        struct replfile_state st;
+        bool torn = false;
+        int have_repl = (replfile_load(dfd, &rf, &st, &torn) == 0);
+        if (have_repl) {
+            rid = st.rid;
+            rep_node = st.node;
+            replfile_close(rf);
+            replfile_state_free(&st);
+        }
+        close(dfd);
+        if (!all_vdirs && (!have_repl || rep_node != old_node))
+            continue;
+        if (kind == 3 && !have_repl) {
+            /* Incomplete v<N>.snap/.old with no REPL from OLD: remove so snapinst_leftovers never trips on it. */
+            adopt_rm_tree(from);
+            synced = 1;
+            continue;
+        }
+        char to[PATH_MAX];
+        struct stat sb;
+        int found = 0;
+        for (unsigned k = 0; k < 1000; k++) {
+            int n = k == 0 ? snprintf(to, sizeof to, "%s/v%" PRIu32 ".stale-%016" PRIx64, root, vol, rid)
+                           : snprintf(to, sizeof to, "%s/v%" PRIu32 ".stale-%016" PRIx64 ".%u", root, vol, rid, k);
+            if (n < 0 || n >= (int)sizeof to)
+                break;
+            if (lstat(to, &sb) != 0 && errno == ENOENT) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            continue;
+        if (rename(from, to) == 0) {
+            synced = 1;
+            fprintf(stderr,
+                    "tsdbd: disks: adopted disk %s: set aside log replica %s (node %" PRIu32 ", rid %016" PRIx64
+                    ") as %s (will rebuild via snapshot)\n",
+                    root, de->d_name, rep_node, rid, to);
+        } else {
+            fprintf(stderr, "tsdbd: disks: warning: failed setting aside %s -> %s: %s\n", from, to, strerror(errno));
+        }
+    }
+    closedir(d);
+    if (synced) {
+        int rfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (rfd >= 0) {
+            if (tsdb_fsync(rfd) != 0)
+                fprintf(stderr, "tsdbd: disks: warning: fsync dir %s after set-aside failed: %s\n", root,
+                        strerror(errno));
+            close(rfd);
+        }
+    }
+}
+
+static int adopt_should_log_err(void)
+{
+    uint64_t now = drain_now_ns();
+    int do_log = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.adopt_err_log_ns == 0 || now - G.adopt_err_log_ns >= 30ULL * 1000000000ULL) {
+        G.adopt_err_log_ns = now;
+        do_log = 1;
+    }
+    pthread_mutex_unlock(&g_mu);
+    return do_log;
+}
+
+static void disks_try_adopt(const struct cluster_copy *c)
+{
+    uint32_t adopt_old = 0;
+#ifdef TSDB_TEST_HOOKS
+    int mut = DISKS_MUT_NONE;
+#endif
+    struct adopt_todo {
+        int disk_idx;
+        int has_chunks;
+        int chunk_slot;
+        int lock_fd;
+        char path[PATH_MAX];
+        char cpath[PATH_MAX];
+        uint8_t store_id[16];
+    };
+
+    pthread_mutex_lock(&g_mu);
+    if (!G.started || G.adopt_old == 0 || G.adopt_done) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    pthread_mutex_unlock(&g_mu);
+
+    struct adopt_todo *todo = calloc(DISKS_MAX, sizeof *todo);
+    if (!todo)
+        return;
+    int ntodo = 0;
+
+    pthread_mutex_lock(&g_mu);
+    if (!G.started || G.adopt_old == 0 || G.adopt_done) {
+        pthread_mutex_unlock(&g_mu);
+        free(todo);
+        return;
+    }
+    adopt_old = G.adopt_old;
+#ifdef TSDB_TEST_HOOKS
+    mut = G.mutant;
+#endif
+    /* Snapshot ONLY pending_adopt disks: already-UP disks are visible to cvol (and any crash-recovery leftover
+     * OLD v<N> on an already-rebound disk was already set aside in disks_start() before cvol_start()). */
+    for (int i = 0; i < G.ndisks && ntodo < DISKS_MAX; i++) {
+        const struct disk_entry *d = &G.disks[i];
+        if (!d->present || !d->path[0] || !d->pending_adopt)
+            continue;
+        todo[ntodo].disk_idx = i;
+        todo[ntodo].has_chunks = d->has_chunks;
+        todo[ntodo].chunk_slot = d->chunk_slot;
+        todo[ntodo].lock_fd = d->lock_fd >= 0 ? fcntl(d->lock_fd, F_DUPFD_CLOEXEC, 0) : -1;
+        snprintf(todo[ntodo].path, sizeof todo[ntodo].path, "%s", d->path);
+        snprintf(todo[ntodo].cpath, sizeof todo[ntodo].cpath, "%s", d->chunks_path);
+        memcpy(todo[ntodo].store_id, d->meta.store_id, 16);
+        ntodo++;
+    }
+    if (ntodo == 0)
+        G.adopt_done = 1;
+    pthread_mutex_unlock(&g_mu);
+    if (ntodo == 0) {
+        free(todo);
+        return;
+    }
+
+    const struct cluster_copy_member *old_mb = cluster_copy_member(c, adopt_old);
+    if (!old_mb)
+        goto cleanup;
+    if (old_mb->state == META_DESTROYED) {
+        pthread_mutex_lock(&g_mu);
+        int log_now = !G.adopt_destroyed_logged;
+        G.adopt_destroyed_logged = 1;
+        pthread_mutex_unlock(&g_mu);
+        if (log_now)
+            fprintf(stderr, "tsdbd: disks: --adopt %" PRIu32 ": old node is DESTROYED, refusing adoption\n", adopt_old);
+        goto cleanup;
+    }
+    int old_heard = (old_mb->state == META_UP || old_mb->state == META_DRAINING);
+    int allow_heard = 0;
+#ifdef TSDB_TEST_HOOKS
+    allow_heard = (mut == DISKS_MUT_ADOPT_HEARD);
+#endif
+    if (old_heard && !allow_heard) {
+        pthread_mutex_lock(&g_mu);
+        int log_now = !G.adopt_heard_logged;
+        G.adopt_heard_logged = 1;
+        pthread_mutex_unlock(&g_mu);
+        if (log_now)
+            fprintf(stderr,
+                    "tsdbd: disks: --adopt %" PRIu32 ": old node is still %s/heard, refusing adoption until it is DOWN "
+                    "and node replace %" PRIu32 " %" PRIu32 " commits\n",
+                    adopt_old, meta_member_state_name(old_mb->state), adopt_old, c->self);
+        goto cleanup;
+    }
+    if (old_mb->replaced_by != c->self)
+        goto cleanup;
+
+    struct cluster_self me_self;
+    if (cluster_self(&me_self) != 0 || !me_self.have_node || me_self.id != c->self || me_self.id == adopt_old) {
+        tsdb_wipe(&me_self, sizeof me_self);
+        goto cleanup;
+    }
+
+    uint32_t *vols = NULL;
+    uint64_t *eps = NULL;
+    size_t nv = 0;
+    collect_cluster_epochs(c, &vols, &eps, &nv);
+
+    int skip_rebind = 0, skip_logdir = 0;
+#ifdef TSDB_TEST_HOOKS
+    skip_rebind = (mut == DISKS_MUT_ADOPT_NOREBIND);
+    skip_logdir = (mut == DISKS_MUT_ADOPT_LOGDIR);
+    const char *crash_at = getenv("TSDB_ADOPT_CRASH_AT");
+#endif
+
+    int all_ok = 1;
+    int any_adopted = 0;
+    int need_kick_rec = 0;
+    for (int t = 0; t < ntodo; t++) {
+        int new_lfd = -1;
+        if (!skip_rebind) {
+            int rc = todo[t].lock_fd >= 0
+                         ? disk_rebind_locked(todo[t].lock_fd, todo[t].path, me_self.uuid, adopt_old, me_self.id)
+                         : disk_rebind(todo[t].path, me_self.uuid, adopt_old, me_self.id);
+            if (rc != 0) {
+                if (adopt_should_log_err())
+                    fprintf(stderr, "tsdbd: disks: adopt %s: disk_rebind failed: %s (will retry)\n", todo[t].path,
+                            tsdb_strerror(rc));
+                all_ok = 0;
+                continue;
+            }
+#ifdef TSDB_TEST_HOOKS
+            if (crash_at && strcmp(crash_at, "after_rebind") == 0) {
+                fprintf(stderr, "tsdbd: disks: TSDB_ADOPT_CRASH_AT=after_rebind on %s -> _exit(99)\n", todo[t].path);
+                fflush(stderr);
+                _exit(99);
+            }
+#endif
+        } else {
+            fprintf(stderr, "tsdbd: disks: MUTANT adoptnorebind: skipping DISK rewrite on %s\n", todo[t].path);
+        }
+        if (todo[t].lock_fd < 0) {
+            char lerr[256] = "";
+            if (try_lock_disk(todo[t].path, &new_lfd, lerr, sizeof lerr) != 0) {
+                if (adopt_should_log_err())
+                    fprintf(stderr, "tsdbd: disks: adopt %s: %s (will retry)\n", todo[t].path, lerr);
+                all_ok = 0;
+                continue;
+            }
+        }
+        if (!skip_logdir)
+            adopt_setaside_logdirs(todo[t].path, adopt_old, 1);
+        else
+            fprintf(stderr, "tsdbd: disks: MUTANT adoptlogdir: keeping v<N> log directories on %s\n", todo[t].path);
+
+        if (todo[t].has_chunks && todo[t].chunk_slot >= 0 && todo[t].cpath[0]) {
+            uint8_t cid[16];
+            if (chunk_store_meta_read(todo[t].cpath, cid, NULL) == TSDB_ERR_NOTFOUND)
+                (void)chunk_store_init(todo[t].cpath, todo[t].store_id, NULL);
+            chunk_store *ns = NULL;
+            int arc = chunk_store_prepare_attach(todo[t].cpath, todo[t].store_id, vols, eps, nv, &ns);
+            if (arc != 0) {
+                if (adopt_should_log_err())
+                    fprintf(stderr, "tsdbd: disks: adopt %s: chunk_store_prepare_attach failed: %s (will retry)\n",
+                            todo[t].cpath, tsdb_strerror(arc));
+                if (new_lfd >= 0)
+                    close(new_lfd);
+                all_ok = 0;
+                continue;
+            }
+            struct chunksrv *cs = chunksrv_cluster_hold();
+            if (!cs) {
+                chunk_store_close(ns);
+                if (new_lfd >= 0)
+                    close(new_lfd);
+                all_ok = 0;
+                continue;
+            }
+            chunk_backend *be = chunksrv_backend(cs);
+            int irc;
+            if (!be || chunk_be_detach_for_attach(be, todo[t].chunk_slot) != 0) {
+                chunk_store_close(ns);
+                irc = TSDB_ERR_UNAVAILABLE;
+            } else {
+                /* chunk_be_install_attached takes ownership of ns (closing it on error). */
+                irc = chunk_be_install_attached(be, todo[t].chunk_slot, todo[t].cpath, ns);
+            }
+            if (irc != 0) {
+                chunksrv_cluster_release();
+                if (adopt_should_log_err())
+                    fprintf(stderr, "tsdbd: disks: adopt %s: chunk_be_install_attached failed: %s (will retry)\n",
+                            todo[t].cpath, tsdb_strerror(irc));
+                if (new_lfd >= 0)
+                    close(new_lfd);
+                all_ok = 0;
+                continue;
+            }
+            /* Fences are raised and NEW holds no stripe positions until STRIPE_SET(FILLING) commits: promote UP so
+             * HBS_STORES reports the adopted stores, place_plan moves OLD's positions onto NEW (FILLING), sfill
+             * verifies intact chunks locally, and sreconcile runs two-way CHUNK_LIST on STRIPE_WHOLE. */
+            (void)chunk_be_promote_up(be, todo[t].chunk_slot);
+            chunksrv_cluster_release();
+            need_kick_rec = 1;
+        }
+
+        int di = todo[t].disk_idx;
+        pthread_mutex_lock(&g_mu);
+        if (G.started && di >= 0 && di < G.ndisks && G.disks[di].pending_adopt) {
+            struct disk_entry *d = &G.disks[di];
+            if (new_lfd >= 0) {
+                if (d->lock_fd >= 0)
+                    close(d->lock_fd);
+                d->lock_fd = new_lfd;
+                new_lfd = -1;
+            }
+            d->pending_adopt = 0;
+            d->adopted = 1;
+            if (!skip_rebind) {
+                memcpy(d->meta.cluster_uuid, me_self.uuid, 16);
+                d->meta.node_id = me_self.id;
+                d->meta.bound = true;
+            }
+            d->state = META_STORE_UP;
+            d->replacing = 0;
+            any_adopted = 1;
+        }
+        pthread_mutex_unlock(&g_mu);
+        if (new_lfd >= 0)
+            close(new_lfd);
+        disk_probe_add_disk(di);
+        char shex[33];
+        chunk_oid_hex(todo[t].store_id, shex);
+        fprintf(stderr, "tsdbd: disks: adopted %s (store %s) from node %" PRIu32 " to node %" PRIu32 "\n", todo[t].path,
+                shex, adopt_old, me_self.id);
+    }
+
+    free(vols);
+    free(eps);
+    tsdb_wipe(&me_self, sizeof me_self);
+
+    if (all_ok) {
+        pthread_mutex_lock(&g_mu);
+        G.adopt_done = 1;
+        pthread_mutex_unlock(&g_mu);
+    }
+    if (any_adopted) {
+        persist_known_from_state();
+        disk_usage_kick();
+        if (need_kick_rec)
+            kick_reconcile_unlocked();
+        cluster_beat_soon();
+    }
+cleanup:
+    for (int t = 0; t < ntodo; t++)
+        if (todo[t].lock_fd >= 0)
+            close(todo[t].lock_fd);
+    free(todo);
+}
+
+void disks_adopt_retry(const struct cluster_copy *c)
+{
+    if (!c || !c->self || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    disks_try_adopt(c);
+}
+
 void disks_sync_copy(const struct cluster_copy *c)
 {
     if (!c || !c->self || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
         return;
+
+    disks_try_adopt(c);
 
     const struct cluster_copy_member *me = NULL;
     for (uint32_t m = 0; m < c->nmembers; m++) {

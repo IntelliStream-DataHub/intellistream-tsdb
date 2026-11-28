@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "cluster_int.h"
+#include "disks.h"
 
 static int cnode_mutant(const char *name)
 {
@@ -299,8 +300,28 @@ void cnode_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, siz
               new_node, new_mb->replaced_by);
         return;
     }
+    uint32_t adopt_cs = 0;
+    uint32_t adopt_target = cl_member_adopt_info(new_node, &adopt_cs);
+    if (adopt_target != 0) {
+        if (adopt_target != old_node) {
+            reply(conn, reqid, META_ERR_INVALID,
+                  "node replace: new node %" PRIu32 " is pending adoption of node %" PRIu32 ", not node %" PRIu32,
+                  new_node, adopt_target, old_node);
+            return;
+        }
+        int mut_heard = 0;
+#ifdef TSDB_TEST_HOOKS
+        mut_heard = (disks_mutant_env() == DISKS_MUT_ADOPT_HEARD);
+#endif
+        if (!mut_heard && (cl_heard_fresh(old_node, now) || old_mb->state == META_UP)) {
+            reply(conn, reqid, META_ERR_STATE,
+                  "node replace: old node %" PRIu32 " is still heard (state %s): refusing adoption by node %" PRIu32,
+                  old_node, meta_member_state_name(old_mb->state), new_node);
+            return;
+        }
+    }
     /* NEW must hold NO position (log or stripe) of any volume OLD holds; if OLD holds stripe positions, NEW must have
-     * at least one chunk store UP. */
+     * at least one chunk store UP (or pending adoption for OLD). */
     int need_stores = 0;
     for (uint32_t i = 0; i < sm->nvolumes; i++) {
         const struct meta_volume *v = &sm->volumes[i];
@@ -329,7 +350,10 @@ void cnode_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, siz
             return;
         }
     }
-    if (need_stores && cl_member_chunk_stores(new_node) == 0) {
+    uint32_t new_cs = cl_member_chunk_stores(new_node);
+    if (adopt_target == old_node && adopt_cs > new_cs)
+        new_cs = adopt_cs;
+    if (need_stores && new_cs == 0) {
         reply(conn, reqid, META_ERR_INVALID,
               "node replace: old node %" PRIu32 " holds stripe positions, but new node %" PRIu32
               " has no chunk stores up",
@@ -673,7 +697,8 @@ void cnode_duty(uint64_t now)
             /* If OLD is still live (UP or DRAINING), it serves as copy source (`prev`) for FILLING stripe positions,
              * so keep it out of OUT until every such fill finishes (`nprev == 0`). */
             int live_source = st == META_UP || st == META_DRAINING;
-            int empty = nlog == 0 && nstripe == 0 && ninflight == 0 && (!live_source || nprev == 0);
+            int adopting = cl_member_adopt_pending(sm, id, repl, now);
+            int empty = !adopting && nlog == 0 && nstripe == 0 && ninflight == 0 && (!live_source || nprev == 0);
             if (empty || mut_replaceclear) {
                 struct meta_entry e;
                 meta_entry_init(&e);

@@ -95,6 +95,15 @@ int disk_load(const char *path, disk_meta *out);
  * retains its matching store_id (unbound) and is not rewritten here (r13-start validates ownership via DISK). */
 int disk_bind(const char *path, const uint8_t cluster_uuid[16], uint32_t node_id);
 
+/* Atomically rebind <path>/DISK from (cluster_uuid, old_node_id) to (cluster_uuid, new_node_id) for server adoption
+ * (E54, §15.6). Idempotent if already bound to (cluster_uuid, new_node_id), syncing DISK and its directory before
+ * returning 0 so a crash between rename and dir fsync is made durable. Refuses unbound disks, foreign cluster_uuid,
+ * or any node_id other than old_node_id/new_node_id (TSDB_ERR_INVALID). Returns TSDB_ERR_LOCKED if busy. */
+int disk_rebind(const char *path, const uint8_t cluster_uuid[16], uint32_t old_node_id, uint32_t new_node_id);
+/* Same as disk_rebind(), using an already-open directory fd whose caller already holds the exclusive flock. */
+int disk_rebind_locked(int dirfd, const char *path, const uint8_t cluster_uuid[16], uint32_t old_node_id,
+                       uint32_t new_node_id);
+
 #ifdef TSDB_TEST_HOOKS
 /* Planted mutants, which tests/test_disks.c requires to fail it. */
 enum {

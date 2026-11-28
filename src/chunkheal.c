@@ -1086,8 +1086,11 @@ int chunk_be_install_attached(chunk_backend *be, int index, const char *path, ch
     size_t snv = 0;
     int rc = chunk_store_volumes(ns, &svols, &seps, &snv);
     if (rc == 0) {
+        /* Raise the backend's fences (and every other open healthy store) BEFORE install; `ns` itself already holds
+         * seps[i] durably on disk, so zero other open stores in `be` (e.g. first adopted store) is not an error, while
+         * any real error on an existing store aborts the attach. */
         for (size_t i = 0; i < snv && rc == 0; i++)
-            rc = chunk_be_see_epoch(be, svols[i], seps[i]);
+            rc = chunk_be_see_epoch_for_attach(be, svols[i], seps[i]);
         free(svols);
         free(seps);
     }

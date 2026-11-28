@@ -2675,6 +2675,7 @@ static void copy_publish(void)
     for (uint32_t i = 0; i < nm; i++) {
         const struct meta_member *m = &C.sm.members[i];
         mem[i].id = m->id;
+        mem[i].replaced_by = m->replaced_by;
         mem[i].state = m->state;
         mem[i].role = m->role;
         mem[i].capability = m->capability;
@@ -5721,6 +5722,7 @@ static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, 
             pm[i].failstop = (uint8_t)(atomic_load_explicit(&g_hb_failstop, memory_order_relaxed) != 0);
             pm[i].fill_pct = atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed);
             pm[i].chunk_stores = atomic_load_explicit(&g_chunk_stores, memory_order_relaxed);
+            pm[i].adopt_old = disks_adopt_info(NULL);
             pm[i].heard_age_ms = 0;
         }
         if (h) {
@@ -5730,6 +5732,8 @@ static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, 
             if (id != C.id)
                 pm[i].chunk_stores = h->have_stores ? h->chunk_stores : 0;
             const struct hbs_disks *hd = creport_heard_get(&h->ext, HBS_DISKS);
+            if (hd)
+                pm[i].adopt_old = hd->adopt_old;
             if (hd && hd->ndisks > 0 && du_pool) {
                 uint32_t nd = hd->ndisks <= META_DISKS_MAX ? hd->ndisks : META_DISKS_MAX;
                 if (du_off + nd <= total_disks) {
@@ -8304,12 +8308,18 @@ static struct disk_sent disk_sent[DISK_SENT_CAP];
 static uint32_t ndisk_sent, disk_sent_rot;
 static uint64_t disk_sent_term;
 
-static int sm_store_known(const struct meta_state *m, const uint8_t store_id[16])
+static const struct meta_member *sm_store_owner(const struct meta_state *m, const uint8_t store_id[16],
+                                                const struct meta_disk **disk_out)
 {
-    for (uint32_t i = 0; i < m->nmembers; i++)
-        if (meta_member_disk(&m->members[i], store_id))
-            return 1;
-    return 0;
+    for (uint32_t i = 0; i < m->nmembers; i++) {
+        const struct meta_disk *d = meta_member_disk(&m->members[i], store_id);
+        if (d) {
+            if (disk_out)
+                *disk_out = d;
+            return &m->members[i];
+        }
+    }
+    return NULL;
 }
 
 /* R13 (r13-dev): per-device DOWN -> OUT timer tracking on the Raft leader (mirrors R9's member timers). */
@@ -8485,8 +8495,15 @@ static void propose_disks(uint64_t now)
             const struct hbs_disk_row *r = &hd->disks[k];
             if (r->state != META_STORE_UP || r->size_bytes == 0)
                 continue;
-            if (sm_store_known(&C.sm, r->store_id))
-                continue;
+            const struct meta_disk *owned_d = NULL;
+            const struct meta_member *owner = sm_store_owner(&C.sm, r->store_id, &owned_d);
+            if (owner) {
+                /* R13 r13-adopt: allow proposing STORE_ADD to transfer an adopted non-DESTROYED disk from OLD to NEW
+                 * once NODE_REPLACE(OLD, NEW) has committed (owner->replaced_by == mb->id). */
+                if (owner->id == mb->id || owner->replaced_by != mb->id || owner->state == META_DESTROYED ||
+                    (owned_d && owned_d->state == META_STORE_DESTROYED))
+                    continue;
+            }
             int dup = 0;
             for (uint32_t j = 0; j < added; j++) {
                 if (memcmp(added_ids[j], r->store_id, 16) == 0) {
@@ -11114,6 +11131,57 @@ uint32_t cl_member_chunk_stores(uint32_t id)
         return atomic_load_explicit(&g_chunk_stores, memory_order_relaxed);
     struct heard *h = heard_get(id);
     return h && h->have_stores ? h->chunk_stores : 0;
+}
+
+uint32_t cl_member_adopt_info(uint32_t id, uint32_t *chunk_stores_out)
+{
+    if (chunk_stores_out)
+        *chunk_stores_out = 0;
+    if (id == C.id)
+        return disks_adopt_info(chunk_stores_out);
+    struct heard *h = heard_get(id);
+    const struct hbs_disks *hd = h ? creport_heard_get(&h->ext, HBS_DISKS) : NULL;
+    if (!hd || hd->adopt_old == 0)
+        return 0;
+    if (chunk_stores_out)
+        *chunk_stores_out = hd->adopt_chunk_stores;
+    return hd->adopt_old;
+}
+
+int cl_member_adopt_pending(const struct meta_state *sm, uint32_t old_node, uint32_t new_node, uint64_t now)
+{
+    if (!sm || !old_node || !new_node)
+        return 0;
+    if (cl_member_adopt_info(new_node, NULL) == old_node)
+        return 1;
+    const struct meta_member *old_mb = meta_member(sm, old_node);
+    if (!old_mb || old_mb->ndisks == 0 || old_mb->state == META_DESTROYED)
+        return 0;
+    /* Wait for a fresh heartbeat from new_node (e.g. right after Raft failover) when OLD owns disks, so an adopting
+     * replacement's HBS_DISKS is never missed while old_node already holds zero positions. */
+    if (!cl_heard_fresh(new_node, now))
+        return 1;
+    if (new_node == C.id) {
+        for (uint32_t k = 0; k < old_mb->ndisks && k < META_DISKS_MAX; k++) {
+            const struct meta_disk *od = &old_mb->disks[k];
+            if (od->state != META_STORE_DESTROYED && disks_has_up_store(od->store_id))
+                return 1;
+        }
+        return 0;
+    }
+    struct heard *h = heard_get(new_node);
+    const struct hbs_disks *hd = h ? creport_heard_get(&h->ext, HBS_DISKS) : NULL;
+    if (!hd)
+        return 0;
+    for (uint32_t k = 0; k < hd->ndisks; k++) {
+        const struct hbs_disk_row *r = &hd->disks[k];
+        if (r->state != META_STORE_UP)
+            continue;
+        const struct meta_disk *od = meta_member_disk(old_mb, r->store_id);
+        if (od && od->state != META_STORE_DESTROYED)
+            return 1;
+    }
+    return 0;
 }
 
 static int cl_member_place_ok(uint32_t node, uint64_t now, int is_stripe, const char **why_out)

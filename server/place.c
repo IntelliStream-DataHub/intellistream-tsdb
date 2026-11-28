@@ -231,6 +231,9 @@ static int member_placeable(const struct place_in *in, const struct meta_member 
         return 0;
     if (is_replace_old(in, mb->id))
         return 0;
+    const struct place_member *pm = find_pm(in, mb->id);
+    if (pm && pm->adopt_old != 0)
+        return 0; /* R13 r13-adopt: pending adoption, must not take general placements until adopted */
     return member_heard_fresh(in, mb->id);
 }
 

@@ -114,6 +114,10 @@ int chunk_be_add_store(chunk_backend *be, const char *path, const uint8_t *expec
                        bool replacing);
 int chunk_be_add_lost(chunk_backend *be, const char *path);
 int chunk_be_fence_store(chunk_backend *be, int index);
+/* Like chunk_be_see_epoch(), for chunk_be_install_attached(): `ns` already holds `(volume, e)` durably on disk, so
+ * having zero other open healthy stores in `be` (e.g. first adopted store into an all-NULL backend) still raises the
+ * in-memory fence without returning TSDB_ERR_IO; any real error on an existing open healthy store still fails. */
+int chunk_be_see_epoch_for_attach(chunk_backend *be, uint32_t volume, uint64_t e);
 /* R13 (r13-dev): split cluster attach so open + epoch fsyncs run off chunksrv_cluster_hold(). */
 int chunk_be_detach_for_attach(chunk_backend *be, int index);
 int chunk_store_prepare_attach(const char *path, const uint8_t *expect_id, const uint32_t *vols, const uint64_t *epochs,

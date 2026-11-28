@@ -679,7 +679,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs 
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
     nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio diskout \
-    ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill posbalance
+    ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill posbalance adopt
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
 	CRASHFS_SO=$(B)/libcrashfs.so OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1087,7 +1087,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants diskout-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants tierscrub-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants balance-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak sim-place-soak-classes sim-place-class-mutants place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants diskout-mutants adopt-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants tierscrub-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants balance-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak sim-place-soak-classes sim-place-class-mutants place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1159,7 +1159,7 @@ $(B)/chunkpeer.o: server/chunkpeer.c server/chunkpeer.h server/chunksrv.h src/co
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/chunksrv_cluster.o: server/chunksrv_cluster.c server/chunksrv.h server/creport.h server/disks.h server/peerlink.h server/cluster.h server/meta.h src/chunk.h src/chunkscrub.h src/chunkmove.h client/tsdb_crypto.h src/chunk_priv.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
-$(B)/disks.o: server/disks.c server/disks.h server/chunksrv.h server/cluster.h server/creport.h server/meta.h client/tsdb_crypto.h src/disk.h src/chunk.h src/chunk_priv.h src/chunkmove.h src/compat.h src/cvol.h src/internal.h | $(B)
+$(B)/disks.o: server/disks.c server/disks.h server/chunksrv.h server/cluster.h server/creport.h server/meta.h client/tsdb_crypto.h src/disk.h src/chunk.h src/chunk_priv.h src/chunkmove.h src/compat.h src/cvol.h src/internal.h src/replfile.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
@@ -1348,6 +1348,11 @@ diskout-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/liboutagefs.so
 	@$(if $(EC_OBJ),true,echo "diskout-mutants: this build has no erasure codec (NO_EC=1): diskout skips, nothing to plant"; false)
 	$(MUT) --name diskout --uring --list "devoutnohold rebuildtofast damagenoout" -- env TSDB_DISKS_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_cluster @D@ diskout
+# R13 (r13-adopt) server disk adoption mutants (TSDB_DISKS_MUTANT): adoptheard, adoptlogdir, adoptnorebind
+adopt-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
+	@$(if $(EC_OBJ),true,echo "adopt-mutants: this build has no erasure codec (NO_EC=1): adopt skips, nothing to plant"; false)
+	$(MUT) --name adopt --uring --list "adoptheard adoptlogdir adoptnorebind" -- env TSDB_DISKS_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ adopt
 # R13 (r13-cvolfs) multi-disk log replica placement and duplicate-copy planted bugs, each must fail test_cvolfs and test_cluster twodisks
 cvolfs-mutants: $(B)/test_cvolfs $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	$(MUT) --name test_cvolfs_r13 --list "cvolfirstdisk cvoldupok" -- ./$(B)/test_cvolfs --mutant @M@ @D@

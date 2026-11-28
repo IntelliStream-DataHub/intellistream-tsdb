@@ -46,6 +46,7 @@
 #include "rdma_dev.h"
 #include "raft/raft.h"
 #include "raft/raft_log.h"
+#include "replfile.h"
 #include "snapshot.h"
 #include "tsdb_client.h"
 #include "users.h"
@@ -35833,6 +35834,646 @@ static void scen_posbalance(void)
     stop_all();
 }
 
+#ifdef TSDB_EC
+static void adopt_copy_file(const char *src, const char *dst)
+{
+    int in = open(src, O_RDONLY);
+    if (in < 0)
+        die("adopt: open %s: %s", src, strerror(errno));
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) {
+        close(in);
+        die("adopt: open %s: %s", dst, strerror(errno));
+    }
+    uint8_t buf[4096];
+    for (;;) {
+        ssize_t r = read(in, buf, sizeof buf);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r < 0)
+            die("adopt: read %s: %s", src, strerror(errno));
+        if (r == 0)
+            break;
+        ssize_t off = 0;
+        while (off < r) {
+            ssize_t w = write(out, buf + off, (size_t)(r - off));
+            if (w < 0 && errno == EINTR)
+                continue;
+            if (w <= 0)
+                die("adopt: write %s: %s", dst, strerror(errno));
+            off += w;
+        }
+    }
+    (void)fsync(out);
+    close(out);
+    close(in);
+}
+
+static int adopt_read_vdir_repl(const char *vdir, uint32_t *node_out, uint64_t *rid_out)
+{
+    int dfd = open(vdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return -1;
+    struct replfile *rf = NULL;
+    struct replfile_state st;
+    bool torn = false;
+    int rc = replfile_load(dfd, &rf, &st, &torn);
+    close(dfd);
+    if (rc != 0)
+        return -1;
+    if (node_out)
+        *node_out = st.node;
+    if (rid_out)
+        *rid_out = st.rid;
+    replfile_close(rf);
+    replfile_state_free(&st);
+    return 0;
+}
+#endif
+
+/* R13 (r13-adopt; E54, §15.6, D20): state-dir loss recovery via `tsdbd --adopt OLD` + `node replace OLD NEW`.
+ * Verifies:
+ *   1. --adopt / node replace while OLD is still heard is refused (catches adoptheard).
+ *   2. Before `node replace OLD NEW` commits, NO DISK is rewritten, NEW serves 0 stores, and v<N> is untouched.
+ *   3. Once `node replace OLD NEW` commits: every adopted DISK is atomically rebound to NEW (catches adoptnorebind),
+ *      v<N> log dirs on adopted fast disks are set aside as v<N>.stale-<rid> and rebuilt via snapshot (catches
+ *      adoptlogdir), adopted chunk stores reconcile with < 1% peer chunk bytes copied, post-adopt settles work,
+ *      all keys read bit-exact, and NEW restarts cleanly without --adopt. */
+static uint64_t adopt_tree_hash_walk(const char *root, size_t root_len)
+{
+    DIR *d = opendir(root);
+    if (!d)
+        die("adopt: opendir %s: %s", root, strerror(errno));
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (struct dirent *de; (de = readdir(d)) != NULL;) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof full, "%s/%s", root, de->d_name) >= (int)sizeof full)
+            die("adopt: path too long under %s", root);
+        struct stat st;
+        if (lstat(full, &st) != 0)
+            die("adopt: lstat %s: %s", full, strerror(errno));
+        uint64_t eh = 14695981039346656037ULL;
+        const char *rel = full + root_len;
+        for (const unsigned char *p = (const unsigned char *)rel; *p; p++) {
+            eh ^= (uint64_t)*p;
+            eh *= 1099511628211ULL;
+        }
+        eh ^= (uint64_t)st.st_ino * 0x9e3779b97f4a7c15ULL;
+        eh ^= (uint64_t)st.st_mode * 0xbf58476d1ce4e5b9ULL;
+        if (!S_ISDIR(st.st_mode)) {
+            eh ^= (uint64_t)st.st_size * 0x94d049bb133111ebULL;
+            eh ^= (uint64_t)st.st_mtime * 0x517cc1b727220a95ULL;
+        } else {
+            eh ^= adopt_tree_hash_walk(full, root_len);
+        }
+        h ^= eh; /* order-independent across readdir() order */
+    }
+    closedir(d);
+    return h;
+}
+
+static uint64_t adopt_tree_fingerprint(const char *root) { return adopt_tree_hash_walk(root, strlen(root)); }
+
+static void scen_adopt(void)
+{
+    scenario("adopt");
+#ifndef TSDB_EC
+    printf("  skipped: no erasure codec in this build\n");
+    return;
+#else
+    enum { ND = 6 };
+    char nv[ND][PATH_MAX], h0[ND][PATH_MAX], h1[ND][PATH_MAX];
+    for (int i = 0; i < ND; i++) {
+        snprintf(nv[i], sizeof nv[i], "%s/ad_n%d_nv", base, i);
+        snprintf(h0[i], sizeof h0[i], "%s/ad_n%d_h0", base, i);
+        snprintf(h1[i], sizeof h1[i], "%s/ad_n%d_h1", base, i);
+        disk_make(nv[i], "nvme");
+        disk_make(h0[i], "hdd");
+        disk_make(h1[i], "hdd");
+    }
+
+    static char xa[8][PATH_MAX * 3 + 384];
+    int mports[8] = {0};
+    for (int i = 0; i < ND; i++) {
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+        snprintf(xa[i], sizeof xa[i],
+                 "%s--disk %s:nvme --disk %s:hdd --disk %s:hdd --metrics-port auto "
+                 "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+                 i >= 2 ? "--io epoll " : "", nv[i], h0[i], h1[i]);
+        xargs[i] = xa[i];
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < ND; i++)
+        node_add(0, i);
+
+    unsigned five = 5;
+    await_view(0, p_voters, &five, "adopt: 5 voters");
+    for (int i = 0; i < ND; i++) {
+        struct disks_want wi = {ids[i], 3, META_ROLE_BOTH, META_CAP_BOTH};
+        await_view(0, p_member_disks, &wi, "adopt: initial node disks");
+    }
+
+    char p0[META_ADDR_MAX], args[2048], out[8192];
+    peer_of(0, p0, sizeof p0);
+    snprintf(args, sizeof args, "cluster settings set %s rebuild_after_s=120 balance=off --secret-file %s", p0,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "settings updated"))
+        die("adopt: settings set failed:\n%s", out);
+
+    uint32_t ec_num = 0, tw_num = 0;
+    char etxt[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "ad42", 0, 4, 2, &ec_num, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("adopt: vol_add_ec 4+2: %s (%s)", cluster_strerror(rc), etxt);
+    if ((rc = vol_add(0, "adtwin", 3, &tw_num)) != 0)
+        die("adopt: vol_add twin: %s", cluster_strerror(rc));
+
+    struct meta_volume mv, mt;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "ad42", &mv) || !mv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("adopt: no leader for ad42");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "adtwin", &mt) || !mt.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("adopt: no leader for adtwin");
+    await_isr(0, "ad42", (int)mv.nrep, 30000, "adopt: ad42 ISR full");
+    await_isr(0, "adtwin", (int)mt.nrep, 30000, "adopt: adtwin ISR full");
+
+    /* Pick Raft leader R, victim OLD (!= R, holds a log replica & stripe pos of ad42), follower voter F, and LIVE. */
+    int R = leader_of(0);
+    int OLD = -1, F = -1, LIVE = -1;
+    for (uint32_t k = 0; k < mv.nrep; k++) {
+        int s = server_of(mv.rep[k].node);
+        if (s >= 0 && s != R) {
+            OLD = s;
+            break;
+        }
+    }
+    if (OLD < 0)
+        die("adopt: could not pick OLD holding ad42 log replica");
+    for (int i = 0; i < 5 && F < 0; i++)
+        if (i != R && i != OLD)
+            F = i;
+    for (int i = 0; i < ND && LIVE < 0; i++)
+        if (i != R && i != OLD)
+            LIVE = i;
+    if (F < 0 || LIVE < 0)
+        die("adopt: could not pick F and LIVE");
+    await_view(F, p_names_leader, &ids[R], "adopt: follower F knows leader R");
+
+    uint32_t old_pos = UINT32_MAX;
+    for (uint32_t p = 0; p < mv.nstripe; p++)
+        if (mv.stripe[p] == ids[OLD])
+            old_pos = p;
+    if (old_pos == UINT32_MAX)
+        die("adopt: OLD not in ad42 stripe");
+
+    /* Write and settle partitions so OLD's two HDD stores hold substantial chunks (both h0 and h1 non-empty). */
+    int L = server_of(mv.leader);
+    int Lt = server_of(mt.leader);
+    tsdbc *ce = client(L);
+    tsdbc_set_retry(ce, 30000);
+    tsdbc *ct = client(Lt);
+    tsdbc_set_retry(ct, 30000);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ad.s%d", s);
+        ide[s] = ecb_series(ce, nm, "ad42");
+        idt[s] = ecb_series(ct, nm, "adtwin");
+    }
+    const int64_t day0 = 1704067200000LL;
+    const int64_t part_step = 30LL * 86400000LL;
+    int days_written = 0;
+    for (int d = 0; d < 12; d++) {
+        int64_t day = day0 + (int64_t)d * part_step;
+        for (int b = 0; b < 2; b++) {
+            for (int s = 0; s < ECB_SERIES; s++) {
+                int64_t ts[ECB_ROWS];
+                float val[ECB_ROWS];
+                ecb_rows_of(s, b, day, ts, val);
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ce, ide[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("adopt: insert ad42: %s", ers(rc));
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("adopt: insert twin: %s", ers(rc));
+            }
+            usleep(300000);
+        }
+        days_written++;
+        for (uint64_t t0 = now_ms();
+             count_chunk_files_in(h0[OLD], ec_num) + count_chunk_files_in(h1[OLD], ec_num) < days_written;
+             usleep(200000))
+            if (now_ms() - t0 > 60000)
+                die("adopt: day %d did not settle onto OLD in 60 s", d);
+        if (days_written >= 6 && count_chunk_files_in(h0[OLD], ec_num) >= 2 &&
+            count_chunk_files_in(h1[OLD], ec_num) >= 2)
+            break;
+    }
+    /* Wait for trailing settles to go quiet. */
+    {
+        int prev_tot = -1, stable = 0;
+        for (int k = 0; k < 25; k++) {
+            usleep(200000);
+            int cur_tot = count_chunk_files_in(h0[OLD], ec_num) + count_chunk_files_in(h1[OLD], ec_num);
+            if (cur_tot == prev_tot) {
+                if (++stable >= 8)
+                    break;
+            } else {
+                prev_tot = cur_tot;
+                stable = 0;
+            }
+        }
+    }
+    int old_h0_cnt = count_chunk_files_in(h0[OLD], ec_num);
+    int old_h1_cnt = count_chunk_files_in(h1[OLD], ec_num);
+    uint64_t old_chunk_bytes =
+        sum_chunk_k_bounds_in(h0[OLD], ec_num, NULL, NULL) + sum_chunk_k_bounds_in(h1[OLD], ec_num, NULL, NULL);
+    if (old_h0_cnt < 2 || old_h1_cnt < 2 || old_chunk_bytes < 4096)
+        die("adopt: expected chunks on OLD h0/h1 (got h0=%d h1=%d bytes=%" PRIu64 ")", old_h0_cnt, old_h1_cnt,
+            old_chunk_bytes);
+
+    /* Record OLD's disk metadata and fast-disk log replica directory inode & rid. */
+    disk_meta old_dm_nv, old_dm_h0, old_dm_h1;
+    if (disk_load(nv[OLD], &old_dm_nv) != 0 || disk_load(h0[OLD], &old_dm_h0) != 0 || disk_load(h1[OLD], &old_dm_h1) != 0)
+        die("adopt: disk_load on OLD failed");
+    char old_vdir[PATH_MAX + 64];
+    snprintf(old_vdir, sizeof old_vdir, "%s/v%" PRIu32, nv[OLD], ec_num);
+    struct stat old_vst;
+    if (lstat(old_vdir, &old_vst) != 0)
+        die("adopt: OLD fast disk missing %s: %s", old_vdir, strerror(errno));
+    uint32_t old_vnode = 0;
+    uint64_t old_vrid = 0;
+    if (adopt_read_vdir_repl(old_vdir, &old_vnode, &old_vrid) != 0 || old_vnode != ids[OLD] || old_vrid == 0)
+        die("adopt: failed reading OLD %s/REPL (node=%u rid=%" PRIu64 ")", old_vdir, old_vnode, old_vrid);
+    printf("  setup: OLD=node %" PRIu32 " pos=%" PRIu32 " h0=%d h1=%d chunk_bytes=%" PRIu64 " v%" PRIu32
+           " rid=%016" PRIx64 "\n",
+           ids[OLD], old_pos, old_h0_cnt, old_h1_cnt, old_chunk_bytes, ec_num, old_vrid);
+
+    char pF[META_ADDR_MAX], pR[META_ADDR_MAX];
+    peer_of(F, pF, sizeof pF);
+    peer_of(R, pR, sizeof pR);
+
+    /* ---- 1. --adopt of a member that is still heard MUST be refused (catches adoptheard) ---- */
+    {
+        char cl_nv[PATH_MAX], cl_h0[PATH_MAX], src_d[PATH_MAX + 16], dst_d[PATH_MAX + 16];
+        snprintf(cl_nv, sizeof cl_nv, "%s/adopt_heard_nv", base);
+        snprintf(cl_h0, sizeof cl_h0, "%s/adopt_heard_h0", base);
+        if (mkdir(cl_nv, 0755) != 0 || mkdir(cl_h0, 0755) != 0)
+            die("adopt: mkdir copy dirs failed");
+        snprintf(src_d, sizeof src_d, "%s/DISK", nv[LIVE]);
+        snprintf(dst_d, sizeof dst_d, "%s/DISK", cl_nv);
+        adopt_copy_file(src_d, dst_d);
+        snprintf(src_d, sizeof src_d, "%s/DISK", h0[LIVE]);
+        snprintf(dst_d, sizeof dst_d, "%s/DISK", cl_h0);
+        adopt_copy_file(src_d, dst_d);
+
+        no_auto_disk[6] = 1;
+        omit_dir[6] = 1;
+        snprintf(xa[6], sizeof xa[6], "--io epoll --adopt %" PRIu32 " --disk %s:nvme --disk %s:hdd --metrics-port auto",
+                 ids[LIVE], cl_nv, cl_h0);
+        xargs[6] = xa[6];
+        start(6);
+        mports[6] = th_mport;
+        node_add(R, 6);
+
+        /* Wait until Raft leader sees node 6's HBS_DISKS with adopt_old=ids[LIVE]. */
+        char want_ao[64];
+        snprintf(want_ao, sizeof want_ao, "adopt_old=%" PRIu32, ids[LIVE]);
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            struct view vw;
+            view(R, &vw);
+            int got = 0;
+            for (uint32_t k = 0; k < vw.st.nheard; k++)
+                if (vw.st.heard[k].id == ids[6] && vw.st.heard[k].sections &&
+                    strstr(vw.st.heard[k].sections, want_ao))
+                    got = 1;
+            view_free(&vw);
+            if (got)
+                break;
+            if (now_ms() - t0 > 15000)
+                die("adopt: node 6 did not report '%s' in HBS_DISKS sections", want_ao);
+        }
+
+        snprintf(args, sizeof args, "cluster node replace %s %" PRIu32 " %" PRIu32 " --secret-file %s", pF, ids[LIVE],
+                 ids[6], secret_path);
+        int hrc = cli_run(args, NULL, out, sizeof out);
+        if (hrc == 0)
+            die("adopt: node replace while OLD (node %" PRIu32 ") is still heard succeeded (adoptheard!):\n%s",
+                ids[LIVE], out);
+        if (!strstr(out, "still heard"))
+            die("adopt: node replace refusal while OLD heard gave unexpected message:\n%s", out);
+
+        disk_meta cnv, ch0;
+        if (disk_load(cl_nv, &cnv) != 0 || disk_load(cl_h0, &ch0) != 0 || cnv.node_id != ids[LIVE] ||
+            ch0.node_id != ids[LIVE])
+            die("adopt: DISK was rewritten while OLD was still heard (nv=%u h0=%u, want %u)", cnv.node_id, ch0.node_id,
+                ids[LIVE]);
+
+        stop(6, SIGTERM);
+        snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", pR, ids[6], secret_path);
+        (void)cli_run(args, NULL, out, sizeof out);
+        printf("  1. --adopt of still-heard node %" PRIu32 " refused and DISK untouched\n", ids[LIVE]);
+    }
+
+    /* ---- 2. Kill OLD, delete its --state-dir, start NEW with --adopt OLD on OLD's disks ---- */
+    stop(OLD, SIGKILL);
+    struct state_want down_w = {ids[OLD], META_DOWN, 0};
+    await_view(F, p_member_state, &down_w, "adopt: OLD marked DOWN");
+
+    char old_sdir[PATH_MAX + 32];
+    snprintf(old_sdir, sizeof old_sdir, "%s/n%d/state", base, OLD);
+    (void)nftw(old_sdir, rm_tree_cb, 16, FTW_DEPTH | FTW_PHYS);
+
+    /* Ensure the volume leader of ad42 is alive (if OLD was leader, wait for failover). */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(F, "ad42", &mv) && mv.leader && mv.leader != ids[OLD])
+            break;
+        if (now_ms() - t0 > 20000)
+            die("adopt: ad42 did not fail over off dead OLD");
+    }
+
+    /* Fingerprint all 3 disks of OLD before NEW starts: nothing may be written/created/modified before node replace! */
+    uint64_t fp_nv_before = adopt_tree_fingerprint(nv[OLD]);
+    uint64_t fp_h0_before = adopt_tree_fingerprint(h0[OLD]);
+    uint64_t fp_h1_before = adopt_tree_fingerprint(h1[OLD]);
+
+    int NEW = 7;
+    int do_crash_recovery = (getenv("TSDB_DISKS_MUTANT") == NULL);
+    no_auto_disk[NEW] = 1;
+    omit_dir[NEW] = 1;
+    snprintf(xa[NEW], sizeof xa[NEW],
+             "--io epoll --adopt %" PRIu32
+             " --disk %s:nvme --disk %s:hdd --disk %s:hdd --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             ids[OLD], nv[OLD], h0[OLD], h1[OLD]);
+    xargs[NEW] = xa[NEW];
+    if (do_crash_recovery)
+        setenv("TSDB_ADOPT_CRASH_AT", "after_rebind", 1);
+    start(NEW);
+    if (do_crash_recovery)
+        unsetenv("TSDB_ADOPT_CRASH_AT");
+    mports[NEW] = th_mport;
+    node_add(R, NEW);
+
+    /* Wait until NEW is UP and reporting adopt_old=ids[OLD] in HBS_DISKS. */
+    {
+        char want_ao[64];
+        snprintf(want_ao, sizeof want_ao, "adopt_old=%" PRIu32, ids[OLD]);
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            struct view vw;
+            view(R, &vw);
+            int got = 0;
+            for (uint32_t k = 0; k < vw.st.nheard; k++)
+                if (vw.st.heard[k].id == ids[NEW] && vw.st.heard[k].sections &&
+                    strstr(vw.st.heard[k].sections, want_ao))
+                    got = 1;
+            view_free(&vw);
+            if (got)
+                break;
+            if (now_ms() - t0 > 15000)
+                die("adopt: NEW did not report '%s' in HBS_DISKS sections", want_ao);
+        }
+    }
+
+    /* ---- 2a. Before `node replace`: ZERO writes to OLD's disks, 0 stores served, v<N> untouched ---- */
+    usleep(500000);
+    {
+        disk_meta dnv, dh0, dh1;
+        if (disk_load(nv[OLD], &dnv) != 0 || disk_load(h0[OLD], &dh0) != 0 || disk_load(h1[OLD], &dh1) != 0)
+            die("adopt: disk_load before replace failed");
+        if (dnv.node_id != ids[OLD] || dh0.node_id != ids[OLD] || dh1.node_id != ids[OLD])
+            die("adopt: DISK rewritten BEFORE node replace (nv=%u h0=%u h1=%u, want %u)", dnv.node_id, dh0.node_id,
+                dh1.node_id, ids[OLD]);
+        if (adopt_tree_fingerprint(nv[OLD]) != fp_nv_before || adopt_tree_fingerprint(h0[OLD]) != fp_h0_before ||
+            adopt_tree_fingerprint(h1[OLD]) != fp_h1_before)
+            die("adopt: OLD's disks were modified BEFORE node replace committed (engine root or file written on pending disk!)");
+
+        struct view vw;
+        view(R, &vw);
+        const struct meta_member *nm = meta_member(&vw.m, ids[NEW]);
+        if (!nm || nm->ndisks != 0)
+            die("adopt: NEW registered %u disks BEFORE node replace (expected 0)", nm ? nm->ndisks : 0);
+        view_free(&vw);
+
+        char mbuf[65536];
+        metrics_get(mports[NEW], mbuf, sizeof mbuf);
+        int64_t cst0 = -1, cst1 = -1;
+        if (metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"0\"} ", &cst0) && cst0 == 0)
+            die("adopt: NEW chunk store 0 served UP before node replace");
+        if (metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"1\"} ", &cst1) && cst1 == 0)
+            die("adopt: NEW chunk store 1 served UP before node replace");
+
+        struct stat cur_vst;
+        if (lstat(old_vdir, &cur_vst) != 0 || cur_vst.st_ino != old_vst.st_ino)
+            die("adopt: %s modified before node replace", old_vdir);
+        printf("  2a. before node replace: ZERO writes on OLD's 3 disks, NEW serves 0 stores, v%" PRIu32
+               " untouched\n",
+               ec_num);
+    }
+
+    /* ---- 2b. Commit `tsdb cluster node replace OLD NEW` (+ mid-adoption crash-and-restart recovery) ---- */
+    int64_t peer_rd_before = sum_peer_chunk_read_bytes(mports, ND, OLD);
+    snprintf(args, sizeof args, "cluster node replace %s %" PRIu32 " %" PRIu32 " --secret-file %s", pF, ids[OLD],
+             ids[NEW], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "replacing with node"))
+        die("adopt: CLI node replace OLD NEW failed:\n%s", out);
+
+    if (do_crash_recovery) {
+        int ex = await_exit(NEW, 20000);
+        if (ex != 99)
+            die("adopt: NEW did not hit TSDB_ADOPT_CRASH_AT=after_rebind (exit=%d)", ex);
+        /* Verify partial state: first disk rebound to NEW, remaining DISKs still OLD, v1 not set aside yet. */
+        disk_meta cnv, ch0, ch1;
+        if (disk_load(nv[OLD], &cnv) != 0 || disk_load(h0[OLD], &ch0) != 0 || disk_load(h1[OLD], &ch1) != 0)
+            die("adopt: disk_load after mid-adoption crash failed");
+        int n_new = (cnv.node_id == ids[NEW]) + (ch0.node_id == ids[NEW]) + (ch1.node_id == ids[NEW]);
+        int n_old = (cnv.node_id == ids[OLD]) + (ch0.node_id == ids[OLD]) + (ch1.node_id == ids[OLD]);
+        if (n_new != 1 || n_old != 2)
+            die("adopt: expected 1 rebound + 2 pending DISKs after after_rebind crash (got new=%d old=%d)", n_new,
+                n_old);
+        struct stat mid_vst;
+        if (lstat(old_vdir, &mid_vst) != 0 || mid_vst.st_ino != old_vst.st_ino)
+            die("adopt: expected %s still present before crash-recovery restart", old_vdir);
+        /* Restart NEW with --adopt OLD (no crash point): must finish rebinding remaining disks & set aside v1! */
+        start(NEW);
+        mports[NEW] = th_mport;
+        printf("  2b. mid-adoption crash after 1st DISK rebind: restarted NEW with --adopt %" PRIu32 "\n", ids[OLD]);
+    }
+
+    /* Wait for adoption, disk transfer, log rebuild, stripe fill -> WHOLE, and OLD -> OUT. */
+    for (uint64_t t0 = now_ms();; usleep(150000)) {
+        struct view vw;
+        view(F, &vw);
+        const struct meta_member *om = meta_member(&vw.m, ids[OLD]);
+        const struct meta_member *nm = meta_member(&vw.m, ids[NEW]);
+        const struct meta_volume *ev = meta_volume(&vw.m, ec_num);
+        int ok_m = om && om->state == META_OUT && om->replaced_by == 0 && nm && nm->ndisks == 3 &&
+                   nm->capability == META_CAP_BOTH;
+        int ok_e = ev && meta_replica(ev, ids[OLD]) == NULL && meta_replica(ev, ids[NEW]) != NULL &&
+                   meta_volume_in_isr(ev, ids[NEW]) && ev->stripe[old_pos] == ids[NEW] &&
+                   ev->stripe_pos[old_pos].state == META_STRIPE_WHOLE;
+        view_free(&vw);
+        if (ok_m && ok_e)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("adopt: adoption/replace did not complete in 90 s (ok_m=%d ok_e=%d)", ok_m, ok_e);
+    }
+
+    /* Verify both adopted chunk stores are UP (state 0) after attach + sfill/sreconcile -> STRIPE_WHOLE. */
+    for (uint64_t t0 = now_ms();; usleep(150000)) {
+        char mbuf[65536];
+        int64_t cst0 = -1, cst1 = -1;
+        metrics_get(mports[NEW], mbuf, sizeof mbuf);
+        if (metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"0\"} ", &cst0) && cst0 == 0 &&
+            metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"1\"} ", &cst1) && cst1 == 0)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("adopt: NEW chunk stores did not report UP (cst0=%" PRId64 " cst1=%" PRId64 ")", cst0, cst1);
+    }
+
+    /* ---- 2c. Verify DISK rebind (adoptnorebind), .stale-<rid> set-aside (adoptlogdir), and < 1% peer bytes ---- */
+    {
+        disk_meta dnv, dh0, dh1;
+        if (disk_load(nv[OLD], &dnv) != 0 || disk_load(h0[OLD], &dh0) != 0 || disk_load(h1[OLD], &dh1) != 0)
+            die("adopt: disk_load after replace failed");
+        if (!dnv.bound || dnv.node_id != ids[NEW] || memcmp(dnv.store_id, old_dm_nv.store_id, 16) != 0 ||
+            !dh0.bound || dh0.node_id != ids[NEW] || memcmp(dh0.store_id, old_dm_h0.store_id, 16) != 0 ||
+            !dh1.bound || dh1.node_id != ids[NEW] || memcmp(dh1.store_id, old_dm_h1.store_id, 16) != 0)
+            die("adopt: DISK files not rebound to NEW %" PRIu32 " (nv=%u h0=%u h1=%u) (adoptnorebind!)", ids[NEW],
+                dnv.node_id, dh0.node_id, dh1.node_id);
+
+        char stale_vdir[PATH_MAX + 96];
+        snprintf(stale_vdir, sizeof stale_vdir, "%s/v%" PRIu32 ".stale-%016" PRIx64, nv[OLD], ec_num, old_vrid);
+        struct stat sst, nst;
+        if (lstat(stale_vdir, &sst) != 0 || !S_ISDIR(sst.st_mode))
+            die("adopt: old log replica dir was not set aside as %s (adoptlogdir!)", stale_vdir);
+        if (lstat(old_vdir, &nst) != 0 || !S_ISDIR(nst.st_mode))
+            die("adopt: rebuilt log replica dir %s missing", old_vdir);
+        if (nst.st_ino == old_vst.st_ino)
+            die("adopt: %s kept OLD's inode instead of rebuilding fresh via snapshot (adoptlogdir!)", old_vdir);
+        uint32_t new_vnode = 0;
+        uint64_t new_vrid = 0;
+        if (adopt_read_vdir_repl(old_vdir, &new_vnode, &new_vrid) != 0 || new_vnode != ids[NEW] || new_vrid == old_vrid)
+            die("adopt: rebuilt %s/REPL unexpected (node=%u want %u, rid=%016" PRIx64 " old=%016" PRIx64 ")", old_vdir,
+                new_vnode, ids[NEW], new_vrid, old_vrid);
+
+        int64_t peer_rd_after = sum_peer_chunk_read_bytes(mports, ND, OLD);
+        int64_t peer_rd_delta = peer_rd_after - peer_rd_before;
+        if (peer_rd_delta < 0)
+            peer_rd_delta = 0;
+        if ((uint64_t)peer_rd_delta * 100ull >= old_chunk_bytes)
+            die("adopt: peer chunk bytes copied (%" PRId64 ") >= 1%% of adopted stores' bytes (%" PRIu64 ")",
+                peer_rd_delta, old_chunk_bytes);
+        printf("  2c. all 3 DISKs rebound to node %" PRIu32 ", v%" PRIu32 ".stale-%016" PRIx64
+               " set aside & rebuilt, peer_chunk_bytes=%" PRId64 " / %" PRIu64 " (< 1%%)\n",
+               ids[NEW], ec_num, old_vrid, peer_rd_delta, old_chunk_bytes);
+    }
+
+    /* ---- 3. Post-adoption settle works on NEW and all keys read bit-exact ---- */
+    if (!vol_rec(F, "ad42", &mv) || !mv.leader)
+        die("adopt: ad42 leader missing after adoption");
+    tsdbc_close(ce);
+    ce = client(server_of(mv.leader));
+    tsdbc_set_retry(ce, 30000);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ad.s%d", s);
+        ide[s] = ecb_series(ce, nm, "ad42");
+    }
+    {
+        int before_tot = count_chunk_files_in(h0[OLD], ec_num) + count_chunk_files_in(h1[OLD], ec_num);
+        int64_t day = day0 + (int64_t)days_written * part_step;
+        for (int b = 0; b < 2; b++) {
+            for (int s = 0; s < ECB_SERIES; s++) {
+                int64_t ts[ECB_ROWS];
+                float val[ECB_ROWS];
+                ecb_rows_of(s, b, day, ts, val);
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ce, ide[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("adopt: post-adopt insert ad42: %s", ers(rc));
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("adopt: post-adopt insert twin: %s", ers(rc));
+            }
+            usleep(300000);
+        }
+        for (uint64_t t0 = now_ms();
+             count_chunk_files_in(h0[OLD], ec_num) + count_chunk_files_in(h1[OLD], ec_num) <= before_tot;
+             usleep(200000))
+            if (now_ms() - t0 > 45000)
+                die("adopt: post-adoption partition did not settle onto NEW's adopted stores");
+    }
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(ct, idt[s], &b)) != 0 || (rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != b.n || a.h != b.h)
+            die("adopt: post-adoption read mismatch series %d (rc=%d, a.n=%" PRIu64 " b.n=%" PRIu64 ")", s, rc, a.n, b.n);
+    }
+
+    /* ---- 4. Clean restart of NEW WITHOUT --adopt: engine root stays pinned to <state-dir>/engine ---- */
+    stop(NEW, SIGTERM);
+    snprintf(xa[NEW], sizeof xa[NEW],
+             "--io epoll --disk %s:nvme --disk %s:hdd --disk %s:hdd --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             nv[OLD], h0[OLD], h1[OLD]);
+    xargs[NEW] = xa[NEW];
+    start(NEW);
+    mports[NEW] = th_mport;
+    struct state_want up_new = {ids[NEW], META_UP, 0};
+    await_view(F, p_member_state, &up_new, "adopt: NEW back UP without --adopt");
+    {
+        /* Verify <state-dir>/DISKS pins primary state-engine and the server log never switched root to nv[OLD]. */
+        char dfile[PATH_MAX + 64], lfile[PATH_MAX + 64], want_srv[PATH_MAX + 64];
+        snprintf(dfile, sizeof dfile, "%s/n%d/state/DISKS", base, NEW);
+        FILE *df = fopen(dfile, "r");
+        if (!df)
+            die("adopt: cannot read %s", dfile);
+        char dbuf[4096];
+        size_t dn = fread(dbuf, 1, sizeof dbuf - 1, df);
+        fclose(df);
+        dbuf[dn] = '\0';
+        if (!strstr(dbuf, "primary state-engine\n"))
+            die("adopt: %s missing pinned 'primary state-engine':\n%s", dfile, dbuf);
+        snprintf(lfile, sizeof lfile, "%s/n%d.log", base, NEW);
+        snprintf(want_srv, sizeof want_srv, "serving %s/n%d/state/engine ", base, NEW);
+        FILE *lf = fopen(lfile, "r");
+        if (!lf)
+            die("adopt: cannot read %s", lfile);
+        char lbuf[65536];
+        size_t ln = fread(lbuf, 1, sizeof lbuf - 1, lf);
+        fclose(lf);
+        lbuf[ln] = '\0';
+        int n_state_srv = 0;
+        for (const char *p = lbuf; (p = strstr(p, want_srv)) != NULL; p += strlen(want_srv))
+            n_state_srv++;
+        char bad_srv[PATH_MAX + 64];
+        snprintf(bad_srv, sizeof bad_srv, "serving %s ", nv[OLD]);
+        if (strstr(lbuf, bad_srv) != NULL || n_state_srv < (do_crash_recovery ? 3 : 2))
+            die("adopt: engine root switched across restarts (want '%s' >= %d times, got %d)", want_srv,
+                do_crash_recovery ? 3 : 2, n_state_srv);
+    }
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(ct, idt[s], &b)) != 0 || (rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != b.n || a.h != b.h)
+            die("adopt: post-restart read mismatch series %d (rc=%d)", s, rc);
+    }
+    tsdbc_close(ce);
+    tsdbc_close(ct);
+    printf("  3-4. post-adoption settle, bit-exact reads across all partitions, and clean restart without --adopt ok\n");
+    stop_all();
+#endif
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -35894,7 +36535,8 @@ int main(int argc, char **argv)
                {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass},
                {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio}, {"diskout", scen_diskout},
                {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring},
-               {"hddadd", scen_hddadd}, {"settings", scen_settings}, {"diskfill", scen_diskfill}, {"posbalance", scen_posbalance}};
+               {"hddadd", scen_hddadd}, {"settings", scen_settings}, {"diskfill", scen_diskfill}, {"posbalance", scen_posbalance},
+               {"adopt", scen_adopt}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

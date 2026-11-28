@@ -492,11 +492,12 @@ static void sweep_all_disks(void)
         if (cvolfs_disk_scannable(&cd, log_on_hdd))
             roots[nroots++] = di[i].path;
     }
-    if (nroots == 0) {
+    if (nd == 0) {
         roots[0] = M.dir;
         nroots = 1;
     }
-    cvolset_sweep_disks(roots, nroots);
+    if (nroots > 0)
+        cvolset_sweep_disks(roots, nroots);
     free(di);
 }
 

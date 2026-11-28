@@ -518,6 +518,18 @@ int cvolfs_prepare_disks(const char *meta_root, const struct cvolfs_disk *disks,
     }
     int rc = -1;
     uint64_t draw = 0;
+#ifdef TSDB_TEST_HOOKS
+    {
+        const char *dm = getenv("TSDB_DISKS_MUTANT");
+        if (dm && strcmp(dm, "adoptlogdir") == 0 && r->open_gen == 0 &&
+            memcmp(st.volume_uuid, r->uuid, 16) == 0 && memcmp(st.cluster_uuid, r->cluster, 16) == 0 &&
+            st.node != r->node) {
+            /* planted adoptlogdir: carry over OLD's v<N> directory in place instead of setting aside as .stale-<rid> */
+            st.node = r->node;
+            st.rid = r->rid;
+        }
+    }
+#endif
     if (memcmp(st.volume_uuid, r->uuid, 16) || memcmp(st.cluster_uuid, r->cluster, 16) || st.node != r->node) {
         say("volume %" PRIu32 ": %s/REPL belongs to another volume, cluster or node (node %" PRIu32 ", this server is %"
             PRIu32 "): not opened", r->number, vdir, st.node, r->node);

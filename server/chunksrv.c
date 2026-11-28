@@ -796,8 +796,10 @@ int chunksrv_store_info(struct chunksrv *cs, int idx, char *path_out, size_t pat
 {
     if (!cs || !cs->be || idx < 0 || idx >= cs->n)
         return -1;
-    if (path_out && path_cap > 0)
-        snprintf(path_out, path_cap, "%s", cs->paths && cs->paths[idx] ? cs->paths[idx] : "");
+    if (path_out && path_cap > 0) {
+        if (!chunk_be_store_path_copy(cs->be, idx, path_out, path_cap))
+            snprintf(path_out, path_cap, "%s", cs->paths && cs->paths[idx] ? cs->paths[idx] : "");
+    }
     int st = chunk_be_store_state(cs->be, idx);
     if (state_out)
         *state_out = st;

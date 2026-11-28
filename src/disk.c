@@ -1248,3 +1248,83 @@ done:
     free(pcopy);
     return rc;
 }
+
+int disk_rebind_locked(int dirfd, const char *path, const uint8_t cluster_uuid[16], uint32_t old_node_id,
+                       uint32_t new_node_id)
+{
+    if (dirfd < 0 || !path || !cluster_uuid || is_zero16(cluster_uuid) || old_node_id == 0 || new_node_id == 0 ||
+        old_node_id == new_node_id)
+        return TSDB_ERR_INVALID;
+
+    disk_meta cur;
+    int rc = disk_load_fd(dirfd, path, &cur);
+    if (rc != 0)
+        return rc;
+
+    if (!cur.bound) {
+        fprintf(stderr, "tsdb: %s/%s: unbound disk cannot be adopted (expected node %" PRIu32 ")\n", path,
+                DISK_META_FILE, old_node_id);
+        return TSDB_ERR_INVALID;
+    }
+    if (memcmp(cur.cluster_uuid, cluster_uuid, 16) != 0) {
+        char have_hex[33], want_hex[33];
+        chunk_oid_hex(cur.cluster_uuid, have_hex);
+        chunk_oid_hex(cluster_uuid, want_hex);
+        fprintf(stderr,
+                "tsdb: %s/%s: belongs to cluster %s node %" PRIu32 ", refusing adoption into cluster %s\n", path,
+                DISK_META_FILE, have_hex, cur.node_id, want_hex);
+        return TSDB_ERR_INVALID;
+    }
+    if (cur.node_id == new_node_id) {
+        /* Idempotent retry after a crash between rename and dir fsync: make durable before acknowledging. */
+        int dfd = openat(dirfd, DISK_META_FILE, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (dfd < 0)
+            return TSDB_ERR_IO;
+        int s1 = tsdb_fsync(dfd);
+        close(dfd);
+        return s1 == 0 ? sync_dir_fd(dirfd) : TSDB_ERR_IO;
+    }
+    if (cur.node_id != old_node_id) {
+        fprintf(stderr, "tsdb: %s/%s: bound to node %" PRIu32 ", expected node %" PRIu32 " for adoption\n", path,
+                DISK_META_FILE, cur.node_id, old_node_id);
+        return TSDB_ERR_INVALID;
+    }
+
+    cur.node_id = new_node_id;
+    return disk_write_atomic(dirfd, &cur, NULL);
+}
+
+int disk_rebind(const char *path, const uint8_t cluster_uuid[16], uint32_t old_node_id, uint32_t new_node_id)
+{
+    if (!cluster_uuid || is_zero16(cluster_uuid) || old_node_id == 0 || new_node_id == 0 || old_node_id == new_node_id)
+        return TSDB_ERR_INVALID;
+
+    char *pcopy = NULL;
+    const char *p = NULL;
+    int rc = strip_slashes(path, &pcopy, &p);
+    if (rc != 0)
+        return rc;
+
+    int dirfd = open(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dirfd < 0) {
+        int e = errno;
+        free(pcopy);
+        if (e == ENOENT)
+            return TSDB_ERR_NOTFOUND;
+        return e == ELOOP || e == ENOTDIR ? TSDB_ERR_INVALID : TSDB_ERR_IO;
+    }
+
+    rc = lock_dir_nb(dirfd);
+    if (rc != 0) {
+        if (rc == TSDB_ERR_LOCKED)
+            fprintf(stderr, "tsdb: %s: disk directory is busy (locked by another process)\n", p);
+        goto done;
+    }
+
+    rc = disk_rebind_locked(dirfd, p, cluster_uuid, old_node_id, new_node_id);
+
+done:
+    close(dirfd);
+    free(pcopy);
+    return rc;
+}
