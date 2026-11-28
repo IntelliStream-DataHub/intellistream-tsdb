@@ -31,6 +31,15 @@ static void eval_geom(const struct cluster_copy *cp, const struct cluster_copy_v
         int st = member_state(cp, v->stripe[p]);
         if (st == META_DESTROYED)
             gone = true;
+        /* R14 (r9-jc): a FILLING position whose prev holder was declared destroyed still lacks its pre-barrier chunks
+         * until it reaches WHOLE; counting it as destroyed prevents a spare from hiding tier=lost. */
+        if (!gone && v->stripe_pos[p].state == META_STRIPE_FILLING && v->stripe_pos[p].prev != 0) {
+            uint32_t prev = v->stripe_pos[p].prev;
+            for (size_t i = 0; i < nd && !gone; i++)
+                gone = destroyed[i] == prev;
+            if (!gone && member_state(cp, prev) == META_DESTROYED)
+                gone = true;
+        }
         if (gone && mutant != MARGIN_MUT_LOSTASDOWN)
             dest++;
         else if (!gone && (st == META_UP || st == META_DRAINING))

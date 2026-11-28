@@ -201,6 +201,7 @@ void db_parts_insert_locked(eng *db, part *p)
     memmove(db->parts + lo + 1, db->parts + lo, (db->nparts - lo) * sizeof *db->parts);
     db->parts[lo] = p;
     db->nparts++;
+    atomic_fetch_add_explicit(&db->parts_gen, 1, memory_order_release);
     stats_ev_add(db, p); /* statistics: two stores under the lock this holds; never more than this on the write path */
 }
 
@@ -260,6 +261,7 @@ void db_parts_remove_locked(eng *db, part *p)
     if (idx < db->nparts) {
         memmove(db->parts + idx, db->parts + idx + 1, (db->nparts - idx - 1) * sizeof *db->parts);
         db->nparts--;
+        atomic_fetch_add_explicit(&db->parts_gen, 1, memory_order_release);
         stats_ev_remove(db, p);
         part_unref(p);
     }

@@ -680,8 +680,10 @@ their stores come back empty: queries that must decode lost partitions fail with
 queries answered from statistics still answer; TOPOLOGY marks the volume `LOST`; UNAVAILABLE carries reason
 `TSDB_WHY_LOST` (18, after `TSDB_WHY_RELOADING` = 17, include/tsdb_protocol.h:313-317) with the "do not retry" flag;
 `tsdb cluster volume salvage V` drops the lost objects by oid (`MK_DROP_OBJ`) so the volume serves the rest, young
-parts included. A volume whose log group is wholly lost has lost acknowledged writes: salvage says how many positions
-above the last settled object it cannot account for.
+parts included (if a dropped object shadowed lower-block parts of the same partition, salvage logs and reports a
+warning that overwritten or deleted rows in lower blocks may become visible again, deterministically across all
+members). A volume whose log group is wholly lost has lost acknowledged writes: salvage reports the whole log group
+destroyed and the highest known log position whose unsettled writes cannot be accounted for.
 
 ### 5.9 Scrub
 
@@ -758,7 +760,7 @@ the log group, R3's replication is the young tier, R4's rebuild is the log-posit
 | Chunk store META with store id; per-volume `EPOCH` file. *2026-11-11*: the **disk META** of every `--disk` (store id, class, sync latency, node id, cluster uuid; E47, E58), the `EPOCH` in each chunk store (E48) | storage servers; every disk | yes |
 | `.ec` index file: the part's header, index, tombstones, footer, then the object record (with every position's cell sums) | log replicas | yes |
 | `ppos` in MANIFEST entries of cluster volumes, and of single-server volumes with a tier (E55) | log replicas; single servers | yes, behind `requires=cluster` or `requires=tier` |
-| Markers: `MK_COLD` body (Z, object records, `.ec` and `Y` files, retired oids, `stripe_version`), and new `MK_GC` (12), `MK_DIGEST` (13), `MK_DROP_OBJ` (14), `MK_UNSETTLE` (15) | WAL; `MK_TYPE_LAST` moves to 15 (src/marker.h:41) | yes |
+| Markers: `MK_COLD` body (Z, object records, `.ec` and `Y` files, retired oids, `stripe_version`), and new `MK_GC` (12), `MK_DIGEST` (13), `MK_UNSETTLE` (14), `MK_DROP_OBJ` (15) | WAL; `MK_TYPE_LAST` moves to 15 (src/marker.h:41) | yes |
 | The settle intent record (an extension of `parts_commit`'s) | log replicas | yes |
 | `FORMAT_VERSION` | stays 9 (E17) | |
 | A single server's tiers (E55): `TIERS` (beside VOLUMES; checksummed append-only records: store id, path, class, state), (and single-copy flag), each tier store's META with the database's `db_id` (in the root META), `requires=tier` in the META of a volume with a tier, `.ec` entries in its MANIFEST naming the store id; the settle markers of R7 | single-server databases | yes, behind `requires=tier`; `FORMAT_VERSION` stays 9 |

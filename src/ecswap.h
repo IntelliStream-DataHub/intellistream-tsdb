@@ -55,6 +55,13 @@ int ec_swap_unsettle_at(eng *db, part **in, part **out, size_t n, uint64_t unset
  * set for the `salvagelatest` mutant), pushing statistics removal events, and handing retired objects to ecgc.
  * Surviving young .part files and unaffected .ec parts in the same partition are left untouched. */
 int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut);
+/* R14 (r14-salvage, E15, D26): cluster MK_DROP_OBJ variant of ec_swap_salvage. When `cluster_drop_obj` is true, skips
+ * the single-server wal_removed_synced and lower-block shadow refusals (the committed MK_DROP_OBJ marker is applied
+ * deterministically on every member; if any lower-block part was shadowed, logs a warning and increments *shadowed_out
+ * when non-NULL), tags retired objects with `salvage_pos` for ecgc's applied-floor gate, and when `clear_hold` is true
+ * releases `db->unsettle_hold_pos` under publish_lock after the post-rename directory fsync. */
+int ec_swap_salvage_at(eng *db, part **in, size_t n, bool no_lgen_mut, uint64_t salvage_pos, bool cluster_drop_obj,
+                       bool clear_hold, size_t *shadowed_out);
 
 /* The open's recovery of the v4 intent `name` (its whole text in buf[0 .. len), which may be changed). 0: done, and
  * intents_recover unlinks the intent (and syncs the directory); else the open fails with it. */

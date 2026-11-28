@@ -2014,7 +2014,10 @@ static int r9_m1_destroyed_check(void)
             memset(&p, 0, sizeof p);
             int rc = tsdbc_query_points(c, sid, INT64_MIN, INT64_MAX, &p);
             last_rc = rc;
-            if (rc == TSDB_ERR_UNAVAILABLE) {
+            if (rc == TSDB_ERR_IO) {
+                /* E15 / §5.8 / R14: reads of a permanently lost object fail immediately with TSDB_ERR_IO. */
+                got_why_lost = 1;
+            } else if (rc == TSDB_ERR_UNAVAILABLE) {
                 tsdb_unavail u[4];
                 unsigned nu = 0;
                 if (tsdbc_unavailable(c, u, 4, &nu) == 0 && nu >= 1)

@@ -2086,6 +2086,7 @@ struct eng {
     pthread_cond_t merged_cv; /* a merge finished */
     part **parts;             /* sorted by (partition, min_block) */
     size_t nparts, parts_cap;
+    atomic_uint_fast64_t parts_gen; /* bumped on every db_parts_insert_locked / db_parts_remove_locked */
     atomic_uint_fast64_t next_block;
     atomic_uint tmp_counter;
     atomic_bool stop;

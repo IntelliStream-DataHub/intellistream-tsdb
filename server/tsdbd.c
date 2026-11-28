@@ -127,6 +127,7 @@
 #include "chunkpeer.h"
 #include "../src/tiers.h"
 #include "../src/tier.h"
+#include "../src/eccache.h"
 #include "../src/tiersalv.h"
 #include "../src/tierscrub.h"
 #include "../src/settle.h"
@@ -730,9 +731,15 @@ static void dom_waits(int delta) { worker_waits(delta); }
 /* The margins of the cluster volumes (server/margins.h): STATUS, the metrics port and the reason of a settled read's
  * refusal. TSDBD_MARGIN_MUTANT plants margins.h's bugs (tests/margin_mutants.sh). */
 static int margin_mutant;
-/* A settled read of volume v answered TSDB_ERR_CORRUPT here (frame_put, with unav_cold): its settled tier says corrupt
- * until a restart. A young part's CORRUPT does not count: it says nothing about the settled tier. */
+/* A settled read of volume v answered TSDB_ERR_CORRUPT here (either via eccache_set_corrupt_hook from any reader or
+ * helper thread, or via frame_put with test_cold): its settled tier says corrupt until a restart. A young part's
+ * CORRUPT does not count: it says nothing about the settled tier. */
 static _Atomic uint8_t vol_corrupt[TSDB_VOL_ANY];
+static void on_ec_corrupt(uint32_t vol)
+{
+    if (vol < TSDB_VOL_ANY)
+        atomic_store(&vol_corrupt[vol], 1);
+}
 /* Tests (TSDBD_TEST_COLD=FILE, read at every use; no file: no fault): until R9 nobody can declare a node destroyed and
  * no cluster volume reads a settled object (r8f, r8n), so the file stands in for both. A line "destroyed ID..." names
  * the nodes the operator declared destroyed; with "reads" a read of an EC cluster volume this server serves, once
@@ -1489,9 +1496,14 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
         status = TSDB_ERR_UNAVAILABLE;
     /* a settled read of a cluster volume found damage (E15's corrupt: enough positions, checks failed beyond what a
      * decode repairs): its settled tier says corrupt in STATUS and on the metrics port until a restart (R9's repair).
-     * Only a read its path flagged as settled (unav_cold): a damaged young part says nothing about the settled tier */
+     * Only a read its path flagged as settled (unav_cold or eccache_take_thread_err): a damaged young part says nothing
+     * about the settled tier */
+    bool saved_unav_cold = unav_cold;
+    int cold_err = eccache_take_thread_err();
+    if (!unav_cold && status == TSDB_ERR_UNAVAILABLE && cold_err == TSDB_ERR_UNAVAILABLE)
+        unav_cold = true;
     if (status == TSDB_ERR_CORRUPT && unav_vol != TSDB_VOL_ANY && !unav_write && cvol_active() &&
-        (unav_cold || margin_mutant == MARGIN_MUT_YOUNGCORRUPT))
+        (unav_cold || cold_err == TSDB_ERR_CORRUPT || margin_mutant == MARGIN_MUT_YOUNGCORRUPT))
         atomic_store(&vol_corrupt[unav_vol], 1);
     /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
      * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
@@ -1507,6 +1519,7 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
             ulen = tsdb_wire_put_unavail(ub, sizeof ub, &e, 1);
         }
     }
+    unav_cold = saved_unav_cold;
     if (status == TSDB_ERR_MOVED && rmv.on && (!ix || *ix == TSDB_MULTI_END))
         ulen = tsdb_wire_put_moved(ub, sizeof ub, &rmv.m, 1); /* route_moved sends MOVED to 13 only */
     size_t body = 4 + 1 + 4 + pre + alen + blen + dlen + ulen;
@@ -3604,11 +3617,13 @@ static void handle(req *r)
     lguard.ids = NULL;
     rmv.on = false; /* per request, as lguard: no answer carries another request's route body */
     unav_full = false;
+    eccache_clear_thread_err();
     tierfill_clear_last_refused();
     rt_req = r;
     rt_forwarded = false;
     handle_in(r);
     unav_full = false;
+    eccache_clear_thread_err();
     tierfill_clear_last_refused();
     rt_req = NULL;
     rt_forwarded = false;
@@ -3672,6 +3687,15 @@ static void handle_in(req *r)
         repld_note_full_refusal(unav_vol);
         reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* E30: refused before WAL append or lw_enter */
         return;
+    }
+    if (unav_vol != TSDB_VOL_ANY && unav_write && cvol_active()) {
+        struct margins wm;
+        if (vol_margins(unav_vol, &wm) && wm.tier == MARGIN_TIER_LOST && cvol_vol_has_lost_ec(unav_vol)) {
+            unav_cold = true;
+            reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE); /* E15/§5.8: WHY_LOST until `volume salvage` */
+            unav_cold = false;
+            return;
+        }
     }
     if (unav_vol != TSDB_VOL_ANY && cvol_active() && !(fwd_owner && fwdx_mutant == FWM_NOLEASE)) {
         uint64_t gen = cluster_lease_gen();
@@ -8562,6 +8586,7 @@ int main(int argc, char **argv)
                                  .loop_gated = 1};
         if (scrubd_start(db, dir) != 0)
             return 1;
+        eccache_set_corrupt_hook(on_ec_corrupt);
         if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_start() != 0 ||
             fwd_cluster_start(fwd_on_event, NULL) != 0) {
             scrubd_stop();

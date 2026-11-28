@@ -1260,6 +1260,26 @@ static struct ecpart *part_ec(const part *p)
     return atomic_load_explicit(&((part *)p)->ec, memory_order_acquire);
 }
 
+static __thread int eccache_thread_err;
+static void (*_Atomic eccache_corrupt_hook)(uint32_t vol);
+
+void eccache_set_corrupt_hook(void (*fn)(uint32_t vol)) { atomic_store(&eccache_corrupt_hook, fn); }
+
+void eccache_clear_thread_err(void) { eccache_thread_err = 0; }
+
+void eccache_note_thread_err(int rc)
+{
+    if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_CORRUPT || rc == TSDB_ERR_IO)
+        eccache_thread_err = rc;
+}
+
+int eccache_take_thread_err(void)
+{
+    int rc = eccache_thread_err;
+    eccache_thread_err = 0;
+    return rc;
+}
+
 int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi, int type, int64_t *ts, void *v,
                        size_t cap, bool verify)
 {
@@ -1275,6 +1295,10 @@ int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi
     if (len == 0 || g->off < p->hdr_len || g->off > p->index_off || len > p->index_off - g->off ||
         p->index_off > e->rec.object_len) {
         corrupt_line(p, e, g, gi, "the index places it outside the object's granules");
+        void (*ch)(uint32_t) = atomic_load(&eccache_corrupt_hook);
+        if (ch)
+            ch(e->volume);
+        eccache_thread_err = TSDB_ERR_CORRUPT;
         return TSDB_ERR_CORRUPT;
     }
     uint64_t h = ce_hash64(e->rec.oid, g->off);
@@ -1421,6 +1445,13 @@ int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi
         ce_evict_global(c, &vict, false, (int)si);
     if (vict)
         ce_free_list(vict);
+    if (rc == TSDB_ERR_CORRUPT) {
+        void (*ch)(uint32_t) = atomic_load(&eccache_corrupt_hook);
+        if (ch)
+            ch(e->volume);
+    }
+    if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_CORRUPT || rc == TSDB_ERR_IO)
+        eccache_thread_err = rc;
     return rc;
 }
 

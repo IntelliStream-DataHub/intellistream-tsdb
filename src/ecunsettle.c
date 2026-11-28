@@ -720,7 +720,8 @@ int eng_unsettle_key(eng *db, int64_t partition_key, uint64_t *objs_out, uint64_
             bool committed = false;
             jr_serial_lock(db);
             pthread_mutex_lock(&db->lock);
-            bool still_ok = eng_check(db) == 0 && !partition_dropping(db, partition_key);
+            bool hold_busy = atomic_load_explicit(&db->unsettle_hold_pos, memory_order_acquire) != 0;
+            bool still_ok = !hold_busy && eng_check(db) == 0 && !partition_dropping(db, partition_key);
             for (size_t i = 0; i < n && still_ok; i++) {
                 size_t j = 0;
                 while (j < db->nparts && db->parts[j] != in[i])
@@ -736,7 +737,7 @@ int eng_unsettle_key(eng *db, int64_t partition_key, uint64_t *objs_out, uint64_
             }
             pthread_mutex_unlock(&db->lock);
             if (!still_ok) {
-                rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
+                rc = hold_busy ? TSDB_ERR_LOCKED : eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
             } else {
                 mk m;
                 memset(&m, 0, sizeof m);

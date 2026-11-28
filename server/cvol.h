@@ -56,6 +56,9 @@ int cvol_active(void);
 /* 1 once the manager went through the volume records of a metadata copy: before that a volume name it does not know
  * may be one the copy has not shown it yet (UNAVAILABLE, RECOVERING, rather than NOTFOUND). */
 int cvol_synced(void);
+/* R14 (E15, §5.8, D26): 1 when EC volume `v` currently holds at least one live .ec part with fewer than k positions
+ * not on META_DESTROYED members (pre-salvage: writes fail UNAVAILABLE WHY_LOST; post-salvage: 0 -> writes resume). */
+int cvol_vol_has_lost_ec(uint32_t v);
 struct snap_ident;
 /* The install of a received snapshot of replicated volume v (server/snapinst.c; the snapshot worker, no lock held; R4
  * D5, D6): takes the volume from the manager (requests UNAVAILABLE RECOVERING), stops its driver and closes its engine

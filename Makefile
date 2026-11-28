@@ -153,7 +153,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/tierfill.h src/tierctl.h src/tiersalv.h src/tierscrub.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/ecunsettle.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
+R7_HDR := src/ecpart.h src/tier.h src/tierfill.h src/tierctl.h src/tiersalv.h src/tierscrub.h src/tiers.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/ecunsettle.h src/ecsalvage.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -679,7 +679,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode redund r
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast
 CLUSTER_SCEN_4 := outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
     nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio diskout \
-    ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill posbalance adopt
+    ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill posbalance adopt salvage
 test-cluster-1 test-cluster-2 test-cluster-3 test-cluster-4: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
 	CRASHFS_SO=$(B)/libcrashfs.so OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1435,6 +1435,14 @@ degsettle-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	@$(if $(EC_OBJ),true,echo "degsettle-mutants: this build has no erasure codec (NO_EC=1): ecdegraded skips, nothing to plant"; false)
 	$(MUT) --name ecdegraded --list "degtwo degnoupcheck degnopositions" -- env TSDB_ECCOLD_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecdegraded
+# r14-salvage: node destroyed (salvageheard) and volume salvage (salvagenotlost) planted bugs must fail test_cluster salvage
+.PHONY: salvage-mutants
+salvage-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	@$(if $(EC_OBJ),true,echo "salvage-mutants: this build has no erasure codec (NO_EC=1): salvage skips, nothing to plant"; false)
+	$(MUT) --name salvage-heard --list "salvageheard" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ salvage
+	$(MUT) --name salvage-notlost --list "salvagenotlost" -- env TSDB_SALVAGE_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ salvage
 # r10-unsettle: cluster MK_UNSETTLE planted bugs in tsdbd (TSDB_ECUNSETTLE_MUTANT), each must fail test_cluster unsettle
 .PHONY: unsettle-mutants
 unsettle-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/test_ecapply

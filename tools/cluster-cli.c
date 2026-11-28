@@ -108,6 +108,9 @@ static const char cl_help[] =
     "                      number) back on. It stops after a force-leader (and a restore, once built; status:\n"
     "                      gc_suspended 1) until an operator has checked that no chunk the volume still needs\n"
     "                      would be taken for an orphan.\n"
+    "  volume salvage PEER VOLUME [--force]  retire permanently lost settled .ec objects (more than M positions on\n"
+    "                      destroyed members) via MK_DROP_OBJ so surviving objects and young data resume serving.\n"
+    "                      Refuses while an OUT stripe holder may still return unless --force is given.\n"
     "  volume force-leader PEER VOLUME NODE  when no ISR member of volume number VOLUME is up (clients get\n"
     "                      UNAVAILABLE NO_OWNER), makes the replica on node NODE its leader. Unclean: writes\n"
     "                      acknowledged past that replica's log end are lost; the leader of the group logs its log\n"
@@ -263,6 +266,16 @@ static const char help_volume_gc_resume[] =
     "usage: tsdb cluster volume gc resume PEER VOLUME --secret-file F\n"
     "\n"
     "  Resume orphan chunk collection on erasure-coded VOLUME (name or number) after force-leader or restore.\n"
+    "  Exit codes: 0 ok, 1 refused/failed, 2 usage.\n";
+
+static const char help_volume_salvage[] =
+    "usage: tsdb cluster volume salvage PEER VOLUME [--force] --secret-file F\n"
+    "\n"
+    "  Drop permanently lost settled .ec objects (fewer than K positions not on destroyed members) on VOLUME\n"
+    "  (name or number) by committing MK_DROP_OBJ, keeping young data and surviving settled objects intact.\n"
+    "  Refuses while an OUT stripe holder may still return unless --force is given.\n"
+    "  If the whole log group was destroyed, prints how many log positions above the last settled object\n"
+    "  cannot be accounted for.\n"
     "  Exit codes: 0 ok, 1 refused/failed, 2 usage.\n";
 
 static const char help_volume_force_leader[] =
@@ -2421,6 +2434,7 @@ struct cl_ctx {
     uint64_t set_ver;
     int have_set_ver;
     uint32_t bal_flags;
+    uint32_t salvage_flags;
 };
 
 typedef int (*cl_parse_flag_fn)(struct cl_ctx *ctx, int argc, char **argv, int *idx);
@@ -2994,6 +3008,28 @@ static int enc_volume_redundancy(struct cl_ctx *ctx, uint8_t *req, size_t cap, s
     return 0;
 }
 
+static int parse_flag_volume_salvage(struct cl_ctx *ctx, int argc, char **argv, int *idx)
+{
+    (void)argc;
+    if (strcmp(argv[*idx], "--force") == 0) {
+        ctx->salvage_flags |= CLUSTER_SALVAGE_FORCE;
+        return 1;
+    }
+    return 0;
+}
+
+static int enc_volume_salvage(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
+{
+    if (cap < 8)
+        return 1;
+    ctx->peer = ctx->pos[0];
+    uint32_t sv = 0;
+    if (resolve_volume_arg("volume salvage", ctx->pos[1], ctx->peer, ctx->secret, ctx->slen, &sv) != 0)
+        return 1;
+    *req_len = cluster_volume_salvage_encode(sv, ctx->salvage_flags, req);
+    return 0;
+}
+
 static int enc_vol_node(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
 {
     (void)cap;
@@ -3508,6 +3544,8 @@ static const struct cl_verb cl_verbs[] = {
      prt_text_reply, help_disk_class},
     {{"volume", "gc", "resume"}, 3, 2, 2, CL_VF_PRINT_ERR_BODY | CL_VF_SECRET_IN_ENCODE, CLUSTER_OP_VOLUME_GC_RESUME,
      30000, NULL, enc_volume_gc_resume, prt_volume_gc_resume, help_volume_gc_resume},
+    {{"volume", "salvage", NULL}, 2, 2, 2, CL_VF_PRINT_ERR_BODY | CL_VF_SECRET_IN_ENCODE, CLUSTER_OP_VOLUME_SALVAGE,
+     60000, parse_flag_volume_salvage, enc_volume_salvage, prt_text_reply, help_volume_salvage},
     {{"volume", "add", NULL}, 2, 2, 2, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_VOLUME_ADD, 30000, parse_flag_volume_add,
      enc_volume_add, prt_volume_add, help_volume_add},
     {{"volume", "force-leader", NULL}, 2, 3, 3, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_VOLUME_FORCE, 30000, NULL,

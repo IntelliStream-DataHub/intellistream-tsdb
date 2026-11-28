@@ -72,7 +72,8 @@ for hargs in "" "help" "help status" "help status volumes" "help status volume" 
              "help init" "help node" "help node add" "help node hold" "help node out" "help node drain" \
              "help node replace" "help node destroyed" "help disk" "help disk out" "help disk replace" "help disk class" \
              "help volume" "help volume add" "help volume move" "help volume redundancy" \
-             "help volume transfer" "help volume force-leader" "help volume gc resume" "help replica reset" \
+             "help volume transfer" "help volume force-leader" "help volume gc resume" "help volume salvage" \
+             "help replica reset" \
              "help settings" "help settings show" "help settings set" "help balance" \
              "help secret" "help user"; do
     # shellcheck disable=SC2086
@@ -96,7 +97,7 @@ done
 # Wrong verb / missing args must exit 2 with empty stdout.
 for bad in "bogus" "help bogus" "help status volumes extra" "status" "status --json" "status volumes" \
            "status volume" "status volume 1" "status disks" "node nope" "disk nope" "disk out" "disk replace" \
-           "disk class" "volume nope" "volume redundancy" "replica nope" \
+           "disk class" "volume nope" "volume redundancy" "volume salvage" "volume salvage 127.0.0.1:1" "replica nope" \
            "settings" "settings nope" "settings show" "settings set" "settings set 127.0.0.1:1" "balance"; do
     # shellcheck disable=SC2086
     out=$("$T" cluster $bad 2>"$scratch/err"); rc=$?

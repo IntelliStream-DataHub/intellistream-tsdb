@@ -2259,8 +2259,13 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                 mb->hold_until_ms = 0;
                 mb->hold_clock_ms = 0;
             }
-            if (st == META_DESTROYED && !MUT(61)) /* destroyedkeepreplace */
-                mb->replaced_by = 0;
+            if (st == META_DESTROYED) {
+                if (!MUT(61)) /* destroyedkeepreplace */
+                    mb->replaced_by = 0;
+                for (uint32_t j = 0; j < mb->ndisks && j < META_DISKS_MAX; j++)
+                    mb->disks[j].state = META_STORE_DESTROYED;
+                mb->capability = member_compute_cap(mb, m->set.log_on_hdd);
+            }
         }
         return META_OK;
     }
@@ -4847,9 +4852,13 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
             FAIL("member %u: unknown role %u", b->id, b->role);
         if (b->ndisks > META_DISKS_MAX)
             FAIL("member %u: ndisks %u exceeds META_DISKS_MAX", b->id, b->ndisks);
-        for (uint32_t j = 0; j < b->ndisks; j++)
+        for (uint32_t j = 0; j < b->ndisks; j++) {
             if (!disk_fields_valid(&b->disks[j]))
                 FAIL("member %u: disk %u has invalid fields", b->id, j);
+            if (b->state == META_DESTROYED && b->disks[j].state != META_STORE_DESTROYED)
+                FAIL("member %u: DESTROYED with non-DESTROYED disk %u (%s)", b->id, j,
+                     meta_store_state_name(b->disks[j].state));
+        }
         uint8_t want_cap = member_compute_cap(b, next->set.log_on_hdd);
         if (b->capability != want_cap)
             FAIL("member %u: capability %s does not match UP disks (%s)", b->id, meta_cap_name(b->capability),

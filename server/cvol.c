@@ -89,6 +89,8 @@
 #include "../client/tsdb_crypto.h"
 #include "../src/compat.h"
 #include "../src/cvol.h"
+#include "../src/chunk.h"
+#include "../src/ecsalvage.h"
 #include "../src/internal.h"
 #include "../src/snapshot.h"
 #include "tsdb_protocol.h"
@@ -122,6 +124,13 @@ struct mvol {
     uint64_t wal_last_min;
     uint64_t wal_buckets[WAL_RATE_BUCKETS];
     double wal_bps;
+    /* R14: O(1) cache for cvol_vol_has_lost_ec (invalidated on parts_gen, applied, stripe_version, or filled_gen). */
+    uint64_t lost_ec_pgen;
+    uint64_t lost_ec_applied;
+    uint64_t lost_ec_sver;
+    uint64_t lost_ec_fgen;
+    int8_t lost_ec_valid;
+    int8_t lost_ec_val;
 };
 
 static struct {
@@ -132,6 +141,8 @@ static struct {
     pthread_cond_t cv;
     pthread_t th;
     int started, stop, dirty, active, disks_ready;
+    int salvage_active;
+    pthread_cond_t salvage_cv;
     int synced; /* the manager has gone through the volume records of a metadata copy once (every one declared) */
     uint32_t init_vols[CLUSTER_REPORT_VOLS]; /* R9 (D5): volumes held at startup (first push) */
     uint32_t ninit;
@@ -152,7 +163,8 @@ static struct {
     int stale_first; /* TSDB_CLUSTER_TEST stale_first_watch=1, until the first push */
     unsigned unreach_ms; /* UNREACH_MS, or TSDB_CVOL_TEST unreach_ms=N (tests only: a report later than the leader's
                           * shrink request, which cluster.c's cut_move holds for, test_cluster cuthold) */
-} M = {.op = PTHREAD_MUTEX_INITIALIZER, .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+} M = {.op = PTHREAD_MUTEX_INITIALIZER, .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER,
+       .salvage_cv = PTHREAD_COND_INITIALIZER};
 
 #define say cvolfs_say
 
@@ -858,6 +870,9 @@ void cvol_disks_ready(void)
     pthread_mutex_unlock(&M.mu);
 }
 
+/* Forward declaration for cvol_start(). */
+static void cvol_salvage_run(void *arg, uint32_t vol, uint32_t flags, cluster_salvage_done_fn done, void *cb_arg);
+
 int cvol_start(tsdb *t, const char *dir)
 {
     M.t = t;
@@ -930,6 +945,7 @@ int cvol_start(tsdb *t, const char *dir)
     cluster_set_fence_handler(repld_fence, NULL);
     cluster_set_drv_counts(repld_transfer_counts);
     cluster_set_volcmd_handler(repld_volcmd, NULL);
+    cluster_set_salvage_handler(cvol_salvage_run, NULL);
     cluster_set_reporter(on_report, NULL);
     return 0;
 }
@@ -1063,13 +1079,280 @@ int cvol_vol_reopening(uint32_t v)
     return r;
 }
 
+struct cvol_salv_ctx {
+    const struct cluster_copy *cp;
+    const struct cluster_copy_vol *v;
+};
+
+static int cvol_salvage_pos(void *ctx, const ec_record *rec, unsigned pos)
+{
+    const struct cvol_salv_ctx *sc = ctx;
+    const struct cluster_copy_vol *v = sc->v;
+    if (pos >= v->nstripe || pos >= META_STRIPE_MAX)
+        return EC_SALV_DOWN;
+    uint32_t holder = v->stripe[pos];
+    if (v->stripe_pos[pos].state == META_STRIPE_FILLING) {
+        uint64_t barrier = v->stripe_pos[pos].set_ver ? v->stripe_pos[pos].set_ver : v->stripe_version;
+        if (barrier == 0 || rec->stripe_version < barrier) {
+            if (v->stripe_pos[pos].prev != 0 && !chunkpeer_is_filled(holder, v->number, pos, barrier, rec->oid))
+                holder = v->stripe_pos[pos].prev;
+        }
+    }
+    const struct cluster_copy_member *mb = cluster_copy_member(sc->cp, holder);
+    if (!mb || mb->state == META_DESTROYED)
+        return EC_SALV_DESTROYED;
+    if (mb->state == META_OUT)
+        return EC_SALV_OUT;
+    if (mb->state == META_DOWN)
+        return EC_SALV_DOWN;
+    return EC_SALV_UP;
+}
+
+static int copy_vol_holds_ec(const struct cluster_copy_vol *v)
+{
+    return v && (v->redundancy == META_RED_EC ||
+                 ((v->conv.phase == META_CONV_REENCODE || v->conv.phase == META_CONV_DROP) &&
+                  v->conv.orig_redundancy == META_RED_EC) ||
+                 v->mixed_redundancy == META_RED_EC);
+}
+
+int cvol_vol_has_lost_ec(uint32_t v)
+{
+    if (!M.t)
+        return 0;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp)
+        return 0;
+    const struct cluster_copy_vol *cv = cluster_copy_vol(cp, v);
+    if (!copy_vol_holds_ec(cv)) {
+        cluster_copy_put(cp);
+        return 0;
+    }
+    struct eng *db = tsdb_cvol_ref(M.t, v);
+    if (!db) {
+        cluster_copy_put(cp);
+        return 0;
+    }
+    uint64_t pgen = ec_eng_parts_gen(db);
+    uint64_t fgen = chunkpeer_filled_gen();
+    pthread_mutex_lock(&M.mu);
+    struct mvol *mv = mv_get(v);
+    if (mv && mv->lost_ec_valid && mv->lost_ec_pgen == pgen && mv->lost_ec_applied == cp->applied &&
+        mv->lost_ec_sver == cv->stripe_version && mv->lost_ec_fgen == fgen) {
+        int cached = mv->lost_ec_val;
+        pthread_mutex_unlock(&M.mu);
+        tsdb_cvol_unref(&db);
+        cluster_copy_put(cp);
+        return cached;
+    }
+    pthread_mutex_unlock(&M.mu);
+
+    struct cvol_salv_ctx sctx = {.cp = cp, .v = cv};
+    int lost = ec_eng_has_lost_obj(db, cvol_salvage_pos, &sctx) ? 1 : 0;
+    if (ec_eng_parts_gen(db) == pgen && chunkpeer_filled_gen() == fgen) {
+        pthread_mutex_lock(&M.mu);
+        mv = mv_get(v);
+        if (mv) {
+            mv->lost_ec_pgen = pgen;
+            mv->lost_ec_applied = cp->applied;
+            mv->lost_ec_sver = cv->stripe_version;
+            mv->lost_ec_fgen = fgen;
+            mv->lost_ec_val = (int8_t)lost;
+            mv->lost_ec_valid = 1;
+        }
+        pthread_mutex_unlock(&M.mu);
+    }
+    tsdb_cvol_unref(&db);
+    cluster_copy_put(cp);
+    return lost;
+}
+
+struct cvol_salv_job {
+    uint32_t vol;
+    uint32_t flags;
+    cluster_salvage_done_fn done;
+    void *cb_arg;
+};
+
+static void *cvol_salvage_worker(void *arg)
+{
+    struct cvol_salv_job *j = arg;
+    uint32_t vol = j->vol, flags = j->flags;
+    cluster_salvage_done_fn done = j->done;
+    void *cb_arg = j->cb_arg;
+    free(j);
+
+    int32_t out_rc = 0;
+    char msg[4096];
+    msg[0] = '\0';
+
+    if (repld_leading(vol, NULL) != 1) {
+        out_rc = META_ERR_STATE;
+        snprintf(msg, sizeof msg, "volume salvage: volume %" PRIu32 " leader is not ready yet; retry", vol);
+        goto finish;
+    }
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp || !cluster_copy_caught_up_at(cp)) {
+        out_rc = META_ERR_STATE;
+        snprintf(msg, sizeof msg, "volume salvage: metadata copy is not caught up yet; retry");
+        if (cp)
+            cluster_copy_put(cp);
+        goto finish;
+    }
+    const struct cluster_copy_vol *cv = cluster_copy_vol(cp, vol);
+    if (!copy_vol_holds_ec(cv)) {
+        out_rc = cv ? META_ERR_INVALID : META_ERR_NOTFOUND;
+        snprintf(msg, sizeof msg, "volume salvage: volume %" PRIu32 " holds no erasure-coded objects", vol);
+        if (cp)
+            cluster_copy_put(cp);
+        goto finish;
+    }
+    if (cluster_versions_mixed()) {
+        out_rc = META_ERR_STATE;
+        snprintf(msg, sizeof msg,
+                 "volume salvage: refused while cluster runs mixed versions (finish upgrade first, E38)");
+        cluster_copy_put(cp);
+        goto finish;
+    }
+    bool force = (flags & CLUSTER_SALVAGE_FORCE) != 0;
+    if (!force) {
+        uint32_t out_node = 0;
+        for (uint32_t p = 0; p < cv->nstripe && p < META_STRIPE_MAX && !out_node; p++) {
+            const struct cluster_copy_member *mb = cluster_copy_member(cp, cv->stripe[p]);
+            if (mb && mb->state == META_OUT)
+                out_node = mb->id;
+            else if (cv->stripe_pos[p].state == META_STRIPE_FILLING && cv->stripe_pos[p].prev != 0) {
+                const struct cluster_copy_member *pm = cluster_copy_member(cp, cv->stripe_pos[p].prev);
+                if (pm && pm->state == META_OUT)
+                    out_node = pm->id;
+            }
+        }
+        if (out_node) {
+            out_rc = META_ERR_STATE;
+            snprintf(msg, sizeof msg,
+                     "volume salvage: refusing while OUT stripe holder node %" PRIu32
+                     " may still return (declare it destroyed or pass --force)",
+                     out_node);
+            cluster_copy_put(cp);
+            goto finish;
+        }
+    }
+
+    struct eng *db = M.t ? tsdb_cvol_ref(M.t, vol) : NULL;
+    if (!db) {
+        out_rc = META_ERR_STATE;
+        snprintf(msg, sizeof msg, "volume salvage: volume %" PRIu32 " is not open on this leader", vol);
+        cluster_copy_put(cp);
+        goto finish;
+    }
+
+    struct cvol_salv_ctx sctx = {.cp = cp, .v = cv};
+    ec_salvage_report rep;
+    char why[256] = {0};
+    int rc = ec_salvage_leader(db, cvol_salvage_pos, &sctx, force, &rep, why, sizeof why);
+    tsdb_cvol_unref(&db);
+    char vname[META_NAME_MAX];
+    snprintf(vname, sizeof vname, "%s", cv->name);
+    cluster_copy_put(cp);
+
+    if (rc != 0) {
+        out_rc = rc == TSDB_ERR_INVALID ? META_ERR_INVALID : META_ERR_STATE;
+        if (rc == TSDB_ERR_INDETERMINATE && !why[0])
+            snprintf(msg, sizeof msg,
+                     "volume salvage: outcome unknown (leader deposed during MK_DROP_OBJ commit; check status and retry)");
+        else
+            snprintf(msg, sizeof msg, "volume salvage: %s", why[0] ? why : tsdb_strerror(rc));
+        ec_salvage_report_free(&rep);
+        goto finish;
+    }
+    if (rep.nobjs == 0) {
+        snprintf(msg, sizeof msg, "volume %" PRIu32 " (%s): 0 lost objects dropped", vol, vname);
+    } else {
+        size_t off = (size_t)snprintf(msg, sizeof msg, "volume %" PRIu32 " (%s): dropped %zu lost object(s) (%" PRIu64
+                                      " rows):",
+                                      vol, vname, rep.nobjs, rep.rows_lost);
+        for (size_t i = 0; i < rep.nobjs && off + 80 < sizeof msg; i++) {
+            char hex[33];
+            chunk_oid_hex(rep.objs[i].oid, hex);
+            int w = snprintf(msg + off, sizeof msg - off, "%s %s (partition %" PRId64 ", %" PRIu64 " rows)",
+                             i ? "," : "", hex, rep.objs[i].partition, rep.objs[i].rows);
+            if (w > 0 && (size_t)w < sizeof msg - off)
+                off += (size_t)w;
+            else
+                break;
+        }
+        if (rep.shadowed > 0 && off + 100 < sizeof msg) {
+            int w = snprintf(msg + off, sizeof msg - off,
+                             "; warning: %zu salvaged part(s) shadowed lower-block parts (overwritten/deleted rows may "
+                             "reappear)",
+                             rep.shadowed);
+            if (w > 0 && (size_t)w < sizeof msg - off)
+                off += (size_t)w;
+        }
+    }
+    say("%s", msg);
+    ec_salvage_report_free(&rep);
+
+finish:
+    done(cb_arg, out_rc, msg);
+    pthread_mutex_lock(&M.mu);
+    M.salvage_active--;
+    if (M.salvage_active == 0)
+        pthread_cond_broadcast(&M.salvage_cv);
+    pthread_mutex_unlock(&M.mu);
+    return NULL;
+}
+
+static void cvol_salvage_run(void *arg, uint32_t vol, uint32_t flags, cluster_salvage_done_fn done, void *cb_arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&M.mu);
+    if (M.stop || !M.started) {
+        pthread_mutex_unlock(&M.mu);
+        done(cb_arg, CLUSTER_ERR_STATE, "volume salvage: server is stopping");
+        return;
+    }
+    struct cvol_salv_job *j = calloc(1, sizeof *j);
+    if (!j) {
+        pthread_mutex_unlock(&M.mu);
+        done(cb_arg, CLUSTER_ERR_RETRY, "volume salvage: out of memory");
+        return;
+    }
+    j->vol = vol;
+    j->flags = flags;
+    j->done = done;
+    j->cb_arg = cb_arg;
+    M.salvage_active++;
+    pthread_mutex_unlock(&M.mu);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    if (pthread_create(&th, &attr, cvol_salvage_worker, j) != 0) {
+        pthread_attr_destroy(&attr);
+        free(j);
+        pthread_mutex_lock(&M.mu);
+        M.salvage_active--;
+        if (M.salvage_active == 0)
+            pthread_cond_broadcast(&M.salvage_cv);
+        pthread_mutex_unlock(&M.mu);
+        done(cb_arg, CLUSTER_ERR_STATE, "volume salvage: cannot spawn worker thread");
+        return;
+    }
+    pthread_attr_destroy(&attr);
+}
+
 void cvol_stop(void)
 {
     if (!M.started)
         return;
+    cluster_set_salvage_handler(NULL, NULL);
     pthread_mutex_lock(&M.mu);
     M.stop = 1;
     pthread_cond_signal(&M.cv);
+    while (M.salvage_active > 0)
+        pthread_cond_wait(&M.salvage_cv, &M.mu);
     pthread_mutex_unlock(&M.mu);
     pthread_join(M.th, NULL);
     pthread_mutex_lock(&M.op); /* an install inside repld_close is waited for; later ones take nothing */

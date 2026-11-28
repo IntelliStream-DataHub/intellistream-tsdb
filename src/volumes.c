@@ -3786,6 +3786,7 @@ typedef struct latest_job {
     tsdb_latest_result *out;
     atomic_size_t next;
     atomic_int rc;
+    atomic_int cold_err;
 } latest_job;
 
 static int cmp_latest_item(const void *a, const void *b)
@@ -3820,6 +3821,7 @@ static void latest_worker(void *arg, int idx)
 {
     (void)idx;
     latest_job *j = arg;
+    eccache_clear_thread_err();
     uint32_t *local = NULL;
     int64_t *ends = NULL;
     latest_row *rows = NULL;
@@ -3856,6 +3858,11 @@ static void latest_worker(void *arg, int idx)
             latest_fill(&j->out[j->it[a + i].idx], &rows[i]);
         if (rc)
             atomic_store(&j->rc, rc);
+    }
+    {
+        int ce = eccache_take_thread_err();
+        if (ce != 0)
+            atomic_store(&j->cold_err, ce);
     }
     free(local);
     free(ends);
@@ -4072,6 +4079,7 @@ int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *
                             .out = out};
             atomic_init(&j.next, 0);
             atomic_init(&j.rc, 0);
+            atomic_init(&j.cold_err, 0);
             qrun qr;
             qs_begin(t, &qr);
             int want = opts && opts->threads > 0 ? opts->threads : 1 << 20; /* the group's cap clamps it */
@@ -4079,6 +4087,9 @@ int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *
                 want = (int)nc;
             sched_run(t->sched, want, latest_worker, &j);
             rc = atomic_load(&j.rc);
+            int ce = atomic_load(&j.cold_err);
+            if (ce != 0)
+                eccache_note_thread_err(ce);
             qs_end(&qr, -1, m);
         }
     }

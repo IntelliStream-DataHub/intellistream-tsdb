@@ -106,6 +106,16 @@ void eccache_reopen_vol(struct tier *t, uint32_t volume);
 void eccache_set_prefetch(struct tier *t, bool on);
 bool eccache_prefetch_enabled(const struct tier *t);
 
+/* R14: cold-read error tracking so tsdbd distinguishes real EC settled read errors (UNAVAILABLE / CORRUPT / IO) from
+ * young-part errors without TSDBD_TEST_COLD, including across sched.c helper threads:
+ *   - eccache_set_corrupt_hook: invoked directly from ec_granule_read_at on any thread when a settled read returns
+ *     TSDB_ERR_CORRUPT (passing the volume number).
+ *   - eccache_{clear,note,take}_thread_err: per-thread cold error propagated across agg_worker and multi.c helpers. */
+void eccache_set_corrupt_hook(void (*fn)(uint32_t vol));
+void eccache_clear_thread_err(void);
+void eccache_note_thread_err(int rc);
+int eccache_take_thread_err(void);
+
 /* ------------------------------------------------------------ tests */
 typedef struct eccache_counters {
     uint64_t hits, misses, waits;   /* granule lookups; waits: a miss another reader was already filling */

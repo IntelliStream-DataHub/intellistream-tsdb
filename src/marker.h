@@ -18,15 +18,13 @@
  *   CLASS, SERIES, STATE, NOW        payloads defined below (the replica engine applies them, src/replica.c)
  *   FEED_SLOT                        number reserved for the change feed (its payload comes with the feed)
  *   SLOT                             number reserved for the cluster (design-cluster.md 4.1; its payload comes with it)
- *   COLD, GC, DIGEST, UNSETTLE       payloads defined below (R8/R10, docs/design-cluster-data.md 2.3, §6.4, E14, E26):
- *                                    a settle's cut, a chunk deletion, a settle's logical digest, an unsettle back to
- *                                    plain parts. GC, DIGEST and UNSETTLE (12, 13, 14) belong to a volume whose META
- *                                    says requires=ec, COLD to one with ec or tier (E17 and its amendment for E55): an
+ *   COLD, GC, DIGEST, UNSETTLE,      payloads defined below (R8/R10/R14, docs/design-cluster-data.md 2.3, §5.8, §6.4,
+ *   DROP_OBJ                         E14, E15, E26): a settle's cut, a chunk deletion, a settle's logical digest, an
+ *                                    unsettle back to plain parts, a salvage drop of lost objects by oid. GC, DIGEST,
+ *                                    UNSETTLE and DROP_OBJ (12, 13, 14, 15) belong to a volume whose META says
+ *                                    requires=ec, COLD to one with ec or tier (E17 and its amendment for E55): an
  *                                    open of any other refuses them, and so does the writer (mk_type_admitted), where
  *                                    every older binary refuses the word itself
- *   15                               MK_DROP_OBJ of the design (docs/design-cluster-data.md, the format table), behind
- *                                    the same word: this binary cannot apply it, so a volume that holds one is refused,
- *                                    never replayed past it
  * A type this binary does not know at all is MK_UNKNOWN: the record is intact and skipped.
  */
 #ifndef TSDB_MARKER_H
@@ -52,11 +50,9 @@ enum mk_type {
     MK_GC = 12,
     MK_DIGEST = 13,
     MK_UNSETTLE = 14,
-    MK_TYPE_LAST = MK_UNSETTLE /* the types above this one are unknown to this binary */
+    MK_DROP_OBJ = 15,
+    MK_TYPE_LAST = MK_DROP_OBJ /* the types above this one are unknown to this binary */
 };
-/* Number the design gives R10's remaining ec marker (MK_DROP_OBJ): unknown here, and admitted nowhere. */
-#define MK_EC_LATER_LO 15
-#define MK_EC_LATER_HI 15
 
 #define MK_HDR 8 /* type, flags, span: the start of every marker payload (WAL_MARKER_HDR) */
 #define MK_NAME_MAX 255
@@ -216,6 +212,14 @@ typedef struct mk_unsettle {
     const uint8_t *oids; /* noids x MK_OID bytes */
 } mk_unsettle;
 
+/* DROP_OBJ (R14, design-cluster-data.md E15, §5.8, D26): retires permanently lost settled .ec objects
+ * (`oids[0..noids)`) on every log replica during `volume salvage`. Every replica retires its listed .ec parts
+ * matching any named oid via intent v5 (X lines); young parts and surviving objects are left untouched. */
+typedef struct mk_drop_obj {
+    uint32_t noids;      /* 1 .. MK_FILES_MAX */
+    const uint8_t *oids; /* noids x MK_OID bytes */
+} mk_drop_obj;
+
 typedef struct mk {
     uint16_t type;  /* enum mk_type, or the raw number of an unknown one (then mk_type_name gives NULL) */
     uint16_t flags;
@@ -233,6 +237,7 @@ typedef struct mk {
         mk_gc gc;
         mk_digest digest;
         mk_unsettle unsettle;
+        mk_drop_obj drop_obj;
     } u;
     const uint8_t *body; /* every type: the raw body (an unknown or reserved type has nothing else) */
     size_t body_len;
@@ -244,9 +249,8 @@ const char *mk_type_name(uint16_t type);
  * a binary asked to open a volume with requires= for it would refuse. */
 bool mk_type_known(uint16_t type);
 /* Whether a volume admits a marker of this type (E17), at its open's replay and at its writer (a marker the volume's
- * next open would refuse is never logged): GC and DIGEST only where META says requires=ec (`ec`), COLD where it says
- * ec or tier (`tier`), 14 and 15 nowhere (R10's, MK_EC_LATER_*); every other type, unknown ones included, as before
- * (applied or skipped). */
+ * next open would refuse is never logged): GC, DIGEST, UNSETTLE and DROP_OBJ only where META says requires=ec (`ec`),
+ * COLD where it says ec or tier (`tier`); every other type, unknown ones included, as before (applied or skipped). */
 bool mk_type_admitted(uint16_t type, bool ec, bool tier);
 /* The span a marker of this type and content must have: events for COMMIT (at least 1), else 1. */
 uint32_t mk_span(const mk *m);

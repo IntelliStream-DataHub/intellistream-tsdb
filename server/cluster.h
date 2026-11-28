@@ -100,12 +100,16 @@ enum cluster_admin_op {
     /* R10 (E2, §6.4, D26; server/credund.c): volume redundancy change on the Raft leader. Reply: text.
      * Body (16 bytes): u32 volume, u8 redundancy, u8 ec_k, u8 ec_m, u8 pad(0), u32 replicas, u32 flags. */
     CLUSTER_OP_VOLUME_REDUNDANCY = 26,
+    /* R14 (E15, §5.8, D26; r14-salvage): body u32 volume, u32 flags (CLUSTER_SALVAGE_FORCE); runs on the volume
+     * leader (or Raft leader when the whole log group is destroyed). Reply: text for the operator. */
+    CLUSTER_OP_VOLUME_SALVAGE = 27,
 };
 enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
 enum { CLUSTER_HOLD_RELEASE = 1 };                      /* CLUSTER_OP_NODE_HOLD's flags */
 enum { CLUSTER_DRAIN_CANCEL = 1 };                      /* CLUSTER_OP_NODE_DRAIN's flags */
 enum { CLUSTER_BALANCE_APPLY = 1 };                     /* CLUSTER_OP_BALANCE's flags */
 enum { CLUSTER_REDUND_CANCEL = 1 };                     /* CLUSTER_OP_VOLUME_REDUNDANCY's flags */
+enum { CLUSTER_SALVAGE_FORCE = 1 };                     /* CLUSTER_OP_VOLUME_SALVAGE's flags */
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
 enum cluster_err {
@@ -727,6 +731,15 @@ size_t cluster_volume_redundancy_encode(uint32_t volume, const struct meta_redun
                                         uint8_t *out);
 int cluster_volume_redundancy_decode(const uint8_t *p, size_t n, uint32_t *volume,
                                      struct meta_redundancy_target *target, uint32_t *flags);
+
+/* R14 (E15, §5.8, D26): CLUSTER_OP_VOLUME_SALVAGE body (8 bytes: u32 volume, u32 flags). */
+size_t cluster_volume_salvage_encode(uint32_t volume, uint32_t flags, uint8_t *out);
+int cluster_volume_salvage_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *flags);
+/* Handler registered by cvol.c for CLUSTER_OP_VOLUME_SALVAGE on the volume leader (must not block the cluster thread;
+ * invokes `done(cb_arg, rc, text)` from a worker thread when complete). */
+typedef void (*cluster_salvage_done_fn)(void *cb_arg, int32_t rc, const char *text);
+typedef void (*cluster_salvage_fn)(void *arg, uint32_t vol, uint32_t flags, cluster_salvage_done_fn done, void *cb_arg);
+void cluster_set_salvage_handler(cluster_salvage_fn fn, void *arg);
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

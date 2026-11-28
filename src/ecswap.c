@@ -1362,7 +1362,8 @@ static bool swap_renames_salvage(eng *db, part **in, size_t n)
     return true;
 }
 
-int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
+int ec_swap_salvage_at(eng *db, part **in, size_t n, bool no_lgen_mut, uint64_t salvage_pos, bool cluster_drop_obj,
+                       bool clear_hold, size_t *shadowed_out)
 {
     sm_init();
     if (n == 0)
@@ -1394,7 +1395,7 @@ int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
             j++;
         pre_ok = j < db->nparts && !in[i]->dropped && !in[i]->merging && !in[i]->reencoding;
     }
-    bool pre_shadow = pre_ok && salvage_shadows_lower_locked(db, in, n);
+    bool pre_shadow = pre_ok && !cluster_drop_obj && salvage_shadows_lower_locked(db, in, n);
     if (!pre_ok || pre_shadow) {
         int rc = pre_shadow ? TSDB_ERR_INVALID : eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
         db_pub_end_locked(db);
@@ -1404,27 +1405,31 @@ int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
     }
     pthread_mutex_unlock(&db->lock);
 
-    /* WAL-replay guard: never retire a part whose WAL segment is not durably unlinked (retiring it would drop
-     * the WAL replay barrier and let a crash replay its WAL segment). */
-    uint64_t max_wal_seq = 0;
-    for (size_t i = 0; i < n; i++)
-        if (in[i]->wal_seq > max_wal_seq)
-            max_wal_seq = in[i]->wal_seq;
-    if (max_wal_seq > atomic_load(&db->wal_removed_synced)) {
-        if (max_wal_seq <= atomic_load(&db->wal_removed)) {
-            if (eng_sync_dir(db, "fsync of the directory to advance wal_removed_synced before salvage") != 0) {
+    /* Single-server WAL-replay guard: never retire a part whose WAL segment is not durably unlinked (retiring it
+     * would drop the WAL replay barrier and let a crash replay its WAL segment). Cluster volumes retain WAL segments
+     * for replication and rely on REPL.floor + unsettle_hold_pos instead. */
+    if (!cluster_drop_obj) {
+        uint64_t max_wal_seq = 0;
+        for (size_t i = 0; i < n; i++)
+            if (in[i]->wal_seq > max_wal_seq)
+                max_wal_seq = in[i]->wal_seq;
+        if (max_wal_seq > atomic_load(&db->wal_removed_synced)) {
+            if (max_wal_seq <= atomic_load(&db->wal_removed)) {
+                if (eng_sync_dir(db, "fsync of the directory to advance wal_removed_synced before salvage") != 0) {
+                    db_pub_end(db);
+                    pthread_mutex_unlock(&db->publish_lock);
+                    return TSDB_ERR_IO;
+                }
+            }
+            if (max_wal_seq > atomic_load(&db->wal_removed_synced)) {
+                fprintf(stderr,
+                        "tsdb: %s: tier salvage deferred: lost part wal_seq %" PRIu64 " > wal_removed_synced %" PRIu64
+                        "\n",
+                        db->dir, max_wal_seq, atomic_load(&db->wal_removed_synced));
                 db_pub_end(db);
                 pthread_mutex_unlock(&db->publish_lock);
-                return TSDB_ERR_IO;
+                return TSDB_ERR_LOCKED;
             }
-        }
-        if (max_wal_seq > atomic_load(&db->wal_removed_synced)) {
-            fprintf(stderr,
-                    "tsdb: %s: tier salvage deferred: lost part wal_seq %" PRIu64 " > wal_removed_synced %" PRIu64 "\n",
-                    db->dir, max_wal_seq, atomic_load(&db->wal_removed_synced));
-            db_pub_end(db);
-            pthread_mutex_unlock(&db->publish_lock);
-            return TSDB_ERR_LOCKED;
         }
     }
 
@@ -1465,11 +1470,21 @@ int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
             j++;
         ok = j < db->nparts && !in[i]->dropped && !in[i]->merging && !in[i]->reencoding;
     }
-    bool shadow_err = ok && salvage_shadows_lower_locked(db, in, n);
+    bool shadows_lower = ok && salvage_shadows_lower_locked(db, in, n);
+    bool shadow_err = !cluster_drop_obj && shadows_lower;
     if (shadow_err)
         ok = false;
     bool renamed = ok && swap_renames_salvage(db, in, n);
     if (renamed) {
+        if (cluster_drop_obj && shadows_lower) {
+            fprintf(stderr,
+                    "tsdb: %s: cluster salvage of partition %" PRId64
+                    " retired %zu lost object(s) that shadowed lower-block parts; overwritten or deleted rows in lower "
+                    "blocks may become visible again\n",
+                    db->dir, in[0]->partition, n);
+            if (shadowed_out)
+                *shadowed_out += n;
+        }
         lt_salvage_marks(db, &lsec, in, n);
         for (size_t i = 0; i < n; i++) {
             char settled[sizeof in[0]->name + 16];
@@ -1478,7 +1493,10 @@ int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
                 eckeep_unsettle_locked(db, settled);
             in[i]->dropped = true;
             cls_dropped_note(db, in[i]);
-            ecgc_retire_locked(db, in[i]);
+            if (salvage_pos > 0)
+                ecgc_retire_locked_at(db, in[i], salvage_pos);
+            else
+                ecgc_retire_locked(db, in[i]);
             if (db->opt.obsolete_part_lifetime_s <= 0) {
                 in[i]->retired = true;
                 atomic_store(&in[i]->obsolete, true);
@@ -1527,6 +1545,8 @@ int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
     }
     if (unlinked_settled)
         (void)eng_sync_dir(db, "fsync of the directory after removing a corrupt settled_ copy");
+    if (clear_hold)
+        atomic_store_explicit(&db->unsettle_hold_pos, 0, memory_order_release);
     db_pub_end(db);
     pthread_mutex_unlock(&db->publish_lock);
     eckeep_unsettle_cleanup_jobs(db);
@@ -1540,6 +1560,11 @@ int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
         ecgc_kick_tier(db->tier);
     (void)ec_swap_publish(db);
     return 0;
+}
+
+int ec_swap_salvage(eng *db, part **in, size_t n, bool no_lgen_mut)
+{
+    return ec_swap_salvage_at(db, in, n, no_lgen_mut, 0, false, false, NULL);
 }
 
 /* ------------------------------------------------------------ recovery */

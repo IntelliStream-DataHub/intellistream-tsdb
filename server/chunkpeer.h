@@ -168,6 +168,7 @@ void chunkpeer_hedge_reset(void); /* clears per-peer latency/bucket/avoid state 
  * for that exact fill version, and stale entries are purged when the stripe version or fill state changes. */
 void chunkpeer_note_filled(uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver, const uint8_t oid[16]);
 bool chunkpeer_is_filled(uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver, const uint8_t oid[16]);
+uint64_t chunkpeer_filled_gen(void);
 void chunkpeer_filled_clear_vol(uint32_t volume);
 void chunkpeer_filled_reset(void);
 

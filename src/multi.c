@@ -21,6 +21,7 @@
  * Locks: c->m is a leaf; the callback and the queries run without it.
  */
 #include "internal.h"
+#include "eccache.h"
 #include "tsdb_calendar.h"
 #include "tsdb_protocol.h"
 
@@ -39,6 +40,7 @@ enum { S_FREE, S_RUNNING, S_DONE, S_DEFERRED };
 /* a result collected ahead of its turn (and the head's buckets) */
 typedef struct mres {
     int status;
+    int cold_err; /* R14: eccache_take_thread_err() from the helper that ran this series */
     size_t n, cap;
     int type; /* VALUES, LTTB: of the values, -1 before the first row */
     int64_t *ts;
@@ -388,7 +390,9 @@ static void run_ahead(mcall *c, size_t i)
     qbudget b = {multi_defer_bytes};
     const qbudget *saved = cur_budget;
     cur_budget = &b;
+    eccache_clear_thread_err();
     int st = run_one(c, i, &k);
+    r.cold_err = eccache_take_thread_err();
     cur_budget = saved;
     const tsdb_multi_opts *mo = c->mo;
     bool ok = st != TSDB_ERR_DEFER, refused = false;
@@ -529,6 +533,9 @@ static int conduct(mcall *c)
             pthread_mutex_unlock(&c->m);
             if (c->fn != collect_fn)
                 route_cache_release(&rc_cache); /* never hold a volume ref across a user callback */
+            eccache_clear_thread_err();
+            if (r.cold_err != 0)
+                eccache_note_thread_err(r.cold_err);
             rc = deliver(c, h, &r);
             pthread_mutex_lock(&c->m);
             sl->r.buckets = r.buckets; /* NULL if collect_fn transferred ownership */

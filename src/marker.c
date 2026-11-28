@@ -22,6 +22,7 @@
  *           u32 reason, u32 0, u32 rel_vol, u32 rel_pos, u32 rel_node, u32 0, u64 rel_ver (RELEASE/RELEASE_DONE)
  *   DIGEST  i64 key, u64 z, u64 rows, u64 series, u64 xxh64, i64 now_ms, u32 noids, u32 0, noids x oid[16]; flags MKD_TOMBS
  *   UNSETTLE i64 key, u32 noids, u32 0, noids x oid[16]
+ *   DROP_OBJ u32 noids, u32 0, noids x oid[16]
  *
  * The decoder refuses what the encoder never writes (a non-zero reserved field or padding, a span other than the
  * type's, trailing bytes), so a payload has exactly one encoding and the fuzz harness compares both directions.
@@ -35,7 +36,7 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "marker payloads are l
 
 static const char *const type_names[] = {NULL,    "COMMIT", "DROP", "RETENTION", "EPOCH", "FEED_SLOT", "CLASS",
                                          "SERIES", "STATE",  "SLOT", "NOW",       "COLD",  "GC",        "DIGEST",
-                                         "UNSETTLE"};
+                                         "UNSETTLE", "DROP_OBJ"};
 _Static_assert(sizeof type_names / sizeof type_names[0] == MK_TYPE_LAST + 1, "a name per type");
 
 int mk_test_mutant;
@@ -54,18 +55,16 @@ bool mk_type_admitted(uint16_t type, bool ec, bool tier)
 {
     if (mk_test_mutant == MK_MUT_ADMIT_ALL)
         return true;
-    if (type >= MK_EC_LATER_LO && type <= MK_EC_LATER_HI)
-        return false;
     if (type == MK_COLD)
         return ec || tier;
-    return ec || (type != MK_GC && type != MK_DIGEST && type != MK_UNSETTLE);
+    return ec || (type != MK_GC && type != MK_DIGEST && type != MK_UNSETTLE && type != MK_DROP_OBJ);
 }
 
 /* the types whose payload this file defines: their span is 1 (COMMIT: its events) */
 static bool defined(uint16_t t)
 {
     return (t >= MK_COMMIT && t <= MK_EPOCH) || t == MK_CLASS || t == MK_SERIES || t == MK_STATE || t == MK_NOW ||
-           t == MK_COLD || t == MK_GC || t == MK_DIGEST || t == MK_UNSETTLE;
+           t == MK_COLD || t == MK_GC || t == MK_DIGEST || t == MK_UNSETTLE || t == MK_DROP_OBJ;
 }
 
 uint32_t mk_span(const mk *m)
@@ -136,6 +135,7 @@ static bool name_ok(const char *s, size_t n)
 #define GC_RELEASE_LEN 32 /* u32 reason, u32 0, u32 vol, u32 pos, u32 node, u32 0, u64 ver */
 #define DIGEST_FIXED 56
 #define UNSETTLE_FIXED 16
+#define DROP_OBJ_FIXED 8
 
 size_t mk_file_size(const mk_file *f)
 {
@@ -405,6 +405,17 @@ static int decode_unsettle(const uint8_t *b, size_t n, mk_unsettle *u)
     return 0;
 }
 
+static int decode_drop_obj(const uint8_t *b, size_t n, mk_drop_obj *d)
+{
+    if (n < DROP_OBJ_FIXED || !zeros(b, 4, 8))
+        return TSDB_ERR_CORRUPT;
+    memcpy(&d->noids, b, 4);
+    d->oids = b + DROP_OBJ_FIXED;
+    if (d->noids == 0 || !counts_ok(d->noids, 0, 0) || n - DROP_OBJ_FIXED != (size_t)d->noids * MK_OID)
+        return TSDB_ERR_CORRUPT;
+    return 0;
+}
+
 int mk_decode(const uint8_t *p, size_t n, mk *m)
 {
     memset(m, 0, sizeof *m);
@@ -505,6 +516,9 @@ int mk_decode(const uint8_t *p, size_t n, mk *m)
     case MK_UNSETTLE:
         rc = decode_unsettle(b, bn, &m->u.unsettle);
         break;
+    case MK_DROP_OBJ:
+        rc = decode_drop_obj(b, bn, &m->u.drop_obj);
+        break;
     default:
         break; /* reserved and unknown types: the body is theirs */
     }
@@ -589,6 +603,11 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
         if (m->u.unsettle.noids == 0 || !counts_ok(m->u.unsettle.noids, 0, 0) || !m->u.unsettle.oids)
             return TSDB_ERR_INVALID;
         bn = UNSETTLE_FIXED + (size_t)m->u.unsettle.noids * MK_OID;
+        break;
+    case MK_DROP_OBJ:
+        if (m->u.drop_obj.noids == 0 || !counts_ok(m->u.drop_obj.noids, 0, 0) || !m->u.drop_obj.oids)
+            return TSDB_ERR_INVALID;
+        bn = DROP_OBJ_FIXED + (size_t)m->u.drop_obj.noids * MK_OID;
         break;
     default:
         bn = m->body_len;
@@ -718,6 +737,13 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
         memcpy(b + 8, &u->noids, 4);
         if (u->noids)
             memcpy(b + UNSETTLE_FIXED, u->oids, (size_t)u->noids * MK_OID);
+        break;
+    }
+    case MK_DROP_OBJ: {
+        const mk_drop_obj *d = &m->u.drop_obj;
+        memcpy(b, &d->noids, 4);
+        if (d->noids)
+            memcpy(b + DROP_OBJ_FIXED, d->oids, (size_t)d->noids * MK_OID);
         break;
     }
     default:

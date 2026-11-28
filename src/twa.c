@@ -29,6 +29,7 @@
  * parts of segments outside [start, end) are cut off.
  */
 #include "internal.h"
+#include "eccache.h"
 #include "tsdb_protocol.h"
 
 #include <math.h>
@@ -441,6 +442,7 @@ typedef struct twa_job {
     size_t *work;
     size_t nwork;
     atomic_int err;
+    atomic_int cold_err;
     /* stack-allocated in twa_window: explicit 64-byte padding isolates next without over-aligning on ASan's fake stack */
     char pad_next_pre[64];
     atomic_size_t next;
@@ -451,6 +453,7 @@ static void twa_worker(void *arg, int idx)
 {
     (void)idx;
     twa_job *j = arg;
+    eccache_clear_thread_err();
     qstats local_qs;
     if (j->qs) {
         memset(&local_qs, 0, sizeof local_qs);
@@ -509,6 +512,11 @@ static void twa_worker(void *arg, int idx)
             break;
     }
 out:
+    {
+        int ce = eccache_take_thread_err();
+        if (ce != 0)
+            atomic_store(&j->cold_err, ce);
+    }
     if (cc)
         cc_put(j->db, cc);
     qscratch_put(ts);
@@ -717,11 +725,15 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
         twa_job j = {.db = db, .qs = cur_qstats, .q = &q, .sn = &sn, .pc = pc, .work = work, .nwork = nwork};
         atomic_init(&j.next, 0);
         atomic_init(&j.err, 0);
+        atomic_init(&j.cold_err, 0);
         uint64_t rows = 0;
         for (size_t w = 0; w < nwork; w++)
             rows += (uint64_t)gx_count(sn.parts[pc[work[w]].src], pc[work[w]].k) * TWA_ROW_WEIGHT;
         sched_run(db->sched, query_threads_for(db, rows, nwork), twa_worker, &j);
         rc = atomic_load(&j.err);
+        int ce = atomic_load(&j.cold_err);
+        if (ce != 0)
+            eccache_note_thread_err(ce);
         if (rc)
             goto done;
     }

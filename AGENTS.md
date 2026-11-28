@@ -259,8 +259,8 @@ cgroup, so `nice` does not keep your work out of its way.
   setchurn resetlost`, `test_cvolfs` setpower; `make rset-mutants` (tests/rset_mutants.sh). `TSDB_REPLD_TEST=keepall` keeps every
   leader segment, for the tests that fill a learner from the log (a fresh learner otherwise gets a snapshot, below).
   `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
-  decoder; `MK_COLD` = 11, `MK_GC` = 12, `MK_DIGEST` = 13, `MK_UNSETTLE` = 14 = `MK_TYPE_LAST`, `MK_EC_LATER_LO..HI` = 15..15 reserved
-  for R10 (`MK_DROP_OBJ`) and admitted nowhere; `mk_type_admitted` gates both writer and replay on `requires=ec|tier`; `test_marker`
+  decoder; `MK_COLD` = 11, `MK_GC` = 12, `MK_DIGEST` = 13, `MK_UNSETTLE` = 14, `MK_DROP_OBJ` = 15 = `MK_TYPE_LAST`;
+  `mk_type_admitted` gates both writer and replay on `requires=ec|tier`; `test_marker`
   mutants `mkcoldbounds mkadmitall ecpposloose mkwriteany`; `jr_intent`/`jr_commit` and `jr_cold`/
   `jr_markers_append`/`jr_markers_wait` in `src/replica.c` carry them).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
@@ -1253,7 +1253,20 @@ cgroup, so `nice` does not keep your work out of its way.
     `unsettle-after-marker`; test hooks `TSDB_ECUNSETTLE_TEST=trigger=<path>[,after_marker_ms=<N>]` and
     `TSDB_ECUNSETTLE_MUTANT`; tests `test_ecapply --case unsettle`, `test_repl` (`applied_floor`), `test_cluster unsettle`
     (in `CLUSTER_SCEN_3`), and `make unsettle-mutants` (`unsettleleaderonly`, `unsettlenogcgate`, `unsettlenofloorclamp`,
-    `unsettlesnapnohold`). Answers do not change (`tests/test_settle_oracle.c`).
+    `unsettlesnapnohold`). Cluster salvage (`r14-salvage`, `MK_DROP_OBJ = 15`, E15, §5.8, D26; `src/ecsalvage.[ch]`):
+    `cnode_destroyed_admin` refuses while target is still heard (`cl_heard_fresh`) and `META_OP_MEMBER_STATE` ->
+    `META_DESTROYED` marks all disks `META_STORE_DESTROYED` and recomputes capability; `CLUSTER_OP_VOLUME_SALVAGE = 27`
+    (`tsdb cluster volume salvage PEER VOLUME [--force]`) reports whole-log-group loss on the Raft leader or dispatches
+    asynchronously on the volume leader (checking `cluster_copy_caught_up_at`, refusing OUT holders without `--force`),
+    commits `MK_DROP_OBJ` under `jr_serial` with `unsettle_hold_pos` armed before append and retires via `ec_swap_salvage_at`
+    (with `ecgc_retire_locked_at` gated on all replicas applying past `MK_DROP_OBJ`, and `ec_salvage_apply` on replay/followers).
+    `server/margins.c` counts `META_STRIPE_FILLING` with destroyed `prev` as lost until `WHOLE`; `server/chunkpeer.c`
+    fast-fails `CP_NODE_DESTROYED` peers (`TSDB_ERR_IO`); `server/tsdbd.c` refuses writes on `tier=lost` with `TSDB_WHY_LOST`
+    while `cvol_vol_has_lost_ec` (cached on `parts_gen`/`applied`/`stripe_version`) holds and resumes after salvage;
+    `eccache_set_corrupt_hook` + `agg_worker`/`multi.c` cold-error propagation cover `sched.c` helpers. Crash point
+    `salvage-after-marker` (`CP_SALVAGE_AFTER_MARKER`); tests `test_cluster salvage` (in `CLUSTER_SCEN_4`) and
+    `make salvage-mutants` (`salvageheard` via `TSDB_CLUSTER_MUTANT`, `salvagenotlost` via `TSDB_SALVAGE_MUTANT`).
+    Answers do not change (`tests/test_settle_oracle.c`).
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another

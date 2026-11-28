@@ -29900,6 +29900,8 @@ static void scen_nodedestroyed(void)
     /* Destroy 2 more stripe holders (watchers 4 and 5) -> m+1 = 3 holders DESTROYED! */
     for (int s = 4; s <= 5; s++) {
         stop(s, SIGKILL);
+        struct state_want ds = {ids[s], META_DOWN, 0};
+        await_view(0, p_member_state, &ds, "watcher DOWN before destroyed");
         snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", p0, ids[s], secret_path);
         if (cli_run(args, NULL, out, sizeof out) != 0)
             die("nodedestroyed: node out %d failed: %s", s, out);
@@ -37419,6 +37421,1049 @@ static void scen_adopt(void)
 #endif
 }
 
+/* salvage (R14 r14-salvage; E15, §5.8, D26):
+ *   Phase 1 (2+1 EC on 4 nodes):
+ *     - node 0: nvme + hdd, node 1: nvme, nodes 2 & 3: hdd; 3 voters (0, 1, 2) + watcher 3.
+ *       Deterministic layout: log group = {0, 1} (both voters), stripe group = {0, 2, 3}.
+ *     - Settle 2 full-width 2+1 keys (> 64 KiB each so k'=2, npos=3) and keep 1 young (unsettled) key.
+ *     - Mark live node 3 OUT while still running -> `node destroyed` MUST be refused while heard (catches
+ *       TSDB_CLUSTER_MUTANT=salvageheard).
+ *     - Kill node 3 -> wait DOWN -> mark OUT & DESTROYED -> verify its disk is META_STORE_DESTROYED.
+ *     - With only 1 of 3 stripe holders destroyed (k=2 surviving), run `volume salvage` -> MUST drop 0 objects
+ *       and all settled keys stay readable (catches TSDB_SALVAGE_MUTANT=salvagenotlost).
+ *     - Kill node 2 -> wait DOWN -> mark node 2 OUT (NOT yet destroyed) -> `volume salvage` without --force MUST
+ *       refuse while OUT holder may still return.
+ *     - Declare node 2 DESTROYED (2 > m=1 stripe holders destroyed, disk META_STORE_DESTROYED) -> OP_STATUS reports
+ *       tier=lost; on a cold leader, reads of the lost settled keys fail with TSDB_ERR_IO (server log names the
+ *       lost object), whole-day statistics queries still answer, writes fail with UNAVAILABLE + TSDB_WHY_LOST
+ *       (retry_after == TSDB_RETRY_MAX_MS, not retried), and young data still reads.
+ *     - Run `tsdb cluster volume salvage` (via non-leader peer to verify redirect to volume leader): drops the lost
+ *       objects via MK_DROP_OBJ on every log replica.
+ *     - After salvage: writes resume normally, young data and new writes serve, lost keys' rows and statistics are
+ *       gone on BOTH surviving log replicas (per-member reads equal via transfer), GC cleans remaining chunks on
+ *       surviving node 0, and restarting both surviving nodes preserves the salvaged state.
+ *   Phase 2 (whole log group destroyed):
+ *     - 5 nodes (3 voters 0..2 with hdd-only, 2 watchers 3..4 with nvme+hdd); 2+1 volume's log group lands on
+ *       watchers {3, 4}. Write rows, kill & destroy both watchers (Raft keeps 3/3 quorum), run `volume salvage`:
+ *       prints whole log group destroyed and the unaccounted positions above the last settled object. */
+#ifdef TSDB_EC
+static int salvage_leader_of(const char *vname, uint32_t num, int via, struct meta_volume *out)
+{
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(via, vname, out) && out->leader) {
+            int s = server_of(out->leader);
+            if (s >= 0 && pids[s] > 0 && !stopped[s]) {
+                char lead[96];
+                snprintf(lead, sizeof lead, "volume %" PRIu32 ": leads epoch %" PRIu64 " ", num, out->epoch);
+                if (log_has(s, lead))
+                    return s;
+            }
+        }
+        if (now_ms() - t0 > 60000)
+            die("salvage: no active leader of %s (volume %" PRIu32 ") after 60 s", vname, num);
+    }
+}
+
+static int salvage_ec_parts(const char *log_disk, uint32_t num)
+{
+    char p[PATH_MAX + 256];
+    snprintf(p, sizeof p, "%s/v%" PRIu32, log_disk, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        n += l > 3 && !strcmp(e->d_name + l - 3, ".ec") && strncmp(e->d_name, "retired_", 8) != 0;
+    }
+    closedir(dd);
+    return n;
+}
+
+static int salvage_live_parts(const char *log_disk, uint32_t num)
+{
+    char p[PATH_MAX + 256];
+    snprintf(p, sizeof p, "%s/v%" PRIu32, log_disk, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return -1;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] == 'p' && l >= 6 && !strcmp(e->d_name + l - 5, ".part"))
+            n++;
+    }
+    closedir(dd);
+    return n;
+}
+
+static int salvage_chunks(char chunk_disks[][PATH_MAX + 128], int nd, uint32_t num)
+{
+    int n = 0;
+    for (int i = 0; i < nd; i++) {
+        if (!chunk_disks[i][0])
+            continue;
+        char p[PATH_MAX + 256];
+        snprintf(p, sizeof p, "%.*s/chunks/s%" PRIu32, PATH_MAX + 128, chunk_disks[i], num);
+        DIR *dd = opendir(p);
+        if (!dd)
+            continue;
+        for (struct dirent *e; (e = readdir(dd));) {
+            size_t l = strlen(e->d_name);
+            n += e->d_name[0] == 'o' && l > 6 && !strcmp(e->d_name + l - 6, ".chunk");
+        }
+        closedir(dd);
+    }
+    return n;
+}
+#endif
+
+static void scen_salvage(void)
+{
+    scenario("salvage");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    init_voters = 3;
+    epoll_after_two = 1;
+    static char hold_path[PATH_MAX + 128];
+    static char penv_buf[5][PATH_MAX + 256];
+    static char sv_nvme[4][PATH_MAX + 128];
+    static char sv_hdd[4][PATH_MAX + 128];
+    static char xa[4][2 * PATH_MAX + 512];
+    snprintf(hold_path, sizeof hold_path, "%s/salvage_hold", base);
+    unlink(hold_path);
+
+    for (int i = 0; i < 4; i++) {
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+        sv_nvme[i][0] = 0;
+        sv_hdd[i][0] = 0;
+        if (i == 0) {
+            snprintf(sv_nvme[i], sizeof sv_nvme[i], "%s/sv_nvme%d", base, i);
+            snprintf(sv_hdd[i], sizeof sv_hdd[i], "%s/sv_hdd%d", base, i);
+            disk_make(sv_nvme[i], "nvme");
+            disk_make(sv_hdd[i], "hdd");
+            snprintf(xa[i], sizeof xa[i],
+                     "--disk %s:nvme --disk %s:hdd --ec-settle-grace-s 0 --ec-settle-keep-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     sv_nvme[i], sv_hdd[i]);
+        } else if (i == 1) {
+            snprintf(sv_nvme[i], sizeof sv_nvme[i], "%s/sv_nvme%d", base, i);
+            disk_make(sv_nvme[i], "nvme");
+            snprintf(xa[i], sizeof xa[i],
+                     "--disk %s:nvme --role compute --ec-settle-grace-s 0 --ec-settle-keep-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     sv_nvme[i]);
+        } else {
+            snprintf(sv_hdd[i], sizeof sv_hdd[i], "%s/sv_hdd%d", base, i);
+            disk_make(sv_hdd[i], "hdd");
+            snprintf(xa[i], sizeof xa[i],
+                     "--disk %s:hdd --role storage --ec-settle-grace-s 0 --ec-settle-keep-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     sv_hdd[i]);
+        }
+        xargs[i] = xa[i];
+        snprintf(penv_buf[i], sizeof penv_buf[i],
+                 "TSDB_SETTLE_HOLD=%s TSDB_ECGC_TEST=poll_ms=200,lifetime_s=0", hold_path);
+        penv[i] = penv_buf[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 4; i++)
+        node_add(0, i);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "3 voters of 4 before salvage");
+    unsigned four = 4;
+    await_view(0, p_n_placeable, &four, "4 members UP for salvage");
+    /* Wait until all 4 members have committed disks (nodes 0,2,3 have hdd -> 3 storage; nodes 0,1 have nvme -> 2 compute). */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view v;
+        view(0, &v);
+        int ok = v.m.nmembers == 4;
+        for (uint32_t i = 0; ok && i < v.m.nmembers; i++) {
+            int s = server_of(v.m.members[i].id);
+            uint32_t want_d = s == 0 ? 2u : 1u;
+            if (v.m.members[i].ndisks < want_d)
+                ok = 0;
+        }
+        view_free(&v);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage: disks not registered in 30 s");
+    }
+
+    uint32_t num = 0;
+    char etxt[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "sv21", 0, 2, 1, &num, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("salvage: ec=2+1 add: %s (%s)", cluster_strerror(rc), etxt);
+
+    struct meta_volume ev;
+    int L = salvage_leader_of("sv21", num, 0, &ev);
+    await_isr(0, "sv21", 2, 30000, "sv21 ISR=2");
+    if (ev.nrep != 2 || ev.nstripe != 3)
+        die("salvage: unexpected layout nrep=%u nstripe=%u", ev.nrep, ev.nstripe);
+    int R0 = server_of(ev.rep[0].node), R1 = server_of(ev.rep[1].node);
+    int other_rep = (L == R0) ? R1 : R0;
+    if ((R0 != 0 && R0 != 1) || (R1 != 0 && R1 != 1))
+        die("salvage: expected log replicas on nodes 0 and 1, got %d and %d", R0, R1);
+
+    /* 1. Write 2 old days (> 64 KiB each, 2 batches a flush apart -> level-1 merge -> full-width 2+1 .ec parts). */
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 30000);
+    tsdb_sid s_lost0 = ecb_series(c, "sv.lost0", "sv21");
+    tsdb_sid s_lost1 = ecb_series(c, "sv.lost1", "sv21");
+    tsdb_sid s_young = ecb_series(c, "sv.young", "sv21");
+
+    const int64_t day0 = 1704067200000LL; /* 2024-01-01 */
+    const int64_t day1 = day0 + 30 * 86400000LL;
+    const size_t NROWS = 30000;
+    int64_t *tsbuf = malloc(NROWS * sizeof *tsbuf);
+    float *vbuf = malloc(NROWS * sizeof *vbuf);
+    if (!tsbuf || !vbuf)
+        die("salvage: oom");
+    for (int d = 0; d < 2; d++) {
+        int64_t base_ts = d == 0 ? day0 : day1;
+        tsdb_sid sid = d == 0 ? s_lost0 : s_lost1;
+        for (size_t j = 0; j < NROWS; j++) {
+            tsbuf[j] = base_ts + (int64_t)j * 1000LL;
+            uint64_t z = ((uint64_t)d << 40 | (uint64_t)j) * 0xbf58476d1ce4e5b9ull + 0x9e3779b97f4a7c15ull;
+            z = (z ^ (z >> 30)) * 0x94d049bb133111ebull;
+            z ^= z >> 31;
+            uint32_t bits = (uint32_t)(z & 0x7fffffu) | ((uint32_t)(127 + (z >> 61)) << 23);
+            memcpy(&vbuf[j], &bits, 4);
+        }
+        for (size_t off = 0; off < NROWS; off += 2000) {
+            if (off == NROWS / 2)
+                usleep(400000); /* split across two flushes so idle merge produces a level-1 part */
+            size_t cnt = NROWS - off < 2000 ? NROWS - off : 2000;
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, sid, tsbuf + off, vbuf + off, cnt)) != 0;
+                 usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("salvage: insert lost day %d: %s", d, ers(rc));
+        }
+    }
+    /* Wait until both old days settle to .ec parts on BOTH log replicas and all 3 stripe holders hold chunks. */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int ec0 = salvage_ec_parts(sv_nvme[R0], num), ec1 = salvage_ec_parts(sv_nvme[R1], num);
+        int lp0 = salvage_live_parts(sv_nvme[R0], num), lp1 = salvage_live_parts(sv_nvme[R1], num);
+        int nch = salvage_chunks(sv_hdd, 4, num);
+        if (ec0 >= 2 && ec1 >= 2 && lp0 == 0 && lp1 == 0 && nch == ec0 * 3)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("salvage: 2 days did not settle full-width in 120 s (ec=%d/%d lp=%d/%d chunks=%d)", ec0, ec1, lp0, lp1,
+                nch);
+    }
+    int settled_ec = salvage_ec_parts(sv_nvme[L], num);
+    printf("  phase 1: settled %d full-width 2+1 .ec parts (%d chunks on 3 stores)\n", settled_ec,
+           salvage_chunks(sv_hdd, 4, num));
+
+    /* Hold further settles, then write young data into a fresh partition (stays as unsettled .part / WAL). */
+    touch_file(hold_path);
+    const int64_t day_y = day0 + 60 * 86400000LL;
+    const size_t NYOUNG = 200;
+    for (size_t j = 0; j < NYOUNG; j++) {
+        tsbuf[j] = day_y + (int64_t)j * 1000LL;
+        vbuf[j] = 100.0f + (float)j;
+    }
+    for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, s_young, tsbuf, vbuf, NYOUNG)) != 0; usleep(50000))
+        if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+            die("salvage: insert young: %s", ers(rc));
+    tsdbc_close(c);
+    c = NULL;
+
+    char p0[META_ADDR_MAX], p_other[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[8192];
+    peer_of(0, p0, sizeof p0);
+    peer_of(other_rep, p_other, sizeof p_other);
+
+    /* 2. Refusal of `node destroyed` while node 3 is OUT but STILL HEARD (catches TSDB_CLUSTER_MUTANT=salvageheard). */
+    snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", p0, ids[3], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("salvage: node out live 3 failed: %s", out);
+    snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ids[3], secret_path);
+    int drc = cli_run(args, NULL, out, sizeof out);
+    if (drc != 1 || !strstr(out, "still heard"))
+        die("salvage: node destroyed accepted while node 3 is still heard! rc=%d out=%s", drc, out);
+    if (member_state_of(leader_of(0), ids[3], NULL, NULL) == META_DESTROYED)
+        die("salvage: node 3 became META_DESTROYED while still heard!");
+    printf("  node destroyed refused while node 3 still heard (ok)\n");
+
+    /* 3. Kill node 3, wait until Raft leader reports heard age > node_timeout_ms, declare node 3 DESTROYED ->
+     * verify disk META_STORE_DESTROYED. */
+    stop(3, SIGKILL);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view v;
+        view(leader_of(0), &v);
+        uint64_t ago = 0;
+        for (uint32_t k = 0; k < v.st.nheard; k++)
+            if (v.st.heard[k].id == ids[3])
+                ago = v.st.heard[k].ago_ms;
+        uint64_t tout = v.m.set.node_timeout_ms ? v.m.set.node_timeout_ms : 1500;
+        view_free(&v);
+        if (ago > tout)
+            break;
+        if (now_ms() - t0 > 15000)
+            die("salvage: node 3 heard age (%" PRIu64 " ms) never passed node_timeout_ms (%" PRIu64 ")", ago, tout);
+    }
+    snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ids[3], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "declared destroyed"))
+        die("salvage: node destroyed 3 after stop failed: %s", out);
+    {
+        struct view v;
+        view(leader_of(0), &v);
+        const struct meta_member *m3 = meta_member(&v.m, ids[3]);
+        if (!m3 || m3->state != META_DESTROYED || m3->ndisks < 1 || m3->disks[0].state != META_STORE_DESTROYED ||
+            m3->capability != META_CAP_NONE)
+            die("salvage: node 3 disks not marked META_STORE_DESTROYED");
+        view_free(&v);
+    }
+
+    /* 4. With only 1 of 3 stripe holders destroyed (k=2 positions left!), `volume salvage` MUST drop 0 objects
+     * (catches TSDB_SALVAGE_MUTANT=salvagenotlost, which drops objects with k positions left!). */
+    snprintf(args, sizeof args, "cluster volume salvage %s sv21 --secret-file %s", p_other, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "0 lost objects dropped"))
+        die("salvage: salvage with k=2 left should drop 0 objects: %s", out);
+    if (salvage_ec_parts(sv_nvme[R0], num) != settled_ec || salvage_ec_parts(sv_nvme[R1], num) != settled_ec)
+        die("salvage: salvage with k=2 left dropped .ec parts! (%d/%d vs %d)", salvage_ec_parts(sv_nvme[R0], num),
+            salvage_ec_parts(sv_nvme[R1], num), settled_ec);
+    printf("  1 of 3 destroyed (k=2 left): salvage dropped 0 objects (ok)\n");
+
+    /* 5. Kill node 2 -> wait DOWN -> mark node 2 OUT (NOT yet destroyed) -> `volume salvage` without --force MUST
+     * refuse while OUT stripe holder may still return (E15). */
+    stop(2, SIGKILL);
+    struct state_want d2 = {ids[2], META_DOWN, 0};
+    await_view(leader_of(0), p_member_state, &d2, "node 2 DOWN");
+    snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", p0, ids[2], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("salvage: node out 2 failed: %s", out);
+    snprintf(args, sizeof args, "cluster volume salvage %s sv21 --secret-file %s", p_other, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "OUT"))
+        die("salvage: salvage without --force should refuse while node 2 is OUT: %s", out);
+    printf("  node 2 OUT (not destroyed): salvage without --force refused (ok)\n");
+
+    /* 6. Declare node 2 DESTROYED (now 2 > m=1 stripe holders destroyed, disks DESTROYED). */
+    snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ids[2], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "declared destroyed"))
+        die("salvage: node destroyed 2 failed: %s", out);
+
+    /* Transfer leadership to other_rep so the new leader has a completely cold granule cache. */
+    await_isr(0, "sv21", 2, 30000, "sv21 ISR=2 before transfer to cold leader");
+    snprintf(args, sizeof args, "cluster volume transfer %s %" PRIu32 " %" PRIu32 " --secret-file %s", p0, num,
+             ids[other_rep], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("salvage: transfer to cold leader %d failed: %s", other_rep, out);
+    L = salvage_leader_of("sv21", num, 0, &ev);
+    if (L != other_rep)
+        die("salvage: expected cold leader %d, got %d", other_rep, L);
+    other_rep = (L == R0) ? R1 : R0;
+    peer_of(other_rep, p_other, sizeof p_other);
+
+    /* Wait for L's OP_STATUS to show vol.<N>.tier=lost. */
+    c = client(L);
+    char want_tier[64];
+    snprintf(want_tier, sizeof want_tier, "vol.%" PRIu32 ".tier=lost", num);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        char *stxt = NULL;
+        int src = tsdbc_status(c, &stxt);
+        int ok = src == 0 && stxt && strstr(stxt, want_tier) != NULL;
+        free(stxt);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 15000)
+            die("salvage: OP_STATUS never showed '%s'", want_tier);
+    }
+
+    /* 7. Before salvage:
+     *    - Read of lost settled key -> TSDB_ERR_IO (fast-fail, no 30 s wait; server log names the lost object).
+     *    - Statistics-only agg query over lost settled day -> STILL answers!
+     *    - Write to volume -> TSDB_ERR_UNAVAILABLE with TSDB_WHY_LOST (retry_after == TSDB_RETRY_MAX_MS, not retried).
+     *    - Read of young data -> STILL succeeds! */
+    tsdbc_set_retry(c, 30000);
+    uint64_t t0_rd = now_ms();
+    rc = tsdbc_query_raw(c, s_lost0, day0, day0 + 86400000LL, no_rows, NULL);
+    uint64_t rd_ms = now_ms() - t0_rd;
+    if (rc != TSDB_ERR_IO)
+        die("salvage: read of lost key before salvage returned %s (want TSDB_ERR_IO)", ers(rc));
+    if (rd_ms > 5000)
+        die("salvage: read of lost key took %" PRIu64 " ms (destroyed peers not fast-failed!)", rd_ms);
+    if (!log_has(L, "): TSDB_ERR_IO"))
+        die("salvage: leader %d stderr did not log lost object on TSDB_ERR_IO read", L);
+
+    tsdb_bucket *bk = NULL;
+    size_t nbk = 0;
+    rc = tsdbc_query_agg(c, s_lost0, day0, day0 + 86400000LL, 86400000LL, &bk, &nbk);
+    if (rc != 0 || nbk != 1 || bk[0].count != NROWS)
+        die("salvage: stats query over lost partition before salvage failed: %s nbk=%zu cnt=%" PRIu64, ers(rc), nbk,
+            nbk ? bk[0].count : 0);
+    free(bk);
+
+    int64_t wts = day_y + 500000LL;
+    float wv = 42.5f;
+    uint64_t t0_wr = now_ms();
+    rc = tsdbc_insert_series(c, s_young, &wts, &wv, 1);
+    uint64_t wr_ms = now_ms() - t0_wr;
+    tsdb_unavail u[4];
+    unsigned nu = 0;
+    if (rc != TSDB_ERR_UNAVAILABLE || tsdbc_unavailable(c, u, 4, &nu) != 0 || nu != 1 || u[0].reason != TSDB_WHY_LOST ||
+        u[0].vol != num || u[0].retry_after_ms != TSDB_RETRY_MAX_MS)
+        die("salvage: write before salvage returned %s nu=%u reason=%u vol=%u retry=%u (want UNAVAILABLE WHY_LOST)",
+            ers(rc), nu, nu ? u[0].reason : 0, nu ? u[0].vol : 0, nu ? u[0].retry_after_ms : 0);
+    if (wr_ms > 1500)
+        die("salvage: write WHY_LOST retried (took %" PRIu64 " ms)", wr_ms);
+
+    tsdb_points yp;
+    memset(&yp, 0, sizeof yp);
+    if ((rc = tsdbc_query_points(c, s_young, day_y, day_y + 86400000LL, &yp)) != 0 || yp.n != NYOUNG)
+        die("salvage: young read before salvage failed: %s n=%zu", ers(rc), yp.n);
+    free(yp.ts);
+    free(yp.values);
+    tsdbc_close(c);
+    c = NULL;
+    printf("  before salvage: lost read TSDB_ERR_IO in %" PRIu64 " ms, stats ok, write WHY_LOST in %" PRIu64
+           " ms, young read ok\n",
+           rd_ms, wr_ms);
+
+    /* 8. Run `tsdb cluster volume salvage` via non-leader peer -> drops both lost objects via MK_DROP_OBJ! */
+    snprintf(args, sizeof args, "cluster volume salvage %s sv21 --secret-file %s", p_other, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "dropped "))
+        die("salvage: volume salvage failed: %s", out);
+    printf("  CLI salvage: %s", out);
+
+    /* Wait until BOTH surviving log replicas have 0 live .ec parts (MK_DROP_OBJ applied on both). */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (salvage_ec_parts(sv_nvme[R0], num) == 0 && salvage_ec_parts(sv_nvme[R1], num) == 0)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage: .ec parts not retired on both replicas (ec=%d/%d)", salvage_ec_parts(sv_nvme[R0], num),
+                salvage_ec_parts(sv_nvme[R1], num));
+    }
+
+    /* Wait for GC to remove remaining chunks of salvaged objects on surviving node 0. */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char live_hdd[1][PATH_MAX + 128];
+        snprintf(live_hdd[0], sizeof live_hdd[0], "%s", sv_hdd[0]);
+        if (salvage_chunks(live_hdd, 1, num) == 0)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage: GC did not remove remaining chunks on surviving node 0 (left=%d)",
+                salvage_chunks(live_hdd, 1, num));
+    }
+
+    /* 9. After salvage: writes resume, lost keys return 0 rows (stats too) on BOTH members, young + new rows intact! */
+    c = client(L);
+    tsdbc_set_retry(c, 30000);
+    if ((rc = tsdbc_insert_series(c, s_young, &wts, &wv, 1)) != 0)
+        die("salvage: write after salvage failed: %s", ers(rc));
+    tsdbc_close(c);
+    c = NULL;
+
+    for (int pass = 0; pass < 2; pass++) {
+        int cur = pass == 0 ? L : other_rep;
+        if (pass == 1) {
+            await_isr(0, "sv21", 2, 30000, "sv21 ISR=2 before per-member transfer");
+            snprintf(args, sizeof args, "cluster volume transfer %s %" PRIu32 " %" PRIu32 " --secret-file %s", p0, num,
+                     ids[cur], secret_path);
+            if (cli_run(args, NULL, out, sizeof out) != 0)
+                die("salvage: transfer to %d for per-member check failed: %s", cur, out);
+            if (salvage_leader_of("sv21", num, 0, &ev) != cur)
+                die("salvage: transfer to %d did not activate leader", cur);
+        }
+        c = client(cur);
+        tsdbc_set_retry(c, 30000);
+        for (int k = 0; k < 2; k++) {
+            tsdb_sid sid = k == 0 ? s_lost0 : s_lost1;
+            int64_t dms = k == 0 ? day0 : day1;
+            tsdb_points lp;
+            memset(&lp, 0, sizeof lp);
+            if ((rc = tsdbc_query_points(c, sid, dms, dms + 86400000LL, &lp)) != 0 || lp.n != 0)
+                die("salvage: member %d lost key %d after salvage: %s n=%zu (want 0)", cur, k, ers(rc), lp.n);
+            free(lp.ts);
+            free(lp.values);
+            bk = NULL;
+            nbk = 0;
+            if ((rc = tsdbc_query_agg(c, sid, dms, dms + 86400000LL, 86400000LL, &bk, &nbk)) != 0 || nbk != 0)
+                die("salvage: member %d lost key %d stats after salvage: %s nbk=%zu (want 0)", cur, k, ers(rc), nbk);
+            free(bk);
+        }
+        memset(&yp, 0, sizeof yp);
+        if ((rc = tsdbc_query_points(c, s_young, day_y, day_y + 86400000LL, &yp)) != 0 || yp.n != NYOUNG + 1)
+            die("salvage: member %d young key after salvage: %s n=%zu (want %zu)", cur, ers(rc), yp.n, NYOUNG + 1);
+        free(yp.ts);
+        free(yp.values);
+        tsdbc_close(c);
+        c = NULL;
+    }
+
+    /* 10. Restart BOTH surviving nodes one after the other (2/3 voters left, so each cleanly checkpoints the other's
+     * updated peer port before restarting) and verify salvaged state persists across restart. */
+    for (int step = 0; step < 2; step++) {
+        int victim = step == 0 ? R0 : R1;
+        int peer = step == 0 ? R1 : R0;
+        struct view v;
+        view(peer, &v);
+        const struct meta_member *mb = meta_member(&v.m, ids[victim]);
+        struct state_want up = {ids[victim], META_UP, mb ? mb->incarnation + 1 : 1};
+        view_free(&v);
+        stop(victim, SIGTERM);
+        start(victim);
+        await_view(peer, p_member_state, &up, "surviving replica back after restart");
+    }
+    await_isr(R0, "sv21", 2, 60000, "ISR=2 after restart");
+    L = salvage_leader_of("sv21", num, R0, &ev);
+    c = client(L);
+    tsdbc_set_retry(c, 30000);
+    for (int k = 0; k < 2; k++) {
+        tsdb_sid sid = k == 0 ? s_lost0 : s_lost1;
+        int64_t dms = k == 0 ? day0 : day1;
+        tsdb_points lp;
+        memset(&lp, 0, sizeof lp);
+        if ((rc = tsdbc_query_points(c, sid, dms, dms + 86400000LL, &lp)) != 0 || lp.n != 0)
+            die("salvage: after restart lost key %d: %s n=%zu (want 0)", k, ers(rc), lp.n);
+        free(lp.ts);
+        free(lp.values);
+    }
+    memset(&yp, 0, sizeof yp);
+    if ((rc = tsdbc_query_points(c, s_young, day_y, day_y + 86400000LL, &yp)) != 0 || yp.n != NYOUNG + 1)
+        die("salvage: after restart young key: %s n=%zu (want %zu)", ers(rc), yp.n, NYOUNG + 1);
+    free(yp.ts);
+    free(yp.values);
+    tsdbc_close(c);
+    free(tsbuf);
+    free(vbuf);
+    printf("  after salvage + GC + restart: lost keys gone on all members, young + new writes intact (ok)\n");
+
+    /* Phase 2: whole log group destroyed (5 nodes: 3 voters 0..2 hdd-only, 2 watchers 3..4 nvme+hdd; log group of 2+1
+     * lands on {3, 4}; destroy both -> Raft keeps 3/3 quorum -> volume salvage reports unaccounted log positions). */
+    scenario("salvage_p2");
+    init_voters = 3;
+    epoll_after_two = 1;
+    static char xa2[5][2 * PATH_MAX + 512];
+    for (int i = 0; i < 5; i++) {
+        char dn[PATH_MAX + 128], dh[PATH_MAX + 128];
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+        snprintf(dn, sizeof dn, "%s/p2_nvme%d", base, i);
+        snprintf(dh, sizeof dh, "%s/p2_hdd%d", base, i);
+        if (i >= 3) {
+            disk_make(dn, "nvme");
+            disk_make(dh, "hdd");
+            snprintf(xa2[i], sizeof xa2[i], "--disk %s:nvme --disk %s:hdd", dn, dh);
+        } else {
+            disk_make(dh, "hdd");
+            snprintf(xa2[i], sizeof xa2[i], "--disk %s:hdd --role storage", dh);
+        }
+        xargs[i] = xa2[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    await_view(0, p_voters, &three, "3 voters of 5 for salvage phase 2");
+    unsigned five = 5;
+    await_view(0, p_n_placeable, &five, "5 members UP for salvage phase 2");
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view v;
+        view(0, &v);
+        int ok = v.m.nmembers == 5;
+        for (uint32_t i = 0; ok && i < v.m.nmembers; i++) {
+            int s = server_of(v.m.members[i].id);
+            uint32_t want_d = s >= 3 ? 2u : 1u;
+            if (v.m.members[i].ndisks < want_d)
+                ok = 0;
+        }
+        view_free(&v);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage phase 2: disks not registered in 30 s");
+    }
+    uint32_t num2 = 0;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "svlog", 0, 2, 1, &num2, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("salvage phase 2: ec=2+1 add: %s (%s)", cluster_strerror(rc), etxt);
+    struct meta_volume ev2;
+    int L2 = salvage_leader_of("svlog", num2, 0, &ev2);
+    await_isr(0, "svlog", 2, 30000, "svlog ISR=2");
+    c = client(L2);
+    tsdbc_set_retry(c, 30000);
+    tsdb_sid sl2 = ecb_series(c, "sv.loglost", "svlog");
+    int64_t ts5[5] = {day0 + 1000, day0 + 2000, day0 + 3000, day0 + 4000, day0 + 5000};
+    float v5[5] = {1, 2, 3, 4, 5};
+    if ((rc = tsdbc_insert_series(c, sl2, ts5, v5, 5)) != 0)
+        die("salvage phase 2: insert failed: %s", ers(rc));
+    tsdb_points p2chk;
+    memset(&p2chk, 0, sizeof p2chk);
+    if ((rc = tsdbc_query_points(c, sl2, day0, day0 + 86400000LL, &p2chk)) != 0 || p2chk.n != 5)
+        die("salvage phase 2: verify insert failed: %s n=%zu", ers(rc), p2chk.n);
+    free(p2chk.ts);
+    free(p2chk.values);
+    tsdbc_close(c);
+
+    peer_of(0, p0, sizeof p0);
+    for (uint32_t k = 0; k < ev2.nrep; k++) {
+        int rs = server_of(ev2.rep[k].node);
+        stop(rs, SIGKILL);
+        struct state_want dr = {ev2.rep[k].node, META_DOWN, 0};
+        await_view(leader_of(0), p_member_state, &dr, "log replica DOWN");
+        snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", p0, ev2.rep[k].node, secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("salvage phase 2: node out failed: %s", out);
+        snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ev2.rep[k].node,
+                 secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("salvage phase 2: node destroyed failed: %s", out);
+    }
+    snprintf(args, sizeof args, "cluster volume salvage %s svlog --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "whole log group destroyed"))
+        die("salvage phase 2: expected whole-log-group-destroyed report, got: %s", out);
+    const char *ppos = strstr(out, "highest known log position ");
+    uint64_t reported_pos = ppos ? strtoull(ppos + 27, NULL, 10) : 0;
+    if (!ppos || reported_pos < 5)
+        die("salvage phase 2: expected highest known log position >= 5, got: %s", out);
+    printf("  phase 2 (whole log group destroyed): %s", out);
+    stop_all();
+
+    /* Phase 3 (crash-point recovery: salvage-after-marker):
+     * 5 nodes (3 voters: 0=nvme+hdd, 1=nvme compute, 2=nvme compute; 2 storage watchers: 3,4=hdd storage).
+     * Volume svcr (2+1) places stripe on {0, 3, 4} and 2 log replicas among {0, 1, 2}. Destroy watchers 3 and 4
+     * (3/3 voters remain up). Leader L3 commits MK_DROP_OBJ and crashes (exit 99) BEFORE its own ec_swap_salvage_at.
+     * Verify: Raft keeps 2/3 quorum, F3 promotes and retires its .ec (0 .ec) while crashed L3 still holds its .ec
+     * on disk (1 .ec); restarting L3 clamps REPL.floor below MK_DROP_OBJ, replays MK_DROP_OBJ via ec_salvage_apply,
+     * retires its .ec, GC cleans surviving node 0's chunks, writes resume, and a second salvage is idempotent. */
+    scenario("salvage_crash");
+    init_voters = 3;
+    epoll_after_two = 1;
+    static char hold3[PATH_MAX + 128], ctrig[PATH_MAX + 128];
+    static char penv3[5][3 * PATH_MAX + 512];
+    static char nv3[5][PATH_MAX + 128], hd3[5][PATH_MAX + 128];
+    static char xa3[5][2 * PATH_MAX + 512];
+    snprintf(hold3, sizeof hold3, "%s/salvage_hold3", base);
+    snprintf(ctrig, sizeof ctrig, "%s/salvage_crash_trig", base);
+    unlink(hold3);
+    unlink(ctrig);
+
+    for (int i = 0; i < 5; i++) {
+        nv3[i][0] = 0;
+        hd3[i][0] = 0;
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+        if (i == 0) {
+            snprintf(nv3[i], sizeof nv3[i], "%s/sc_nvme%d", base, i);
+            snprintf(hd3[i], sizeof hd3[i], "%s/sc_hdd%d", base, i);
+            disk_make(nv3[i], "nvme");
+            disk_make(hd3[i], "hdd");
+            snprintf(xa3[i], sizeof xa3[i],
+                     "--disk %s:nvme --disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     nv3[i], hd3[i]);
+        } else if (i == 1 || i == 2) {
+            snprintf(nv3[i], sizeof nv3[i], "%s/sc_nvme%d", base, i);
+            disk_make(nv3[i], "nvme");
+            snprintf(xa3[i], sizeof xa3[i],
+                     "--disk %s:nvme --role compute --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     nv3[i]);
+        } else {
+            snprintf(hd3[i], sizeof hd3[i], "%s/sc_hdd%d", base, i);
+            disk_make(hd3[i], "hdd");
+            snprintf(xa3[i], sizeof xa3[i],
+                     "--disk %s:hdd --role storage --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     hd3[i]);
+        }
+        xargs[i] = xa3[i];
+        snprintf(penv3[i], sizeof penv3[i],
+                 "TSDB_SETTLE_HOLD=%s TSDB_ECGC_TEST=poll_ms=200,lifetime_s=0 "
+                 "TSDB_CRASH_AT=salvage-after-marker:1@%s",
+                 hold3, ctrig);
+        penv[i] = penv3[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    await_view(0, p_voters, &three, "3 voters of 5 for salvage phase 3");
+    await_view(0, p_n_placeable, &five, "5 members UP for salvage phase 3");
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view v;
+        view(0, &v);
+        int ok = v.m.nmembers == 5;
+        for (uint32_t i = 0; ok && i < v.m.nmembers; i++) {
+            int s = server_of(v.m.members[i].id);
+            uint32_t want_d = s == 0 ? 2u : 1u;
+            if (v.m.members[i].ndisks < want_d)
+                ok = 0;
+        }
+        view_free(&v);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage phase 3: disks not registered in 30 s");
+    }
+
+    uint32_t num3 = 0;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "svcr", 0, 2, 1, &num3, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("salvage phase 3: ec=2+1 add: %s (%s)", cluster_strerror(rc), etxt);
+    struct meta_volume ev3;
+    int L3 = salvage_leader_of("svcr", num3, 0, &ev3);
+    await_isr(0, "svcr", 2, 30000, "svcr ISR=2");
+    int CR0 = server_of(ev3.rep[0].node), CR1 = server_of(ev3.rep[1].node);
+    int F3 = (L3 == CR0) ? CR1 : CR0;
+
+    c = client(L3);
+    tsdbc_set_retry(c, 30000);
+    tsdb_sid s_cr = ecb_series(c, "sv.cr", "svcr");
+    int64_t *cts = malloc(NROWS * sizeof *cts);
+    float *cv = malloc(NROWS * sizeof *cv);
+    if (!cts || !cv)
+        die("salvage phase 3: oom");
+    for (size_t j = 0; j < NROWS; j++) {
+        cts[j] = day0 + (int64_t)j * 1000LL;
+        uint64_t z = (0x55ull << 40 | (uint64_t)j) * 0xbf58476d1ce4e5b9ull + 0x9e3779b97f4a7c15ull;
+        z = (z ^ (z >> 30)) * 0x94d049bb133111ebull;
+        z ^= z >> 31;
+        uint32_t bits = (uint32_t)(z & 0x7fffffu) | ((uint32_t)(127 + (z >> 61)) << 23);
+        memcpy(&cv[j], &bits, 4);
+    }
+    for (size_t off = 0; off < NROWS; off += 2000) {
+        if (off == NROWS / 2)
+            usleep(400000);
+        size_t cnt = NROWS - off < 2000 ? NROWS - off : 2000;
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, s_cr, cts + off, cv + off, cnt)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("salvage phase 3: insert failed: %s", ers(rc));
+    }
+    tsdbc_close(c);
+    free(cts);
+    free(cv);
+
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int ec0 = salvage_ec_parts(nv3[CR0], num3), ec1 = salvage_ec_parts(nv3[CR1], num3);
+        int lp0 = salvage_live_parts(nv3[CR0], num3), lp1 = salvage_live_parts(nv3[CR1], num3);
+        int nch = salvage_chunks(hd3, 5, num3);
+        if (ec0 >= 1 && ec1 >= 1 && lp0 == 0 && lp1 == 0 && nch == ec0 * 3)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("salvage phase 3: did not settle full-width in 120 s (ec=%d/%d lp=%d/%d chunks=%d)", ec0, ec1, lp0,
+                lp1, nch);
+    }
+    touch_file(hold3);
+
+    /* Kill & destroy both storage-only stripe holders (watchers 3 and 4); all 3 voters (0, 1, 2) stay up! */
+    peer_of(0, p0, sizeof p0);
+    for (int k = 4; k >= 3; k--) {
+        stop(k, SIGKILL);
+        struct state_want dk = {ids[k], META_DOWN, 0};
+        await_view(leader_of(0), p_member_state, &dk, "phase 3 storage node DOWN");
+        snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", p0, ids[k], secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("salvage phase 3: node out %d failed: %s", k, out);
+        snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ids[k], secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("salvage phase 3: node destroyed %d failed: %s", k, out);
+    }
+
+    /* Phase 3 uses default keep_s so local settled_<P>.part still exists on L3: salvage WITHOUT --force must refuse
+     * to drop a locally recoverable object; salvage WITH --force then proceeds and hits salvage-after-marker! */
+    peer_of(F3, p_other, sizeof p_other);
+    snprintf(args, sizeof args, "cluster volume salvage %s svcr --secret-file %s", p_other, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "settled_"))
+        die("salvage phase 3: expected refusal while local settled_ copy exists, got: %s", out);
+    printf("  phase 3: salvage without --force refused while local settled_ copy exists (ok)\n");
+
+    /* Arm the crash trigger and run volume salvage --force: L3 commits MK_DROP_OBJ then exits 99 BEFORE its own swap! */
+    touch_file(ctrig);
+    snprintf(args, sizeof args, "cluster volume salvage %s svcr --force --secret-file %s", p_other, secret_path);
+    (void)cli_run(args, NULL, out, sizeof out); /* expected to fail when L3 crashes mid-RPC */
+
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int st = 0;
+        if (waitpid(pids[L3], &st, WNOHANG) == pids[L3]) {
+            pids[L3] = 0;
+            break;
+        }
+        if (now_ms() - t0 > 30000)
+            die("salvage phase 3: leader %d did not exit at salvage-after-marker in 30 s", L3);
+    }
+    if (!log_has(L3, "salvage-after-marker"))
+        die("salvage phase 3: leader %d exited without hitting salvage-after-marker", L3);
+    unlink(ctrig);
+
+    /* Raft still has 2/3 quorum (F3 + witness 2): failover promotes F3, which applies committed MK_DROP_OBJ (0 .ec),
+     * while crashed L3 still holds its .ec on disk! */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (salvage_ec_parts(nv3[F3], num3) == 0)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage phase 3: promoted follower %d did not retire .ec after leader crash (ec=%d)", F3,
+                salvage_ec_parts(nv3[F3], num3));
+    }
+    if (salvage_ec_parts(nv3[L3], num3) == 0)
+        die("salvage phase 3: crashed leader %d already retired .ec before salvage-after-marker!", L3);
+
+    /* Restart L3 without crash trigger: REPL.floor was clamped below MK_DROP_OBJ, so L3 replays MK_DROP_OBJ,
+     * retires its own .ec parts, GC removes surviving node 0's chunks, and writes resume on the leader! */
+    snprintf(penv3[L3], sizeof penv3[L3], "TSDB_SETTLE_HOLD=%s TSDB_ECGC_TEST=poll_ms=200,lifetime_s=0", hold3);
+    struct view v3;
+    view(F3, &v3);
+    const struct meta_member *ml3 = meta_member(&v3.m, ids[L3]);
+    struct state_want up3 = {ids[L3], META_UP, ml3 ? ml3->incarnation + 1 : 1};
+    view_free(&v3);
+    start(L3);
+    await_view(F3, p_member_state, &up3, "salvage phase 3: crashed leader back UP");
+    await_isr(F3, "svcr", 2, 60000, "salvage phase 3: ISR=2 after leader crash recovery");
+
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (salvage_ec_parts(nv3[L3], num3) == 0 && salvage_ec_parts(nv3[F3], num3) == 0)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage phase 3: restarted leader %d did not replay MK_DROP_OBJ (ec=%d/%d)", L3,
+                salvage_ec_parts(nv3[L3], num3), salvage_ec_parts(nv3[F3], num3));
+    }
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char lh3[1][PATH_MAX + 128];
+        snprintf(lh3[0], sizeof lh3[0], "%s", hd3[0]);
+        if (salvage_chunks(lh3, 1, num3) == 0)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage phase 3: GC did not clean surviving node 0 chunks (left=%d)", salvage_chunks(lh3, 1, num3));
+    }
+
+    int L3_new = salvage_leader_of("svcr", num3, F3, &ev3);
+    c = client(L3_new);
+    tsdbc_set_retry(c, 30000);
+    int64_t cr_ts = day_y + 1000LL;
+    float cr_v = 7.5f;
+    if ((rc = tsdbc_insert_series(c, s_cr, &cr_ts, &cr_v, 1)) != 0)
+        die("salvage phase 3: write after leader crash recovery failed: %s", ers(rc));
+    tsdbc_close(c);
+
+    peer_of(F3, p_other, sizeof p_other);
+    snprintf(args, sizeof args, "cluster volume salvage %s svcr --secret-file %s", p_other, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "0 lost objects dropped"))
+        die("salvage phase 3: follow-up idempotent salvage failed: %s", out);
+    printf("  phase 3 (salvage-after-marker crash recovery): leader replayed MK_DROP_OBJ, retired .ec, GC=0, writes ok\n");
+
+    /* Phase 4 (R10 x R14 integration): destroy > m stripe holders during ec=2+1 -> replicas=2 REENCODE.
+     * After RECORD sets v->redundancy = META_RED_REPLICAS while orig_redundancy = META_RED_EC still has live .ec
+     * objects: OP_STATUS must show tier=lost, writes must refuse with WHY_LOST, `volume salvage` must drop the lost
+     * .ec object, and the blocked conversion must complete to replicas=2 (nstripe=0) with writes resuming. */
+    scenario("salvage_conv");
+    init_voters = 3;
+    epoll_after_two = 1;
+    static char hold4[PATH_MAX + 128];
+    static char penv4[5][2 * PATH_MAX + 256];
+    static char nv4[5][PATH_MAX + 128], hd4[5][PATH_MAX + 128];
+    static char xa4[5][2 * PATH_MAX + 512];
+    snprintf(hold4, sizeof hold4, "%s/salvage_hold4", base);
+    unlink(hold4);
+
+    for (int i = 0; i < 5; i++) {
+        nv4[i][0] = 0;
+        hd4[i][0] = 0;
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+        if (i == 0) {
+            snprintf(nv4[i], sizeof nv4[i], "%s/cv_nvme%d", base, i);
+            snprintf(hd4[i], sizeof hd4[i], "%s/cv_hdd%d", base, i);
+            disk_make(nv4[i], "nvme");
+            disk_make(hd4[i], "hdd");
+            snprintf(xa4[i], sizeof xa4[i],
+                     "--disk %s:nvme --disk %s:hdd --ec-settle-grace-s 0 --ec-settle-keep-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     nv4[i], hd4[i]);
+        } else if (i == 1 || i == 2) {
+            snprintf(nv4[i], sizeof nv4[i], "%s/cv_nvme%d", base, i);
+            disk_make(nv4[i], "nvme");
+            snprintf(xa4[i], sizeof xa4[i],
+                     "--disk %s:nvme --role compute --ec-settle-grace-s 0 --ec-settle-keep-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     nv4[i]);
+        } else {
+            snprintf(hd4[i], sizeof hd4[i], "%s/cv_hdd%d", base, i);
+            disk_make(hd4[i], "hdd");
+            snprintf(xa4[i], sizeof xa4[i],
+                     "--disk %s:hdd --role storage --ec-settle-grace-s 0 --ec-settle-keep-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200",
+                     hd4[i]);
+        }
+        xargs[i] = xa4[i];
+        snprintf(penv4[i], sizeof penv4[i],
+                 "TSDB_SETTLE_HOLD=%s TSDB_ECGC_TEST=poll_ms=200,lifetime_s=0", hold4);
+        penv[i] = penv4[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    await_view(0, p_voters, &three, "3 voters of 5 for salvage phase 4");
+    await_view(0, p_n_placeable, &five, "5 members UP for salvage phase 4");
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view v;
+        view(0, &v);
+        int ok = v.m.nmembers == 5;
+        for (uint32_t i = 0; ok && i < v.m.nmembers; i++) {
+            int s = server_of(v.m.members[i].id);
+            uint32_t want_d = s == 0 ? 2u : 1u;
+            if (v.m.members[i].ndisks < want_d)
+                ok = 0;
+        }
+        view_free(&v);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage phase 4: disks not registered in 30 s");
+    }
+
+    uint32_t num4 = 0;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "svconv", 0, 2, 1, &num4, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("salvage phase 4: ec=2+1 add: %s (%s)", cluster_strerror(rc), etxt);
+    struct meta_volume ev4;
+    int L4 = salvage_leader_of("svconv", num4, 0, &ev4);
+    await_isr(0, "svconv", 2, 30000, "svconv ISR=2");
+    int CV0 = server_of(ev4.rep[0].node), CV1 = server_of(ev4.rep[1].node);
+    int F4 = (L4 == CV0) ? CV1 : CV0;
+
+    c = client(L4);
+    tsdbc_set_retry(c, 30000);
+    tsdb_sid s_cv = ecb_series(c, "sv.conv", "svconv");
+    int64_t *cvts = malloc(NROWS * sizeof *cvts);
+    float *cvval = malloc(NROWS * sizeof *cvval);
+    if (!cvts || !cvval)
+        die("salvage phase 4: oom");
+    for (size_t j = 0; j < NROWS; j++) {
+        cvts[j] = day0 + (int64_t)j * 1000LL;
+        uint64_t z = (0x77ull << 40 | (uint64_t)j) * 0xbf58476d1ce4e5b9ull + 0x9e3779b97f4a7c15ull;
+        z = (z ^ (z >> 30)) * 0x94d049bb133111ebull;
+        z ^= z >> 31;
+        uint32_t bits = (uint32_t)(z & 0x7fffffu) | ((uint32_t)(127 + (z >> 61)) << 23);
+        memcpy(&cvval[j], &bits, 4);
+    }
+    for (size_t off = 0; off < NROWS; off += 2000) {
+        if (off == NROWS / 2)
+            usleep(400000);
+        size_t cnt = NROWS - off < 2000 ? NROWS - off : 2000;
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, s_cv, cvts + off, cvval + off, cnt)) != 0;
+             usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("salvage phase 4: insert failed: %s", ers(rc));
+    }
+    tsdbc_close(c);
+    free(cvts);
+    free(cvval);
+
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int ec0 = salvage_ec_parts(nv4[CV0], num4), ec1 = salvage_ec_parts(nv4[CV1], num4);
+        int lp0 = salvage_live_parts(nv4[CV0], num4), lp1 = salvage_live_parts(nv4[CV1], num4);
+        int nch = salvage_chunks(hd4, 5, num4);
+        if (ec0 >= 1 && ec1 >= 1 && lp0 == 0 && lp1 == 0 && nch == ec0 * 3)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("salvage phase 4: did not settle full-width in 120 s (ec=%d/%d lp=%d/%d chunks=%d)", ec0, ec1, lp0,
+                lp1, nch);
+    }
+    touch_file(hold4);
+
+    /* Stop both storage watchers (3 & 4) BEFORE starting conversion so unsettle cannot decode the .ec part;
+     * start `volume redundancy svconv replicas=2` -> RECORD sets redundancy=REPLICAS while orig_redundancy=EC
+     * stays in REENCODE; then mark 3 & 4 OUT -> DESTROYED. */
+    peer_of(0, p0, sizeof p0);
+    for (int k = 4; k >= 3; k--) {
+        stop(k, SIGKILL);
+        struct state_want dk = {ids[k], META_DOWN, 0};
+        await_view(leader_of(0), p_member_state, &dk, "phase 4 storage node DOWN");
+    }
+    snprintf(args, sizeof args, "cluster volume redundancy %s svconv replicas=2 --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("salvage phase 4: volume redundancy replicas=2 failed: %s", out);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view v;
+        view(0, &v);
+        const struct meta_volume *mv = meta_volume(&v.m, num4);
+        int ok = mv && mv->redundancy == META_RED_REPLICAS && mv->conv.phase == META_CONV_REENCODE &&
+                 mv->conv.orig_redundancy == META_RED_EC;
+        view_free(&v);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("salvage phase 4: conversion did not reach REENCODE with redundancy=REPLICAS");
+    }
+    for (int k = 4; k >= 3; k--) {
+        snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", p0, ids[k], secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("salvage phase 4: node out %d failed: %s", k, out);
+        snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ids[k], secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("salvage phase 4: node destroyed %d failed: %s", k, out);
+    }
+
+    /* OP_STATUS must show tier=lost and writes must fail with WHY_LOST even though redundancy==REPLICAS now. */
+    L4 = salvage_leader_of("svconv", num4, 0, &ev4);
+    F4 = (L4 == CV0) ? CV1 : CV0;
+    c = client(L4);
+    snprintf(want_tier, sizeof want_tier, "vol.%" PRIu32 ".tier=lost", num4);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        char *stxt = NULL;
+        int src = tsdbc_status(c, &stxt);
+        int ok = src == 0 && stxt && strstr(stxt, want_tier) != NULL;
+        free(stxt);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 15000)
+            die("salvage phase 4: OP_STATUS never showed '%s' during ec->replicas REENCODE", want_tier);
+    }
+    tsdbc_set_retry(c, 30000);
+    int64_t cv_wts = day_y + 2000LL;
+    float cv_wv = 9.5f;
+    rc = tsdbc_insert_series(c, s_cv, &cv_wts, &cv_wv, 1);
+    nu = 0;
+    if (rc != TSDB_ERR_UNAVAILABLE || tsdbc_unavailable(c, u, 4, &nu) != 0 || nu != 1 || u[0].reason != TSDB_WHY_LOST)
+        die("salvage phase 4: write during lost REENCODE returned %s nu=%u reason=%u (want WHY_LOST)", ers(rc), nu,
+            nu ? u[0].reason : 0);
+    tsdbc_close(c);
+
+    /* `volume salvage` must accept the converting volume, drop the lost .ec object, and unblock REENCODE -> DONE!
+     * An eng_unsettle_key started before nodes 3 & 4 were declared DESTROYED may still be unwinding its peer read
+     * timeout; retry while salvage reports the lost .ec part is busy. */
+    peer_of(F4, p_other, sizeof p_other);
+    snprintf(args, sizeof args, "cluster volume salvage %s svconv --secret-file %s", p_other, secret_path);
+    for (uint64_t t0 = now_ms();; usleep(500000)) {
+        int src = cli_run(args, NULL, out, sizeof out);
+        if (src == 0 && strstr(out, "dropped "))
+            break;
+        if (!strstr(out, "is busy") || now_ms() - t0 > 45000)
+            die("salvage phase 4: volume salvage during ec->replicas REENCODE failed (rc=%d): %s", src, out);
+    }
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        struct view v;
+        view(0, &v);
+        const struct meta_volume *mv = meta_volume(&v.m, num4);
+        int ok = mv && mv->conv.phase == META_CONV_NONE && mv->redundancy == META_RED_REPLICAS && mv->nstripe == 0;
+        view_free(&v);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("salvage phase 4: conversion did not complete to replicas=2 (nstripe=0) after salvage");
+    }
+    L4 = salvage_leader_of("svconv", num4, 0, &ev4);
+    c = client(L4);
+    tsdbc_set_retry(c, 30000);
+    if ((rc = tsdbc_insert_series(c, s_cv, &cv_wts, &cv_wv, 1)) != 0)
+        die("salvage phase 4: write after salvage + conversion completion failed: %s", ers(rc));
+    tsdbc_close(c);
+    printf("  phase 4 (ec->replicas REENCODE lost-object salvage): WHY_LOST -> salvage -> conversion DONE (nstripe=0), writes ok\n");
+
+    epoll_after_two = 0;
+    stop_all();
+#endif
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -37481,7 +38526,7 @@ int main(int argc, char **argv)
                {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio}, {"diskout", scen_diskout},
                {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring},
                {"hddadd", scen_hddadd}, {"settings", scen_settings}, {"diskfill", scen_diskfill}, {"posbalance", scen_posbalance},
-               {"adopt", scen_adopt}};
+               {"adopt", scen_adopt}, {"salvage", scen_salvage}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

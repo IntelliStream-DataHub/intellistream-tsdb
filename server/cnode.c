@@ -17,6 +17,7 @@
  * Planted mutants (TSDB_CLUSTER_MUTANT under TSDB_TEST_HOOKS):
  *   - drainleaves:  marks a DRAINING member OUT even while it still holds a log replica, stripe position, or filling prev.
  *   - replaceclear: clears replaced_by (and marks OLD OUT) even while OLD still holds a log replica or stripe position.
+ *   - salvageheard: accepts `node destroyed` while the target member is still heard (R14 D26).
  */
 #include <inttypes.h>
 #include <stdarg.h>
@@ -399,6 +400,21 @@ void cnode_destroyed_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, s
               "node destroyed: node %" PRIu32 " is %s, not out (only an out member may be declared destroyed)", node,
               meta_member_state_name(mb->state));
         return;
+    }
+    uint64_t now = cl_now_ns();
+    if (!cnode_mutant("salvageheard")) {
+        if (!cl_leader_settled(now)) {
+            reply(conn, reqid, META_ERR_STATE,
+                  "node destroyed: cluster leader has not completed its first heartbeat round yet; retry");
+            return;
+        }
+        if (cl_heard_fresh(node, now)) {
+            reply(conn, reqid, META_ERR_STATE,
+                  "node destroyed: node %" PRIu32
+                  " is still heard (stop the server before declaring it destroyed)",
+                  node);
+            return;
+        }
     }
     uint64_t wms = cl_wall_ms();
     struct meta_entry e;

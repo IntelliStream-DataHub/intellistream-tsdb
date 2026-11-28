@@ -714,6 +714,9 @@ typedef struct cp_filled_ent {
 static pthread_mutex_t cp_filled_mu = PTHREAD_MUTEX_INITIALIZER;
 static cp_filled_ent *cp_filled;
 static size_t cp_filled_cap, cp_filled_used, cp_filled_tomb;
+static _Atomic uint64_t cp_filled_gen_cnt;
+
+uint64_t chunkpeer_filled_gen(void) { return atomic_load_explicit(&cp_filled_gen_cnt, memory_order_acquire); }
 
 static size_t cp_filled_hash(uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver, const uint8_t oid[16],
                              size_t mask)
@@ -827,6 +830,7 @@ void chunkpeer_note_filled(uint32_t node, uint32_t volume, unsigned pos, uint64_
             };
             memcpy(cp_filled[dst].oid, oid, 16);
             cp_filled_used++;
+            atomic_fetch_add_explicit(&cp_filled_gen_cnt, 1, memory_order_release);
             break;
         }
         if (e->state == CP_FS_TOMB) {
@@ -867,8 +871,10 @@ bool chunkpeer_is_filled(uint32_t node, uint32_t volume, unsigned pos, uint64_t 
 void chunkpeer_filled_clear_vol(uint32_t volume)
 {
     pthread_mutex_lock(&cp_filled_mu);
-    if (cp_filled_used > 0 && cp_filled_cap > 0)
+    if (cp_filled_used > 0 && cp_filled_cap > 0) {
         cp_filled_evict_vol_locked(volume);
+        atomic_fetch_add_explicit(&cp_filled_gen_cnt, 1, memory_order_release);
+    }
     pthread_mutex_unlock(&cp_filled_mu);
 }
 
@@ -880,6 +886,7 @@ void chunkpeer_filled_reset(void)
     cp_filled_cap = 0;
     cp_filled_used = 0;
     cp_filled_tomb = 0;
+    atomic_fetch_add_explicit(&cp_filled_gen_cnt, 1, memory_order_release);
     pthread_mutex_unlock(&cp_filled_mu);
 }
 
@@ -900,6 +907,8 @@ struct cold_obj {
     uint64_t *rec;               /* the object record's sums, or NULL */
     void (*on_damaged)(void *arg, uint32_t volume, const uint8_t oid[16], unsigned pos, uint32_t node);
     void *on_damaged_arg;
+    int (*node_state)(void *arg, uint32_t node);
+    void *node_state_arg;
 };
 
 static void req_init(struct cs_req *r, uint8_t op, uint32_t volume, uint64_t epoch, const uint8_t vuuid[16],
@@ -1327,6 +1336,7 @@ typedef struct read_ctx {
     uint64_t cur_stripe;
     uint32_t seen_direct_mask; /* data positions already visited in the direct pass of cur_stripe */
     uint32_t skip_mask;        /* positions skipped for this entire read_ctx (set by hedge worker) */
+    uint32_t lost_mask;        /* positions known DESTROYED / CHUNK_ST_LOST for this read (computed once per read) */
     uint32_t bad_mask;         /* positions known bad in cur_stripe */
     int bad_st[CHUNK_POS_MAX]; /* failure status for positions in bad_mask */
     bool stripe_failed;        /* a failed hedge already proved cur_stripe has < k good positions */
@@ -1377,6 +1387,8 @@ typedef struct read_race {
     chunk_report hedge_rep;
     uint64_t *rec_copy;
     uint64_t *sums_copy[CHUNK_POS_MAX];
+    int (*node_state)(void *arg, uint32_t node);
+    void *node_state_arg;
 } read_race;
 
 static void race_unref_locked(read_race *rr)
@@ -1427,6 +1439,8 @@ static void race_hedge_run(void *arg)
     for (unsigned i = 0; i < CHUNK_POS_MAX; i++)
         ho.sums[i] = rr->sums_copy[i];
     ho.rec = rr->rec_copy;
+    ho.node_state = rr->node_state;
+    ho.node_state_arg = rr->node_state_arg;
 
     read_ctx hctx;
     memset(&hctx, 0, sizeof hctx);
@@ -1434,6 +1448,11 @@ static void race_hedge_run(void *arg)
     hctx.flags = rr->flags;
     hctx.allow_hedge = false;
     hctx.skip_mask = rr->skip_mask;
+    if (ho.node_state) {
+        for (unsigned p = 0; p < ho.npos && p < CHUNK_POS_MAX && p < 32u; p++)
+            if (ho.st[p] == CHUNK_ST_LOST || ho.node_state(ho.node_state_arg, ho.node[p]) == CP_NODE_DESTROYED)
+                hctx.lost_mask |= (1u << p);
+    }
 
     chunk_source hsrc = {.ctx = &hctx, .read = src_read, .sums = src_sums, .positions = ho.positions};
     for (int i = 0; i < 16; i++)
@@ -1487,6 +1506,8 @@ static int hedge_read_cell(read_ctx *rctx, unsigned pos, uint64_t off, void *buf
     if (rctx->skip_mask & (1u << pos))
         return CHUNK_ST_DOWN;
     uint32_t node = o->node[pos];
+    if (o->st[pos] == CHUNK_ST_LOST || (pos < 32u && (rctx->lost_mask & (1u << pos))))
+        return CHUNK_ST_LOST;
     /* Check read-avoid before o->st[pos] for positions skipped at open due to read-avoid, or normal OK positions. */
     if ((o->st[pos] == CHUNK_ST_OK || o->avoided[pos]) && cp_peer_is_avoid(node, true)) {
         rctx->had_avoid = true;
@@ -1543,6 +1564,8 @@ static int hedge_read_cell(read_ctx *rctx, unsigned pos, uint64_t off, void *buf
     rr->cell_len = len;
     rr->flags = rctx->flags;
     rr->skip_mask = rctx->bad_mask | (1u << pos);
+    rr->node_state = o->node_state;
+    rr->node_state_arg = o->node_state_arg;
     rr->pri_job = (cp_job){.fn = race_primary_run, .arg = rr};
 
     if (pool_submit(&rr->pri_job) != 0) {
@@ -1627,10 +1650,10 @@ static int hedge_read_cell(read_ctx *rctx, unsigned pos, uint64_t off, void *buf
     } else {
         int pri_st = rr->pri_st ? rr->pri_st : CHUNK_ST_DOWN;
         if (rr->hedge_launched && rr->hedge_done &&
-            (rr->hedge_rc == TSDB_ERR_UNAVAILABLE || rr->hedge_rc == TSDB_ERR_CORRUPT)) {
+            (rr->hedge_rc == TSDB_ERR_UNAVAILABLE || rr->hedge_rc == TSDB_ERR_CORRUPT || rr->hedge_rc == TSDB_ERR_IO)) {
             /* The hedge already probed every other position of this stripe and proved < k good (or corrupt encoding):
              * preserve the exact E15 result and avoid re-reading all survivors a second time in outer degrade(). */
-            unsigned ngood = 0, down = 0;
+            unsigned ngood = 0, down = 0, lost = 0;
             for (unsigned p = 0; p < o->npos; p++) {
                 int pst;
                 if (p == pos)
@@ -1641,10 +1664,14 @@ static int hedge_read_cell(read_ctx *rctx, unsigned pos, uint64_t off, void *buf
                     pst = rr->hedge_rep.st[p];
                 if (pst == CHUNK_ST_OK || pst == CHUNK_ST_VIRTUAL)
                     ngood++;
+                else if (pst == CHUNK_ST_LOST)
+                    lost++;
                 else if (pst == CHUNK_ST_DOWN)
                     down++;
             }
-            int fail_rc = (ngood < o->g.k && ngood + down >= o->g.k) ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
+            int fail_rc = lost > o->g.m ? TSDB_ERR_IO
+                          : (ngood < o->g.k && ngood + down >= o->g.k) ? TSDB_ERR_UNAVAILABLE
+                                                                       : TSDB_ERR_CORRUPT;
             if (fail_rc == TSDB_ERR_UNAVAILABLE && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
                 fail_rc = TSDB_ERR_CORRUPT;
             rctx->stripe_failed = true;
@@ -1679,7 +1706,9 @@ static int src_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len
         rctx->seen_direct_mask |= 1u << pos;
 
     if (rctx->stripe_failed) {
-        int st = rctx->stripe_fail_rc == TSDB_ERR_UNAVAILABLE ? CHUNK_ST_DOWN : CHUNK_ST_DAMAGED;
+        int st = rctx->stripe_fail_rc == TSDB_ERR_IO          ? CHUNK_ST_LOST
+                 : rctx->stripe_fail_rc == TSDB_ERR_UNAVAILABLE ? CHUNK_ST_DOWN
+                                                                : CHUNK_ST_DAMAGED;
         if (st == CHUNK_ST_DOWN && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
             st = CHUNK_ST_DAMAGED;
         if (pos < CHUNK_POS_MAX) {
@@ -1730,13 +1759,17 @@ static void p_obj_close(cold_obj *o)
 /* An open with no position OK: NOTFOUND only when every position answered that it holds no such chunk; UNAVAILABLE
  * when one is away or failed to read (its chunk may be there: E15, never CORRUPT for that), CORRUPT when the rest
  * failed their checks (another encoding of the object, a header or table that does not parse). */
-static int none_ok(const int *st, unsigned n)
+static int none_ok(const int *st, unsigned n, unsigned m)
 {
     bool away = false, damaged = false;
+    unsigned lost = 0;
     for (unsigned i = 0; i < n; i++) {
+        lost += st[i] == CHUNK_ST_LOST;
         away |= st[i] == CHUNK_ST_DOWN || st[i] == CHUNK_ST_IOERR;
         damaged |= st[i] == CHUNK_ST_DAMAGED;
     }
+    if (lost > m)
+        return TSDB_ERR_IO;
     return away ? TSDB_ERR_UNAVAILABLE : damaged ? TSDB_ERR_CORRUPT : TSDB_ERR_NOTFOUND;
 }
 
@@ -1759,16 +1792,20 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
     o->positions = positions;
     o->on_damaged = p->cp->on_damaged;
     o->on_damaged_arg = p->cp->on_damaged_arg;
+    o->node_state = p->cp->node_state;
+    o->node_state_arg = p->cp->view_arg;
     memcpy(o->vuuid, p->vuuid, 16);
     memcpy(o->oid, oid, 16);
 
     /* R9 (r9-whole, D10): for each FILLING position at barrier V and an object with stripe_version < V,
-     * read from prev (A) while A is UP and listed as prev; else treat pos as an erasure (CHUNK_ST_DOWN) unless
-     * the filling holder B has reported this object filled. Never ask B for an unfilled object. */
+     * read from prev (A) while A is UP and listed as prev; else treat pos as an erasure (CHUNK_ST_DOWN, or
+     * CHUNK_ST_LOST when prev is DESTROYED) unless the filling holder B has reported this object filled. */
     bool skip_filling[CHUNK_POS_MAX];
     bool from_prev[CHUNK_POS_MAX];
+    bool is_destroyed[CHUNK_POS_MAX];
     memset(skip_filling, 0, sizeof skip_filling);
     memset(from_prev, 0, sizeof from_prev);
+    memset(is_destroyed, 0, sizeof is_destroyed);
     bool any_filling_skip = false;
     for (unsigned i = 0; i < v.nstripe; i++) {
         o->node[i] = v.stripe[i];
@@ -1781,19 +1818,31 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
                 o->node[i] = v.stripe_prev[i];
                 from_prev[i] = true;
             } else if (!chunkpeer_is_filled(o->node[i], p->volume, i, barrier, oid)) {
-                skip_filling[i] = true;
-                any_filling_skip = true;
+                if (v.stripe_prev[i] != 0 && o->node_state &&
+                    o->node_state(o->node_state_arg, v.stripe_prev[i]) == CP_NODE_DESTROYED) {
+                    is_destroyed[i] = true;
+                } else {
+                    skip_filling[i] = true;
+                    any_filling_skip = true;
+                }
             }
         }
+        if (!skip_filling[i] && !is_destroyed[i] && o->node_state &&
+            o->node_state(o->node_state_arg, o->node[i]) == CP_NODE_DESTROYED)
+            is_destroyed[i] = true;
     }
     if (expect) {
         o->g = *expect;
     } else { /* the geometry from the first header found (positions are placed whatever k' is: E9) */
         uint32_t probe_nodes[CHUNK_POS_MAX];
-        unsigned probe_pos[CHUNK_POS_MAX], nprobe = 0;
+        unsigned probe_pos[CHUNK_POS_MAX], nprobe = 0, probe_lost = 0;
         for (unsigned i = 0; i < v.nstripe; i++) {
             if (positions != 0 && !(positions & (1u << i)))
                 continue;
+            if (is_destroyed[i]) {
+                probe_lost++;
+                continue;
+            }
             if (skip_filling[i])
                 continue;
             probe_nodes[nprobe] = o->node[i];
@@ -1802,7 +1851,7 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
         }
         if (nprobe == 0) {
             p_obj_close(o);
-            return any_filling_skip ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
+            return probe_lost > v.m ? TSDB_ERR_IO : any_filling_skip ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
         }
         fan *f = fan_new(p->cp, o->volume, o->epoch, probe_nodes, nprobe);
         if (!f) {
@@ -1826,10 +1875,12 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
             }
         }
         if (!found) {
+            for (unsigned j = 0; j < probe_lost && nst < CHUNK_POS_MAX; j++)
+                st[nst++] = CHUNK_ST_LOST;
             if (any_filling_skip && nst < CHUNK_POS_MAX)
                 st[nst++] = CHUNK_ST_DOWN;
             p_obj_close(o);
-            return none_ok(st, nst);
+            return none_ok(st, nst, v.m);
         }
     }
     o->npos = chunk_npos(&o->g);
@@ -1839,10 +1890,15 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
     }
     uint32_t active_nodes[CHUNK_POS_MAX];
     unsigned active_pos[CHUNK_POS_MAX];
-    unsigned nactive = 0;
+    unsigned nactive = 0, lost_cnt = 0;
     for (unsigned i = 0; i < o->npos; i++) {
         if (positions != 0 && !(positions & (1u << i))) {
             o->st[i] = CHUNK_ST_UNWRITTEN; /* E10: known erasure, never asked */
+            continue;
+        }
+        if (is_destroyed[i]) {
+            o->st[i] = CHUNK_ST_LOST; /* E15: permanently destroyed member, fast-fail without RPC */
+            lost_cnt++;
             continue;
         }
         if (skip_filling[i]) {
@@ -1857,6 +1913,14 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
             active_pos[nactive] = i;
             nactive++;
         }
+    }
+    if (lost_cnt > o->g.m) {
+        char hex[33];
+        chunk_oid_hex(oid, hex);
+        fprintf(stderr, "tsdb: object %s: %u of %u positions are on destroyed members (> m=%u): data lost\n", hex,
+                lost_cnt, o->npos, o->g.m);
+        p_obj_close(o);
+        return TSDB_ERR_IO;
     }
     unsigned ok = 0;
     if (nactive > 0) {
@@ -1929,7 +1993,7 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
                 continue;
             st_all[nchk++] = o->avoided[i] ? CHUNK_ST_DOWN : o->st[i];
         }
-        int rc0 = nchk ? none_ok(st_all, nchk) : TSDB_ERR_CORRUPT;
+        int rc0 = nchk ? none_ok(st_all, nchk, o->g.m) : TSDB_ERR_CORRUPT;
         if (nactive < nchk && rc0 == TSDB_ERR_UNAVAILABLE && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
             rc0 = TSDB_ERR_CORRUPT;
         p_obj_close(o);
@@ -1964,10 +2028,28 @@ static int p_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsign
     chunk_report local_rep;
     if (!rep)
         rep = &local_rep;
+    memset(rep, 0, sizeof *rep);
+    uint32_t lost_mask = 0;
+    if (o->node_state) {
+        unsigned lost_cnt = 0;
+        for (unsigned p = 0; p < o->npos && p < CHUNK_POS_MAX; p++) {
+            if (o->st[p] == CHUNK_ST_UNWRITTEN)
+                continue;
+            if (o->st[p] == CHUNK_ST_LOST || o->node_state(o->node_state_arg, o->node[p]) == CP_NODE_DESTROYED) {
+                lost_cnt++;
+                if (p < 32u)
+                    lost_mask |= (1u << p);
+                rep->st[p] = CHUNK_ST_LOST;
+            }
+        }
+        if (lost_cnt > o->g.m)
+            return TSDB_ERR_IO;
+    }
     read_ctx rctx;
     memset(&rctx, 0, sizeof rctx);
     rctx.o = o;
     rctx.flags = flags;
+    rctx.lost_mask = lost_mask;
     if (len > 0 && o->g.cell > 0) {
         rctx.allow_hedge = true;
         rctx.c0 = off / o->g.cell;
@@ -2039,6 +2121,8 @@ static int p_del(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t epoch,
         return rc;
     if (pos >= v.nstripe)
         return TSDB_ERR_NOTFOUND;
+    if (p->cp->node_state && p->cp->node_state(p->cp->view_arg, v.stripe[pos]) == CP_NODE_DESTROYED)
+        return TSDB_ERR_NOTFOUND;
     struct cs_req r;
     req_init(&r, CS_OP_DEL, p->volume, epoch, p->vuuid, oid, pos);
     int32_t arc = 0;
@@ -2061,6 +2145,8 @@ static int p_del_gc(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t epo
     if (rc)
         return rc;
     if (pos >= v.nstripe)
+        return TSDB_ERR_NOTFOUND;
+    if (p->cp->node_state && p->cp->node_state(p->cp->view_arg, v.stripe[pos]) == CP_NODE_DESTROYED)
         return TSDB_ERR_NOTFOUND;
     struct cs_req r;
     req_init(&r, CS_OP_DEL, p->volume, epoch, p->vuuid, oid, pos);
@@ -2197,25 +2283,57 @@ static int p_owner(void *ctx, const chunk_listed *c, uint8_t vuuid[16])
 /* EPOCH at e on every stripe member at once (e 0: only asks): how many hold e (a fence at or above it, a store that is
  * sure) in *held, how many answered at all in *answered (NULL: not wanted); *first_bad the first that did not hold it
  * (its index), its answer in *bad. */
-static int ask_all(pctx *p, uint64_t e, bool stop_on_fail, unsigned *held, unsigned *answered, unsigned *nstripe,
-                   int *first_bad, ask *bad)
+static int ask_all(pctx *p, uint64_t e, bool stop_on_fail, bool skip_destroyed, unsigned *held, unsigned *answered,
+                   unsigned *nstripe, int *first_bad, ask *bad)
 {
     struct chunkpeer_view v;
     int rc = view_of(p, &v);
     if (rc)
         return rc;
-    fan *f = fan_new(p->cp, p->volume, e, v.stripe, v.nstripe);
-    if (!f)
-        return TSDB_ERR_NOMEM;
-    f->epoch_op = true;
+    uint32_t active[CHUNK_POS_MAX];
+    unsigned map[CHUNK_POS_MAX], nactive = 0;
+    bool dest[CHUNK_POS_MAX];
+    memset(dest, 0, sizeof dest);
+    for (unsigned i = 0; i < v.nstripe; i++) {
+        if (p->cp->node_state && p->cp->node_state(p->cp->view_arg, v.stripe[i]) == CP_NODE_DESTROYED) {
+            dest[i] = true;
+            continue;
+        }
+        active[nactive] = v.stripe[i];
+        map[nactive] = i;
+        nactive++;
+    }
     ask a[CHUNK_POS_MAX];
-    fan_run(f, 0, 0, stop_on_fail, a, TSDB_ERR_UNAVAILABLE);
+    memset(a, 0, sizeof a);
+    for (unsigned i = 0; i < v.nstripe; i++)
+        a[i].st = TSDB_ERR_UNAVAILABLE;
+    if (nactive > 0) {
+        fan *f = fan_new(p->cp, p->volume, e, active, nactive);
+        if (!f)
+            return TSDB_ERR_NOMEM;
+        f->epoch_op = true;
+        ask fa[CHUNK_POS_MAX];
+        fan_run(f, 0, 0, stop_on_fail, fa, TSDB_ERR_UNAVAILABLE);
+        for (unsigned j = 0; j < nactive; j++)
+            a[map[j]] = fa[j];
+    }
     *held = 0;
     if (answered)
         *answered = 0;
     *nstripe = v.nstripe;
     *first_bad = -1;
     for (unsigned i = 0; i < v.nstripe; i++) {
+        if (dest[i]) {
+            if (skip_destroyed) {
+                (*held)++;
+                continue;
+            }
+            if (*first_bad < 0) {
+                *first_bad = (int)i;
+                *bad = a[i];
+            }
+            continue;
+        }
         if (a[i].st == 0) {
             see_fence(p, a[i].fence);
             if (answered)
@@ -2252,7 +2370,7 @@ static int p_see_epoch(void *ctx, uint64_t e)
     unsigned held, n;
     int bad_i;
     ask bad;
-    int rc = ask_all(p, e, false, &held, NULL, &n, &bad_i, &bad);
+    int rc = ask_all(p, e, false, true, &held, NULL, &n, &bad_i, &bad);
     if (rc)
         return rc;
     if (held == n) {
@@ -2289,7 +2407,7 @@ static bool p_writable(void *ctx)
     unsigned held, n;
     int bad_i;
     ask bad;
-    if (ask_all(p, v.epoch, true, &held, NULL, &n, &bad_i, &bad) != 0 || held != n)
+    if (ask_all(p, v.epoch, true, true, &held, NULL, &n, &bad_i, &bad) != 0 || held != n)
         return false;
     atomic_store(&p->unfenced, false);
     fprintf(stderr, "tsdbd: volume %" PRIu32 ": every stripe member holds epoch %" PRIu64 ": puts and deletes go "
@@ -2305,8 +2423,8 @@ static bool p_all_up(void *ctx)
     int bad_i;
     ask bad;
     if (chunkpeer_mutant == CP_MUT_UNSUREDOWN)
-        return ask_all(ctx, 0, true, &held, &up, &n, &bad_i, &bad) == 0 && held == n; /* planted: unsure is down */
-    return ask_all(ctx, 0, true, &held, &up, &n, &bad_i, &bad) == 0 && up == n;
+        return ask_all(ctx, 0, true, false, &held, &up, &n, &bad_i, &bad) == 0 && held == n; /* planted: unsure is down */
+    return ask_all(ctx, 0, true, false, &held, &up, &n, &bad_i, &bad) == 0 && up == n;
 }
 
 static uint64_t p_stripe_version(void *ctx)

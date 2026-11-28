@@ -5717,6 +5717,24 @@ int cluster_versions_mixed(void)
     return 0;
 }
 
+size_t cluster_volume_salvage_encode(uint32_t volume, uint32_t flags, uint8_t *out)
+{
+    for (int j = 0; j < 4; j++) {
+        out[j] = (uint8_t)(volume >> (8 * j));
+        out[4 + j] = (uint8_t)(flags >> (8 * j));
+    }
+    return 8;
+}
+
+int cluster_volume_salvage_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *flags)
+{
+    if (!p || n != 8)
+        return -1;
+    *volume = le32(p);
+    *flags = le32(p + 4);
+    return 0;
+}
+
 /* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
 static int text_ok_cl(const char *s)
 {
@@ -6961,6 +6979,212 @@ static void admin_settings_set(struct conn *c, uint32_t reqid, struct rd *r)
 
 static void admin_balance(struct conn *c, uint32_t reqid, struct rd *r);
 
+/* R14 (E15, §5.8, D26): async admin reply queue for volume-leader ops (CLUSTER_OP_VOLUME_SALVAGE) that run off the
+ * cluster thread so MK_DROP_OBJ commit and fsync never stall Raft heartbeats or elections. */
+struct cl_async_reply {
+    uint64_t conn;
+    uint32_t reqid;
+    int32_t rc;
+    char *text;
+    struct cl_async_reply *next;
+};
+static pthread_mutex_t g_async_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct cl_async_reply *g_async_head, *g_async_tail;
+static int g_async_running;
+static cluster_salvage_fn g_salvage_fn;
+static void *g_salvage_arg;
+
+void cluster_set_salvage_handler(cluster_salvage_fn fn, void *arg)
+{
+    pthread_mutex_lock(&g_async_mu);
+    g_salvage_fn = fn;
+    g_salvage_arg = arg;
+    pthread_mutex_unlock(&g_async_mu);
+}
+
+static void async_reply_post(uint64_t conn, uint32_t reqid, int32_t rc, const char *text)
+{
+    struct cl_async_reply *item = calloc(1, sizeof *item);
+    if (!item)
+        return;
+    item->conn = conn;
+    item->reqid = reqid;
+    item->rc = rc;
+    if (text && *text) {
+        item->text = strdup(text);
+        if (!item->text) {
+            free(item);
+            return;
+        }
+    }
+    pthread_mutex_lock(&g_async_mu);
+    if (!g_async_running) {
+        pthread_mutex_unlock(&g_async_mu);
+        free(item->text);
+        free(item);
+        return;
+    }
+    if (g_async_tail)
+        g_async_tail->next = item;
+    else
+        g_async_head = item;
+    g_async_tail = item;
+    ssize_t w = write(C.stop_pipe[1], "a", 1);
+    (void)w;
+    pthread_mutex_unlock(&g_async_mu);
+}
+
+static void async_reply_drain(void)
+{
+    pthread_mutex_lock(&g_async_mu);
+    struct cl_async_reply *list = g_async_head;
+    g_async_head = g_async_tail = NULL;
+    pthread_mutex_unlock(&g_async_mu);
+    while (list) {
+        struct cl_async_reply *next = list->next;
+        admin_reply(list->conn, list->reqid, list->rc, list->text, list->text ? strlen(list->text) : 0);
+        free(list->text);
+        free(list);
+        list = next;
+    }
+}
+
+struct salvage_cb_ctx {
+    uint64_t conn;
+    uint32_t reqid;
+};
+
+static void salvage_done_cb(void *cb_arg, int32_t rc, const char *text)
+{
+    struct salvage_cb_ctx *sc = cb_arg;
+    if (!sc)
+        return;
+    async_reply_post(sc->conn, sc->reqid, rc, text);
+    free(sc);
+}
+
+static int meta_vol_holds_ec(const struct meta_volume *v)
+{
+    return v && (v->redundancy == META_RED_EC ||
+                 ((v->conv.phase == META_CONV_REENCODE || v->conv.phase == META_CONV_DROP) &&
+                  v->conv.orig_redundancy == META_RED_EC) ||
+                 v->mixed_redundancy == META_RED_EC);
+}
+
+static void admin_volume_salvage(struct conn *c, uint32_t reqid, struct rd *r)
+{
+    uint32_t vol = 0, flags = 0;
+    if (cluster_volume_salvage_decode(r->p + r->off, r->len - r->off, &vol, &flags) != 0) {
+        static const char msg[] = "volume salvage: a body of 8 bytes is expected";
+        admin_reply(c->serial, reqid, META_ERR_INVALID, msg, sizeof msg - 1);
+        return;
+    }
+    if (flags & ~CLUSTER_SALVAGE_FORCE) {
+        char msg[128];
+        int l = snprintf(msg, sizeof msg, "volume salvage: unknown flags 0x%" PRIx32, flags);
+        admin_reply(c->serial, reqid, META_ERR_INVALID, msg, l > 0 ? (size_t)l : 0);
+        return;
+    }
+    if (!C.sm.initialised) {
+        static const char msg[] = "volume salvage: cluster is not initialised";
+        admin_reply(c->serial, reqid, CLUSTER_ERR_STATE, msg, sizeof msg - 1);
+        return;
+    }
+    const struct meta_volume *v = meta_volume(&C.sm, vol);
+    if (!v) {
+        char msg[128];
+        int l = snprintf(msg, sizeof msg, "volume salvage: volume %" PRIu32 " does not exist", vol);
+        admin_reply(c->serial, reqid, META_ERR_NOTFOUND, msg, l > 0 ? (size_t)l : 0);
+        return;
+    }
+    if (!meta_vol_holds_ec(v)) {
+        char msg[160];
+        int l = snprintf(msg, sizeof msg, "volume salvage: volume %" PRIu32 " (%s) holds no erasure-coded objects", vol,
+                         v->name);
+        admin_reply(c->serial, reqid, META_ERR_INVALID, msg, l > 0 ? (size_t)l : 0);
+        return;
+    }
+
+    /* Check if the whole log group was destroyed (every replica member is META_DESTROYED, §5.8 / D26). */
+    int all_log_destroyed = v->nrep > 0;
+    for (uint32_t i = 0; i < v->nrep; i++) {
+        const struct meta_member *rm = meta_member(&C.sm, v->rep[i].node);
+        if (!rm || rm->state != META_DESTROYED) {
+            all_log_destroyed = 0;
+            break;
+        }
+    }
+    if (all_log_destroyed) {
+        if (!cl_leading()) {
+            const char *lp = leader_peer();
+            admin_reply(c->serial, reqid, CLUSTER_ERR_NOTLEADER, lp, strlen(lp));
+            return;
+        }
+        uint64_t max_pos = v->isr_commit;
+        if (v->grant_min_end > max_pos)
+            max_pos = v->grant_min_end;
+        if (v->nhist > 0 && v->hist[v->nhist - 1].start > max_pos)
+            max_pos = v->hist[v->nhist - 1].start;
+        for (size_t i = 0; i < C.nheard; i++) {
+            const struct heard *h = &C.heard[i];
+            for (uint32_t k = 0; k < h->nvols; k++)
+                if (h->vols[k].v.volume == vol && h->vols[k].v.log_end > max_pos)
+                    max_pos = h->vols[k].v.log_end;
+        }
+        uint32_t dest_stripe = 0;
+        for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+            const struct meta_member *sm = meta_member(&C.sm, v->stripe[p]);
+            if (sm && sm->state == META_DESTROYED)
+                dest_stripe++;
+        }
+        char text[512];
+        int tl = snprintf(text, sizeof text,
+                          "volume %" PRIu32 " (%s): whole log group destroyed (all %" PRIu32
+                          " log replicas destroyed); 0 objects dropped (no surviving log replica); highest known log "
+                          "position %" PRIu64 " (unsettled writes up to this position cannot be accounted for; %" PRIu32
+                          "/%" PRIu32 " stripe positions destroyed)",
+                          vol, v->name, v->nrep, max_pos, dest_stripe, v->nstripe);
+        say("%s", text);
+        admin_reply(c->serial, reqid, 0, text, tl > 0 ? (size_t)tl : 0);
+        return;
+    }
+
+    if (v->leader == 0) {
+        char msg[160];
+        int l = snprintf(msg, sizeof msg, "volume salvage: volume %" PRIu32 " (%s) has no leader", vol, v->name);
+        admin_reply(c->serial, reqid, META_ERR_STATE, msg, l > 0 ? (size_t)l : 0);
+        return;
+    }
+    if (v->leader != C.id) {
+        const struct meta_member *lm = meta_member(&C.sm, v->leader);
+        if (!lm || lm->state != META_UP || !lm->peer[0]) {
+            char msg[160];
+            int l = snprintf(msg, sizeof msg, "volume salvage: leader node %" PRIu32 " of volume %" PRIu32 " is not up",
+                             v->leader, vol);
+            admin_reply(c->serial, reqid, META_ERR_STATE, msg, l > 0 ? (size_t)l : 0);
+            return;
+        }
+        admin_reply(c->serial, reqid, CLUSTER_ERR_NOTLEADER, lm->peer, strlen(lm->peer));
+        return;
+    }
+
+    pthread_mutex_lock(&g_async_mu);
+    cluster_salvage_fn fn = g_salvage_fn;
+    void *fn_arg = g_salvage_arg;
+    pthread_mutex_unlock(&g_async_mu);
+    if (!fn) {
+        static const char msg[] = "volume salvage: volume manager is not active";
+        admin_reply(c->serial, reqid, CLUSTER_ERR_STATE, msg, sizeof msg - 1);
+        return;
+    }
+    struct salvage_cb_ctx *sc = calloc(1, sizeof *sc);
+    if (!sc)
+        oom();
+    sc->conn = c->serial;
+    sc->reqid = reqid;
+    fn(fn_arg, vol, flags, salvage_done_cb, sc);
+}
+
 /* R4's admin ops (cluster_int.h): only the Raft leader hands them on; a follower answers NOTLEADER with the leader's
  * peer address, as every op that proposes does (the CLI follows none of them) */
 static void r4_admin(struct conn *c, uint32_t reqid, struct rd *r,
@@ -7009,6 +7233,7 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_DISK_REPLACE: r4_admin(c, reqid, r, cnode_disk_replace_admin); break;
     case CLUSTER_OP_DISK_CLASS: r4_admin(c, reqid, r, cnode_disk_class_admin); break;
     case CLUSTER_OP_VOLUME_REDUNDANCY: r4_admin(c, reqid, r, credund_admin); break;
+    case CLUSTER_OP_VOLUME_SALVAGE: admin_volume_salvage(c, reqid, r); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -10610,6 +10835,7 @@ static void *cluster_main(void *arg)
             while (read(C.stop_pipe[0], drain, sizeof drain) > 0)
                 ;
         }
+        async_reply_drain();
         if (rc > 0 && (pf[0].revents & POLLIN)) {
             for (int k = 0; k < 64 && C.nconns < MAX_CONNS; k++) {
                 int fd = accept4(C.lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -10925,6 +11151,9 @@ int cluster_start(const struct cluster_cfg *cfg)
     C.gasp_done = 0;
     g_gasp_running = 1;
     pthread_mutex_unlock(&g_gasp_mu);
+    pthread_mutex_lock(&g_async_mu);
+    g_async_running = 1;
+    pthread_mutex_unlock(&g_async_mu);
     (void)creport_progress_register();
     (void)disks_creport_register(); /* decode HBS_DISKS on every member, witnesses included (for leader propose_disks) */
     cheal_start();
@@ -11044,6 +11273,17 @@ void cluster_stop(void)
     free(C.pend);
     free(C.pend_text);
     buf_free(&C.fb);
+    pthread_mutex_lock(&g_async_mu);
+    g_async_running = 0;
+    struct cl_async_reply *ar = g_async_head;
+    g_async_head = g_async_tail = NULL;
+    pthread_mutex_unlock(&g_async_mu);
+    while (ar) {
+        struct cl_async_reply *nx = ar->next;
+        free(ar->text);
+        free(ar);
+        ar = nx;
+    }
     close(C.lfd);
     close(C.stop_pipe[0]);
     close(C.stop_pipe[1]);

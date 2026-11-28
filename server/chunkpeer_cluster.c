@@ -2322,7 +2322,11 @@ static void conv_run_one(const struct conv_req *req)
                     struct timespec ts = {0, 50 * 1000000L};
                     nanosleep(&ts, NULL);
                 }
-            } else if (rc == TSDB_ERR_INDETERMINATE || rc == TSDB_ERR_READONLY || rc == TSDB_ERR_STOPPED) {
+            } else if (rc == TSDB_ERR_INDETERMINATE || rc == TSDB_ERR_READONLY || rc == TSDB_ERR_STOPPED ||
+                       rc == TSDB_ERR_IO) {
+                if (rc == TSDB_ERR_IO)
+                    fprintf(stderr, "tsdbd: volume %" PRIu32 ": conversion reencode hit I/O error; yielding\n",
+                            req->volume);
                 return;
             } else if (rc != 0) {
                 if (++busy_tries >= max_busy) {
@@ -2356,7 +2360,12 @@ static void conv_run_one(const struct conv_req *req)
                     struct timespec ts = {0, 50 * 1000000L};
                     nanosleep(&ts, NULL);
                 }
-            } else if (rc == TSDB_ERR_INDETERMINATE || rc == TSDB_ERR_READONLY || rc == TSDB_ERR_STOPPED) {
+            } else if (rc == TSDB_ERR_INDETERMINATE || rc == TSDB_ERR_READONLY || rc == TSDB_ERR_STOPPED ||
+                       rc == TSDB_ERR_IO) {
+                if (rc == TSDB_ERR_IO)
+                    fprintf(stderr,
+                            "tsdbd: volume %" PRIu32 ": conversion unsettle on key %" PRId64 " hit I/O error; yielding\n",
+                            req->volume, k);
                 return;
             } else {
                 if (++busy_tries >= max_busy) {

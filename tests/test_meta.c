@@ -2733,6 +2733,18 @@ static void test_r13_meta(void)
         meta_op_member_state(&e, 4, META_OUT, 1, META_DOWN_NONE, 0, 0);
         meta_op_member_state(&e, 4, META_DESTROYED, 1, META_DOWN_NONE, 0, 0);
         CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+        /* R14 (D26): declaring a member DESTROYED also marks all of its disks DESTROYED and clears capability. */
+        {
+            const struct meta_member *dm4 = meta_member(&ma, 4);
+            CHECK(dm4 && dm4->state == META_DESTROYED && dm4->ndisks == 1 &&
+                  dm4->disks[0].state == META_STORE_DESTROYED && dm4->capability == META_CAP_NONE);
+            struct meta_state bad_d;
+            meta_init(&bad_d);
+            meta_copy(&bad_d, &ma);
+            ((struct meta_member *)meta_member(&bad_d, 4))->disks[0].state = META_STORE_UP;
+            CHECK(meta_check_step(&ma, &bad_d, why, sizeof why) != 0);
+            meta_free(&bad_d);
+        }
         meta_op_store_add(&e, 3, &d_a4);
         CHECK(apply1(&ma, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS);
         meta_free(&ma);

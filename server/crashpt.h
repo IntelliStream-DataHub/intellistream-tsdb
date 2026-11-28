@@ -55,7 +55,8 @@
     X(CP_UNSETTLE_AFTER_MARKER, "unsettle-after-marker") /* leader committed MK_UNSETTLE, before its own swap (R10) */ \
     X(CP_CONV_GROW, "conv-grow")                       /* Raft leader in conversion GROW phase (credund.c, R10) */   \
     X(CP_CONV_RECORD, "conv-record")                   /* Raft leader in conversion RECORD phase (credund.c, R10) */ \
-    X(CP_CONV_DROP, "conv-drop")                       /* Raft leader in conversion DROP phase (credund.c, R10) */
+    X(CP_CONV_DROP, "conv-drop")                       /* Raft leader in conversion DROP phase (credund.c, R10) */   \
+    X(CP_SALVAGE_AFTER_MARKER, "salvage-after-marker") /* leader committed MK_DROP_OBJ, before its own swap (R14) */
 
 enum crash_point_id {
 #define X(id, name) id,

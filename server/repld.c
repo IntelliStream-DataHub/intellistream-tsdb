@@ -121,6 +121,7 @@
 #include "../src/eccold.h"
 #include "../src/ecapply.h"
 #include "../src/ecdiverge.h"
+#include "../src/ecsalvage.h"
 #include "../src/ecunsettle.h"
 #include "../src/marker.h"
 #include "../src/repl.h"
@@ -3512,6 +3513,13 @@ static void unsettle_leader_crash(struct eng *db)
     crash_point(CP_UNSETTLE_AFTER_MARKER);
 }
 
+/* a leader's MK_DROP_OBJ committed, before its own salvage swap (src/ecsalvage.c) */
+static void salvage_leader_crash(struct eng *db)
+{
+    (void)db;
+    crash_point(CP_SALVAGE_AFTER_MARKER);
+}
+
 /* Test hook (TSDB_ECUNSETTLE_TEST=trigger=<path>): when <path> exists containing "<vol>", spawns a worker thread
  * on the leader of volume <vol> to unsettle all listed .ec keys via eng_ec_keys + eng_unsettle_key, writes the
  * outcome to <path>.out, and removes <path>. Runs off the volume thread so jr_markers_wait never deadlocks repld. */
@@ -3752,6 +3760,7 @@ void repld_init(tsdb *t, const char *dir)
     atomic_store(&ecapply_crash_hook, cold_apply_crash);  /* cold-before-apply, cold-mid-intent */
     atomic_store(&ecunsettle_crash_hook, unsettle_apply_crash); /* r10-unsettle: unsettle-mid-apply */
     atomic_store(&ecunsettle_leader_crash_hook, unsettle_leader_crash); /* r10-unsettle: unsettle-after-marker */
+    atomic_store(&ecsalvage_leader_crash_hook, salvage_leader_crash);   /* r14-salvage: salvage-after-marker */
     ecunsettle_env_init();
     const char *ut = getenv("TSDB_ECUNSETTLE_TEST");
     if (ut) {

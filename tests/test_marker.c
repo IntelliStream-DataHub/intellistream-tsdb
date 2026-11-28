@@ -298,10 +298,23 @@ static void test_gc_digest(void)
     m.u.unsettle.noids = 0;
     CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID); /* an UNSETTLE names at least one oid */
 
-    CHECK(MK_TYPE_LAST == 14 && strcmp(mk_type_name(MK_GC), "GC") == 0 &&
+    memset(&m, 0, sizeof m);
+    m.type = MK_DROP_OBJ;
+    m.u.drop_obj = (mk_drop_obj){.noids = 5, .oids = oids};
+    CHECK(mk_encode(&m, &p, &n) == 0 && n == MK_HDR + 8 + 5 * MK_OID);
+    CHECK(mk_decode(p, n, &d) == 0 && d.type == MK_DROP_OBJ && d.span == 1 && d.u.drop_obj.noids == 5 &&
+          memcmp(mk_oid_at(d.u.drop_obj.oids, 4), oids + 4 * MK_OID, MK_OID) == 0);
+    truncations(p, n, "DROP_OBJ");
+    p[MK_HDR + 4] = 1; /* the reserved word */
+    CHECK(mk_decode(p, n, &d) == TSDB_ERR_CORRUPT);
+    free(p);
+    m.u.drop_obj.noids = 0;
+    CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID); /* a DROP_OBJ names at least one oid */
+
+    CHECK(MK_TYPE_LAST == 15 && strcmp(mk_type_name(MK_GC), "GC") == 0 &&
           strcmp(mk_type_name(MK_DIGEST), "DIGEST") == 0 && strcmp(mk_type_name(MK_UNSETTLE), "UNSETTLE") == 0 &&
-          mk_type_name(15) == NULL);
-    printf("  GC, DIGEST and UNSETTLE: round trips, reasons, truncation\n");
+          strcmp(mk_type_name(MK_DROP_OBJ), "DROP_OBJ") == 0 && mk_type_name(16) == NULL);
+    printf("  GC, DIGEST, UNSETTLE and DROP_OBJ: round trips, reasons, truncation\n");
 }
 
 /* ---------------------------------------------------------------- bounds */
@@ -358,6 +371,9 @@ static void test_bounds(void)
         memset(fixed, 0, sizeof fixed);
         memcpy(fixed + 8, &cnt, 4);
         CHECK(decode_body(MK_UNSETTLE, fixed, 16, ids, (size_t)cnt * MK_OID) == want);
+        memset(fixed, 0, sizeof fixed);
+        memcpy(fixed, &cnt, 4);
+        CHECK(decode_body(MK_DROP_OBJ, fixed, 8, ids, (size_t)cnt * MK_OID) == want);
     }
     /* the encoder refuses a count past the bound as well */
     mk m;
@@ -378,6 +394,10 @@ static void test_bounds(void)
     memset(&m, 0, sizeof m);
     m.type = MK_UNSETTLE;
     m.u.unsettle = (mk_unsettle){.key = 1, .noids = over, .oids = ids};
+    CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID);
+    memset(&m, 0, sizeof m);
+    m.type = MK_DROP_OBJ;
+    m.u.drop_obj = (mk_drop_obj){.noids = over, .oids = ids};
     CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID);
     /* a huge count with nothing behind it: refused without walking past the end */
     uint32_t huge = UINT32_MAX;
@@ -454,6 +474,8 @@ static void marker_of(mk *m, uint16_t type, uint8_t oid[MK_OID])
         m->u.digest = (mk_digest){.key = 1, .z = 1, .noids = 1, .oids = oid};
     else if (type == MK_UNSETTLE)
         m->u.unsettle = (mk_unsettle){.key = 1, .noids = 1, .oids = oid};
+    else if (type == MK_DROP_OBJ)
+        m->u.drop_obj = (mk_drop_obj){.noids = 1, .oids = oid};
     else
         m->u.cold = (mk_cold){.z = 1, .key = 1}; /* COLD with empty lists */
 }
@@ -520,23 +542,22 @@ static void test_admitted(void)
 {
     for (uint32_t t = 1; t <= 70000; t = t < 40 ? t + 1 : t * 2) {
         uint16_t ty = (uint16_t)t;
-        bool later = ty >= MK_EC_LATER_LO && ty <= MK_EC_LATER_HI;
-        bool ec_only = ty == MK_GC || ty == MK_DIGEST || ty == MK_UNSETTLE;
+        bool ec_only = ty == MK_GC || ty == MK_DIGEST || ty == MK_UNSETTLE || ty == MK_DROP_OBJ;
         for (int ec = 0; ec < 2; ec++)
             for (int tier = 0; tier < 2; tier++) {
-                bool want = later ? false : ty == MK_COLD ? (ec || tier) : ec_only ? ec : true;
+                bool want = ty == MK_COLD ? (ec || tier) : ec_only ? ec : true;
                 if (mk_type_admitted(ty, ec, tier) != want)
                     fprintf(stderr, "type %u, ec %d, tier %d: admitted %d\n", t, ec, tier, !want);
                 CHECK(mk_type_admitted(ty, ec, tier) == want);
             }
     }
-    printf("  admitted: GC, DIGEST, UNSETTLE with ec; COLD with ec or tier; 15 nowhere; the rest everywhere\n");
+    printf("  admitted: GC, DIGEST, UNSETTLE, DROP_OBJ with ec; COLD with ec or tier; the rest everywhere\n");
 }
 
 static void test_open(const char *scratch)
 {
-    static const uint16_t types[4] = {MK_GC, MK_DIGEST, MK_UNSETTLE, MK_COLD};
-    for (int t = 0; t < 4; t++) {
+    static const uint16_t types[5] = {MK_GC, MK_DIGEST, MK_UNSETTLE, MK_DROP_OBJ, MK_COLD};
+    for (int t = 0; t < 5; t++) {
         uint16_t type = types[t];
         char dir[PATH_MAX];
         fresh_dir(scratch, mk_type_name(type), dir, sizeof dir);
@@ -577,45 +598,7 @@ static void test_open(const char *scratch)
         }
         rm_dir(dir);
     }
-    /* 14 and 15 (R10's): a segment that holds one is refused even with the word; the writer never logs one */
-    for (uint16_t type = MK_EC_LATER_LO; type <= MK_EC_LATER_HI; type++) {
-        char dir[PATH_MAX], what[16];
-        snprintf(what, sizeof what, "later%u", (unsigned)type);
-        fresh_dir(scratch, what, dir, sizeof dir);
-        eng *db;
-        CHECK(open_eng(dir, &db) == 0);
-        if (db)
-            eng_close(db);
-        set_requires(dir, "ec");
-        static const uint8_t body[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-        CHECK(open_eng(dir, &db) == 0);
-        if (db) {
-            uint64_t fno = 0;
-            int rc = wal_marker(db, type, 0, 1, body, sizeof body, &fno);
-            if (rc != TSDB_ERR_INVALID)
-                fprintf(stderr, "an ec volume logged a marker of type %u (%d)\n", (unsigned)type, rc);
-            CHECK(rc == TSDB_ERR_INVALID);
-            eng_close(db);
-        }
-        pid_t pid = fork(); /* a later release's segment: planted through the writer's test hook */
-        if (pid == 0) {
-            if (open_eng(dir, &db) != 0)
-                _exit(2);
-            mk_test_mutant = MK_MUT_WRITE_ANY;
-            uint64_t fno = 0;
-            _exit(wal_marker(db, type, 0, 1, body, sizeof body, &fno) == 0 ? 0 : 3);
-        }
-        int st = 0;
-        CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
-        int rc = open_eng(dir, &db);
-        if (rc == 0) {
-            fprintf(stderr, "an ec volume opened with a marker of type %u in its WAL\n", (unsigned)type);
-            eng_close(db);
-        }
-        CHECK(rc == TSDB_ERR_CORRUPT);
-        rm_dir(dir);
-    }
-    printf("  open: GC, DIGEST, COLD refused by the writer and the replay of a volume without the word\n");
+    printf("  open: GC, DIGEST, UNSETTLE, DROP_OBJ, COLD refused by the writer and the replay of a volume without the word\n");
 }
 
 /* requires=cluster,ec (through META's rewrite, as r8f's attach): ec_cluster at the open; cluster or ec alone does not */

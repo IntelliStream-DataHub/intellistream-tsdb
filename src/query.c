@@ -1320,6 +1320,7 @@ typedef struct agg_job {
     agg_edge *edge;      /* when !t.accx */
     agg_edge_dev *edged; /* when t.accx */
     atomic_int err;
+    atomic_int cold_err; /* propagated from eccache_take_thread_err() on helper threads */
     /* claimed by every worker per granule: isolated from read-only fields and stripe locks */
     _Alignas(64) atomic_size_t next;
     /* striped by bucket range: each lock on its own cache line so adjacent stripes never false-share */
@@ -1436,6 +1437,7 @@ static void agg_worker(void *arg, int idx)
     (void)idx;
     agg_job *j = arg;
     eng *db = j->db;
+    eccache_clear_thread_err();
     qstats local_qs;
     if (j->qs) {
         memset(&local_qs, 0, sizeof local_qs);
@@ -1525,6 +1527,11 @@ static void agg_worker(void *arg, int idx)
             break;
     }
 out:
+    {
+        int ce = eccache_take_thread_err();
+        if (ce != 0)
+            atomic_store(&j->cold_err, ce);
+    }
     if (cc)
         cc_put(db, cc);
     qscratch_put(ts);
@@ -1986,12 +1993,16 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
             j->edged = edged;
             atomic_init(&j->next, 0);
             atomic_init(&j->err, 0);
+            atomic_init(&j->cold_err, 0);
             for (int k = 0; k < AGG_STRIPES; k++)
                 pthread_mutex_init(&j->locks[k].m, NULL);
             sched_run(db->sched, threads, agg_worker, j);
             for (int k = 0; k < AGG_STRIPES; k++)
                 pthread_mutex_destroy(&j->locks[k].m);
             rc = atomic_load(&j->err);
+            int ce = atomic_load(&j->cold_err);
+            if (ce != 0)
+                eccache_note_thread_err(ce);
             if (rc == 0) {
                 if (edged) {
                     for (size_t w = 0; w < nwork; w++) {

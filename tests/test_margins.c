@@ -110,6 +110,28 @@ int main(int argc, char **argv)
     margins_of(&cp, &v, three, 3, false, mut, &m);
     CHECK(m.tier == MARGIN_TIER_LOST && m.destroyed == 3 && m.settled == -1, "three destroyed: tier %s destroyed %u "
           "settled %d", margin_tier_name(m.tier), m.destroyed, m.settled);
+    /* R14 (r9-jc): a FILLING spare whose prev is META_DESTROYED still counts as destroyed until WHOLE */
+    {
+        struct cluster_copy_vol vf = ec42();
+        members_up();
+        members[0].state = META_DESTROYED;
+        members[1].state = META_DESTROYED;
+        members[2].state = META_DESTROYED;
+        /* Spare node 7 takes position 2 as FILLING with prev = node 3 (META_DESTROYED): must still be tier=lost! */
+        vf.stripe[2] = 7;
+        vf.stripe_pos[2] = (struct meta_stripe_pos){.state = META_STRIPE_FILLING, .prev = 3, .set_ver = 2};
+        margins_of(&cp, &vf, NULL, 0, false, mut, &m);
+        CHECK(m.tier == MARGIN_TIER_LOST && m.destroyed == 3 && m.present == 3 && m.settled == -1,
+              "filling spare over destroyed prev: tier %s destroyed %u present %u settled %d",
+              margin_tier_name(m.tier), m.destroyed, m.present, m.settled);
+        /* Once WHOLE, only 2 positions remain destroyed (<= m): tier=ok with margin 0. */
+        vf.stripe_pos[2] = (struct meta_stripe_pos){.state = META_STRIPE_WHOLE, .prev = 0, .set_ver = 2};
+        margins_of(&cp, &vf, NULL, 0, false, mut, &m);
+        CHECK(m.tier == MARGIN_TIER_OK && m.destroyed == 2 && m.present == 4 && m.settled == 0,
+              "spare reached WHOLE: tier %s destroyed %u present %u settled %d",
+              margin_tier_name(m.tier), m.destroyed, m.present, m.settled);
+        members_up();
+    }
     /* unavailable wins over corrupt: short of k positions, a read is retried whatever damage was seen before */
     members[0].state = members[1].state = members[2].state = META_DOWN;
     margins_of(&cp, &v, NULL, 0, true, mut, &m);
