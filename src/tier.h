@@ -11,13 +11,15 @@
  *
  * The configuration is a test feature until R15 (D3): the environment variable TSDB_TEST_TIER, read by tsdb_open,
  *
- *     k=2,m=1,dirs=/a:/b:/c,grace_s=3600,keep_s=86400,coarse_s=604800,cache_mb=0,eager=0
+ *     k=2,m=1,dirs=/a:/b:/c,grace_s=3600,keep_s=86400,coarse_s=604800,cache_mb=0,eager=0,reencode_objects=3,reencode_tomb_pct=8
  *
  * acts only with TSDB_TEST_TIER_I_KNOW=1 beside it; set without it, the open fails with a line: a stray variable must
  * not lead an open to write requires=tier into META, which older builds and builds without TSDB_EC refuse. k (1 ..
  * CHUNK_K_MAX), m (1 .. CHUNK_M_MAX) and dirs (absolute paths split by ':', at least k + m, no repeats, at most
  * TIER_DIRS_MAX) are required; the rest default as above (cache_mb 0: 10% of RAM, r7-seam; eager=1: jepsen's policy,
- * r7-settle). Unknown keys, repeated keys, empty values, signs, numbers out of range and trailing commas are refused.
+ * r7-settle; optional test-only reencode_objects 1..64 and reencode_tomb_pct 1..100 override single-server re-encode
+ * policy thresholds when non-zero). Unknown keys, repeated keys, empty values, signs, numbers out of range and
+ * trailing commas are refused.
  *
  * Owners: r7-iface wrote this header, tier_cfg_parse and tier_from_env (pure parsing) and the plain reference count in
  * src/tier.c; r7-tier fills tier_open, tier_engine_attach (refusals, chunk_be_see_epoch(be, vol, 1)) and the rest.
@@ -41,6 +43,8 @@ typedef struct tier_cfg {
     int64_t grace_s, keep_s, coarse_s;
     uint64_t cache_mb;
     bool eager;
+    unsigned reencode_objects;  /* test-only (TSDB_TEST_TIER): override ec_objects_max (0 = default) */
+    unsigned reencode_tomb_pct; /* test-only (TSDB_TEST_TIER): override tombstone % threshold (0 = default) */
 } tier_cfg;
 
 #define TIER_GRACE_S_DEFAULT 3600
@@ -202,6 +206,8 @@ typedef struct tier_settings {
     _Atomic int64_t grace_s, keep_s, coarse_s;
     uint64_t cache_mb;
     bool eager;
+    unsigned reencode_objects;  /* test-only (TSDB_TEST_TIER): override ec_objects_max (0 = default) */
+    unsigned reencode_tomb_pct; /* test-only (TSDB_TEST_TIER): override tombstone % threshold (0 = default) */
     /* r8g-cut, a cluster leader's settle (src/eccold.c; ec.settle_force_s, ec.settle_wait_max_s): how long past
      * grace_s the policy waits for the memtable to let go of the key's rows by itself before the gate flushes it, and
      * how long a settle waits for every position to be UP under the stripe version it put by. 0: the defaults

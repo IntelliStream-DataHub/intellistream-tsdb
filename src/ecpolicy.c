@@ -661,7 +661,8 @@ static bool span_fits(part *const *parts, size_t a, size_t b, size_t limit, uint
 /* Evaluate all candidate start indices x in [g_lo, g_last] sharing the same right endpoint `end` in a single
  * right-to-left cumulative tomb_set pass (O(end - g_lo) instead of O(M^2)/O(M^3)). Sets *out_lo to the leftmost
  * triggering start index, matching a left-to-right scan. */
-static bool eval_tomb_group(part *const *parts, size_t g_lo, size_t g_last, size_t end, size_t *out_lo)
+static bool eval_tomb_group(part *const *parts, size_t g_lo, size_t g_last, size_t end, unsigned tomb_pct,
+                            size_t *out_lo)
 {
     tomb_set ts = {0};
     bool dirty = false;
@@ -686,7 +687,7 @@ static bool eval_tomb_group(part *const *parts, size_t g_lo, size_t g_last, size
             hidden += ec_hidden_rows_ts(parts[x], &ts);
         }
         if (x <= g_last && parts[x]->rows > 0 && ec_rows > 0 &&
-            (__uint128_t)hidden * 100 > (__uint128_t)ec_rows * ECPOLICY_TOMB_PCT)
+            (__uint128_t)hidden * 100 > (__uint128_t)ec_rows * tomb_pct)
             pick_i = x;
     }
     tomb_set_free(&ts);
@@ -697,8 +698,8 @@ static bool eval_tomb_group(part *const *parts, size_t g_lo, size_t g_last, size
 }
 
 /* Scan a combinable run parts[0 .. len) for Trigger 2 using a two-pointer window bound and constant-end grouping. */
-static bool pick_tomb_window(part *const *parts, size_t len, size_t limit, uint64_t max_bytes, size_t *out_lo,
-                             size_t *out_hi)
+static bool pick_tomb_window(part *const *parts, size_t len, size_t limit, uint64_t max_bytes, unsigned tomb_pct,
+                             size_t *out_lo, size_t *out_hi)
 {
     size_t last_tomb = 0;
     for (size_t i = len; i-- > 0;)
@@ -734,7 +735,7 @@ static bool pick_tomb_window(part *const *parts, size_t len, size_t limit, uint6
                 g_last = i;
             } else {
                 size_t pick_i = 0;
-                if (eval_tomb_group(parts, g_lo, g_last, cur_end, &pick_i)) {
+                if (eval_tomb_group(parts, g_lo, g_last, cur_end, tomb_pct, &pick_i)) {
                     *out_lo = pick_i;
                     *out_hi = cur_end;
                     return true;
@@ -750,7 +751,7 @@ static bool pick_tomb_window(part *const *parts, size_t len, size_t limit, uint6
     }
     if (g_lo != SIZE_MAX) {
         size_t pick_i = 0;
-        if (eval_tomb_group(parts, g_lo, g_last, cur_end, &pick_i)) {
+        if (eval_tomb_group(parts, g_lo, g_last, cur_end, tomb_pct, &pick_i)) {
             *out_lo = pick_i;
             *out_hi = cur_end;
             return true;
@@ -803,9 +804,10 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
     uint64_t cap_ms = atomic_load(&db->lead_cap_ms);
     int64_t retain = cap_ms ? (int64_t)cap_ms : ECCOLD_RETAIN_S_DEFAULT * 1000LL;
     int64_t margin = cfg->keep_s * 1000 + retain + 3600 * 1000LL;
-    unsigned obj_max = atomic_load(&ecpolicy_objects_max);
+    unsigned obj_max = (!cluster && cfg->reencode_objects) ? cfg->reencode_objects : atomic_load(&ecpolicy_objects_max);
     if (obj_max == 0)
         obj_max = ECPOLICY_OBJECTS_MAX_DEFAULT;
+    unsigned tomb_pct = (!cluster && cfg->reencode_tomb_pct) ? cfg->reencode_tomb_pct : ECPOLICY_TOMB_PCT;
     size_t limit = MIN(cap, (size_t)MAX_MERGE_PARTS);
     uint64_t max_bytes = db->opt.max_part_bytes;
     if (limit < 2 || max_bytes == 0)
@@ -1013,7 +1015,7 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
     for (size_t ri = 0; ri < got_runs; ri++) {
         size_t wlo = 0, whi = 0;
         part *const *rp = cand_parts + runs[ri].off;
-        if (pick_tomb_window(rp, runs[ri].len, limit, max_bytes, &wlo, &whi)) {
+        if (pick_tomb_window(rp, runs[ri].len, limit, max_bytes, tomb_pct, &wlo, &whi)) {
             if (cluster) {
                 if (wlo > runs[ri].max_lo)
                     wlo = runs[ri].max_lo;

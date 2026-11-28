@@ -96,6 +96,8 @@ int settle_mutant_parse(const char *name)
                                         "nullnosync",  "syncfailgo",  "nohaltstop",
                                         "reencodedroptomb", "reencoderankdown", "reencodemarkunavail",
                                         "afterignored", "highnotoldest", "settledegraded"};
+    if (strcmp(name, "droptomb") == 0)
+        return SETTLE_MUT_DROPTOMB;
     for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
@@ -719,6 +721,8 @@ static bool settle_hit_store_cap(const eng *db)
            chunk_be_any_store_full(tier_backend(db->tier));
 }
 
+static _Thread_local bool settle_in_reencode;
+
 static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, uint32_t posmask,
                          uint32_t *written_mask_out, int fail_at)
 {
@@ -798,6 +802,8 @@ static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, ui
     if (written_mask_out)
         *written_mask_out = written;
     ecswap_crash_point(ECSWAP_CRASH_AFTER_PUT);
+    if (settle_in_reencode)
+        ecswap_crash_point(ECSWAP_CRASH_REENCODE_AFTER_PUT);
     r->object_xxh64 = f.hash;
     r->settle_ms = eng_now_ms(db);
 out:
@@ -818,6 +824,8 @@ static int settle_index_as(eng *db, part *p, const ec_record *r, part **out, int
         return rc;
     }
     ecswap_crash_point(ECSWAP_CRASH_AFTER_EC_TMP);
+    if (settle_in_reencode)
+        ecswap_crash_point(ECSWAP_CRASH_REENCODE_AFTER_EC_TMP);
     char name[96];
     snprintf(name, sizeof name, "%.*s.ec", (int)strlen(p->name) - 5, p->name);
     part *e = NULL;
@@ -1133,7 +1141,9 @@ static int eng_reencode_ex(eng *db, int64_t partition, part **sel, size_t n, siz
         rc = merge_parts_reencode(db, pin, np, cuts, ncuts, tombs_below, &merged);
     if (rc == 0 && merged) {
         if (merged->ng > 0) {
+            settle_in_reencode = true;
             rc = settle_one(db, merged, &out);
+            settle_in_reencode = false;
             if (merged->pending)
                 unlinkat(db->dirfd, merged->pending, 0);
             if (rc == 0 && out)

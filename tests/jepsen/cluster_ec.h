@@ -428,8 +428,11 @@ static void *ec_poller(void *arg)
         ec_poll();
         if (!planted && !strcmp(mutant, "ec-diverged") && atomic_load(&ec_polls) >= 10 * (unsigned)nn)
             planted = ec_plant();
-        while (atomic_load(&ec_poll_run) && now_ms() - t0 < 1000)
-            usleep(50000);
+        while (atomic_load(&ec_poll_run) && now_ms() - t0 < 1000) {
+            usleep(100000);
+            if (r10_convert_on)
+                r10_poll_conv();
+        }
     }
     return NULL;
 }

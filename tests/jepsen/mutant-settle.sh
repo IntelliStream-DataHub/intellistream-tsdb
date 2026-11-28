@@ -13,17 +13,20 @@
 #               for a reason of the machine, e.g. io_uring out of memory, is no catch). Set by
 #               TSDB_SWAP_MUTANT=swapearly, an environment variable of the tsdbd the mutant is in (the name of the
 #               variable is r7-swap's: change it here if that track named it otherwise).
+#   droptomb    R10 re-encode mutant (TSDB_SETTLE_MUTANT=droptomb): drops tombstones covering older parts below the
+#               re-encode window; must fail the --tier 6 --reencode run under kill by logical digest mismatch or a data
+#               check (resurrected row).
 # A tsdbd that has no such mutant (the strings are not in the binary: a tree before r7-settle or r7-swap) is skipped
 # with a line, unless JEPSEN_REQUIRE_TIER=1, which makes it a failure (`make jepsen-selftest` sets it once the tree has
-# a tier: JEPSEN_TIER non-empty). Which names arm the mutants (TSDB_SETTLE_MUTANT=ecrankdown, TSDB_SWAP_MUTANT=swapearly)
-# is the contract with r7-settle and r7-swap: a run that finds the needle in the binary and a mutant that does not
-# arm that way fails as "went unnoticed".
-# Usage: tests/jepsen/mutant-settle.sh JEPSEN_DIR [ecrankdown swapearly]   (default: both)
+# a tier: JEPSEN_TIER non-empty). Which names arm the mutants (TSDB_SETTLE_MUTANT=ecrankdown, TSDB_SWAP_MUTANT=swapearly,
+# TSDB_SETTLE_MUTANT=droptomb) is the contract with r7-settle, r7-swap and r10-local: a run that finds the needle in the
+# binary and a mutant that does not arm that way fails as "went unnoticed".
+# Usage: tests/jepsen/mutant-settle.sh JEPSEN_DIR [ecrankdown swapearly droptomb]   (default: all three)
 # (JEPSEN_TSDBD names another tsdbd than build/tsdbd, JEPSEN_BIN another jepsen than build/jepsen)
 set -u
-dir=${1:?usage: mutant-settle.sh JEPSEN_DIR [ecrankdown|swapearly...]}
+dir=${1:?usage: mutant-settle.sh JEPSEN_DIR [ecrankdown|swapearly|droptomb...]}
 shift
-muts=${*:-ecrankdown swapearly}
+muts=${*:-ecrankdown swapearly droptomb}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 tsdbd=${JEPSEN_TSDBD:-$root/build/tsdbd}
 jepsen=${JEPSEN_BIN:-$root/build/jepsen}
@@ -33,6 +36,7 @@ for m in $muts; do
     case $m in
     ecrankdown) var=TSDB_SETTLE_MUTANT; needle=TSDB_SETTLE_MUTANT ;;
     swapearly) var=TSDB_SWAP_MUTANT; needle=swapearly ;;
+    droptomb) var=TSDB_SETTLE_MUTANT; needle=reencodedroptomb ;;
     *) echo "unknown mutant $m"; exit 2 ;;
     esac
     if ! grep -aq "$needle" "$tsdbd"; then
@@ -50,16 +54,20 @@ for m in $muts; do
         want='lost: final holds|final holds .* completed before|: stale$|: torn$|acknowledged before a read saw|^  final: series|^  final latest'
         ;;
     swapearly)
-        sw_seed=1
         for sw_seed in 1 2 3; do
             out=$(env TSDB_SWAP_MUTANT=swapearly JEPSEN_TSDBD="$tsdbd" "$jepsen" --dir "$dir" --nemesis settle-steps \
                 --crashfs "$crashfs" --seconds 40 --tier 3 --seed "$sw_seed" 2>&1); st=$?
-            [ "$st" -ne 0 ] && break
+            { [ "$st" -eq 1 ] || [ "$st" -eq 2 ]; } && break
         done
         want='lost: final holds|final holds .* completed before|: stale$|: torn$|acknowledged before a read saw|^  final: series|^  final latest'
         # jepsen says "does not come up" on one line and the server's log tail, which names the file, below it
         refused='does not come up|cannot open'
         named='^tsdb: .*(settle intent .*(damage|the open fails)|both exist and no intent names them \(a settle leaves one of the two\): the open fails)'
+        ;;
+    droptomb)
+        out=$(env TSDB_SETTLE_MUTANT=droptomb JEPSEN_TSDBD="$tsdbd" "$jepsen" --dir "$dir" --nemesis kill \
+            --seconds 30 --tier 6 --reencode 2>&1); st=$?
+        want='^  tier-reencode: [1-9][0-9]* re-encode logical digest mismatch|lost: final holds|final holds .* completed before|: stale$|: torn$|acknowledged before a read saw|^  final: series|^  final latest'
         ;;
     esac
     # the refusal's own line: one below jepsen's "does not come up", never any line of the run that names an intent

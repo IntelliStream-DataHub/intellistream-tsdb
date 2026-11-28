@@ -203,8 +203,9 @@ int tier_cfg_parse(const char *spec, tier_cfg *c, char *err, size_t errlen)
     c->keep_s = TIER_KEEP_S_DEFAULT;
     c->coarse_s = TIER_COARSE_S_DEFAULT;
     int rc = 0;
-    enum { K_K, K_M, K_DIRS, K_GRACE, K_KEEP, K_COARSE, K_CACHE, K_EAGER, K_N };
-    static const char *const keys[K_N] = {"k", "m", "dirs", "grace_s", "keep_s", "coarse_s", "cache_mb", "eager"};
+    enum { K_K, K_M, K_DIRS, K_GRACE, K_KEEP, K_COARSE, K_CACHE, K_EAGER, K_RE_OBJS, K_RE_TOMB, K_N };
+    static const char *const keys[K_N] = {"k", "m", "dirs", "grace_s", "keep_s", "coarse_s", "cache_mb", "eager",
+                                          "reencode_objects", "reencode_tomb_pct"};
     bool seen[K_N] = {false};
     if (!spec || !*spec) {
         TIER_ERR("the setting is empty");
@@ -264,6 +265,16 @@ int tier_cfg_parse(const char *spec, tier_cfg *c, char *err, size_t errlen)
                 TIER_ERR("eager must be 0 or 1");
             c->eager = n == 1;
             break;
+        case K_RE_OBJS:
+            if (!tier_num(v, end, 1, 64, &n))
+                TIER_ERR("reencode_objects must be 1 .. 64");
+            c->reencode_objects = (unsigned)n;
+            break;
+        case K_RE_TOMB:
+            if (!tier_num(v, end, 1, 100, &n))
+                TIER_ERR("reencode_tomb_pct must be 1 .. 100");
+            c->reencode_tomb_pct = (unsigned)n;
+            break;
         }
         if (!*end)
             break;
@@ -295,10 +306,12 @@ out:
 /* Timing-only overrides from TSDB_TEST_TIER beside a TIERS file that names stores (R15 D16). */
 typedef struct tier_env_override {
     bool any;
-    bool has_grace, has_keep, has_coarse, has_cache, has_eager;
+    bool has_grace, has_keep, has_coarse, has_cache, has_eager, has_re_objs, has_re_tomb;
     int64_t grace_s, keep_s, coarse_s;
     uint64_t cache_mb;
     bool eager;
+    unsigned reencode_objects;
+    unsigned reencode_tomb_pct;
 } tier_env_override;
 
 static int tier_env_override_parse(const char *dir, const char *spec, const char *iknow, tier_env_override *ov)
@@ -308,8 +321,9 @@ static int tier_env_override_parse(const char *dir, const char *spec, const char
         return 0;
     const char *sep = dir ? ": " : "";
     dir = dir ? dir : "";
-    enum { K_GRACE, K_KEEP, K_COARSE, K_CACHE, K_EAGER, K_N };
-    static const char *const keys[K_N] = {"grace_s", "keep_s", "coarse_s", "cache_mb", "eager"};
+    enum { K_GRACE, K_KEEP, K_COARSE, K_CACHE, K_EAGER, K_RE_OBJS, K_RE_TOMB, K_N };
+    static const char *const keys[K_N] = {"grace_s", "keep_s", "coarse_s", "cache_mb", "eager",
+                                          "reencode_objects", "reencode_tomb_pct"};
     bool seen[K_N] = {false};
     /* First scan: validate key=value framing and always refuse dirs= (and k=/m=) beside TIERS, even without I_KNOW=1. */
     char bad_geom = '\0';
@@ -406,6 +420,22 @@ static int tier_env_override_parse(const char *dir, const char *spec, const char
             }
             ov->has_eager = true;
             ov->eager = n == 1;
+            break;
+        case K_RE_OBJS:
+            if (!tier_num(v, end, 1, 64, &n)) {
+                fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: reencode_objects must be 1 .. 64: the open fails\n", dir, sep);
+                return TSDB_ERR_INVALID;
+            }
+            ov->has_re_objs = true;
+            ov->reencode_objects = (unsigned)n;
+            break;
+        case K_RE_TOMB:
+            if (!tier_num(v, end, 1, 100, &n)) {
+                fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: reencode_tomb_pct must be 1 .. 100: the open fails\n", dir, sep);
+                return TSDB_ERR_INVALID;
+            }
+            ov->has_re_tomb = true;
+            ov->reencode_tomb_pct = (unsigned)n;
             break;
         }
         if (!*end)
@@ -985,6 +1015,10 @@ static int tier_open_impl(const char *dir, const tsdb_options *opt, bool salvage
                 c.coarse_s = ov.coarse_s;
             if (ov.has_eager)
                 c.eager = ov.eager;
+            if (ov.has_re_objs)
+                c.reencode_objects = ov.reencode_objects;
+            if (ov.has_re_tomb)
+                c.reencode_tomb_pct = ov.reencode_tomb_pct;
         }
         if (ov.has_cache)
             c.cache_mb = ov.cache_mb;
@@ -1302,6 +1336,8 @@ void tier_settings_from_cfg(const tier_cfg *c, tier_settings *s)
     s->coarse_s = c->coarse_s;
     s->cache_mb = c->cache_mb;
     s->eager = c->eager;
+    s->reencode_objects = c->reencode_objects;
+    s->reencode_tomb_pct = c->reencode_tomb_pct;
 }
 
 coldvol *tier_cold_ref(coldvol *cv)

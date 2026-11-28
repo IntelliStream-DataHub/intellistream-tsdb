@@ -2553,7 +2553,7 @@ static void t_tiers_settings(void)
     err = cap_end();
     CHECK(rc == TSDB_ERR_INVALID && !d.t && strstr(err, "dirs=") != NULL);
 
-    setenv("TSDB_TEST_TIER", "grace_s=5,keep_s=10,eager=1", 1);
+    setenv("TSDB_TEST_TIER", "grace_s=5,keep_s=10,eager=1,reencode_objects=3,reencode_tomb_pct=8", 1);
     unsetenv("TSDB_TEST_TIER_I_KNOW");
     cap_begin();
     rc = direct_open(dbdir, 0, &d);
@@ -2565,8 +2565,23 @@ static void t_tiers_settings(void)
     if (d.t && d.db) {
         const tier_settings *s0 = tier_eng_settings(d.db);
         CHECK(s0 && s0->k == 3 && s0->m == 2 && s0->grace_s == 5 && s0->tier_after_s == 5 && s0->keep_s == 10 &&
-              s0->eager);
+              s0->eager && s0->reencode_objects == 3 && s0->reencode_tomb_pct == 8);
         direct_close(&d);
+    }
+    static const char *const bad_ov[] = {
+        "reencode_objects=0",
+        "reencode_objects=65",
+        "reencode_objects=2,reencode_objects=3",
+        "reencode_tomb_pct=0",
+        "reencode_tomb_pct=101",
+        "reencode_tomb_pct=8,reencode_tomb_pct=9",
+    };
+    for (size_t i = 0; i < sizeof bad_ov / sizeof *bad_ov; i++) {
+        setenv("TSDB_TEST_TIER", bad_ov[i], 1);
+        cap_begin();
+        rc = direct_open(dbdir, 0, &d);
+        (void)cap_end();
+        CHECK(rc == TSDB_ERR_INVALID && !d.t);
     }
     no_tier_env();
 

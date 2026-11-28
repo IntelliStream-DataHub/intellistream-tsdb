@@ -1951,8 +1951,12 @@ JEPSEN_OUTAGE_SEEDS ?= 1 2
 # settle-steps (a power cut at each step of a settle) on both workloads and both backends, under the eager policy, and
 # the run fails when nothing settled. Empty until the tree has settles (src/ names TSDB_SETTLE_MUTANT, r7-settle's
 # mutant): before that every tier run would fail its settle count, as it is meant to. JEPSEN_TIER= turns it off.
-JEPSEN_TIER ?= $(if $(shell grep -l TSDB_SETTLE_MUTANT src/*.c 2>/dev/null),3 6,)
+# Also gated on EC_OBJ so NO_EC=1 builds skip tier/re-encode runs cleanly.
+JEPSEN_TIER ?= $(if $(EC_OBJ),$(if $(shell grep -l TSDB_SETTLE_MUTANT src/*.c 2>/dev/null),3 6,),)
 JEPSEN_TIER_SEEDS ?= 1 2
+# R10 single-server re-encode (--tier 6 --reencode, eager re-encode policy via TSDB_TEST_TIER keys): kill, power,
+# settle-steps (re-encode crash points) and eio on kv; JEPSEN_TIER_REENCODE= turns it off.
+JEPSEN_TIER_REENCODE ?= $(if $(strip $(JEPSEN_TIER)),kill power settle-steps eio,)
 # R15 local tier nemeses on a six-store TIERS tier (and single-copy m=0) under outagefs (docs/design-cluster-data.md §15.9, E55).
 JEPSEN_TIER_R15 ?= $(if $(strip $(JEPSEN_TIER)),store-eio store-stuck store-lost salvage fill single-copy,)
 # Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
@@ -1987,6 +1991,13 @@ jepsen-run: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs
 	        TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --tier $$n --nemesis eio \
 	            --seconds $(call jsec,20) --crashfs $(B)/libcrashfs.so || exit 1; done && \
 	    if [ $$wl = kv ]; then \
+	        for nem in $(JEPSEN_TIER_REENCODE); do \
+	            echo "== tsdbd --io $$io, workload kv, --tier 6 --reencode, nemesis $$nem (R10)" && \
+	            re_secs=$(call jsec,30); re_shim=""; \
+	            case $$nem in power|settle-steps|eio) re_shim="--crashfs $(B)/libcrashfs.so";; esac; \
+	            case $$nem in settle-steps) re_secs=$(call jsec,45);; esac; \
+	            TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --tier 6 --reencode \
+	                --nemesis $$nem --seconds $$re_secs $$re_shim || exit 1; done && \
 	        for nem in $(JEPSEN_TIER_R15); do \
 	            echo "== tsdbd --io $$io, workload kv, R15 tier nemesis $$nem" && \
 	            TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis $$nem \
@@ -2252,7 +2263,7 @@ jepsen-selftest-5:
 # front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
 # (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
 # each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
-$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/jepsen/cluster_ec.h tests/jepsen/cluster_r9.h tests/jepsen/cluster_r13.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
+$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/jepsen/cluster_ec.h tests/jepsen/cluster_r9.h tests/jepsen/cluster_r13.h tests/jepsen/cluster_r10.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
     server/crashpt.h server/users.h src/chunk.h src/disk.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
@@ -2310,6 +2321,23 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)
 	$(MAKE) --no-print-directory jepsen-cluster-ec
 	$(MAKE) --no-print-directory jepsen-cluster-r9
 	$(MAKE) --no-print-directory jepsen-cluster-r13
+	$(MAKE) --no-print-directory jepsen-cluster-r10
+
+# R10 online redundancy conversion under kill and partition (tests/jepsen/cluster_r10.h, §6.4, §11, D26-D29):
+# Starts conversion 30 s into each run across replicas=3:4+2, 4+2:4+3 and 4+2:replicas=3 (--io epoll on nodes >= 2).
+# Skips cleanly on NO_EC=1 or when JEPSEN_R10=none.
+JEPSEN_R10 ?=
+JEPSEN_R10_CONVERTS ?= replicas=3:4+2 4+2:4+3 4+2:replicas=3
+JEPSEN_R10_NEMESES ?= kill partition
+.PHONY: jepsen-cluster-r10
+jepsen-cluster-r10: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb
+	@if [ "$(JEPSEN_R10)" = none ]; then echo "jepsen-cluster-r10: off (JEPSEN_R10=none)"; exit 0; fi; \
+	if [ -z "$(EC_OBJ)" ]; then echo "jepsen-cluster-r10: skipped (NO_EC=1)"; exit 0; fi; \
+	for io in $(IO); do for conv in $(JEPSEN_R10_CONVERTS); do for nem in $(JEPSEN_R10_NEMESES); do \
+	    echo "== tsdbd --io $$io, --convert $$conv, nemesis $$nem (R10)"; \
+	    TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) \
+	        --convert $$conv --nemesis $$nem --workload meta,kv --seconds $(call jsec,60) --seed $(JEPSEN_SEED) || exit 1; \
+	    done; done; done
 
 # R13 two-class disks on one machine and disk nemeses (tests/jepsen/cluster_r13.h, §15.9, D21):
 # Each server gets 2 :nvme disks under the scratch root and 2 :hdd disks under a second prefix wrapped by outagefs
@@ -2544,7 +2572,10 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	    out=$$(TSDB_PLACE_MUTANT=partialdelnow $$j --geometry 4+2 --workload meta,kv --nemesis back --seconds 40 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r9: partialdelnow:'; then \
 	        echo "jepsen-cluster-selftest: R9 mutant partialdelnow went unnoticed under back (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate, scrubskipcell, repairnolive, wholeearly, fillnocheck, partialdelnow skipped (NO_EC=1)"; fi; \
+	    out=$$(TSDB_CLUSTER_MUTANT=dropearly $$j --convert 4+2:replicas=3 --convert-at 8 --convert-timeout-s 25 --workload meta,kv --nemesis kill --seconds 30 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -Eq 'FAIL: r10: (stripe positions dropped during REENCODE|conversion .* did not finish .*\(stuck in phase=reencode,.*old_objs=[1-9])'; then \
+	        echo "jepsen-cluster-selftest: R10 mutant dropearly went unnoticed under --convert (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate, scrubskipcell, repairnolive, wholeearly, fillnocheck, partialdelnow, dropearly skipped (NO_EC=1)"; fi; \
 	out=$$(TSDB_PLACE_MUTANT=noguard $$j --geometry r3 --workload meta,kv --nemesis two --seconds 35 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r9: noguard:'; then \
 	        echo "jepsen-cluster-selftest: R9 mutant noguard went unnoticed under two (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \

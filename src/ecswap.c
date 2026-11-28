@@ -105,10 +105,30 @@ void (*ecswap_intent_fail_hook)(eng *db);
 
 /* ------------------------------------------------------------ crash points */
 
-enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_AFTER_PUT, SC_AFTER_EC_TMP, SC_N };
+enum {
+    SC_AFTER_INTENT,
+    SC_BETWEEN_RENAMES,
+    SC_BEFORE_UNLINK,
+    SC_AFTER_PUT,
+    SC_AFTER_EC_TMP,
+    SC_RE_AFTER_INTENT,
+    SC_RE_BETWEEN_RENAMES,
+    SC_RE_BEFORE_UNLINK,
+    SC_RE_AFTER_PUT,
+    SC_RE_AFTER_EC_TMP,
+    SC_N
+};
 #ifdef TSDB_TEST_HOOKS
-static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink", "after-put",
-                                           "after-ec-tmp"};
+static const char *const sc_names[SC_N] = {"after-intent",
+                                           "between-renames",
+                                           "before-unlink",
+                                           "after-put",
+                                           "after-ec-tmp",
+                                           "reencode-after-intent",
+                                           "reencode-between-renames",
+                                           "reencode-before-unlink",
+                                           "reencode-after-put",
+                                           "reencode-after-ec-tmp"};
 static pthread_once_t sc_once = PTHREAD_ONCE_INIT;
 static int sc_point = -1; /* the armed point, -1: none */
 static long sc_at = 1;
@@ -163,7 +183,14 @@ static void sm_read(void)
 
 static inline void sm_init(void) { pthread_once(&sm_once, sm_read); }
 
-void ecswap_crash_point(int which) { settle_crash(which == ECSWAP_CRASH_AFTER_PUT ? SC_AFTER_PUT : SC_AFTER_EC_TMP); }
+void ecswap_crash_point(int which)
+{
+    int p = which == ECSWAP_CRASH_AFTER_PUT            ? SC_AFTER_PUT
+            : which == ECSWAP_CRASH_AFTER_EC_TMP       ? SC_AFTER_EC_TMP
+            : which == ECSWAP_CRASH_REENCODE_AFTER_PUT ? SC_RE_AFTER_PUT
+                                                       : SC_RE_AFTER_EC_TMP;
+    settle_crash(p);
+}
 #else
 static inline void settle_crash(int point) { (void)point; }
 static inline void sm_init(void) {}
@@ -676,6 +703,7 @@ static bool swap_renames_reencode(eng *db, part **in, size_t nin, part *out)
     char dst[sizeof in[0]->name + 16];
     for (size_t i = 0; i < nin; i++) {
         settle_crash(SC_BETWEEN_RENAMES);
+        settle_crash(SC_RE_BETWEEN_RENAMES);
         if (atomic_load(&in[i]->ec))
             retired_of(in[i]->name, dst, sizeof dst);
         else
@@ -766,8 +794,10 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
                 eng_sync_dir(db, "fsync of the directory after writing a re-encode's intent") != 0)
                 rc = TSDB_ERR_IO;
         }
-        if (rc == 0)
+        if (rc == 0) {
             settle_crash(SC_AFTER_INTENT);
+            settle_crash(SC_RE_AFTER_INTENT);
+        }
     }
     if (ok && rc == 0)
         renamed = swap_renames_reencode(db, in, nin, out);
@@ -863,6 +893,7 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
     }
     ecapply_swap_post(db, in, out1, 1);
     settle_crash(SC_BEFORE_UNLINK);
+    settle_crash(SC_RE_BEFORE_UNLINK);
     if (unlinkat(db->dirfd, intent, 0) != 0)
         fprintf(stderr, "tsdb: unlink of re-encode intent %s after its swap: %s (the next open rolls it forward)\n",
                 intent, strerror(errno));

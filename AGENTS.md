@@ -30,11 +30,15 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # `tsdb DIR/db tier add` with stores in DIR/tier/s0..s(N-1) and timings via TSDB_TEST_TIER (grace_s/keep_s/eager;
                           # JEPSEN_TIER_LEGACY=1 keeps the legacy dirs= path without TIERS): kill, power, eio and settle-steps
                           # (TSDB_SETTLE_CRASH_AT: a power cut at each named step of a settle) on kv and classes, both backends,
-                          # JEPSEN_TIER_SEEDS 1 2; plus JEPSEN_TIER_R15 (`store-eio`, `store-stuck`, `store-lost`, `salvage`, `fill`,
-                          # `single-copy`) under outagefs (`rate MB/s` and `fill PCT` controls added to tests/jepsen/outagefs.c);
-                          # a run in which nothing settled fails; JEPSEN_TIER= turns them off; tests/jepsen/mutant-settle.sh plants
-                          # ecrankdown and swapearly, and tests/jepsen/mutant-tier.sh plants downnoread, fullnoflag, lostnoreplace and
-                          # salvagelatest via TSDB_TIER_MUTANT: jepsen-selftest runs both and every mutant must be caught)
+                          # JEPSEN_TIER_SEEDS 1 2; plus JEPSEN_TIER_REENCODE (`jepsen --tier 6 --reencode`: eager re-encode
+                          # policy via TSDB_TEST_TIER `reencode_objects`/`reencode_tomb_pct`, under `kill`, `power`,
+                          # `settle-steps` with `reencode-*` crash points, and `eio`, gated on `TSDB_EC`); plus JEPSEN_TIER_R15
+                          # (`store-eio`, `store-stuck`, `store-lost`, `salvage`, `fill`, `single-copy`) under outagefs (`rate MB/s`
+                          # and `fill PCT` controls added to tests/jepsen/outagefs.c); a run in which nothing settled (or
+                          # re-encoded, with `--reencode`) fails; JEPSEN_TIER= turns them off; tests/jepsen/mutant-settle.sh
+                          # plants ecrankdown, swapearly and droptomb (`TSDB_SETTLE_MUTANT=droptomb` under `--tier 6 --reencode`),
+                          # and tests/jepsen/mutant-tier.sh plants downnoread, fullnoflag, lostnoreplace and salvagelatest via
+                          # TSDB_TIER_MUTANT: jepsen-selftest runs both and every mutant must be caught)
                           # (kv also writes nulls and checks every QUERY_LATEST answer, and the final ones; tests/jepsen/mutant-latest.sh
                           # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
                           # jepsen exits 0 valid, 1 VIOLATION (a wrong answer of tsdb: never repeated), 2 harness failure, 3 INCONCLUSIVE
@@ -124,7 +128,13 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # `jepsen-cluster-r13-diskback-long` runs the 35-min run with `--rebuild-after-s 2400 --diskback-hold-s 1500`),
                           # and `nvmefill` (one NVMe fills via `TSDB_DISK_USAGE_FILE` -> `kvr` refused with `TSDB_WHY_FULL` while sibling
                           # volume on the other NVMe of the same node keeps accepting writes); `jepsen-cluster-selftest` plants
-                          # `TSDB_DISKS_MUTANT=stallexit` (under `nvmestuck`) and `TSDB_DISKS_MUTANT=fullall` (under `nvmefill`)
+                          # `TSDB_DISKS_MUTANT=stallexit` (under `nvmestuck`) and `TSDB_DISKS_MUTANT=fullall` (under `nvmefill`).
+                          # `jepsen-cluster-r10` (`tests/jepsen/cluster_r10.h`, §6.4, §11, D26-D29; run by `make jepsen-cluster`;
+                          # `JEPSEN_R10=none` or `NO_EC=1` skips; `JEPSEN_R10_CONVERTS`, default `replicas=3:4+2 4+2:4+3 4+2:replicas=3`;
+                          # `JEPSEN_R10_NEMESES`, default `kill partition`): runs `--convert A:B` (started `--convert-at` 30 s into
+                          # the run, `--io epoll` on nodes >= 2 per D15), checking normal invariants plus conversion completion,
+                          # phase ordering, final `.ec` geometry (or 0 `.ec` parts for `replicas=3`), and no lost/resurrected writes;
+                          # `jepsen-cluster-selftest` plants `TSDB_CLUSTER_MUTANT=dropearly` under `--convert 4+2:replicas=3`
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec

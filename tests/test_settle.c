@@ -2896,6 +2896,48 @@ static void reencode_case(void)
         atomic_store(&settle_reencode_pause, false);
     }
 
+    /* 7b. TSDB_TEST_TIER reencode_objects / reencode_tomb_pct overrides in ecpolicy_pick_reencode. */
+    {
+        where w;
+        fresh("re-override", &w);
+        char spec[4 * PATH_MAX + 160];
+        snprintf(spec, sizeof spec,
+                 "k=2,m=1,dirs=%s:%s:%s,grace_s=%d,coarse_s=86400,eager=0,reencode_objects=2,reencode_tomb_pct=5",
+                 w.st[0], w.st[1], w.st[2], QUIET_GRACE);
+        setenv("TSDB_TEST_TIER", spec, 1);
+        setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+        atomic_store(&NOW, 1000);
+        atomic_store(&settle_reencode_pause, true);
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0);
+        if (d.db) {
+            uint32_t sd = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0);
+            /* 3 settled objects (> reencode_objects=2, below default 4): MUST collapse to 1 .ec object */
+            for (int k = 0; k < 3; k++) {
+                write_rows(d.db, sd, k * 5000000LL, 4000, 1000, k);
+                CHECK(eng_flush(d.db) == 0);
+                CHECK(settle_key(d.db, 0, NULL) == 0);
+            }
+            for (int i = 0; i < 500 && eckeep_key_pending(d.db, 0); i++)
+                sleep_ms(10);
+            acc want = digest(d.db, "s");
+            CHECK(want.n == 12000);
+            atomic_store(&settle_reencode_pause, false);
+            CHECK(wait_parts(d.db, 0, 1, 1, 20000));
+            CHECK(same(digest(d.db, "s"), want));
+            /* 6% deletion (720 of 12000 rows: > reencode_tomb_pct=5, below default 10%): MUST trigger re-encode */
+            for (int i = 0; i < 500 && eckeep_key_pending(d.db, 0); i++)
+                sleep_ms(10);
+            CHECK(eng_delete_range(d.db, sd, 0, 720 * 1000) == 0);
+            CHECK(wait_parts(d.db, 0, 1, 1, 20000));
+            CHECK(digest(d.db, "s").n == 12000 - 720);
+            CHECK(t_close(&d) == 0);
+        }
+        atomic_store(&settle_reencode_pause, false);
+    }
+
     /* 8. Crash points & crashfs power loss at every step of a re-encode swap (2 .ec + 1 .part -> 1 .ec). */
     if (!quick || !strcmp(mutant, "none")) {
         where base, w;

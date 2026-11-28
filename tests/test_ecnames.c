@@ -208,7 +208,15 @@ static void cfg_good(void)
     tier_cfg_free(&c);
 
     CHECK(tier_cfg_parse("k=1,m=1,dirs=/a:/b:/c", &c, err, sizeof err) == 0); /* more stores than k + m */
-    CHECK(c.ndirs == 3);
+    CHECK(c.ndirs == 3 && c.reencode_objects == 0 && c.reencode_tomb_pct == 0);
+    tier_cfg_free(&c);
+
+    CHECK(tier_cfg_parse("k=2,m=1,dirs=/a:/b:/c,reencode_objects=1,reencode_tomb_pct=1", &c, err, sizeof err) == 0);
+    CHECK(c.reencode_objects == 1 && c.reencode_tomb_pct == 1);
+    tier_cfg_free(&c);
+
+    CHECK(tier_cfg_parse("k=2,m=1,dirs=/a:/b:/c,reencode_objects=64,reencode_tomb_pct=100", &c, err, sizeof err) == 0);
+    CHECK(c.reencode_objects == 64 && c.reencode_tomb_pct == 100);
     tier_cfg_free(&c);
 }
 
@@ -252,6 +260,14 @@ static void cfg_bad(void)
         "k=2,m=1,dirs=/a:/b:/c,eager=2",
         "k=2,m=1,dirs=/a:/b:/c,eager=yes",
         "k=2,m=1,dirs=/a:/b:/c,eager",
+        "k=2,m=1,dirs=/a:/b:/c,reencode_objects=0",
+        "k=2,m=1,dirs=/a:/b:/c,reencode_objects=65",
+        "k=2,m=1,dirs=/a:/b:/c,reencode_objects=-1",
+        "k=2,m=1,dirs=/a:/b:/c,reencode_objects=2,reencode_objects=3",
+        "k=2,m=1,dirs=/a:/b:/c,reencode_tomb_pct=0",
+        "k=2,m=1,dirs=/a:/b:/c,reencode_tomb_pct=101",
+        "k=2,m=1,dirs=/a:/b:/c,reencode_tomb_pct=-1",
+        "k=2,m=1,dirs=/a:/b:/c,reencode_tomb_pct=8,reencode_tomb_pct=9",
         "k=2,m=1,dirs=/a:/b:/c,turbo=1",
         "K=2,m=1,dirs=/a:/b:/c",
         "k=2,m=1,dirs=/a:/b:/c,=1",

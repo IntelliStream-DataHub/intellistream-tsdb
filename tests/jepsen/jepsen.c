@@ -6,7 +6,7 @@
  *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|settle-steps|store-eio|store-stuck|
  *                               store-lost|salvage|fill|single-copy|none] [--seconds 20]
  *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so]
- *          [--workload kv|classes] [--verify-checksums] [--auth] [--feed] [--tier N]
+ *          [--workload kv|classes] [--verify-checksums] [--auth] [--feed] [--tier N] [--reencode]
  *
  * Tier (--tier N; R7/R15, docs/design-cluster-data.md 10.2, §15.9): the database lives in DIR/db with N store
  * directories in DIR/tier/s0..s(N-1) configured via `tsdb DIR/db tier add` (`TIERS`), with timing overrides in
@@ -550,6 +550,7 @@ static bool md, rot;                /* --nemesis misdirect / rot */
 static char dbdir[PATH_MAX];        /* DIR/db for TIERS mode (stores are siblings in DIR/tier), else DIR */
 static int tier_n;
 static bool tier_legacy;            /* JEPSEN_TIER_LEGACY=1: legacy TSDB_TEST_TIER dirs= path without TIERS */
+static bool tier_reencode;          /* --reencode (R10): eager re-encode policy through TSDB_TEST_TIER keys */
 static bool settle_steps;
 static bool t_store_eio, t_store_stuck, t_store_lost, t_salvage, t_fill, t_single_copy, tier_nem;
 static char tier_root[PATH_MAX];    /* DIR/tier, as an absolute path: the stores are tier_root/s<i> */
@@ -618,8 +619,13 @@ static int64_t wall_ms_now(void)
 #endif
 static const char *const settle_step_names[] = {"after-put", "after-ec-tmp", "after-intent", "between-renames",
                                                 "before-unlink"};
+static const char *const reencode_step_names[] = {"reencode-after-put", "reencode-after-ec-tmp",
+                                                  "reencode-after-intent", "reencode-between-renames",
+                                                  "reencode-before-unlink"};
+static const char *const *active_step_names(void) { return tier_reencode ? reencode_step_names : settle_step_names; }
 #define NSTEPS 5
 #define SETTLE_WAIT_S 12            /* a server that has not reached its armed step by then is killed and restarted */
+#define REENCODE_WAIT_S 20          /* --reencode settle-steps: allow settles before the first re-encode crash point */
 static int cur_step = -1;           /* the step the current server is armed with, -1: none */
 static int64_t up_ns;               /* when the current server came up */
 static int step_crashes[NSTEPS], step_unreached, step_armed[NSTEPS];
@@ -1133,7 +1139,7 @@ static bool step_reached(int step, pid_t pid)
     } else {
         step_nocut++;
         fprintf(stderr, "  step %s: the server ended with exit 99 and crashfs did not roll back (a _exit?)\n",
-                settle_step_names[step]);
+                active_step_names()[step]);
     }
     return false;
 }
@@ -1248,10 +1254,11 @@ static void start_server_run(bool faulty)
         unlink(pullpath);
         char arm[48] = "";
         cur_step = -1;
-        if (settle_steps && faulty && crashfs && attempt == 0) { /* this server ends at a settle step, as a power cut */
+        if (settle_steps && faulty && crashfs && attempt == 0) { /* this server ends at a settle/re-encode step, as a power cut */
             uint64_t q = mix(seed * 7919 + (uint64_t)restarts * 31 + 5);
             cur_step = (int)(((uint64_t)restarts + (seed % NSTEPS)) % NSTEPS);
-            snprintf(arm, sizeof arm, "%s:%d", settle_step_names[cur_step], 1 + (int)((q >> 20) % 3));
+            snprintf(arm, sizeof arm, "%s:%d", active_step_names()[cur_step],
+                     tier_reencode ? 1 : 1 + (int)((q >> 20) % 3));
             step_armed[cur_step]++;
         }
         th_portfile(pf, sizeof pf, dir);
@@ -1289,7 +1296,9 @@ static void start_server_run(bool faulty)
                 setenv("CRASHFS_PROB", crash_prob(), 1);
                 setenv("CRASHFS_WARMUP", "200", 1);
                 if ((!strcmp(nemesis, "power") && restarts % 2 == 1) ||
-                    (settle_steps && (restarts % 2 == 1 || cur_step == 3)))
+                    (settle_steps &&
+                     (restarts % 2 == 1 ||
+                      (cur_step >= 0 && strstr(active_step_names()[cur_step], "between-renames") != NULL))))
                     setenv("CRASHFS_TEAR", "1", 1); /* every other server, and always on between-renames: keep what a real disk may keep */
                 if (arm[0]) { /* no random power loss: the settle step is the cut, and the shim rolls back at exit */
                     setenv("CRASHFS_PROB", "0", 1);
@@ -1354,6 +1363,9 @@ static void start_server_run(bool faulty)
             }
             if (classes) {
                 av[ac++] = "--granule-rows", av[ac++] = CL_STR(CL_GRANULE_ROWS);
+                av[ac++] = "--merge-idle-s", av[ac++] = "1";
+                av[ac++] = "--flush-interval-ms", av[ac++] = "500";
+            } else if (tier_reencode) {
                 av[ac++] = "--merge-idle-s", av[ac++] = "1";
                 av[ac++] = "--flush-interval-ms", av[ac++] = "500";
             }
@@ -4879,7 +4891,8 @@ static void *nemesis_thread(void *arg)
             bool gone = reap_server(pid, &st, WNOHANG) == pid, killed = false;
             /* a server with no step (the clean one after an armed server died while starting) is replaced after a
              * few seconds and not counted as one that never reached a step */
-            if (!gone && now_ns() - up_ns > (int64_t)(cur_step >= 0 ? SETTLE_WAIT_S : 3) * 1000000000LL) {
+            int wait_s = tier_reencode ? REENCODE_WAIT_S : SETTLE_WAIT_S;
+            if (!gone && now_ns() - up_ns > (int64_t)(cur_step >= 0 ? wait_s : 3) * 1000000000LL) {
                 signal_pid(pid, SIGKILL);
                 reap_server(pid, &st, 0);
                 gone = killed = true;
@@ -7049,15 +7062,50 @@ static int tier_check(void)
             VIOLATION("tier: %d faults on a file of a store in %.0f s, at least %u wanted: the eio nemesis never hit "
                       "a store\n", store_eios, seconds, min_eios);
     }
+    if (tier_reencode) {
+        unsigned re_lines = 0, re_digest_bad = 0;
+        FILE *lf = fopen(slogpath, "r");
+        char lbuf[2048];
+        while (lf && fgets(lbuf, sizeof lbuf, lf)) {
+            if (strstr(lbuf, "re-encoded ") != NULL && strstr(lbuf, " parts of partition ") != NULL &&
+                strstr(lbuf, " into 1") != NULL)
+                re_lines++;
+            if (strstr(lbuf, "aborted: logical digest mismatch") != NULL)
+                re_digest_bad++;
+        }
+        if (lf)
+            fclose(lf);
+        unsigned want_re = seconds >= 40 ? 2 : 1;
+        if (!strcmp(nemesis, "eio") || settle_steps)
+            want_re = 1;
+        const char *min_re = getenv("JEPSEN_MIN_REENCODES");
+        if (min_re && *min_re) {
+            char *ep = NULL;
+            unsigned long v = strtoul(min_re, &ep, 10);
+            if (ep != min_re && *ep == '\0')
+                want_re = (unsigned)v;
+        }
+        printf("tier-reencode: %u re-encode(s) completed, %u digest mismatch(es); at least %u wanted\n", re_lines,
+               re_digest_bad, want_re);
+        if (re_digest_bad > 0)
+            VIOLATION("tier-reencode: %u re-encode logical digest mismatch(es) in the server logs (droptomb?)\n",
+                      re_digest_bad);
+        if (re_lines < want_re)
+            VIOLATION("tier-reencode: %u re-encode(s) completed in the server logs, at least %u wanted in "
+                      "%.0f s: nothing, or too little, re-encoded\n",
+                      re_lines, want_re, seconds);
+    }
     if (settle_steps) {
         unsigned crashes = 0;
+        const char *const *snames = active_step_names();
+        int wait_s = tier_reencode ? REENCODE_WAIT_S : SETTLE_WAIT_S;
         printf("settle-steps: servers armed / ended there:");
         for (int i = 0; i < NSTEPS; i++) {
-            printf(" %s %d/%d", settle_step_names[i], step_armed[i], step_crashes[i]);
+            printf(" %s %d/%d", snames[i], step_armed[i], step_crashes[i]);
             crashes += (unsigned)step_crashes[i];
         }
         printf("; %d killed after %d s without reaching their step; %d ended with exit 99 and no power cut\n",
-               step_unreached, SETTLE_WAIT_S, step_nocut);
+               step_unreached, wait_s, step_nocut);
         if (step_nocut)
             VIOLATION("settle-steps: %d servers ended at their step with exit 99 and crashfs did not roll back: the "
                       "hook must leave through exit(99), a _exit cuts no power\n", step_nocut);
@@ -7385,8 +7433,10 @@ static int tier_setup(void)
         }
         char *spec = malloc(sizeof dirs + 256);
         const char *extra = getenv("JEPSEN_TIER_EXTRA");
-        snprintf(spec, sizeof dirs + 256, "k=%d,m=%d,dirs=%s,grace_s=1,keep_s=5,eager=1%s%s", k, m, dirs,
-                 extra && *extra ? "," : "", extra && *extra ? extra : "");
+        const char *re_keys = tier_reencode ? ",reencode_objects=3,reencode_tomb_pct=8" : "";
+        int keep = tier_reencode ? 1 : 5;
+        snprintf(spec, sizeof dirs + 256, "k=%d,m=%d,dirs=%s,grace_s=1,keep_s=%d,eager=1%s%s%s", k, m, dirs, keep,
+                 re_keys, extra && *extra ? "," : "", extra && *extra ? extra : "");
         setenv("TSDB_TEST_TIER", spec, 1);
         setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
         printf("tier (legacy): %d stores, k=%d m=%d, TSDB_TEST_TIER=%s\n", tier_n, k, m, spec);
@@ -7476,8 +7526,9 @@ static int tier_setup(void)
     }
     char spec[512];
     const char *extra = getenv("JEPSEN_TIER_EXTRA");
-    int keep = t_salvage ? 1 : 5;
-    snprintf(spec, sizeof spec, "grace_s=1,keep_s=%d,eager=1%s%s", keep, extra && *extra ? "," : "",
+    const char *re_keys = tier_reencode ? ",reencode_objects=3,reencode_tomb_pct=8" : "";
+    int keep = (t_salvage || tier_reencode) ? 1 : 5;
+    snprintf(spec, sizeof spec, "grace_s=1,keep_s=%d,eager=1%s%s%s", keep, re_keys, extra && *extra ? "," : "",
              extra && *extra ? extra : "");
     setenv("TSDB_TEST_TIER", spec, 1);
     setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
@@ -7493,6 +7544,7 @@ int main(int argc, char **argv)
                                    {"seed", required_argument, 0, 's'},    {"crashfs", required_argument, 0, 'f'},
                                    {"workload", required_argument, 0, 'w'}, {"verify-checksums", no_argument, 0, 'V'},
                                    {"feed", no_argument, 0, 'E'},           {"tier", required_argument, 0, 'T'},
+                                   {"reencode", no_argument, 0, 'R'},
                                    {"scan-tier", required_argument, 0, 'S'},
                                    {"auth", no_argument, 0, 'A'},           {"outagefs", required_argument, 0, 'o'},
                                    {"wal-sync-ms", required_argument, 0, 'W'},
@@ -7520,6 +7572,7 @@ int main(int argc, char **argv)
         case 'A': auth = true; break;
         case 'E': feed = true; break;
         case 'T': tier_n = atoi(optarg); break;
+        case 'R': tier_reencode = true; break;
         case 'S': { /* the self-test of tier_scan: DIR,LOG,PATTERN prints ec, settled, retired_ec, lines, partitions */
             char *a = strdup(optarg), *c2 = strrchr(a, ','), *c1 = c2 ? (*c2 = 0, strrchr(a, ',')) : NULL;
             if (!c1)
@@ -7576,7 +7629,7 @@ int main(int argc, char **argv)
                 (tier_nem && outagefs_lib != NULL);
     bool bad_tier_n = tier_n < 0 || tier_n > 16 ||
                       (tier_n && ((t_single_copy ? tier_n != 1 : tier_n < 3) || outage || md || rot || verify)) ||
-                      (tier_nem && (tier_legacy || classes));
+                      (tier_nem && (tier_legacy || classes)) || (tier_reencode && (!tier_n || tier_nem));
     if (!dir || (shim && !outage && !tier_nem && !crashfs) || (need_outagefs && !outagefs_lib) ||
         (outage && (classes || auth)) || ((md || rot) && classes) || bad_tier_n || (settle_steps && !tier_n) ||
         wal_sync_ms < 0 || (wal_sync_ms > 0 && (classes || (strcmp(nemesis, "power") && strcmp(nemesis, "none"))))) {
@@ -7585,8 +7638,8 @@ int main(int argc, char **argv)
                         "              [--seconds S] [--clients N] [--seed N] [--crashfs build/libcrashfs.so]\n"
                         "              [--workload kv|classes] [--verify-checksums]   (misdirect and rot: workload kv)\n"
                         "              [--wal-sync-ms MS]   (periodic WAL sync: workload kv under power or none)\n"
-                        "              [--auth] [--feed] [--tier N]   (N stores, >= 3 or 1 for single-copy; not with outage,\n"
-                        "              misdirect, rot or --verify-checksums; settle-steps needs it)\n"
+                        "              [--auth] [--feed] [--tier N] [--reencode]   (N stores, >= 3 or 1 for single-copy; not with outage,\n"
+                        "              misdirect, rot or --verify-checksums; settle-steps and --reencode need --tier)\n"
                         "              [--outagefs build/liboutagefs.so]   (required for outage, store-eio, store-stuck, fill)\n");
         return 2;
     }

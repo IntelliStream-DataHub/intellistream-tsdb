@@ -186,6 +186,8 @@ static int want_meta = 1, want_kv = 1;
 static int want_rep, want_classes; /* workloads kv and classes: one volume of 3 replicas, written through its leader */
 static int want_via;               /* workload kv-via: kv, with the clients on entry nodes (forwarding), RYW, fwdstall */
 static int want_ec_k, want_ec_m; /* --ec K+M: kvr is an erasure-coded volume (cluster_ec.h) */
+static int r10_convert_on, r10_need_ec; /* --convert A:B: live redundancy conversion on kvr (cluster_r10.h) */
+static void r10_poll_conv(void);
 static char opt_geometry[16];    /* --geometry 4+2|8+2|8+4|16+4|r3 (D24) */
 static _Atomic uint64_t kv_why_full;
 static _Atomic unsigned r9_local_faults;
@@ -810,23 +812,24 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         argv[na++] = "--merge-idle-s";
         argv[na++] = "1";
     }
-    if (want_ec_k || rdma_metrics || (nemeses & (N_ROTYOUNG | N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on) {
+    int need_ec = want_ec_k || r10_need_ec;
+    if (need_ec || rdma_metrics || (nemeses & (N_ROTYOUNG | N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on) {
         argv[na++] = "--metrics-port";
         argv[na++] = "auto";
     }
-    if ((nemeses & N_ROTYOUNG) && !want_ec_k && !want_classes) {
+    if ((nemeses & N_ROTYOUNG) && !need_ec && !want_classes) {
         argv[na++] = "--flush-interval-ms";
         argv[na++] = "500";
         argv[na++] = "--merge-idle-s";
         argv[na++] = "1";
     }
-    if (want_ec_k) { /* the stores exist once the cluster has member ids (ec_stores_make); settles are quick */
+    if (need_ec) { /* the stores exist once the cluster has member ids (ec_stores_make); settles are quick */
         argv[na++] = "--ec-settle-grace-s";
         argv[na++] = "3";
         argv[na++] = "--ec-settle-force-s";
         argv[na++] = "5";
         argv[na++] = "--ec-settle-keep-s";
-        argv[na++] = "30";
+        argv[na++] = r10_convert_on ? "5" : "30";
         if (nemeses & N_HOLD) {
             argv[na++] = "--ec-settle-wait-max-s";
             argv[na++] = "5";
@@ -847,7 +850,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
             }
         }
     }
-    if ((want_ec_k || opt_geometry[0] || (nemeses & (N_R9 | N_R13)) || r13_disks_on || nn > 6) && i >= 2) { /* D15/D24: io_uring on at most two nodes (8 MB memlock per user), epoll on the rest */
+    if ((need_ec || opt_geometry[0] || (nemeses & (N_R9 | N_R13)) || r13_disks_on || nn > 6) && i >= 2) { /* D15/D24: io_uring on at most two nodes (8 MB memlock per user), epoll on the rest */
         argv[na++] = "--io";
         argv[na++] = "epoll";
     } else if (getenv("TSDBD_IO") && *getenv("TSDBD_IO")) {
@@ -910,6 +913,8 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         envp[ne++] = "TSDB_CHUNKSCRUB_TEST=interval_ms=400";
     if ((nemeses & N_ROTYOUNG) && !getenv("TSDB_SCRUB_TEST"))
         envp[ne++] = "TSDB_SCRUB_TEST=interval_ms=400";
+    if (r10_convert_on && !getenv("TSDB_ECGC_TEST"))
+        envp[ne++] = "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=2";
     if (nemeses & N_ROTCOLD) {
         if (!getenv("TSDB_REPAIR_TEST")) {
             snprintf(e9, sizeof e9, "TSDB_REPAIR_TEST=pause_before_put=%s/repair.pause", rundir);
@@ -1983,7 +1988,7 @@ static void *kv_writer(void *arg)
         }
         int lead0 = atomic_load(&kv_leader);
         int rc;
-        if (want_ec_k && nk == 1 && mix(r += 1) % 3 == 0) {
+        if ((want_ec_k || r10_convert_on) && nk == 1 && mix(r += 1) % 3 == 0) {
             /* --ec: a replace of the key's one row (a tombstone of [ts, ts + 1) and the row in one commit): into a settled
              * key it is a young part with a tombstone above the object (design-cluster-data.md E6, the read path of R8 that
              * is the easiest to get wrong); as a write of one key it fits the model of an insert */
@@ -2201,7 +2206,7 @@ static int admin_any(int op, const void *req, size_t rl, int timeout_ms);
 static void rep_setup(void)
 {
     uint8_t req[META_NAME_MAX + 8];
-    size_t rl = cluster_volume_add_encode("kvr", 3, req);
+    size_t rl = cluster_volume_add_encode("kvr", (uint32_t)rep_n, req);
     int rc = want_ec_k ? 0 : admin_real(0, CLUSTER_OP_VOLUME_ADD, req, rl, 1, 15000);
     if (rc != 0)
         die(1, "volume add kvr: %s", cluster_strerror(rc));
@@ -4413,6 +4418,7 @@ static int r4_leftovers_check(void)
 #include "cluster_ec.h"
 #include "cluster_r9.h"
 #include "cluster_r13.h"
+#include "cluster_r10.h"
 
 /* ---- RDMA metrics probe and rdma-qperr nemesis (design-rdma.md §8, rd-hw) */
 
@@ -5035,6 +5041,7 @@ static void usage(void)
                     "                    hddeio,nvmestuck,diskback,nvmefill (with --disks)] [--ec K+M]\n"
                     "         [--disks nvme,nvme,hdd,hdd] [--hdd-dir DIR] [--hdd-slow-ms 4] [--hdd-rate-mb 150]\n"
                     "         [--diskback-hold-s S] [--rebuild-after-s S]\n"
+                    "         [--convert A:B] [--convert-at 30] [--convert-timeout-s 90]\n"
                     "         [--workload meta,kv-local|kv|kv-via|classes|users] [--auth] [--retain-s S]\n"
                     "         [--peer-rdma auto|on|off] [--peer-rdma-pool-mb N] [--peer-rdma-device DEV[:PORT]]\n"
                     "         [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so] [--mutant NAME]\n"
@@ -5109,7 +5116,7 @@ int main(int argc, char **argv)
 {
     int64_t wall_t0 = now_ms();
     signal(SIGPIPE, SIG_IGN);
-    int self_replicas = 0, self_checker = 0;
+    int self_replicas = 0, self_checker = 0, nodes_set = 0;
     for (int a = 1; a < argc; a++) {
         const char *k = argv[a];
         if (!strcmp(k, "--selftest-replicas"))
@@ -5129,8 +5136,10 @@ int main(int argc, char **argv)
             usage();
         else if (!strcmp(k, "--dir"))
             opt_dir = argv[++a];
-        else if (!strcmp(k, "--nodes"))
+        else if (!strcmp(k, "--nodes")) {
             nn = atoi(argv[++a]);
+            nodes_set = 1;
+        }
         else if (!strcmp(k, "--seconds"))
             seconds = atoi(argv[++a]);
         else if (!strcmp(k, "--seed"))
@@ -5223,6 +5232,28 @@ int main(int argc, char **argv)
                         META_EC_K_MAX, META_EC_M_MAX);
                 return 2;
             }
+        } else if (!strcmp(k, "--convert")) { /* R10: live redundancy conversion A:B on kvr (cluster_r10.h) */
+            if (a + 1 >= argc || r10_parse_convert(argv[++a]) != 0) {
+                fprintf(stderr, "jepsen-cluster: --convert A:B expects distinct replicas=N or K+M endpoints "
+                                "(e.g. replicas=3:4+2, 4+2:4+3, 4+2:replicas=3)\n");
+                return 2;
+            }
+        } else if (!strcmp(k, "--convert-at")) {
+            if (a + 1 >= argc)
+                usage();
+            r10_convert_at_s = atoi(argv[++a]);
+            if (r10_convert_at_s < 1 || r10_convert_at_s > 3600) {
+                fprintf(stderr, "jepsen-cluster: --convert-at must be 1 to 3600\n");
+                return 2;
+            }
+        } else if (!strcmp(k, "--convert-timeout-s")) {
+            if (a + 1 >= argc)
+                usage();
+            r10_convert_timeout_s = atoi(argv[++a]);
+            if (r10_convert_timeout_s < 5 || r10_convert_timeout_s > 600) {
+                fprintf(stderr, "jepsen-cluster: --convert-timeout-s must be 5 to 600\n");
+                return 2;
+            }
         }
         else if (!strcmp(k, "--nemesis") || !strcmp(k, "--workload")) {
             int nem = !strcmp(k, "--nemesis");
@@ -5308,6 +5339,37 @@ int main(int argc, char **argv)
             }
         } else
             usage();
+    }
+    if (r10_convert_on) {
+        if (want_ec_k || opt_geometry[0]) {
+            fprintf(stderr, "jepsen-cluster: --convert cannot be combined with --ec or --geometry\n");
+            return 2;
+        }
+        if (!want_rep || want_kv) {
+            fprintf(stderr, "jepsen-cluster: --convert needs the workload kv, kv-via or classes (and not kv-local)\n");
+            return 2;
+        }
+        if (!nodes_set) {
+            int def_n = r10_min_nodes + 1;
+            if (def_n < 7)
+                def_n = 7;
+            nn = def_n;
+        } else if (nn < r10_min_nodes) {
+            fprintf(stderr, "jepsen-cluster: --convert %s needs --nodes of at least %d\n", r10_spec, r10_min_nodes);
+            return 2;
+        }
+        if (r10_src.redundancy == META_RED_EC) {
+            want_ec_k = r10_src.ec_k;
+            want_ec_m = r10_src.ec_m;
+        }
+        rep_n = (int)r10_src.replicas;
+        if (r10_need_ec) {
+            ec_detect();
+            if (!ec_settles) {
+                fprintf(stderr, "jepsen-cluster: --convert %s requires a tsdbd built with TSDB_EC\n", r10_spec);
+                return 2;
+            }
+        }
     }
     if (nn < 3 || nn > MAXN || seconds < 1)
         usage();
@@ -5414,7 +5476,8 @@ int main(int argc, char **argv)
     use_crashfs = (nemeses & N_POWER) != 0;
     use_outagefs = (nemeses & (N_SLOW | N_SLOWLOSS | N_HDDEIO | N_NVMESTUCK | N_DISKBACK)) != 0 ||
                    (r13_disks_on && outagefs_so != NULL);
-    r4_dynamic = (nemeses & (N_CHURN | N_OUT | N_BACK | N_TWO | N_SLOWLOSS | N_M1 | N_R13)) != 0 || r13_disks_on;
+    r4_dynamic = (nemeses & (N_CHURN | N_OUT | N_BACK | N_TWO | N_SLOWLOSS | N_M1 | N_R13)) != 0 || r13_disks_on ||
+                 r10_convert_on;
     /* repl_retain_s: --retain-s; longdown 3 s (a replica down for longer needs a snapshot); a classes run until r4-replay
      * is on main the age that lets the class switches' deferral pass (CLASSES_RETAIN_S); else the cluster's default */
     retain_eff = opt_retain_s > 0 ? opt_retain_s : (nemeses & N_LONGDOWN) ? 3 : (want_classes && !R4_REPLAY_ON_MAIN) ? CLASSES_RETAIN_S : 0;
@@ -5526,12 +5589,12 @@ int main(int argc, char **argv)
     start_nodes_par(term_cp >= 0 ? term_spec : NULL);
     cluster_form();
     settle("the formation");
-    if (want_ec_k)
+    if (want_ec_k || r10_need_ec)
         ec_form_stores();
     else {
         if (r13_disks_on)
             r13_wait_all_disks_registered(30000);
-        if ((nemeses & (N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on)
+        if ((nemeses & (N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on || r10_convert_on)
             ec_poller_start();
     }
     if (want_kv)
@@ -5566,6 +5629,10 @@ int main(int argc, char **argv)
     unsigned rounds = 0, applied = 0;
     while (now_ms() < t_end) { /* --nemesis none: the workloads run their seconds without faults */
         check_unexpected_exits();
+        if (r10_convert_on) {
+            r10_maybe_start_conv(t_start);
+            r10_poll_conv();
+        }
         if (takeover && !takeover_done && now_ms() - t_start > (int64_t)seconds * 1000 / 3) {
             takeover_event();
             settle("the takeover");
@@ -5675,6 +5742,8 @@ int main(int argc, char **argv)
             restart_node(i);
     }
     settle("the last heal");
+    if (r10_convert_on)
+        r10_await_conv_end();
     if (want_users) { /* the probes go on a while after the admin ops stop: every member is clean and must agree */
         ju_stop_admin();
         hold_ms(3000);
@@ -5727,7 +5796,7 @@ int main(int argc, char **argv)
         }
         for (int i = 0; i < nhists; i++)
             kv_final(i);
-        if (want_ec_k)
+        if (want_ec_k || r10_convert_on)
             r4_end_bad += ec_members_check();
         if (!strcmp(mutant, "lost-write")) { /* planted: the final state of node 0 lacks a write that was acknowledged */
             struct hist *h = &hists[0];
@@ -5755,14 +5824,16 @@ int main(int argc, char **argv)
     const char *dirs[MAXN * 3];
     int nd = replica_dirs(dirs, MAXN * 3);
     int rdiff = isr_short, isr = rep_full_mask();
-    if (want_ec_k || (nemeses & (N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on)
+    if (want_ec_k || r10_convert_on || (nemeses & (N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on)
         r4_end_bad += ec_div_check(); /* its own FAIL line: not one of "the replicas differ" */
     if (nemeses & N_R12)
         r4_end_bad += r12_end_check();
-    if (want_ec_k || (nemeses & N_R9) || opt_geometry[0])
+    if (want_ec_k || r10_convert_on || (nemeses & N_R9) || opt_geometry[0])
         r4_end_bad += r9_end_check();
     if (r13_disks_on || (nemeses & N_R13))
         r4_end_bad += r13_end_check();
+    if (r10_convert_on)
+        r4_end_bad += r10_end_check();
     struct rdma_mstat rdma_end;
     memset(&rdma_end, 0, sizeof rdma_end);
     if (rdma_tracking())
@@ -5778,14 +5849,16 @@ int main(int argc, char **argv)
     /* Non-EC volumes: read every replica directory in place read-only (cvol_check). EC volumes have META
      * requires=tier and settled .ec parts backed by the chunk stores, so ec_members_check above already verified every
      * replica live through leadership transfers (full series equality, final keys, and fill_check). */
-    if (nd > 0 && !want_ec_k) {
+    if (nd > 0 && !want_ec_k && !r10_convert_on) {
         rdiff += replicas_equal(dirs, nd, 1);
         rdiff += rep_check(0, isr, &viol);
         if (rdiff)
             fprintf(stderr, "jepsen-cluster: FAIL: %d difference(s) between the replicas of kvr, with its leader's "
                             "final read, or in the filler's large writes\n", rdiff);
     }
-    if (want_ec_k && nd > 0)
+    if (r10_convert_on && nd > 0)
+        rdiff += r10_post_stop_check(dirs, nd);
+    else if (want_ec_k && nd > 0)
         rdiff += ec_parts_check(dirs, nd);
     atomic_store(&stopping, 1);
 
@@ -5832,6 +5905,7 @@ int main(int argc, char **argv)
     r12_summary();
     r9_summary();
     r13_summary();
+    r10_summary();
     if (want_via)
         printf("kv-via: %" PRIu64 " writes and %" PRIu64 " reads answered through a member that did not lead kvr, %" PRIu64
                " read-your-writes reads, %d stall window(s) checked, %" PRIu64 " of %" PRIu64 " nemesis picks aimed at an entry "

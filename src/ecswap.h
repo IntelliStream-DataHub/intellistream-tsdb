@@ -78,9 +78,16 @@ void ecswap_eng_close(eng *db);
  * threads that swap start. */
 extern void (*ec_swap_hook)(eng *db);
 
-/* The settle's own crash points (src/settle.c) of TSDB_SETTLE_CRASH_AT, which this file reads: after-put (the chunks
- * are durable) and after-ec-tmp (the tmp_*.ec is durable too, no intent written) */
-enum { ECSWAP_CRASH_AFTER_PUT = 1, ECSWAP_CRASH_AFTER_EC_TMP = 2 };
+/* The settle's and re-encode's own crash points (src/settle.c) of TSDB_SETTLE_CRASH_AT, which this file reads:
+ * after-put / reencode-after-put (chunks durable) and after-ec-tmp / reencode-after-ec-tmp (tmp_*.ec durable).
+ * The reencode-after-put / reencode-after-ec-tmp points fire in single-server eng_reencode_ex; cluster eccold_reencode
+ * only traverses the ec_swap_reencode points (reencode-after-intent, reencode-between-renames, reencode-before-unlink). */
+enum {
+    ECSWAP_CRASH_AFTER_PUT = 1,
+    ECSWAP_CRASH_AFTER_EC_TMP = 2,
+    ECSWAP_CRASH_REENCODE_AFTER_PUT = 3,
+    ECSWAP_CRASH_REENCODE_AFTER_EC_TMP = 4
+};
 void ecswap_crash_point(int which);
 
 /* tests: what publishes MANIFEST after a swap (manifest_publish) */
