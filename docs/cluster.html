@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cluster preview</title>
+<meta name="description" content="tsdb docs|Run the cluster preview on one machine: replicated volumes, leader failover, transfers, moves and rebuilds. What the preview is, and what it is not.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070a17">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="../assets/favicon.png" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="../assets/site.css?v=81e1313">
+<script src="../assets/site.js?v=81e1313"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+<div class="topbar-in">
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="28" height="28"><span>tsdb</span></a>
+<nav class="topnav" id="topnav" aria-label="Main"><a href="../index.html">Home</a><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a><a class="gh" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg><span>GitHub</span></a></nav>
+<button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</div>
+</header>
+<div class="scrim" hidden></div>
+<div class="docbar"><button class="side-btn" type="button" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h12"/></svg><span>Documentation menu</span></button></div>
+<div class="doc-shell">
+<aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="cluster.html" aria-current="page">Cluster (preview)</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
+<main id="main" class="doc">
+<h1>Cluster preview</h1>
+<p class="lead">Release 0.11.0 adds replicated and erasure-coded cluster volumes on top of 0.10.0's metadata group.
+This page sets up a small cluster on one machine, creates a volume, kills the leader, starts it again, and
+transfers, moves and resets replicas. About ten minutes.</p>
+
+<h2 id="what">What this is, and what it is not</h2>
+<p>The <strong>metadata group</strong> is a few servers that agree, with the Raft protocol, on a list of facts: which
+servers are <strong>members</strong>, whether they are up or down, which are <strong>voters</strong> (they decide) and
+which only <strong>watch</strong>, the cluster's settings, its users and their grants (<a href="#logins">Logins</a>),
+and the places where <strong>volumes</strong>, <strong>owners</strong>, <strong>epochs</strong> and <strong>in-sync
+sets</strong> are kept. A <strong>witness</strong> is a member with no data: it keeps the list and can vote, a cheap
+third or fifth vote.</p>
+<p>With <code>tsdb cluster volume add</code>, the group places a volume on N servers (its <strong>copies</strong>) or
+as an erasure-coded stripe (<code>--redundancy ec=K+M</code>). The leader replicates every write to the in-sync copies
+before answering; when the leader dies, another copy takes over; copies can be moved, leadership transferred, and lost
+disks rebuilt from a snapshot.</p>
+<div class="note"><p>It is still a <strong>0.x preview</strong>. It does not place or move volumes by itself when a
+server is lost for good (you run <code>volume transfer</code>, <code>volume move</code> or <code>replica reset</code>),
+and there is no <code>node drain</code> yet. Clients name the volume (<code>tsdbc_series_at</code>) and may send
+requests to any server. Do not run it in production: the metadata format (version 6) and peer protocol (version 10)
+may change in a later 0.x release; you then start the cluster again with <code>tsdb cluster init</code>, you do not
+upgrade it.</p></div>
+<p>Why ship it? The group and replicated volume path are tested with simulators, checkers and fault injection, and now
+you can run them yourself. Without <code>--cluster</code> none of it runs.</p>
+
+<h2 id="need">What you need</h2>
+<ul>
+<li>A checkout of tsdb, built with <code>make</code> (the first step does it). Linux, no root.</li>
+<li>Four free ports for the servers' clients (17081 to 17083 and 17085; the witness of step 9 has none) and five for their
+peers (17091 to 17095) on <code>127.0.0.1</code>. If something else uses one, change the numbers in the two lines
+marked <code># ports</code> in step 3: they are the only place where the block writes a port.</li>
+<li>Nothing else. The block only writes under <code>/tmp/tsdb-cluster</code>.</li>
+</ul>
+
+<h2 id="tutorial">The tutorial</h2>
+<p>Paste the whole block into a terminal, in the top directory of the checkout. It stops at the first command that
+fails. Our tests run it word for word, so it works as written.</p>
+<pre><code class="language-sh" data-src="docs/cluster-preview.md#The tutorial"># 1. Build. Everything lands in build/.
+make
+
+# 2. A scratch directory, and the cluster's secret. The secret is a file with 32 random bytes written as hex
+#    (mode 0600). Every server and every `tsdb cluster` command reads it. Whoever has it can change the cluster.
+D=/tmp/tsdb-cluster
+rm -rf $D &amp;&amp; mkdir -p $D
+build/tsdb cluster secret $D/secret
+
+# 3. Helpers. A "node" is a server with its own data directory (n1/data) and its own state directory (n1/state).
+#    The state directory holds the cluster's own files and must be on a local disk, never on NFS.
+#    Node N listens for clients on port 1708N and for the other servers on port 1709N (the two lines marked ports).
+#    --no-auth: no login, to keep the tutorial short ([Logins](#logins) below shows how). Fine on 127.0.0.1, nowhere else.
+#    A witness (node 4) has no data directory and no client port.
+port() { echo 1708$1; }                    # ports: the client port of node N
+pport() { echo 1709$1; }                   # ports: the peer port of node N
+peer() { echo 127.0.0.1:$(pport $1); }     # the peer address of node N
+start_node() {                             # start_node N [witness]: start a server, remember its process id
+    mkdir -p $D/n$1/state
+    if [ "${2:-}" = witness ]; then role="--witness --advertise 127.0.0.1"
+    else
+        [ -f $D/n$1/data/DISK ] || build/tsdb disk init $D/n$1/data:ssd
+        role="--dir $D/n$1/data --allow-shared-device --no-auth --port $(port $1)"
+    fi
+    build/tsdbd $role --state-dir $D/n$1/state --peer-port $(pport $1) \
+        --cluster --cluster-secret-file $D/secret --rack rack$1 &gt;&gt; $D/n$1/log 2&gt;&amp;1 &amp;
+    echo $! &gt; $D/n$1/pid
+}
+status() { build/tsdb cluster status $(peer $1) --secret-file $D/secret; }    # status N: ask node N
+wait_for() {                               # wait_for N REGEX: wait (30 s at most) until node N's status has such a line
+    for i in $(seq 150); do status $1 2&gt;/dev/null | grep -q "$2" &amp;&amp; return 0; sleep 0.2; done
+    echo "gave up waiting for: $2"; return 1
+}
+
+# 4. Start three servers. They know nothing of each other yet: each one says it is in no cluster.
+start_node 1; start_node 2; start_node 3
+for n in 1 2 3; do wait_for $n '^node'; done
+status 1
+
+# 5. Make the cluster on node 1 (it becomes node 1 and the leader), then add the other two through it.
+#    The group grows by itself: one voter, then three. Wait until all three vote, then look at it from node 2.
+build/tsdb cluster init $(peer 1) --secret-file $D/secret
+build/tsdb cluster node add $(peer 1) $(peer 2) --secret-file $D/secret
+build/tsdb cluster node add $(peer 1) $(peer 3) --secret-file $D/secret
+wait_for 2 '^group voters 1,2,3 '
+status 2
+
+# 6. A volume: in a cluster, data lives in volumes the group places, never in a server's own directory. Add one
+#    named plant with three copies, one per node, and wait until every node has made its directory (n1/data/v1, ...)
+#    and the group has recorded that it opened it (open_gen). Then write a day of readings into plant through its
+#    leader (only the leader takes writes directly; it replicates every write to the other two copies before answering,
+#    so all three copies hold the data) and read them back.
+build/tsdb cluster volume add $(peer 1) plant --replicas 3 --secret-file $D/secret
+for n in 1 2 3; do wait_for 1 "^replica volume 1 node $n rid [0-9a-f]* open_gen 1$"; done
+status 1 | grep '^volume\|^replica'
+leads=$(status 1 | awk '$1 == "volume" &amp;&amp; $4 == "plant" { print $8 }')
+echo "node $leads leads volume plant"
+TSDB_VOLUME=plant build/client-example 127.0.0.1 $(port $leads)
+ls -d $D/n[123]/data/v1
+
+# 7. Kill the leader, as a crash would (kill -9, by its process id). The others elect a new leader, and once that
+#    one has led for three seconds (node_timeout_ms) without a heartbeat from the dead node, it marks the node down.
+#    Ask a survivor.
+leader=$(status 2 | awk 'NR == 1 { print $10 }')
+other=$(( leader % 3 + 1 ))
+echo "node $leader is the leader: stopping it"
+kill -9 $(cat $D/n$leader/pid)
+wait_for $other "^member $leader down"
+status $other
+
+# 8. Start it again on the same directories. It comes back as the same member with a new incarnation (a counter of
+#    its starts), and it is up again.
+start_node $leader
+wait_for $leader "^member $leader up incarnation 2"
+status $leader
+
+# 9. A witness: a member without data. Start it, add it through any member, look at it. With three voters it only
+#    watches (the group keeps an odd number of voters); it takes a voter's place when one is lost for good.
+start_node 4 witness
+wait_for 4 '^node'
+build/tsdb cluster node add $(peer 1) $(peer 4) --secret-file $D/secret
+wait_for 4 '^member 4 '
+status 4
+
+# 10. Hand over, move, rebuild. Node 5 is a fourth data server. Volume 1 (plant) has its copies on 1, 2 and 3.
+#     a. transfer: plant's leadership goes to another copy. Writes wait a moment while the old leader sends all it has to
+#        the new one, nothing is lost. The command answers when the new leader is in place.
+#     b. move: plant's copy on one node moves to node 5, in the background. wait_gone waits for the old copy to go.
+#     c. reset: a copy whose disk is lost is refused at its start, with a line that names the command that fixes it.
+#        The reset gives it a new identity (a new rid) and the volume's leader sends it a snapshot of the volume.
+wait_gone() {                              # wait_gone N REGEX: wait (30 s at most) until node N's status has no such line
+    for i in $(seq 150); do
+        s=$(status $1 2&gt;/dev/null) &amp;&amp; echo "$s" | grep -q '^volumes ' &amp;&amp; ! echo "$s" | grep -q "$2" &amp;&amp; return 0
+        sleep 0.2
+    done
+    echo "still there: $2"; return 1
+}
+wait_for 1 '^volume 1 .* isr 1,2,3 '       # the restarted node has caught up and is in sync again
+start_node 5
+wait_for 5 '^node'
+build/tsdb cluster node add $(peer 1) $(peer 5) --secret-file $D/secret
+wait_for 1 '^member 5 up .* volumes_ok 1 '
+to=$(status 1 | awk '$1 == "volume" &amp;&amp; $4 == "plant" { n = split($16, a, ","); for (i = 1; i &lt;= n; i++) if (a[i] != $8) { print a[i]; exit } }')
+build/tsdb cluster volume transfer $(peer 1) 1 $to --secret-file $D/secret
+wait_for 1 "^volume 1 name plant .* leader $to "
+status 1 | grep '^volume 1 '
+old=$(( to % 3 + 1 ))                      # a third copy, to move away; the last one stays and is reset below
+lost=$(( 6 - to - old ))
+build/tsdb cluster volume move $(peer 1) 1 --log --from $old --to 5 --secret-file $D/secret
+wait_for 1 '^replica volume 1 node 5 '
+wait_gone 1 "^replica volume 1 node $old "
+status 1 | grep '^volume 1 \|^replica '
+kill $(cat $D/n$lost/pid)                  # the disk of node $lost is lost: stop it, remove the volume's directory, start it
+while kill -0 $(cat $D/n$lost/pid) 2&gt;/dev/null; do sleep 0.1; done
+wait_gone 1 "^volume 1 .* isr [0-9,]*$lost"
+rm -rf $D/n$lost/data/v1
+start_node $lost
+wait_for $lost '^node'
+for i in $(seq 150); do grep -q 'tsdb cluster replica reset' $D/n$lost/log &amp;&amp; break; sleep 0.2; done
+grep -h 'tsdb cluster replica reset' $D/n$lost/log
+build/tsdb cluster replica reset $(peer 1) 1 $lost --secret-file $D/secret
+wait_for 1 "^volume 1 .* isr [0-9,]*$lost"
+status 1 | grep '^volume 1 \|^replica '
+grep -h 'snapshot' $D/n$lost/log
+ls -d $D/n$lost/data/v1/*.part | head -n 2
+
+# 11. What the servers said about the leaders and the members' state, from their logs (the details differ on your machine).
+grep -h 'leads the metadata group\|proposes node' $D/n[123]/log
+
+# 12. Stop every server by its process id, wait until they are gone, and clean up.
+for n in 1 2 3 4 5; do kill $(cat $D/n$n/pid); done
+for n in 1 2 3 4 5; do while kill -0 $(cat $D/n$n/pid) 2&gt;/dev/null; do sleep 0.1; done; done
+rm -rf $D</code></pre>
+
+<h2 id="output">What you should see</h2>
+<p>These lines come from a real run. Yours differ in the cluster's id (random), the times after <code>heard</code>, the
+term and commit numbers, which node leads (so which member the kill of step 7 hits, with its rack), and the numbers of
+the volume's copies, its epoch and in-sync set.</p>
+<p>Step 2 writes the secret:</p>
+<pre><code data-lang="plain" data-block="1" data-src="docs/cluster-preview.md#What you should see">wrote a new cluster secret to /tmp/tsdb-cluster/secret (copy it to every server; tsdbd --cluster-secret-file)</code></pre>
+<p>Step 4: a server that is in no cluster yet.</p>
+<pre><code data-lang="plain" data-block="2" data-src="docs/cluster-preview.md#What you should see">node 0 mode none role - term 0 leader 0 commit 0 applied 0
+cluster (no state yet)</code></pre>
+<p>Step 5: <code>init</code> and <code>node add</code> answer with one line each.</p>
+<pre><code data-lang="plain" data-block="3" data-src="docs/cluster-preview.md#What you should see">initialised: node 1 at 127.0.0.1:17091
+added 127.0.0.1:17092
+added 127.0.0.1:17093</code></pre>
+<p>and <code>status 2</code> shows the cluster, asked of node 2, which follows:</p>
+<pre><code data-lang="plain" data-block="4" data-src="docs/cluster-preview.md#What you should see">node 2 mode core role follower term 1 leader 1 commit 8 applied 8
+cluster 875bd313f7abb7b8c0ca9b6b59e6c292 replication 3 min_isr 1 node_timeout_ms 3000 heartbeat_ms 500 voter_replace_s 600 voters_max 5 mode replicated failover lease read_barrier on lease_s 10 restore_gen 0
+replicated lease_ms 2000 drift_ppm 500 unanswered_ms 1000 commit_interval_ms 5 repl_retain_mb 4096 repl_retain_s 1800 idle_seal_ms 1000 rebuild_mb_s 200 rebuild_max 2 transfer_wait_ms 2000 leader_balance_s 0
+group voters 1,2,3 learners -
+member 1 up incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 344ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 242ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+volumes 0 users 0
+transfers started 0 done 0 timed_out 0 cancelled 0 fell_back 0 balance 0 drains_timed_out 0 resumed_blind 0 ready 0 cuts 0
+moves started 0 done 0 cancelled 0</code></pre>
+<p>Step 6: <code>volume add</code> answers with the volume's number. All three nodes hold a copy, node 1 leads it
+(<code>leader 1</code>), and each copy has a replica id (<code>rid</code>) and an open generation
+(<code>open_gen</code>). <code>isr 1,2,3</code> is the in-sync set: a row written to the leader is on every copy in
+the set before the write answers. The client example is the one of the <a href="quickstart.html">quick start</a>,
+pointed at the volume's leader with <code>TSDB_VOLUME=plant</code>:</p>
+<pre><code data-lang="plain" data-block="5" data-src="docs/cluster-preview.md#What you should see">added volume plant: number 1
+volume-report node 1 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+volume-report node 2 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+volume-report node 3 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
+replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 1
+replica volume 1 node 2 rid f37918561ea1bb09 open_gen 1
+replica volume 1 node 3 rid d7561d069104510c open_gen 1
+volumes 1 users 0
+node 1 leads volume plant
+wrote 1440 rows
+read 1440 rows, the first: 1717200000000 50.00
+24 hours, the first average: 51.28
+Oslo day 1: 1320 rows, average 50.23
+Oslo day 2: 120 rows, average 47.47
+/tmp/tsdb-cluster/n1/data/v1
+/tmp/tsdb-cluster/n2/data/v1
+/tmp/tsdb-cluster/n3/data/v1</code></pre>
+<p>Step 7: after the kill, a survivor sees a new term, a leader, and the dead node 1 as <code>down</code>:</p>
+<pre><code data-lang="plain" data-block="6" data-src="docs/cluster-preview.md#What you should see">node 2 mode core role follower term 2 leader 3 commit 15 applied 15
+cluster ... (the settings, as before)
+group voters 1,2,3 learners -
+member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 4702ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on down_reason timeout down_age 0s out_in 1800s role both cap both disks 1
+volume-report node 1 volume 1 role owner health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+volume-report node 2 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 5ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+volume-report node 3 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 2 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
+replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 1
+replica volume 1 node 2 rid f37918561ea1bb09 open_gen 1
+replica volume 1 node 3 rid d7561d069104510c open_gen 1
+volumes 1 users 0
+transfers started 0 done 0 timed_out 0 cancelled 0 fell_back 0 balance 0 drains_timed_out 0 resumed_blind 0 ready 0 cuts 0
+moves started 0 done 0 cancelled 0</code></pre>
+<p>Your shell may print a line like <code>Killed  build/tsdbd ...</code> about the process you killed. That is the shell,
+not tsdb.</p>
+<p>Step 8: node 1 is back, a follower of the new leader, with <code>incarnation 2</code>:</p>
+<pre><code data-lang="plain" data-block="7" data-src="docs/cluster-preview.md#What you should see">node 1 mode core role follower term 2 leader 3 commit 17 applied 17
+cluster ... (the settings, as before)
+group voters 1,2,3 learners -
+member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 679ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+volume-report node 2 volume 1 role promoting health ok epoch 2 domain - local_fault_s 0 fenced_age_ms 0
+member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ? role both cap both disks 1
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 2,3 isr_version 3 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
+replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 1
+replica volume 1 node 2 rid f37918561ea1bb09 open_gen 1
+replica volume 1 node 3 rid d7561d069104510c open_gen 1
+volumes 1 users 0
+transfers started 0 done 0 timed_out 0 cancelled 0 fell_back 0 balance 0 drains_timed_out 0 resumed_blind 0 ready 0 cuts 0
+moves started 0 done 0 cancelled 0</code></pre>
+<p>Step 9: the witness. It is <code>mode watch</code>, has no client port (<code>addr ...:0</code>) and
+<code>volumes_ok 0</code>: it will never hold a volume. It has not heard from the others as a voter does, so
+<code>heard</code> says <code>never</code> for them.</p>
+<pre><code data-lang="plain" data-block="8" data-src="docs/cluster-preview.md#What you should see">node 4 mode watch role - term 0 leader 0 commit 0 applied 18
+cluster ... (the settings, as before)
+group voters 1,2,3 learners -
+member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ? role both cap both disks 1
+member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ? role both cap both disks 1
+member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ? role both cap both disks 1
+member 4 up incarnation 1 addr 127.0.0.1:0 peer 127.0.0.1:17094 rack rack4 heard 0ms feed - voter_ok 1 volumes_ok 0 core_dropped 0 read_barrier ?
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 2,3 isr_version 3 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
+replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 1
+replica volume 1 node 2 rid f37918561ea1bb09 open_gen 1
+replica volume 1 node 3 rid d7561d069104510c open_gen 1
+volumes 1 users 0
+transfers started 0 done 0 timed_out 0 cancelled 0 fell_back 0 balance 0 drains_timed_out 0 resumed_blind 0 ready 0 cuts 0
+moves started 0 done 0 cancelled 0</code></pre>
+<p>Step 10: three things an operator does by hand on <code>plant</code> (node numbers differ per run).
+<code>volume transfer</code> hands leadership to another in-sync copy; <code>volume move</code> copies node 2's
+replica to node 5 in the background, waits for it to join the in-sync set, and removes node 2's copy;
+<code>replica reset</code> recovers a lost disk (refused on start until reset) by assigning a new <code>rid</code>
+and rebuilding it from a snapshot of the leader:</p>
+<pre><code data-lang="plain" data-block="9" data-src="docs/cluster-preview.md#What you should see">added 127.0.0.1:17095
+node 1 leads at epoch 3 (400 ms, READY at 1448)
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 5 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
+move of volume 1 from node 2 to node 5: proposed (replica 70336e503a1df25e); it runs in the background: learner, join, shrink, remove
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,5,3 isr 1,3,5 isr_version 7 set_version 3 preferred 1 redundancy replicas=3 rack loss survivable: yes
+replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 2
+replica volume 1 node 5 rid 70336e503a1df25e open_gen 1
+replica volume 1 node 3 rid d7561d069104510c open_gen 1
+tsdbd: volumes: volume 1: /tmp/tsdb-cluster/n3/data/v1 is missing, while the metadata group recorded open generation 1 of replica d7561d069104510c here: not made again by itself (an unmounted disk looks the same); `tsdb cluster replica reset PEER 1 3` makes a fresh replica
+volume 1: reset of node 3 proposed (new instance 62f89e2e8f926b65); its old directory is set aside as v1.lost-&lt;old rid&gt; and a fresh one fills
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,5,3 isr 1,3,5 isr_version 9 set_version 4 preferred 1 redundancy replicas=3 rack loss survivable: yes
+replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 2
+replica volume 1 node 5 rid 70336e503a1df25e open_gen 1
+replica volume 1 node 3 rid 62f89e2e8f926b65 open_gen 2
+tsdbd: replication: volume 1: the leader (node 1) no longer has the records this replica needs: it needs a snapshot and asks the leader for one
+tsdbd: replication: volume 1: snapshot received from node 1: 5 files, 4054 bytes in 2.2 s (0.0 MB/s)
+tsdbd: replication: volume 1: snapshot installed: P 1461 of epoch 3, REPL fence 3 (it was 3), open generation 1, in 0.0 s; the volume opens again
+/tmp/tsdb-cluster/n3/data/v1/p79500_1_1_0.part</code></pre>
+<p>Step 11 prints what the servers logged about leaders and members. Only the new leader proposes a change, so a line
+shows in one log only. For example:</p>
+<pre><code data-lang="plain" data-block="10" data-src="docs/cluster-preview.md#What you should see">tsdbd: cluster: node 3 leads the metadata group (term 2)
+tsdbd: cluster: proposes node 1 down (incarnation 1)
+tsdbd: cluster: proposes node 1 up (incarnation 2)</code></pre>
+<p>The dead node is <code>down</code> only after a few seconds: a server is marked down when the leader has not heard its
+heartbeat for <code>node_timeout_ms</code> (3 s by default). The survivors first elect a new leader, and it marks the
+node <code>down</code> once it has itself led for <code>node_timeout_ms</code>, so the <code>down</code> comes a few
+seconds after the election. When the <code>down</code> line appears, a new leader exists.</p>
+
+<h2 id="logins">Logins</h2>
+<p>In a cluster the users and their grants belong to the whole cluster, not to one server: you add a user once, and it
+can log in on every server. A changed password or a revoked grant counts on every server as soon as the command
+answers. Start the servers without <code>--no-auth</code>, and give the first superuser to <code>init</code>:</p>
+<pre><code class="language-sh" data-src="docs/cluster-preview.md#Logins">echo 'a long password' &gt; $D/root.pw; echo 'another one' &gt; $D/alice.pw; chmod 600 $D/*.pw
+build/tsdb cluster init $(peer 1) --secret-file $D/secret --superuser root --password-file $D/root.pw
+build/tsdb cluster user add $(peer 1) alice --password-file $D/alice.pw --secret-file $D/secret
+build/tsdb cluster user grant $(peer 2) alice prefix:plant. read --secret-file $D/secret   # any member will do
+build/tsdb cluster user list $(peer 3) --secret-file $D/secret</code></pre>
+<ul>
+<li><code>tsdb DIR user ...</code> does not work on a cluster server's directory; it names <code>tsdb cluster user</code>.</li>
+<li>A server that was down refuses logins for a moment after it starts (<code>UNAVAILABLE</code>), until it has heard
+the cluster: it might still hold a user that was dropped while it was away. The clients do not wait for it: connect
+again, or to another server.</li>
+<li>Servers that had their own users before (a USERS file) do not start with <code>--cluster</code> until that file is
+gone: bring their users in first with <code>tsdb cluster user import</code>, with the servers stopped
+(<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/cluster-preview.md#logins">the details</a>).</li>
+</ul>
+
+<h2 id="status">How to read status</h2>
+<p><code>tsdb cluster status PEER</code> asks one server what it knows and prints one fact per line. Ask any member: they
+agree, up to a moment's delay. A server that has just restarted may show its saved copy first, with a
+<code>stale</code> line, until the group has confirmed it.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Line</th><th scope="col">Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>node N mode M role R term T leader L commit C applied A</code></td><td>The server you asked. <code>N</code>: its member number (0: in no cluster). <code>M</code>: <code>none</code>, <code>core</code> (it runs a copy of the Raft group: a voter, or a learner on its way to be one) or <code>watch</code> (it follows the group's state without voting). <code>R</code>: <code>follower</code>, <code>pre-candidate</code>, <code>candidate</code> or <code>leader</code> (<code>-</code> outside the group). <code>T</code>: the election term, up by one at every election. <code>L</code>: the leader's number, 0 when it knows none. <code>C</code>, <code>A</code>: how far the log is committed, and how far this server has applied it.</td></tr>
+<tr><td><code>stale ...</code></td><td>The copy this server saved before a restart; no one has confirmed it yet.</td></tr>
+<tr><td><code>cluster UUID replication ... mode M failover F read_barrier B lease_s ... restore_gen R</code></td><td>The cluster's id, settings (<code>init</code> fixes them) and restore generation.</td></tr>
+<tr><td><code>group voters 1,2,3 learners -</code></td><td>Who votes, and who is catching up to join the vote.</td></tr>
+<tr><td><code>member N STATE incarnation I addr A peer P rack R heard H ...</code></td><td>One line per member. <code>STATE</code>: <code>up</code> or <code>down</code> (the group also knows <code>draining</code> and <code>out</code>, which nothing sets in the preview). <code>I</code>: how many times it has started. <code>A</code>: where clients reach it. <code>P</code>: where servers reach it. <code>H</code>: how long ago the server you asked last heard from it. <code>voter_ok</code> and <code>volumes_ok</code>: whether it may vote and may hold volumes (a witness has <code>volumes_ok 0</code>). <code>core_dropped 1</code>: its Raft core was dropped after a log fault; it goes on as a watcher.</td></tr>
+<tr><td><code>replicated lease_ms ...</code></td><td>The settings of replicated volumes (<code>init</code> fixes them).</td></tr>
+<tr><td><code>volume-report ...</code>, <code>domain-report ...</code></td><td>Per member, what it says about its volumes and storage domains.</td></tr>
+<tr><td><code>volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I set_version S [preferred P] redundancy ...</code></td><td>One line per cluster volume: its number and name, leader, copies, in-sync set and redundancy (<code>replicas=N</code> or <code>ec=K+M stripe ...</code>).</td></tr>
+<tr><td><code>replica volume N node X rid R open_gen G [replaces Y]</code></td><td>One line per copy: its replica id and open generation (<code>replaces Y</code> while a move is in progress).</td></tr>
+<tr><td><code>volumes N users M</code></td><td>How many volumes and users the group holds.</td></tr>
+<tr><td><code>transfers started ...</code>, <code>moves started ...</code></td><td>Leadership transfer and copy move counters from the start of the server you ask.</td></tr>
+<tr><td><code>move volume N node A -&gt; node B: STEP, T s</code></td><td>On the group's leader, one line per move running: its step (<code>catch-up</code>, <code>transfer</code>, <code>shrink</code>, <code>remove</code>) and how long it has run.</td></tr>
+<tr><td><code>peer links KIND: ...</code></td><td>Active data-link counts by kind, check level (<code>none</code>, <code>header</code>, <code>full</code>) and transport (<code>tcp</code>, <code>rdma</code>).</td></tr>
+</tbody></table></div>
+<p>How many voters? One with one or two members, three with three or four, five with five or more (at most
+<code>--voters</code>). A member that does not vote watches.</p>
+
+<h2 id="trouble">If something goes wrong</h2>
+<ul>
+<li><strong>"cannot connect to ...: Connection refused"</strong>: the server is not running (yet), or the address is
+wrong. Look at <code>/tmp/tsdb-cluster/n1/log</code>. A port that is taken shows there as "cannot listen"; change the
+numbers in the two lines of step 3 marked <code># ports</code>, and nothing else.</li>
+<li><strong>"... is not a cluster peer port with this secret"</strong>: the address is not a server's peer port, or the
+secret file differs from the one the server was started with.</li>
+<li><strong>"the secret file ... is open to its group or to others: refused"</strong>: <code>chmod 600</code> it.
+<code>tsdb cluster secret FILE</code> makes a file with the right mode.</li>
+<li><strong>"the server is already in a cluster"</strong> (from <code>init</code>): stop it, remove its state directory and
+start it again to start over.</li>
+<li><strong>"the new server did not answer"</strong> (from <code>node add</code>): the server at the new address is not
+running, or not running with <code>--cluster</code> and the same secret.</li>
+<li><strong>"the new server belongs to another cluster or has another id"</strong> (from <code>node add</code>): the
+server at the new address is a member of a cluster already. To use it here, stop it, remove its state directory and
+start it again.</li>
+<li><strong>The block fails in the middle and servers keep running</strong>: stop them by process id:
+<code>for n in 1 2 3 4 5; do kill $(cat /tmp/tsdb-cluster/n$n/pid); done</code>. Do not use <code>pkill</code> or
+<code>killall</code>: they stop every process with that name, also ones that are not yours.</li>
+<li><strong>Two of the three nodes are gone</strong>: the third has no majority. Its role stays
+<code>pre-candidate</code>, it shows <code>leader 0</code>, and the dead members stay <code>up</code> in its view:
+nobody is left to mark them down. The group changes nothing until one of the others is back. That is the rule, not a
+bug.</li>
+<li>When you are done: <code>rm -rf /tmp/tsdb-cluster</code>.</li>
+</ul>
+
+<h2 id="reference">Reference</h2>
+<h3 id="tsdbd">The server: tsdbd options</h3>
+<p>All of these are off without <code>--cluster</code>. The client port, <code>--dir</code> and every other option work as
+before.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Option</th><th scope="col">What it does</th></tr></thead>
+<tbody>
+<tr><td><code>--cluster</code></td><td>Start the cluster thread. Needs <code>--cluster-secret-file</code> and <code>--state-dir</code>, and a writer (not <code>--read-only</code> or <code>--follow</code>).</td></tr>
+<tr><td><code>--cluster-secret-file F</code></td><td>The cluster's secret (<code>tsdb cluster secret F</code> makes one). Mode 0600, the same file on every server.</td></tr>
+<tr><td><code>--state-dir DIR</code></td><td>Where the cluster's files live. A local file system, never <code>--dir</code>, never NFS or CIFS (refused).</td></tr>
+<tr><td><code>--peer-port N|0</code></td><td>The port other servers and <code>tsdb cluster</code> use. Default: the client port + 1. <code>0</code>: the system chooses (the fourth number of <code>--port-file</code>).</td></tr>
+<tr><td><code>--peer-listen ADDR</code></td><td>The address the peer port binds to. Default: <code>--listen</code>.</td></tr>
+<tr><td><code>--advertise HOST</code></td><td>The host other servers and clients are told to use. Default: <code>--listen</code>, which must then not be a wildcard. Needed for a witness.</td></tr>
+<tr><td><code>--rack NAME</code>, <code>--power-feed NAME</code></td><td>Where the server stands; <code>volume add</code> places copies in different racks where it can. Shown by <code>status</code>.</td></tr>
+<tr><td><code>--bmc ADDR</code></td><td>The server's management controller, for the <code>bmc</code> failover. Stored; nothing uses it yet.</td></tr>
+<tr><td><code>--read-barrier on|off</code></td><td>This server's read barrier setting, for shared volumes. Default <code>on</code>.</td></tr>
+<tr><td><code>--wal-sync-ms MS</code></td><td>Must stay <code>0</code> (sync every write before its answer, the default) with <code>--cluster</code>.</td></tr>
+<tr><td><code>--forward on|off</code></td><td>Forward requests for volumes led elsewhere to the leader (default <code>on</code>; <code>off</code> answers <code>MOVED</code>).</td></tr>
+<tr><td><code>--disk PATH[:CLASS]</code></td><td>Cluster disk directory (<code>nvme</code>, <code>ssd</code>, or <code>hdd</code>; repeatable; initialised with <code>tsdb disk init</code>).</td></tr>
+<tr><td><code>--role both|compute|storage</code></td><td>Declared cluster role of this server (default <code>both</code>).</td></tr>
+<tr><td><code>--allow-shared-device</code></td><td>Allow cluster disks to share a filesystem device with <code>/</code>, <code>--state-dir</code>, or another disk (for single-disk tests; health warns while set).</td></tr>
+<tr><td><code>--peer-check none|header|full</code></td><td>Frame integrity check on peer data links.</td></tr>
+<tr><td><code>--peer-rdma off|auto|on</code></td><td>Use RDMA verbs (libibverbs) for peer data links (default <code>off</code>).</td></tr>
+<tr><td><code>--witness</code></td><td>A member without data: needs <code>--cluster</code>, takes no <code>--dir</code> and has no client port. Give it <code>--advertise</code>, the host the others reach it at. It votes and keeps the group's state.</td></tr>
+</tbody></table></div>
+<p>For scripts: with <code>--port-file F</code> the file says <code>PORT PID MPORT PEER_PORT</code>. Start servers with
+<code>--port 0 --peer-port 0 --port-file F</code>, as the tests do, and a port is never taken twice.</p>
+
+<h3 id="cli">The command line: tsdb cluster</h3>
+<p><code>tsdb cluster</code> with no arguments prints these. The commands talk to a running server's peer address
+(<code>PEER</code>, <code>host:port</code>), need no directory, keep no state, and authenticate with the secret
+(<code>--secret-file F</code>).</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+<tbody>
+<tr><td><code>tsdb cluster secret FILE</code></td><td>Make a new secret: 32 random bytes as hex, mode 0600. Never overwrites a file.</td></tr>
+<tr><td><code>tsdb cluster init PEER --secret-file F [options]</code></td><td>Make the cluster on one server that is in no cluster yet. It becomes node 1 and the leader. The options fix the settings.</td></tr>
+<tr><td><code>tsdb cluster node add PEER NEW_PEER --secret-file F</code></td><td>Add the server at <code>NEW_PEER</code> (running with <code>--cluster</code>, in no cluster yet). <code>PEER</code> is any member; the command follows to the leader. Adding a member again does no harm.</td></tr>
+<tr><td><code>tsdb cluster volume add PEER NAME [--replicas N | --redundancy ec=K+M|replicas=N] --secret-file F</code></td><td>Add a replicated or erasure-coded cluster volume and open it on the chosen members.</td></tr>
+<tr><td><code>tsdb cluster volume transfer|move|force-leader|gc resume ...</code></td><td>Hand over leadership, move a copy in the background, force a leader, or resume EC orphan collection.</td></tr>
+<tr><td><code>tsdb cluster replica reset PEER VOLUME NODE --secret-file F</code></td><td>Give a lost or untrusted copy a new replica id and rebuild it from a snapshot.</td></tr>
+<tr><td><code>tsdb cluster user add|passwd|drop|grant|revoke|list|import ...</code></td><td>Manage cluster-wide users and grants, or import local <code>USERS</code> files.</td></tr>
+<tr><td><code>tsdb cluster status PEER --secret-file F</code></td><td>What that server knows (see above).</td></tr>
+</tbody></table></div>
+<p>Options of <code>init</code>; each number is a whole number above 0 (<code>0</code> turns
+<code>--leader-balance-s</code> off). Settings for replication, leases, rebuilds and transfers are acted on; those for
+shared mode (<code>--mode shared</code>, <code>--failover</code>, <code>--lease-s</code>, <code>--read-barrier</code>),
+<code>--rebuild-after-s</code> and <code>--volumes-per-server</code> are only stored.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Option</th><th scope="col">Default</th><th scope="col">What it does</th></tr></thead>
+<tbody>
+<tr><td><code>--replication N</code></td><td>3</td><td>Copies of every volume.</td></tr>
+<tr><td><code>--min-isr N</code></td><td>1</td><td>Copies that must be in sync for a write to count. At most <code>--replication</code>.</td></tr>
+<tr><td><code>--node-timeout-ms MS</code></td><td>3000</td><td>A server is marked down after this long without a heartbeat.</td></tr>
+<tr><td><code>--heartbeat-ms MS</code></td><td>500</td><td>How often servers report. Below <code>--node-timeout-ms</code>.</td></tr>
+<tr><td><code>--isr-lag-ms MS</code></td><td>1000</td><td>A copy this far behind leaves the in-sync set, and comes back once it has caught up. At least 500.</td></tr>
+<tr><td><code>--rebuild-after-s S</code></td><td>1800</td><td>A server down this long is marked <code>out</code>. Stored; in the preview no server is ever marked <code>out</code>.</td></tr>
+<tr><td><code>--voter-replace-s S</code></td><td>600</td><td>A voter down this long is replaced by another member.</td></tr>
+<tr><td><code>--voters N</code></td><td>5</td><td>The most voters the group has (an even number counts as one less).</td></tr>
+<tr><td><code>--volumes-per-server N</code></td><td>16</td><td>Volumes led per server.</td></tr>
+<tr><td><code>--mode replicated|shared</code></td><td>replicated</td><td>Servers with their own disks, or volumes on shared (NFS) storage. One mode for the whole cluster.</td></tr>
+<tr><td><code>--failover lease|attested|bmc</code></td><td>lease</td><td>How a dead owner is replaced in shared mode.</td></tr>
+<tr><td><code>--read-barrier on|off</code></td><td>on</td><td>Owners answer reads only behind a fenced write (shared mode).</td></tr>
+<tr><td><code>--lease-s S</code></td><td>10</td><td>The lease of a shared volume.</td></tr>
+<tr><td><code>--lease-ms MS</code></td><td>2000</td><td>A replicated volume's leader read lease.</td></tr>
+<tr><td><code>--drift-ppm N</code></td><td>500</td><td>The clock drift every lease allows for.</td></tr>
+<tr><td><code>--unanswered-ms MS</code></td><td>1000</td><td>A copy kept in sync that does not answer a promotion is dropped after this.</td></tr>
+<tr><td><code>--commit-interval-ms MS</code></td><td>5</td><td>The commit point reaches the copies within this.</td></tr>
+<tr><td><code>--repl-retain-mb MB</code></td><td>4096</td><td>Log kept for a copy that fell behind, at most, per volume (a copy further behind needs a snapshot).</td></tr>
+<tr><td><code>--repl-retain-s S</code></td><td>1800</td><td>And for at most this long.</td></tr>
+<tr><td><code>--idle-seal-ms MS</code></td><td>1000</td><td>An idle leader closes its log segment after this. At least 100.</td></tr>
+<tr><td><code>--rebuild-mb-s MB</code></td><td>200</td><td>Snapshot send rate per link, in megabytes a second (sending side).</td></tr>
+<tr><td><code>--rebuild-max N</code></td><td>2</td><td>Snapshots sent and, counted apart, received per server at once (at most 16).</td></tr>
+<tr><td><code>--transfer-wait-ms MS</code></td><td>2000</td><td>How long a leader drains for a transfer (100 to 60000).</td></tr>
+<tr><td><code>--leader-balance-s S</code></td><td>0</td><td>0: off. Otherwise leadership returns to a volume's preferred copy once it has been in sync this long (at most 86400).</td></tr>
+</tbody></table></div>
+<p>The designs list more commands (<code>node drain</code> and <code>out</code>, <code>restore</code>, <code>adopt</code>).
+They are not built: <code>tsdb cluster</code> prints what exists.</p>
+
+<h2 id="next">What's next</h2>
+<p>The designs are written; the work goes in this order:</p>
+<ul>
+<li><strong>The metadata group, finished</strong> (S4): names that are unique across the cluster. The servers' links
+to each other, routing and one-hop forwarding of requests are in this preview. The group's state machine (S1) and what
+a single server does while its storage is away (UNAVAILABLE, N1) are already in 0.10.0, and users and grants kept in
+the group are in this preview; the rules for ownership and time come with N7.</li>
+<li><strong>Replicated mode (R1 to R4) and erasure coding (R5 to R8) are built</strong>: each volume on servers with their own
+disks, with replication, the in-sync set, promotion, transfer, move, snapshot rebuild, and erasure-coded settled
+parts. Raft stays off the insert path.</li>
+<li><strong>Shared mode</strong> (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume, fenced by the group.
+Production on NFSv4 needs this first.</li>
+<li>Then clients that talk to the volume leader directly, and device classes / storage tiers (R10, R14).</li>
+</ul>
+<p>Read more on GitHub:
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design-ha-modes.md">design-ha-modes.md</a>
+(the two modes and the build plan),
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design-cluster.md">design-cluster.md</a>
+(the replicated cluster and the metadata group),
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/ha.md">ha.md</a> (failover on NFS) and
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/roadmap.md">roadmap.md</a>.</p>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="operations.html"><span>Previous</span>Operations</a><a class="next" href="benchmarks.html"><span>Next</span>Benchmarks</a></nav></main>
+</div>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source: the server and the engine under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">GNU AGPL-3.0</a> (a commercial licence is available), the client libraries under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSES/Apache-2.0.txt">Apache License 2.0</a>; <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSING.md">which is which</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+</body>
+</html>
