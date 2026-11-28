@@ -32,5 +32,7 @@ void rset_stamp(struct rvol *rv, struct repl_msg *m);
 /* An IN_CMD of kind CL_VOLCMD_DROP_MEMBER, on the volume's thread, rv->mu held. `from` is the member that sent it (the
  * frame carries no term: cluster.h, check it against the Raft leader). */
 void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from);
+/* 1 while a fast-disk OUT DROP_MEMBER (nomove) is holding repl_leave until set_version advances. rv->mu held. */
+int rset_drop_nomove(const struct rvol *rv);
 
 #endif

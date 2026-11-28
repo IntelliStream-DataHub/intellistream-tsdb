@@ -122,6 +122,21 @@ void cnode_drain_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_
 void cnode_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 void cnode_destroyed_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 void cnode_move_pos_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+/* server/cnode.c (R13, r13-dev): CLUSTER_OP_DISK_* on the Raft leader */
+void cnode_disk_out_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+void cnode_disk_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+void cnode_disk_class_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+/* Record an in-flight STORE_STATE OUT proposal on the Raft leader so propose_disks never races DOWN -> UP ahead of it. */
+void cl_disk_out_mark(uint32_t node, const uint8_t store_id[16]);
+static inline void cl_sid_hex(const uint8_t id[16], char out[33])
+{
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[i * 2] = hx[id[i] >> 4];
+        out[i * 2 + 1] = hx[id[i] & 0xf];
+    }
+    out[32] = '\0';
+}
 /* once-per-second Raft leader duty: DRAINING -> OUT when empty, and node replace completion (r9-ops) */
 void cnode_duty(uint64_t now);
 

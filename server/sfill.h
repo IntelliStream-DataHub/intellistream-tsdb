@@ -145,6 +145,11 @@ void sfill_stop(struct sfill *sf, uint32_t volume, uint32_t pos);
 int sfill_enqueue_obj(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t prev_node, int margin,
                       uint32_t concurrency, const uint8_t vuuid[16], struct sfill_obj *obj, bool force_write,
                       bool (*cancel_cb)(void *arg), void (*done_cb)(void *arg, int rc), void *done_arg);
+/* Like sfill_enqueue_obj, targeting an explicit local chunk store index when `target_store >= 0` (-1: default). */
+int sfill_enqueue_obj_store(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t prev_node, int margin,
+                            uint32_t concurrency, const uint8_t vuuid[16], struct sfill_obj *obj, bool force_write,
+                            int target_store, bool (*cancel_cb)(void *arg), void (*done_cb)(void *arg, int rc),
+                            void *done_arg);
 
 /* Collect up to `cap` current fill reports into `out` (non-blocking, called on the cluster heartbeat path).
  * Returns the number of entries written. */

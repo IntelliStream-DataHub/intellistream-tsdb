@@ -16,6 +16,7 @@
 #include "chunkpeer.h"
 
 #include "../include/tsdb.h"
+#include "../src/chunk_priv.h"
 #include "../src/compat.h"
 #include "../src/cvol.h"
 #include "../src/eccache.h"
@@ -1513,7 +1514,7 @@ static int rec_op_list_held(void *arg, struct sreconcile_held_pos **out, uint32_
     *out = NULL;
     *n_out = 0;
     const struct cluster_copy *c = cluster_copy_get();
-    if (!c || c->self == 0) {
+    if (!c || c->self == 0 || !cluster_copy_caught_up_at(c)) {
         if (c)
             cluster_copy_put(c);
         return -1;
@@ -1573,12 +1574,34 @@ static int rec_op_store_info(void *arg, int idx, struct sreconcile_store_info *o
     if (!cs)
         return -1;
     int rc = chunksrv_store_info(cs, idx, out->path, sizeof out->path, &out->state, out->live_id);
+    chunk_backend *be = chunksrv_backend(cs);
+    bool dr = (be && chunk_be_store_draining(be, idx));
     chunksrv_cluster_release();
     if (rc != 0)
         return -1;
     if (out->path[0])
         out->disk_ok = (chunk_store_meta_read(out->path, out->disk_id, NULL) == 0);
+    out->is_out = (disks_slot_is_out(idx) != 0);
+    out->is_draining = dr;
     return 0;
+}
+
+static int rec_op_pick_target_store(void *arg, int lost_slot)
+{
+    (void)arg;
+    return disks_pick_rebuild_store(lost_slot);
+}
+
+static void rec_op_on_replacing_settled(void *arg, uint64_t settled_mask)
+{
+    (void)arg;
+    disks_on_replacing_settled(settled_mask);
+}
+
+static void rec_kick_from_disks(void)
+{
+    if (SF.rec)
+        sreconcile_on_return(SF.rec);
 }
 
 static int rec_op_place_store(void *arg, const uint8_t oid[16], unsigned pos)
@@ -2021,6 +2044,8 @@ int sfill_cluster_start(struct tsdb *db, const char *state_dir)
         .store_count = rec_op_store_count,
         .store_info = rec_op_store_info,
         .place_store = rec_op_place_store,
+        .pick_target_store = rec_op_pick_target_store,
+        .on_replacing_settled = rec_op_on_replacing_settled,
         .notify_holder = rec_op_notify_holder,
         .on_report = rec_op_on_report,
         .arg = NULL,
@@ -2030,6 +2055,7 @@ int sfill_cluster_start(struct tsdb *db, const char *state_dir)
         sfill_free(sf);
         return -1;
     }
+    disks_set_reconcile_kick(rec_kick_from_disks);
     struct chunkrepair_cfg crcfg;
     memset(&crcfg, 0, sizeof crcfg);
     snprintf(crcfg.stage_dir, sizeof crcfg.stage_dir, "%s", G.stage_dir[0] ? G.stage_dir : "/tmp");
@@ -2098,6 +2124,7 @@ void sfill_cluster_stop(void)
 {
     if (!SF.started)
         return;
+    disks_set_reconcile_kick(NULL);
     pthread_mutex_lock(&SF.mu);
     SF.stop = true;
     pthread_cond_signal(&SF.cv);

@@ -316,9 +316,12 @@ struct rec_job {
     unsigned backoff_shift;   /* exponential backoff on persistent errors / down stores */
     uint64_t pace_id;
     uint64_t replace_mask;    /* writable stores with changed store_id that still require full refill */
-    uint64_t down_wait_mask;  /* DOWN/non-writable store indices blocking deferred chunks */
-    bool waiting_store_up;    /* paused until a bit in down_wait_mask transitions UP (no OBJLIST storm) */
-    bool pending_run;         /* queued for coordinator to run a reconcile pass */
+    uint64_t replacing_mask;  /* CHUNK_STORE_REPLACING stores awaiting clean reconcile before promotion to UP */
+    uint64_t down_wait_mask;    /* DOWN/non-writable store indices blocking deferred chunks */
+    uint64_t room_wait_out_mask;/* OUT store indices waiting on local capacity room or off-node eviction */
+    bool waiting_store_up;      /* paused until a bit in down_wait_mask transitions UP (no OBJLIST storm) */
+    bool waiting_room;          /* paused until pick_target_store finds room or OUT set / position changes */
+    bool pending_run;           /* queued for coordinator to run a reconcile pass */
     bool running;             /* coordinator is currently running a reconcile pass */
     bool reporting;           /* visible in HBS_FILL while tasks are filling */
     bool retrigger;           /* another trigger arrived while running */
@@ -347,6 +350,7 @@ struct sreconcile {
     bool thr_started;
     atomic_bool stopping;
     bool trigger_all_pending; /* on_start / on_return queued for reconcile_main (off watch thread) */
+    uint64_t trigger_all_at_ms; /* earliest mono_ms to run trigger_all_pending (retry delay when copy not caught up) */
     bool drain_kicked;
     uint64_t next_drain_ms;
     uint64_t next_store_poll_ms;
@@ -622,10 +626,17 @@ static struct rec_store_ent *store_ent_find_or_add_locked(struct sreconcile *rec
  * Never persists a replacement store's new id until commit_replaced_stores() is called after a clean pass.
  * Never holds rec->mu; heap-allocates store_info array to keep thread stacks small. */
 static void check_stores(struct sreconcile *rec, uint64_t *down_mask_out, uint64_t *replace_mask_out,
+                         uint64_t *out_mask_out, uint64_t *replacing_mask_out, uint64_t *draining_mask_out,
                          bool *all_down_out)
 {
     *down_mask_out = 0;
     *replace_mask_out = 0;
+    if (out_mask_out)
+        *out_mask_out = 0;
+    if (replacing_mask_out)
+        *replacing_mask_out = 0;
+    if (draining_mask_out)
+        *draining_mask_out = 0;
     *all_down_out = false;
     if (!rec->ops.store_count || !rec->ops.store_info)
         return;
@@ -658,7 +669,15 @@ static void check_stores(struct sreconcile *rec, uint64_t *down_mask_out, uint64
         struct rec_store_ent *ent = store_ent_find_or_add_locked(rec, spath);
         if (ent)
             ent->store_idx = i;
-        bool up = (si->state == CHUNK_STORE_UP) && si->disk_ok && !id_is_zero(si->live_id);
+        if (si->is_out) {
+            if (out_mask_out)
+                *out_mask_out |= (1ull << (unsigned)i);
+            continue;
+        }
+        if (si->is_draining && draining_mask_out)
+            *draining_mask_out |= (1ull << (unsigned)i);
+        bool up = (si->state == CHUNK_STORE_UP || si->state == CHUNK_STORE_REPLACING) && si->disk_ok &&
+                  !id_is_zero(si->live_id);
         if (!up) {
             *down_mask_out |= (1ull << (unsigned)i);
             if (!ent || !ent->logged_down) {
@@ -675,6 +694,8 @@ static void check_stores(struct sreconcile *rec, uint64_t *down_mask_out, uint64
             }
             continue;
         }
+        if (si->state == CHUNK_STORE_REPLACING && replacing_mask_out)
+            *replacing_mask_out |= (1ull << (unsigned)i);
 
         const uint8_t *got_id = si->live_id;
         bool disk_diverged = memcmp(si->disk_id, si->live_id, 16) != 0;
@@ -750,7 +771,8 @@ static void commit_replaced_stores(struct sreconcile *rec, uint64_t completed_ma
     uint64_t still_needed = 0;
     pthread_mutex_lock(&rec->mu);
     for (struct rec_job *j = rec->jobs; j; j = j->next) {
-        if (!j->removed && (j->pending_run || j->running || j->retrigger || j->waiting_store_up || j->page_pending > 0))
+        if (!j->removed && (j->pending_run || j->running || j->retrigger || j->waiting_store_up || j->waiting_room ||
+                            j->page_pending > 0))
             still_needed |= j->replace_mask;
     }
     pthread_mutex_unlock(&rec->mu);
@@ -776,6 +798,24 @@ static void commit_replaced_stores(struct sreconcile *rec, uint64_t completed_ma
     if (dirty)
         stores_save_locked(rec);
     pthread_mutex_unlock(&rec->store_mu);
+}
+
+static void settle_replacing_stores(struct sreconcile *rec, uint64_t completed_mask)
+{
+    if (completed_mask == 0 || !rec->ops.on_replacing_settled)
+        return;
+    uint64_t still_needed = 0;
+    pthread_mutex_lock(&rec->mu);
+    for (struct rec_job *j = rec->jobs; j; j = j->next) {
+        if (!j->removed && (j->pending_run || j->running || j->retrigger || j->waiting_store_up || j->waiting_room ||
+                            j->page_pending > 0))
+            still_needed |= j->replacing_mask;
+    }
+    pthread_mutex_unlock(&rec->mu);
+
+    uint64_t ready = completed_mask & ~still_needed;
+    if (ready != 0)
+        rec->ops.on_replacing_settled(rec->ops.arg, ready);
 }
 
 /* ------------------------------------------------------------------ HBS_FILL reporting */
@@ -1026,15 +1066,16 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
         return;
     }
 
-    /* 1. Check local store health/ids. Keep replace_mask persisted in `j` so retries never lose it. */
-    uint64_t down_mask = 0, cur_replace_mask = 0;
+    /* 1. Check local store health/ids. Keep replace_mask/replacing_mask persisted in `j` so retries never lose them. */
+    uint64_t down_mask = 0, cur_replace_mask = 0, out_mask = 0, cur_replacing_mask = 0, draining_mask = 0;
     bool all_down = false;
-    check_stores(rec, &down_mask, &cur_replace_mask, &all_down);
+    check_stores(rec, &down_mask, &cur_replace_mask, &out_mask, &cur_replacing_mask, &draining_mask, &all_down);
 
     uint64_t replace_mask = 0;
     pthread_mutex_lock(&rec->mu);
     if (!j->removed && j->gen == gen) {
         j->replace_mask |= cur_replace_mask;
+        j->replacing_mask |= cur_replacing_mask;
         replace_mask = j->replace_mask;
         j->stripe_version = vv.stripe_version;
         j->done = 0;
@@ -1080,6 +1121,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
 
     uint64_t already_present = 0;
     uint64_t skipped_down = 0;
+    uint64_t skipped_no_room = 0;
     uint64_t total_queued = 0;
     bool pass_failed = false;
     bool lost_position = false;
@@ -1146,14 +1188,21 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
         /* Diff this page against local CHUNK_LIST. */
         uint32_t *miss_idx = malloc(got * sizeof *miss_idx);
         bool *miss_force = calloc(got, sizeof *miss_force);
+        int *miss_target = malloc(got * sizeof *miss_target);
         uint32_t nmiss = 0;
-        if (!miss_idx || !miss_force) {
+        if (!miss_idx || !miss_force || !miss_target) {
             free(miss_idx);
             free(miss_force);
+            free(miss_target);
             sfill_objs_free(page, got);
             pass_failed = true;
             break;
         }
+
+        /* Cache pick_target_store(out_src) once per lost slot per OBJLIST page to avoid per-chunk statvfs calls. */
+        int page_target[64];
+        for (int s = 0; s < 64; s++)
+            page_target[s] = -2;
 
         for (uint32_t i = 0; i < got; i++) {
             const struct sfill_obj *o = &page[i];
@@ -1166,6 +1215,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
                 skipped_down++;
                 continue;
             }
+            bool on_out = placed >= 0 && placed < 64 && (out_mask & (1ull << (unsigned)placed)) != 0;
             bool on_replaced = placed >= 0 && placed < 64 && (replace_mask & (1ull << (unsigned)placed)) != 0;
 
             bool intact = false;
@@ -1176,7 +1226,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
                     for (size_t k = lidx; k < nlocal && memcmp(local[k].oid, o->oid, 16) == 0; k++) {
                         const chunk_listed *c = &local[k];
                         if (c->store >= 0 && c->store < 64 &&
-                            ((down_mask | replace_mask) & (1ull << (unsigned)c->store)) != 0)
+                            ((down_mask | replace_mask | out_mask) & (1ull << (unsigned)c->store)) != 0)
                             continue;
                         if (c->status != CHUNK_ST_OK)
                             continue;
@@ -1199,8 +1249,32 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
             if (!intact && mut == SRECONCILE_MUT_SKIPMISSING)
                 continue; /* planted mutant `backskipmissing` */
 
+            int target_store = -1;
+            int out_src = -1;
+            if (on_out) {
+                out_src = placed;
+            } else if (!on_replaced && out_mask != 0 && placed >= 0 && placed < 64 &&
+                       (draining_mask & (1ull << (unsigned)placed)) != 0) {
+                /* A chunk whose hash slot is draining fell back onto another store at settle time and may have lived
+                 * on the OUT store: route its rebuild through pick_target_store so E50 capacity rules apply. */
+                out_src = __builtin_ctzll(out_mask);
+            }
+            if (out_src >= 0 && out_src < 64) {
+                if (page_target[out_src] == -2) {
+                    page_target[out_src] =
+                        rec->ops.pick_target_store ? rec->ops.pick_target_store(rec->ops.arg, out_src) : -1;
+                }
+                target_store = page_target[out_src];
+                if (target_store < 0) {
+                    /* No local capacity store has room: park on waiting_room (R9 placement evicts off-node). */
+                    skipped_no_room++;
+                    continue;
+                }
+            }
+
             miss_idx[nmiss] = i;
-            miss_force[nmiss] = on_replaced || (mut == SRECONCILE_MUT_FULLCOPY);
+            miss_force[nmiss] = on_replaced || out_src >= 0 || (mut == SRECONCILE_MUT_FULLCOPY);
+            miss_target[nmiss] = target_store;
             nmiss++;
         }
 
@@ -1220,6 +1294,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
                         continue;
                     miss_idx[keep] = miss_idx[i];
                     miss_force[keep] = miss_force[i];
+                    miss_target[keep] = miss_target[i];
                     keep++;
                 }
                 nmiss = keep;
@@ -1234,6 +1309,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
                 pthread_mutex_unlock(&rec->mu);
                 free(miss_idx);
                 free(miss_force);
+                free(miss_target);
                 sfill_objs_free(page, got);
                 pass_failed = true;
                 break;
@@ -1272,14 +1348,16 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
                 tctx->job = j;
                 tctx->gen = gen;
                 tctx->chunk_bytes = chunk_pos_len(&o->g, pos);
-                if (sfill_enqueue_obj(rec->sf, volume, pos, 0, vv.margin, vv.concurrency, vuuid, o, miss_force[i],
-                                      rec_task_cancelled, on_task_done, tctx) != 0) {
+                if (sfill_enqueue_obj_store(rec->sf, volume, pos, 0, vv.margin, vv.concurrency, vuuid, o,
+                                            miss_force[i], miss_target[i], rec_task_cancelled, on_task_done,
+                                            tctx) != 0) {
                     on_task_done(tctx, -1);
                 }
             }
 
             free(miss_idx);
             free(miss_force);
+            free(miss_target);
             sfill_objs_free(page, got);
 
             /* Wait until this page's tasks complete (or stop/cancel). */
@@ -1298,6 +1376,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
         } else {
             free(miss_idx);
             free(miss_force);
+            free(miss_target);
             sfill_objs_free(page, got);
         }
 
@@ -1380,6 +1459,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
 
     /* 5. Finalize pass, update HBS_FILL, and persist replacement store_id only if everything succeeded cleanly. */
     uint64_t completed_replace = 0;
+    uint64_t completed_replacing = 0;
     uint64_t l_done = 0, l_tot = 0, l_bytes = 0;
     bool log_done = false;
     bool was_reporting = false;
@@ -1398,24 +1478,31 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
             j->removed = true;
             j->pending_run = false;
             j->waiting_store_up = false;
+            j->waiting_room = false;
             j->down_wait_mask = 0;
+            j->room_wait_out_mask = 0;
             j->retrigger = false;
             j->replace_mask = 0;
+            j->replacing_mask = 0;
             j->backoff_shift = 0;
         }
         gc_removed_jobs_locked(rec);
     } else if (pass_failed) {
         schedule_retry_locked(rec, j, gen, true);
-    } else if (skipped_down > 0) {
+    } else if (skipped_down > 0 || skipped_no_room > 0) {
         /* Healthy/UP stores reconciled cleanly: commit any replaced UP stores immediately, and park this job until a
-         * bit in down_mask transitions back UP (instead of re-streaming OBJLIST every 60 s while a disk stays down). */
+         * bit in down_mask transitions back UP or local room opens up for room_wait_out_mask (no OBJLIST storm). */
         j->running = false;
         if (!j->removed && j->gen == gen) {
             completed_replace = j->replace_mask & ~down_mask;
+            completed_replacing = j->replacing_mask & ~down_mask;
             j->replace_mask &= down_mask;
+            j->replacing_mask &= down_mask;
             j->backoff_shift = 0;
-            j->waiting_store_up = true;
-            j->down_wait_mask = down_mask;
+            j->waiting_store_up = (skipped_down > 0);
+            j->down_wait_mask = skipped_down > 0 ? down_mask : 0;
+            j->waiting_room = (skipped_no_room > 0);
+            j->room_wait_out_mask = skipped_no_room > 0 ? out_mask : 0;
             if (j->retrigger) {
                 j->retrigger = false;
                 j->pending_run = true;
@@ -1428,9 +1515,13 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
         j->running = false;
         if (!j->removed && j->gen == gen) {
             completed_replace = j->replace_mask;
+            completed_replacing = j->replacing_mask;
             j->replace_mask = 0;
+            j->replacing_mask = 0;
             j->waiting_store_up = false;
+            j->waiting_room = false;
             j->down_wait_mask = 0;
+            j->room_wait_out_mask = 0;
             j->backoff_shift = 0;
             l_done = j->done;
             l_tot = j->total;
@@ -1452,6 +1543,8 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
 
     if (completed_replace != 0)
         commit_replaced_stores(rec, completed_replace);
+    if (completed_replacing != 0)
+        settle_replacing_stores(rec, completed_replacing);
 
     if (log_done) {
         fprintf(stderr,
@@ -1545,23 +1638,51 @@ static void drain_noted_limited(struct sreconcile *rec, size_t max_nudges)
     }
 }
 
-/* Lightweight local store-state poll for jobs parked on `waiting_store_up`. Never issues OBJLIST or CHUNK_LIST:
- * wakes a parked job ONLY when a store bit it was waiting on transitions back UP (or all stores are now UP). */
+/* Lightweight local store-state poll for jobs parked on `waiting_store_up` or `waiting_room`. Never issues OBJLIST or
+ * CHUNK_LIST: wakes a parked job ONLY when a DOWN store it waited on comes back UP, or when local capacity room opens
+ * up (or the OUT store mask changes) for a job parked on `waiting_room`. */
 static void poll_down_stores(struct sreconcile *rec)
 {
-    uint64_t cur_down = 0, cur_replace = 0;
+    uint64_t cur_down = 0, cur_replace = 0, cur_out = 0, cur_replacing = 0, cur_draining = 0;
     bool all_down = false;
-    check_stores(rec, &cur_down, &cur_replace, &all_down);
+    check_stores(rec, &cur_down, &cur_replace, &cur_out, &cur_replacing, &cur_draining, &all_down);
+
+    /* For any waiting_room job, probe pick_target_store cheaply without holding rec->mu. */
+    uint64_t room_wait_union = 0;
+    pthread_mutex_lock(&rec->mu);
+    for (struct rec_job *j = rec->jobs; j; j = j->next) {
+        if (!j->removed && !j->running && !j->pending_run && j->waiting_room)
+            room_wait_union |= j->room_wait_out_mask;
+    }
+    pthread_mutex_unlock(&rec->mu);
+
+    uint64_t room_ready_mask = 0;
+    if (room_wait_union != 0 && rec->ops.pick_target_store) {
+        for (int s = 0; s < 64; s++) {
+            if ((room_wait_union & (1ull << (unsigned)s)) == 0)
+                continue;
+            if (rec->ops.pick_target_store(rec->ops.arg, s) >= 0)
+                room_ready_mask |= (1ull << (unsigned)s);
+        }
+    }
 
     pthread_mutex_lock(&rec->mu);
     for (struct rec_job *j = rec->jobs; j; j = j->next) {
-        if (j->removed || j->running || j->pending_run || !j->waiting_store_up)
+        if (j->removed || j->running || j->pending_run || (!j->waiting_store_up && !j->waiting_room))
             continue;
-        bool recovered = (!all_down && (cur_down == 0 || (j->down_wait_mask & ~cur_down) != 0));
-        if (recovered) {
+        bool wake_down = j->waiting_store_up && !all_down &&
+                         (j->down_wait_mask != 0
+                              ? (cur_down == 0 || (j->down_wait_mask & ~cur_down) != 0)
+                              : cur_down == 0);
+        bool wake_room = j->waiting_room &&
+                         (cur_out != j->room_wait_out_mask || (j->room_wait_out_mask & room_ready_mask) != 0);
+        if (wake_down || wake_room) {
             j->waiting_store_up = false;
+            j->waiting_room = false;
             j->down_wait_mask = 0;
+            j->room_wait_out_mask = 0;
             j->replace_mask |= cur_replace;
+            j->replacing_mask |= cur_replacing;
             j->pending_run = true;
             j->retry_at_ms = 0;
         }
@@ -1576,23 +1697,28 @@ static void *reconcile_main(void *arg)
     while (!atomic_load_explicit(&rec->stopping, memory_order_acquire)) {
         gc_removed_jobs_locked(rec);
 
-        if (rec->trigger_all_pending) {
-            rec->trigger_all_pending = false;
-            pthread_mutex_unlock(&rec->mu);
-            trigger_all_held(rec);
-            pthread_mutex_lock(&rec->mu);
-            continue;
-        }
-
         uint64_t now = mono_ms();
         uint64_t earliest = UINT64_MAX;
+        if (rec->trigger_all_pending) {
+            if (rec->trigger_all_at_ms <= now) {
+                rec->trigger_all_pending = false;
+                rec->trigger_all_at_ms = 0;
+                pthread_mutex_unlock(&rec->mu);
+                trigger_all_held(rec);
+                pthread_mutex_lock(&rec->mu);
+                continue;
+            }
+            if (rec->trigger_all_at_ms < earliest)
+                earliest = rec->trigger_all_at_ms;
+        }
+
         struct rec_job *pick = NULL;
         bool any_waiting_store = false;
 
         for (struct rec_job *j = rec->jobs; j; j = j->next) {
             if (j->removed || j->running || j->page_pending > 0)
                 continue;
-            if (j->waiting_store_up && !j->pending_run) {
+            if ((j->waiting_store_up || j->waiting_room) && !j->pending_run) {
                 any_waiting_store = true;
                 continue;
             }
@@ -1670,7 +1796,7 @@ static void *reconcile_main(void *arg)
 /* ------------------------------------------------------------------ internal trigger helper */
 
 static int trigger_job(struct sreconcile *rec, uint32_t volume, uint32_t pos, uint64_t stripe_version,
-                       uint64_t replace_mask)
+                       uint64_t replace_mask, uint64_t replacing_mask)
 {
     if (!rec || pos >= CHUNK_POS_MAX)
         return -1;
@@ -1685,8 +1811,11 @@ static int trigger_job(struct sreconcile *rec, uint32_t volume, uint32_t pos, ui
         if (stripe_version > j->stripe_version)
             j->stripe_version = stripe_version;
         j->replace_mask |= replace_mask;
+        j->replacing_mask |= replacing_mask;
         j->waiting_store_up = false;
+        j->waiting_room = false;
         j->down_wait_mask = 0;
+        j->room_wait_out_mask = 0;
         j->backoff_shift = 0;
         if (j->running || j->page_pending > 0) {
             j->retrigger = true;
@@ -1705,6 +1834,7 @@ static int trigger_job(struct sreconcile *rec, uint32_t volume, uint32_t pos, ui
         j->stripe_version = stripe_version;
         j->gen = 1;
         j->replace_mask = replace_mask;
+        j->replacing_mask = replacing_mask;
         j->pending_run = true;
         j->next = rec->jobs;
         rec->jobs = j;
@@ -1719,19 +1849,34 @@ static void trigger_all_held(struct sreconcile *rec)
 {
     if (!rec)
         return;
-    uint64_t down_mask = 0, replace_mask = 0;
+    uint64_t down_mask = 0, replace_mask = 0, out_mask = 0, replacing_mask = 0, draining_mask = 0;
     bool all_down = false;
-    check_stores(rec, &down_mask, &replace_mask, &all_down);
+    check_stores(rec, &down_mask, &replace_mask, &out_mask, &replacing_mask, &draining_mask, &all_down);
 
     if (!rec->ops.list_held)
         return;
     struct sreconcile_held_pos *held = NULL;
     uint32_t n = 0;
-    if (rec->ops.list_held(rec->ops.arg, &held, &n) != 0)
+    if (rec->ops.list_held(rec->ops.arg, &held, &n) != 0) {
+        /* Metadata copy is not caught up yet: retry shortly without promoting REPLACING stores prematurely. */
+        pthread_mutex_lock(&rec->mu);
+        if (!atomic_load_explicit(&rec->stopping, memory_order_acquire)) {
+            rec->trigger_all_pending = true;
+            rec->trigger_all_at_ms = mono_ms() + 200;
+            pthread_cond_signal(&rec->cv);
+        }
+        pthread_mutex_unlock(&rec->mu);
         return;
+    }
     for (uint32_t i = 0; i < n; i++)
-        (void)trigger_job(rec, held[i].volume, held[i].pos, held[i].stripe_version, replace_mask);
+        (void)trigger_job(rec, held[i].volume, held[i].pos, held[i].stripe_version, replace_mask, replacing_mask);
     free(held);
+    if (n == 0) {
+        if (replace_mask != 0)
+            commit_replaced_stores(rec, replace_mask);
+        if (replacing_mask != 0)
+            settle_replacing_stores(rec, replacing_mask);
+    }
 }
 
 static void queue_trigger_all(struct sreconcile *rec)
@@ -1741,6 +1886,7 @@ static void queue_trigger_all(struct sreconcile *rec)
     pthread_mutex_lock(&rec->mu);
     if (!atomic_load_explicit(&rec->stopping, memory_order_acquire)) {
         rec->trigger_all_pending = true;
+        rec->trigger_all_at_ms = 0;
         pthread_cond_signal(&rec->cv);
     }
     pthread_mutex_unlock(&rec->mu);
@@ -1830,7 +1976,7 @@ void sreconcile_free(struct sreconcile *rec)
 
 int sreconcile_trigger_ex(struct sreconcile *rec, uint32_t volume, uint32_t pos, uint64_t stripe_version)
 {
-    return trigger_job(rec, volume, pos, stripe_version, 0);
+    return trigger_job(rec, volume, pos, stripe_version, 0, 0);
 }
 
 void sreconcile_on_start_ex(struct sreconcile *rec)

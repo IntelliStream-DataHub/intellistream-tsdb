@@ -43,6 +43,14 @@
 #define HBS_DISK_F_FULL       8u  /* young_fill_pct >= young_high_pct (90% with 2-point hysteresis) */
 #define HBS_DISK_F_CHUNK_FULL 16u /* chunk store past fill mark (settles wait; rebuilds allowed up to 95%) */
 
+/* Per-disk device-lifecycle flags carried in HBS_DISKS v3 e[94] (R13 r13-dev; E12, E27, E54, §5.5, §15.6). */
+#define HBS_DISK_DF_FAILED        1u /* disk/chunk failed in service (EIO/ENOSPC -> failstop_out_s) */
+#define HBS_DISK_DF_DAMAGED       2u /* r12-chunk daily damage > scrub_out_count -> immediate OUT */
+#define HBS_DISK_DF_DRAINING      4u /* local r13-lmove drain in progress */
+#define HBS_DISK_DF_NO_LOCAL_ROOM 8u /* OUT chunk disk has no local capacity room -> move stripe positions off node */
+
+struct cluster_copy;
+
 struct disk_spec {
     char path[PATH_MAX];
     int stated_class; /* DISK_CLASS_NONE (0) when omitted, else DISK_CLASS_NVME/SSD/HDD */
@@ -65,6 +73,7 @@ struct hbs_disk_row {
     uint8_t state;      /* enum meta_store_state */
     uint8_t have_usage; /* 1 when usage bytes are reported (r13-fill or test knob) */
     uint8_t fill_flags; /* HBS_DISK_F_* bitmask */
+    uint8_t dev_flags;  /* HBS_DISK_DF_* bitmask (R13 r13-dev) */
     uint8_t young_fill_pct;
     uint8_t chunk_fill_pct;
     uint64_t size_bytes;
@@ -187,6 +196,15 @@ int disk_probe_info_by_store(const uint8_t store_id[16], tsdb_domain_info *out);
 void disk_probe_chunk_failed(int chunk_slot, int err_code);
 void disk_probe_stop(void);
 
+/* R13 (r13-dev): device OUT, return-before-OUT attach, damage-triggered OUT, replace, and class change hooks. */
+void disks_chunk_damaged_out(int chunk_slot, uint64_t day_damaged);
+void disks_sync_copy(const struct cluster_copy *c);
+int disks_chunk_attach_async(int disk_idx);
+int disks_slot_is_out(int chunk_slot);
+int disks_pick_rebuild_store(int lost_slot);
+void disks_on_replacing_settled(uint64_t settled_mask);
+void disks_set_reconcile_kick(void (*fn)(void));
+
 /* Unregister HBS_DISKS / metrics and release disk locks. */
 void disks_stop(void);
 
@@ -202,9 +220,13 @@ enum {
     DISKS_MUT_FULLALL = 7,       /* fullall: mark EVERY volume on the node FULL when any disk is FULL */
     DISKS_MUT_FULLNORELEASE = 8, /* fullnorelease: do not early-release matched retired parts at 90% */
     DISKS_MUT_FULLMERGEON = 9,   /* fullmergeon: do not hold non-shrinking merges at 90% */
+    DISKS_MUT_DEVOUTNOHOLD = 10, /* devoutnohold: ignore member hold when marking a device OUT */
+    DISKS_MUT_REBUILDTOFAST = 11,/* rebuildtofast: allow capacity-store OUT rebuild onto a fast (NVMe/SSD) disk */
+    DISKS_MUT_DAMAGENOOUT = 12,  /* damagenoout: ignore r12-chunk damage > scrub_out_count instead of marking OUT */
 };
 int disks_mutant_parse(const char *name);
 int disks_mutant(void);
+int disks_mutant_env(void);
 #endif
 
 #endif /* TSDBD_DISKS_H */

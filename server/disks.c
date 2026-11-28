@@ -70,7 +70,16 @@ struct disk_entry {
     int chunk_slot;       /* 0-based index in chunksrv's chunk_backend, -1 if none */
     int probe_down;       /* 1 while health domain is DOWN or RECOVERING */
     int probe_recovering; /* 1 while health domain is RECOVERING */
-    int io_down;          /* 1 after chunk store EIO/ENOSPC or probe DOWN (sticky until restart/replace) */
+    int io_down;          /* 1 after chunk store EIO/ENOSPC or probe DOWN (cleared on clean attach/replace) */
+    /* R13 r13-dev: device failure/damage/OUT/replace/attach state. */
+    int fail_down;         /* 1 after runtime EIO/ENOSPC failure (-> HBS_DISK_DF_FAILED, failstop_out_s) */
+    int damage_out;        /* 1 after r12-chunk daily damage > scrub_out_count (-> HBS_DISK_DF_DAMAGED) */
+    int meta_out;          /* 1 once committed metadata marked this store OUT or DESTROYED */
+    int out_draining;      /* 1 while readable OUT chunk store is draining locally via r13-lmove */
+    int out_no_local_room; /* 1 when OUT chunk store found no local capacity room for rebuild/drain */
+    int attaching;         /* 1 while async return-before-OUT attach thread is running */
+    int replacing;         /* 1 while chunk store is in CHUNK_STORE_REPLACING awaiting reconcile */
+    int fast_only_rebuild; /* test mutant rebuildtofast only: fast disk slot open solely for rebuild */
     /* R13 r13-lmove: local chunk drain state. */
     int draining;                /* 1 while this chunk store is being drained locally (no new puts) */
     int drain_no_space;          /* 1 while drain stopped because no target store has room */
@@ -148,6 +157,12 @@ static struct {
     int usage_started;
     struct disk_usage_worker *usage_workers[DISKS_MAX];
     int nusage_workers;
+    /* R13 r13-dev: reconcile wakeup hook, detached attach/replace worker generation and bounded stop. */
+    void (*reconcile_kick)(void);
+    uint64_t worker_gen;
+    int attach_threads;
+    int replace_thr_running;
+    pthread_cond_t replace_cv;
 #ifdef TSDB_TEST_HOOKS
     int mutant;
 #endif
@@ -509,6 +524,12 @@ int disks_mutant_parse(const char *name)
         return DISKS_MUT_FULLNORELEASE;
     if (strcmp(name, "fullmergeon") == 0)
         return DISKS_MUT_FULLMERGEON;
+    if (strcmp(name, "devoutnohold") == 0)
+        return DISKS_MUT_DEVOUTNOHOLD;
+    if (strcmp(name, "rebuildtofast") == 0)
+        return DISKS_MUT_REBUILDTOFAST;
+    if (strcmp(name, "damagenoout") == 0)
+        return DISKS_MUT_DAMAGENOOUT;
     return -1;
 }
 
@@ -518,6 +539,21 @@ int disks_mutant(void)
     int m = G.mutant;
     pthread_mutex_unlock(&g_mu);
     return m;
+}
+
+int disks_mutant_env(void)
+{
+    pthread_mutex_lock(&g_mu);
+    int m = G.mutant;
+    int prep = G.prepared;
+    pthread_mutex_unlock(&g_mu);
+    if (prep || m != DISKS_MUT_NONE)
+        return m;
+    const char *env = getenv("TSDB_DISKS_MUTANT");
+    if (!env || !*env)
+        return DISKS_MUT_NONE;
+    int parsed = disks_mutant_parse(env);
+    return parsed > 0 ? parsed : DISKS_MUT_NONE;
 }
 #endif
 
@@ -769,6 +805,12 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         r->disk_class = (uint8_t)d->effective_class;
         r->uses = d->uses ? d->uses : META_DISK_USE_LOG;
         r->state = d->state;
+        r->dev_flags = (uint8_t)((d->fail_down ? HBS_DISK_DF_FAILED : 0u) |
+                                 (d->damage_out ? HBS_DISK_DF_DAMAGED : 0u) |
+                                 (d->draining ? HBS_DISK_DF_DRAINING : 0u) |
+                                 ((d->out_no_local_room || (d->out_draining && d->drain_no_space))
+                                      ? HBS_DISK_DF_NO_LOCAL_ROOM
+                                      : 0u));
         r->size_bytes = d->usage_have && d->usage_size > 0 ? d->usage_size : (d->size_bytes > 0 ? d->size_bytes : 1);
         r->sync_us = d->sync_us;
         if (d->usage_have) {
@@ -827,7 +869,7 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         put_le64(e + 84, rows[i].young_peak_7d);
         e[92] = rows[i].young_fill_pct;
         e[93] = rows[i].chunk_fill_pct;
-        e[94] = 0;
+        e[94] = rows[i].dev_flags;
         e[95] = 0;
     }
     return (ssize_t)need;
@@ -914,6 +956,8 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
             r->young_peak_7d = get_le64(e + 84);
             r->young_fill_pct = e[92] > 100u ? 100u : e[92];
             r->chunk_fill_pct = e[93] > 100u ? 100u : e[93];
+            r->dev_flags = e[94] & (HBS_DISK_DF_FAILED | HBS_DISK_DF_DAMAGED | HBS_DISK_DF_DRAINING |
+                                    HBS_DISK_DF_NO_LOCAL_ROOM);
         }
         if (r->size_bytes == 0) {
             free(v);
@@ -1493,6 +1537,7 @@ static void compute_uses_locked(void)
         struct disk_entry *d = &G.disks[i];
         d->has_chunks = 0;
         d->draining = 0;
+        d->fast_only_rebuild = 0;
         d->chunks_path[0] = '\0';
         /* Disk uses follow hardware layout (E48/E50): HDD holds chunks; fast disks hold log replicas, and also
          * chunks on a server without capacity disks. Preserve recorded metadata/DISKS uses for missing (!present)
@@ -1531,6 +1576,17 @@ static void compute_uses_locked(void)
                 }
             }
         }
+#ifdef TSDB_TEST_HOOKS
+        /* Planted mutant rebuildtofast: open a hidden chunk slot on a fast disk even on a mixed NVMe+HDD server so
+         * capacity-store OUT rebuilds can be routed onto it (rejected for regular puts via fast_only_rebuild). */
+        if (G.mutant == DISKS_MUT_REBUILDTOFAST && !d->has_chunks && d->present && has_cap &&
+            G.role != META_ROLE_COMPUTE && d->state != META_STORE_DESTROYED && d->state != META_STORE_OUT &&
+            d->path[0] != '\0' && d->effective_class != DISK_CLASS_HDD) {
+            d->has_chunks = 1;
+            d->fast_only_rebuild = 1;
+            snprintf(d->chunks_path, sizeof d->chunks_path, "%s/chunks", d->path);
+        }
+#endif
     }
 }
 
@@ -1956,7 +2012,7 @@ void disks_chunk_layout(const char **paths, int *prefs, bool *draining, int cap,
                                                                  : 10;
         }
         if (draining)
-            draining[out] = d->draining != 0;
+            draining[out] = (d->draining != 0 || d->fast_only_rebuild != 0);
         /* Known-missing configured chunk disk keeps a NULL DOWN_MISSING slot so hash%n placement stays stable and
          * reads answer UNAVAILABLE instead of NOTFOUND. */
         if (d->present && d->chunks_path[0])
@@ -2130,8 +2186,11 @@ static void disk_on_health_change(void *ctx, int dom_idx, int old_state, int new
                 d->state = META_STORE_DOWN;
             /* A chunk-only disk that went DOWN missed writes/deletes and stays DOWN until replace/restart; a fast
              * log+chunk disk recovers its log state on UP while its chunk backend slot stays DOWN_STALLED. */
-            if (d->chunk_slot >= 0 && !(d->uses & META_DISK_USE_LOG))
+            if (d->chunk_slot >= 0 && !(d->uses & META_DISK_USE_LOG)) {
                 d->io_down = 1;
+                if (chunk_reason == CHUNK_STORE_DOWN_IOERR)
+                    d->fail_down = 1;
+            }
         } else if (new_state == TSDB_DOM_RECOVERING) {
             d->probe_down = 1;
             d->probe_recovering = 1;
@@ -2411,6 +2470,7 @@ void disk_probe_chunk_failed(int chunk_slot, int err_code)
          * never leaves healthy log volumes unscannable while chunksrv already marks the chunk slot DOWN_IOERR. */
         if (!is_log) {
             d->io_down = 1;
+            d->fail_down = 1;
             if (d->state == META_STORE_UP) {
                 d->state = META_STORE_DOWN;
                 changed = 1;
@@ -2546,9 +2606,10 @@ static int drain_pick_target(chunk_backend *be, int src_slot, uint64_t need_byte
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < G.ndisks && nc < DISKS_MAX; i++) {
         const struct disk_entry *d = &G.disks[i];
-        if (!d->present || !d->has_chunks || d->draining || d->chunk_slot < 0 || d->chunk_slot == src_slot)
+        if (!d->present || !d->has_chunks || d->draining || d->fast_only_rebuild || d->chunk_slot < 0 ||
+            d->chunk_slot == src_slot)
             continue;
-        if (d->state != META_STORE_UP || d->io_down || d->probe_down)
+        if (d->state != META_STORE_UP || d->io_down || d->probe_down || d->meta_out || d->damage_out)
             continue;
         cands[nc].slot = d->chunk_slot;
         cands[nc].cls = d->effective_class;
@@ -2819,7 +2880,8 @@ static void *disks_drain_main(void *arg)
         pthread_mutex_lock(&g_mu);
         for (int i = 0; i < G.ndisks && ntodo < DISKS_MAX; i++) {
             const struct disk_entry *d = &G.disks[i];
-            if (d->draining && d->present && d->has_chunks && d->chunk_slot >= 0 && d->state == META_STORE_UP &&
+            int st_ok = (d->state == META_STORE_UP) || (d->state == META_STORE_OUT && d->out_draining);
+            if (d->draining && !d->fast_only_rebuild && d->present && d->has_chunks && d->chunk_slot >= 0 && st_ok &&
                 !d->io_down && !d->probe_down) {
                 todo[ntodo].disk_idx = i;
                 todo[ntodo].slot = d->chunk_slot;
@@ -2877,6 +2939,7 @@ static void *disks_drain_main(void *arg)
             bool beat = false;
             bool log_start = false;
             bool log_done = false;
+            bool retire_out = false;
             uint64_t done_chunks = 0, done_bytes = 0;
             pthread_mutex_lock(&g_mu);
             struct disk_entry *de = &G.disks[di];
@@ -2886,6 +2949,16 @@ static void *disks_drain_main(void *arg)
             if (dl.n == 0) {
                 de->drain_no_space = 0;
                 de->drain_no_space_logged = 0;
+                if (de->out_draining) {
+                    de->out_draining = 0;
+                    de->draining = 0;
+                    if (de->lock_fd >= 0) {
+                        close(de->lock_fd);
+                        de->lock_fd = -1;
+                    }
+                    retire_out = true;
+                    beat = true;
+                }
                 drain_recompute_no_space_locked();
                 if (prev_left > 0 || prev_ns != G.drain_no_space_any)
                     beat = true;
@@ -2904,6 +2977,12 @@ static void *disks_drain_main(void *arg)
                     beat = true;
             }
             pthread_mutex_unlock(&g_mu);
+            if (retire_out) {
+                (void)chunk_be_mark_lost(be, src_slot);
+                chunk_be_release_down(be, src_slot);
+                fprintf(stderr, "tsdbd: disks: local drain of OUT store %d (%s) complete; store retired\n", src_slot,
+                        todo[t].path);
+            }
             if (log_start) {
                 fprintf(stderr,
                         "tsdbd: disks: local drain of store %d (%s) started (%zu chunks, %" PRIu64 " bytes)\n",
@@ -4033,6 +4112,26 @@ int disks_chunk_store_can_put(int chunk_slot, int is_rebuild)
         const struct disk_entry *d = &G.disks[i];
         if (d->chunk_slot != chunk_slot)
             continue;
+        if (d->fast_only_rebuild) {
+            allow = is_rebuild ? 1 : 0;
+            break;
+        }
+        if (!d->present || d->state == META_STORE_OUT || d->state == META_STORE_DESTROYED || d->meta_out ||
+            d->damage_out) {
+            allow = 0;
+            break;
+        }
+        if (d->replacing) {
+            /* A returning store in CHUNK_STORE_REPLACING must accept its own reconcile refill puts while rejecting
+             * regular new settles until reconcile promotes it back UP. */
+            if (!is_rebuild) {
+                allow = 0;
+                break;
+            }
+        } else if (d->io_down || d->probe_down) {
+            allow = 0;
+            break;
+        }
         if (d->usage_have)
             allow = is_rebuild ? !d->usage_chunk_rb_full : !d->usage_chunk_full;
         break;
@@ -4077,8 +4176,1016 @@ int disks_usage_snapshot(struct disk_fill_snap *out, int cap)
     return n;
 }
 
+/* ---------------------------------------------------------------- R13 r13-dev: device OUT, attach, replace & class */
+
+void disks_set_reconcile_kick(void (*fn)(void))
+{
+    pthread_mutex_lock(&g_mu);
+    G.reconcile_kick = fn;
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void kick_reconcile_unlocked(void)
+{
+    pthread_mutex_lock(&g_mu);
+    void (*fn)(void) = G.reconcile_kick;
+    pthread_mutex_unlock(&g_mu);
+    if (fn)
+        fn();
+}
+
+void disks_chunk_damaged_out(int chunk_slot, uint64_t day_damaged)
+{
+    if (chunk_slot < 0)
+        return;
+#ifdef TSDB_TEST_HOOKS
+    if (disks_mutant() == DISKS_MUT_DAMAGENOOUT) {
+        fprintf(stderr,
+                "tsdbd: disks: MUTANT damagenoout: ignoring scrub damage (%" PRIu64 ") on chunk store %d\n",
+                day_damaged, chunk_slot);
+        return;
+    }
+#endif
+    char path[PATH_MAX] = "";
+    int changed = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++) {
+        struct disk_entry *d = &G.disks[i];
+        if (d->chunk_slot != chunk_slot)
+            continue;
+        snprintf(path, sizeof path, "%s", d->path);
+        if (!d->damage_out) {
+            d->damage_out = 1;
+            d->io_down = 1;
+            if (d->state == META_STORE_UP)
+                d->state = META_STORE_DOWN;
+            changed = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (changed) {
+        fprintf(stderr,
+                "tsdbd: disks: chunk store %d (%s) daily damage %" PRIu64
+                " exceeded scrub_out_count: reporting DAMAGED for immediate OUT\n",
+                chunk_slot, path[0] ? path : "-", day_damaged);
+        cluster_beat_soon();
+    }
+}
+
+int disks_slot_is_out(int chunk_slot)
+{
+    if (chunk_slot < 0 || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return 0;
+    int out = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++) {
+        const struct disk_entry *d = &G.disks[i];
+        if (d->chunk_slot != chunk_slot)
+            continue;
+        out = (d->meta_out && !d->out_draining) ? 1 : 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_mu);
+    return out;
+}
+
+int disks_pick_rebuild_store(int lost_slot)
+{
+    if (lost_slot < 0 || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return -1;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return -1;
+    chunk_backend *be = chunksrv_backend(cs);
+    if (!be) {
+        chunksrv_cluster_release();
+        return -1;
+    }
+
+    int lost_di = -1, lost_cls = DISK_CLASS_HDD;
+    struct {
+        int slot;
+        int cls;
+        int fast_mut;
+    } cands[DISKS_MAX];
+    int nc = 0;
+    int have_hdd = 0;
+#ifdef TSDB_TEST_HOOKS
+    int mut = DISKS_MUT_NONE;
+#endif
+
+    pthread_mutex_lock(&g_mu);
+#ifdef TSDB_TEST_HOOKS
+    mut = G.mutant;
+#endif
+    for (int i = 0; i < G.ndisks; i++) {
+        if (G.disks[i].chunk_slot == lost_slot) {
+            lost_di = i;
+            lost_cls = G.disks[i].effective_class;
+            break;
+        }
+    }
+    for (int i = 0; i < G.ndisks && nc < DISKS_MAX; i++) {
+        const struct disk_entry *d = &G.disks[i];
+        if (!d->present || !d->has_chunks || d->chunk_slot < 0 || d->chunk_slot == lost_slot)
+            continue;
+        if (d->state != META_STORE_UP || d->io_down || d->probe_down || d->meta_out || d->damage_out)
+            continue;
+        if (d->draining && !d->fast_only_rebuild)
+            continue;
+        if (d->fast_only_rebuild) {
+#ifdef TSDB_TEST_HOOKS
+            if (mut == DISKS_MUT_REBUILDTOFAST) {
+                cands[nc].slot = d->chunk_slot;
+                cands[nc].cls = d->effective_class;
+                cands[nc].fast_mut = 1;
+                nc++;
+            }
+#endif
+            continue;
+        }
+        cands[nc].slot = d->chunk_slot;
+        cands[nc].cls = d->effective_class;
+        cands[nc].fast_mut = 0;
+        if (d->effective_class == DISK_CLASS_HDD)
+            have_hdd = 1;
+        nc++;
+    }
+    pthread_mutex_unlock(&g_mu);
+
+#ifdef TSDB_TEST_HOOKS
+    if (mut == DISKS_MUT_REBUILDTOFAST && lost_cls == DISK_CLASS_HDD) {
+        for (int i = 0; i < nc; i++) {
+            if (cands[i].fast_mut || cands[i].cls != DISK_CLASS_HDD) {
+                int slot = cands[i].slot;
+                int stt = chunk_be_store_state(be, slot);
+                if (stt == CHUNK_STORE_UP || stt == CHUNK_STORE_REPLACING) {
+                    fprintf(stderr,
+                            "tsdbd: disks: MUTANT rebuildtofast: routing HDD store %d rebuild onto fast slot %d\n",
+                            lost_slot, slot);
+                    chunksrv_cluster_release();
+                    return slot;
+                }
+            }
+        }
+    }
+#endif
+
+    int best = -1;
+    uint64_t best_free = 0;
+    for (int i = 0; i < nc; i++) {
+        if (cands[i].fast_mut)
+            continue;
+        /* E50: a capacity (HDD) store's chunks NEVER rebuild onto a fast (NVMe/SSD) disk. */
+        if (lost_cls == DISK_CLASS_HDD && cands[i].cls != DISK_CLASS_HDD)
+            continue;
+        if (have_hdd && cands[i].cls != DISK_CLASS_HDD)
+            continue;
+        int slot = cands[i].slot;
+        int stt = chunk_be_store_state(be, slot);
+        if (stt != CHUNK_STORE_UP && stt != CHUNK_STORE_REPLACING)
+            continue;
+        if (!disks_chunk_store_can_put(slot, 1))
+            continue;
+        chunk_store *st = chunk_be_store_ref(be, slot);
+        if (!st || chunk_store_failed(st)) {
+            chunk_store_unref(st);
+            continue;
+        }
+        chunk_store_fs_refresh(st);
+        uint64_t used = 0, avail = 0, total = 0;
+        int frc = chunk_store_fs_bytes_cached(st, &used, &avail, &total);
+        chunk_store_unref(st);
+        if (frc != 0 || total == 0 || avail == 0)
+            continue;
+        uint64_t pct = (uint64_t)(((__uint128_t)used * 100u) / total);
+        if (pct >= CHUNK_STORE_PUT_MAX_PCT)
+            continue;
+        if (best < 0 || avail > best_free) {
+            best = slot;
+            best_free = avail;
+        }
+    }
+
+    chunksrv_cluster_release();
+
+    if (lost_di >= 0) {
+        int beat = 0;
+        pthread_mutex_lock(&g_mu);
+        if (lost_di < G.ndisks && G.disks[lost_di].chunk_slot == lost_slot) {
+            int want_nr = (best < 0) ? 1 : 0;
+            if (G.disks[lost_di].out_no_local_room != want_nr) {
+                G.disks[lost_di].out_no_local_room = want_nr;
+                beat = 1;
+            }
+        }
+        pthread_mutex_unlock(&g_mu);
+        if (beat)
+            cluster_beat_soon();
+    }
+    return best;
+}
+
+void disks_on_replacing_settled(uint64_t settled_mask)
+{
+    if (settled_mask == 0 || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    chunk_backend *be = cs ? chunksrv_backend(cs) : NULL;
+    int promoted[DISKS_MAX];
+    int np = 0;
+
+    for (int slot = 0; slot < 64; slot++) {
+        if ((settled_mask & (1ull << (unsigned)slot)) == 0)
+            continue;
+        if (be && chunk_be_store_state(be, slot) == CHUNK_STORE_REPLACING)
+            (void)chunk_be_promote_up(be, slot);
+        pthread_mutex_lock(&g_mu);
+        for (int i = 0; i < G.ndisks; i++) {
+            struct disk_entry *d = &G.disks[i];
+            if (d->chunk_slot != slot)
+                continue;
+            d->replacing = 0;
+            if (!d->meta_out && !d->damage_out && d->present) {
+                d->io_down = 0;
+                d->fail_down = 0;
+                d->probe_down = 0;
+                d->probe_recovering = 0;
+                if (d->state == META_STORE_DOWN)
+                    d->state = META_STORE_UP;
+                if (np < DISKS_MAX)
+                    promoted[np++] = i;
+            }
+            break;
+        }
+        pthread_mutex_unlock(&g_mu);
+    }
+    if (cs)
+        chunksrv_cluster_release();
+
+    for (int i = 0; i < np; i++) {
+        disk_probe_set_up(promoted[i]);
+        fprintf(stderr, "tsdbd: disks: disk %d chunk store reconciled and promoted REPLACING -> UP\n", promoted[i]);
+    }
+    if (np > 0)
+        cluster_beat_soon();
+}
+
+static void collect_cluster_epochs(const struct cluster_copy *c, uint32_t **vols_out, uint64_t **eps_out, size_t *nv_out)
+{
+    *vols_out = NULL;
+    *eps_out = NULL;
+    *nv_out = 0;
+    if (!c || c->nvolumes == 0)
+        return;
+    uint32_t *vs = calloc(c->nvolumes, sizeof *vs);
+    uint64_t *es = calloc(c->nvolumes, sizeof *es);
+    if (!vs || !es) {
+        free(vs);
+        free(es);
+        return;
+    }
+    size_t n = 0;
+    for (uint32_t i = 0; i < c->nvolumes; i++) {
+        if (c->volumes[i].epoch > 0) {
+            vs[n] = c->volumes[i].number;
+            es[n] = c->volumes[i].epoch;
+            n++;
+        }
+    }
+    *vols_out = vs;
+    *eps_out = es;
+    *nv_out = n;
+}
+
+struct disk_attach_arg {
+    int disk_idx;
+    uint64_t gen;
+};
+
+static void *disk_attach_worker(void *arg)
+{
+    struct disk_attach_arg *aa = arg;
+    int disk_idx = aa->disk_idx;
+    uint64_t my_gen = aa->gen;
+    free(aa);
+    unsigned backoff_ms = 500;
+
+    for (;;) {
+        char cpath[PATH_MAX] = "";
+        char path[PATH_MAX] = "";
+        uint8_t sid[16] = {0};
+        int slot = -1;
+        int can_attach = 0;
+
+        pthread_mutex_lock(&g_mu);
+        if (G.started && G.worker_gen == my_gen && disk_idx >= 0 && disk_idx < G.ndisks) {
+            struct disk_entry *d = &G.disks[disk_idx];
+            if (d->present && d->has_chunks && d->chunk_slot >= 0 && !d->meta_out && !d->damage_out &&
+                d->state != META_STORE_OUT && d->state != META_STORE_DESTROYED && d->chunks_path[0]) {
+                snprintf(cpath, sizeof cpath, "%s", d->chunks_path);
+                snprintf(path, sizeof path, "%s", d->path);
+                memcpy(sid, d->meta.store_id, 16);
+                slot = d->chunk_slot;
+                can_attach = 1;
+            }
+        }
+        pthread_mutex_unlock(&g_mu);
+        if (!can_attach)
+            break;
+
+        /* Confirm metadata has NOT marked this store OUT/DESTROYED before attaching. */
+        const struct cluster_copy *c = cluster_copy_get();
+        uint32_t *vols = NULL;
+        uint64_t *eps = NULL;
+        size_t nv = 0;
+        int meta_out_now = 0;
+        if (c) {
+            for (uint32_t m = 0; m < c->nmembers; m++) {
+                if (c->members[m].id != c->self)
+                    continue;
+                for (uint32_t k = 0; k < c->members[m].ndisks && k < META_DISKS_MAX; k++) {
+                    if (memcmp(c->members[m].disks[k].store_id, sid, 16) == 0) {
+                        uint8_t ms = c->members[m].disks[k].state;
+                        if (ms == META_STORE_OUT || ms == META_STORE_DESTROYED)
+                            meta_out_now = 1;
+                        break;
+                    }
+                }
+                break;
+            }
+            if (!meta_out_now)
+                collect_cluster_epochs(c, &vols, &eps, &nv);
+            cluster_copy_put(c);
+        }
+        if (meta_out_now) {
+            pthread_mutex_lock(&g_mu);
+            if (G.worker_gen == my_gen && disk_idx >= 0 && disk_idx < G.ndisks && G.disks[disk_idx].chunk_slot == slot)
+                G.disks[disk_idx].meta_out = 1;
+            pthread_mutex_unlock(&g_mu);
+            free(vols);
+            free(eps);
+            break;
+        }
+
+        /* Detach old parked handle under hold (no disk I/O), then open + fsync epochs OFF chunksrv_cluster_hold() so
+         * a hanging disk can never stall shutdown; reacquire hold only to install the prepared handle. */
+        int done = 0;
+        int already_up = 0, already_rep = 0, detach_ok = 0;
+        struct chunksrv *cs = chunksrv_cluster_hold();
+        if (cs) {
+            chunk_backend *be = chunksrv_backend(cs);
+            if (be) {
+                int stt = chunk_be_store_state(be, slot);
+                if (stt == CHUNK_STORE_UP)
+                    already_up = 1;
+                else if (stt == CHUNK_STORE_REPLACING)
+                    already_rep = 1;
+                else if (chunk_be_detach_for_attach(be, slot) == 0)
+                    detach_ok = 1;
+            }
+            chunksrv_cluster_release();
+        }
+        if (already_up) {
+            disks_on_replacing_settled(1ull << (unsigned)slot);
+            done = 1;
+        } else if (already_rep) {
+            done = 1;
+        } else if (detach_ok) {
+            chunk_store *ns = NULL;
+            int rc = chunk_store_prepare_attach(cpath, sid, vols, eps, nv, &ns);
+            if (rc == 0) {
+                int still_live = 0;
+                pthread_mutex_lock(&g_mu);
+                still_live = (G.started && G.worker_gen == my_gen);
+                pthread_mutex_unlock(&g_mu);
+                if (!still_live) {
+                    chunk_store_close(ns);
+                    free(vols);
+                    free(eps);
+                    break;
+                }
+                cs = chunksrv_cluster_hold();
+                if (cs) {
+                    chunk_backend *be = chunksrv_backend(cs);
+                    rc = be ? chunk_be_install_attached(be, slot, cpath, ns) : TSDB_ERR_UNAVAILABLE;
+                    if (!be)
+                        chunk_store_close(ns);
+                    chunksrv_cluster_release();
+                } else {
+                    chunk_store_close(ns);
+                    rc = TSDB_ERR_UNAVAILABLE;
+                }
+            }
+            if (rc == 0) {
+                pthread_mutex_lock(&g_mu);
+                void (*rk)(void) = NULL;
+                if (G.worker_gen == my_gen && disk_idx >= 0 && disk_idx < G.ndisks &&
+                    G.disks[disk_idx].chunk_slot == slot) {
+                    G.disks[disk_idx].fail_down = 0;
+                    G.disks[disk_idx].replacing = 1;
+                    rk = G.reconcile_kick;
+                }
+                pthread_mutex_unlock(&g_mu);
+                fprintf(stderr, "tsdbd: disks: returning disk %s (slot %d) attached as REPLACING with fences raised\n",
+                        path, slot);
+                if (rk)
+                    rk();
+                else
+                    disks_on_replacing_settled(1ull << (unsigned)slot);
+                done = 1;
+            } else {
+                fprintf(stderr, "tsdbd: disks: returning disk %s (slot %d) attach failed (%s); retrying in %u ms\n",
+                        path, slot, tsdb_strerror(rc), backoff_ms);
+            }
+        }
+        free(vols);
+        free(eps);
+        if (done)
+            break;
+
+        /* Backoff in 50 ms slices so disks_stop() or a probe relapse to DOWN exits promptly. */
+        unsigned slept = 0;
+        int stop_retry = 0;
+        while (slept < backoff_ms) {
+            struct timespec ts = {0, 50 * 1000000L};
+            nanosleep(&ts, NULL);
+            slept += 50;
+            pthread_mutex_lock(&g_mu);
+            if (!G.started || G.worker_gen != my_gen || disk_idx < 0 || disk_idx >= G.ndisks ||
+                G.disks[disk_idx].meta_out || G.disks[disk_idx].damage_out || !G.disks[disk_idx].probe_recovering ||
+                !G.disks[disk_idx].probe_down)
+                stop_retry = 1;
+            pthread_mutex_unlock(&g_mu);
+            if (stop_retry)
+                break;
+        }
+        if (stop_retry)
+            break;
+        if (backoff_ms < 2000)
+            backoff_ms *= 2;
+    }
+
+    pthread_mutex_lock(&g_mu);
+    if (G.worker_gen == my_gen) {
+        if (disk_idx >= 0 && disk_idx < G.ndisks)
+            G.disks[disk_idx].attaching = 0;
+    }
+    if (G.attach_threads > 0)
+        G.attach_threads--;
+    pthread_mutex_unlock(&g_mu);
+    return NULL;
+}
+
+/* Returns 0 if attach started/in-progress, 1 if intentionally held DOWN (OUT/damaged), -1 if no chunk slot or error. */
+int disks_chunk_attach_async(int disk_idx)
+{
+    pthread_mutex_lock(&g_mu);
+    if (!G.started || disk_idx < 0 || disk_idx >= G.ndisks) {
+        pthread_mutex_unlock(&g_mu);
+        return -1;
+    }
+    struct disk_entry *d = &G.disks[disk_idx];
+    if (d->meta_out || d->damage_out || d->state == META_STORE_OUT || d->state == META_STORE_DESTROYED) {
+        pthread_mutex_unlock(&g_mu);
+        return 1;
+    }
+    if (!d->present || !d->has_chunks || d->chunk_slot < 0) {
+        pthread_mutex_unlock(&g_mu);
+        return -1;
+    }
+    if (d->attaching) {
+        pthread_mutex_unlock(&g_mu);
+        return 0;
+    }
+    struct disk_attach_arg *aa = malloc(sizeof *aa);
+    if (!aa) {
+        pthread_mutex_unlock(&g_mu);
+        return -1;
+    }
+    aa->disk_idx = disk_idx;
+    aa->gen = G.worker_gen;
+    d->attaching = 1;
+    G.attach_threads++;
+    pthread_mutex_unlock(&g_mu);
+
+    pthread_t t;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    uint64_t my_gen = aa->gen;
+    if (pthread_create(&t, &at, disk_attach_worker, aa) != 0) {
+        free(aa);
+        pthread_mutex_lock(&g_mu);
+        if (G.worker_gen == my_gen) {
+            G.disks[disk_idx].attaching = 0;
+            if (G.attach_threads > 0)
+                G.attach_threads--;
+        }
+        pthread_mutex_unlock(&g_mu);
+        pthread_attr_destroy(&at);
+        return -1;
+    }
+    pthread_attr_destroy(&at);
+    return 0;
+}
+
+/* Recompute disk uses after a runtime STORE_CLASS change (caller holds g_mu). Returns 1 if any drain state changed. */
+static int recompute_uses_after_class_locked(int *need_drain_slot, int *need_add_disk_idx, int *n_add_out)
+{
+    int has_cap = 0;
+    for (int i = 0; i < G.ndisks; i++) {
+        if (G.disks[i].state != META_STORE_DESTROYED && G.disks[i].state != META_STORE_OUT &&
+            G.disks[i].effective_class == DISK_CLASS_HDD) {
+            has_cap = 1;
+            break;
+        }
+    }
+    int changed = 0;
+    int n_add = 0;
+    for (int i = 0; i < G.ndisks; i++) {
+        struct disk_entry *d = &G.disks[i];
+        if (d->state == META_STORE_DESTROYED)
+            continue;
+        uint8_t want_uses = d->effective_class == DISK_CLASS_HDD ? META_DISK_USE_CHUNK
+                            : has_cap                            ? META_DISK_USE_LOG
+                                                                 : (META_DISK_USE_LOG | META_DISK_USE_CHUNK);
+        if (d->uses != want_uses) {
+            d->uses = want_uses;
+            changed = 1;
+        }
+        if (d->chunk_slot >= 0 && !d->fast_only_rebuild) {
+            int want_drain = (d->out_draining || (has_cap && d->effective_class != DISK_CLASS_HDD)) ? 1 : 0;
+            if (d->draining != want_drain) {
+                d->draining = want_drain;
+                if (need_drain_slot)
+                    need_drain_slot[i] = want_drain ? 1 : -1;
+                changed = 1;
+            }
+        } else if (d->chunk_slot < 0 && d->present && d->state == META_STORE_UP &&
+                   (d->uses & META_DISK_USE_CHUNK) && G.role != META_ROLE_COMPUTE && d->path[0]) {
+            if (need_add_disk_idx && n_add < DISKS_MAX)
+                need_add_disk_idx[n_add++] = i;
+        }
+    }
+    if (n_add_out)
+        *n_add_out = n_add;
+    return changed;
+}
+
+static int g_replace_cv_init;
+
+/* Detached background worker that polls DESTROYED disk paths for a freshly initialised replacement DISK off cc_main
+ * and off chunksrv_cluster_hold(), so a hanging dead device can never stall chunk-server work or shutdown. */
+static void *disks_replace_main(void *arg)
+{
+    uint64_t my_gen = (uint64_t)(uintptr_t)arg;
+    for (;;) {
+        struct {
+            int disk_idx;
+            char path[PATH_MAX];
+            uint8_t old_sid[16];
+        } todo[DISKS_MAX];
+        int ntodo = 0;
+
+        pthread_mutex_lock(&g_mu);
+        if (!G.started || G.worker_gen != my_gen) {
+            pthread_mutex_unlock(&g_mu);
+            break;
+        }
+        for (int i = 0; i < G.ndisks && ntodo < DISKS_MAX; i++) {
+            const struct disk_entry *d = &G.disks[i];
+            if (d->state == META_STORE_DESTROYED && d->path[0]) {
+                todo[ntodo].disk_idx = i;
+                snprintf(todo[ntodo].path, sizeof todo[ntodo].path, "%s", d->path);
+                memcpy(todo[ntodo].old_sid, d->meta.store_id, 16);
+                ntodo++;
+            }
+        }
+        if (ntodo == 0) {
+            pthread_mutex_unlock(&g_mu);
+            break;
+        }
+        pthread_mutex_unlock(&g_mu);
+
+        struct cluster_self me_self;
+        int have_self = (cluster_self(&me_self) == 0 && me_self.have_node);
+        int need_persist = 0, need_kick_rec = 0, need_beat = 0;
+        if (have_self) {
+            for (int a = 0; a < ntodo; a++) {
+                int di = todo[a].disk_idx;
+                disk_meta new_dm;
+                /* Perform all potentially blocking disk I/O WITHOUT holding chunksrv_cluster_hold().
+                 * Accept an unbound DISK or one already bound to THIS (cluster, node) (e.g. if a prior poll bound
+                 * it before a transient try_lock_disk failure), as long as its store_id differs from old_sid. */
+                if (disk_load(todo[a].path, &new_dm) != 0 ||
+                    memcmp(new_dm.store_id, todo[a].old_sid, 16) == 0)
+                    continue;
+                if (new_dm.bound &&
+                    (memcmp(new_dm.cluster_uuid, me_self.uuid, 16) != 0 || new_dm.node_id != me_self.id))
+                    continue;
+                char lerr[256] = "";
+                int lfd = -1;
+                if (!new_dm.bound && disk_bind(todo[a].path, me_self.uuid, me_self.id) != 0)
+                    continue;
+                if (try_lock_disk(todo[a].path, &lfd, lerr, sizeof lerr) != 0)
+                    continue;
+                new_dm.bound = true;
+                memcpy(new_dm.cluster_uuid, me_self.uuid, 16);
+                new_dm.node_id = me_self.id;
+                uint64_t sz = fs_size_bytes(todo[a].path);
+                char cpath[PATH_MAX] = "";
+                int attach_slot = -1;
+                int adopted = 0;
+                pthread_mutex_lock(&g_mu);
+                if (G.started && G.worker_gen == my_gen && di < G.ndisks && G.disks[di].state == META_STORE_DESTROYED &&
+                    memcmp(G.disks[di].meta.store_id, todo[a].old_sid, 16) == 0) {
+                    struct disk_entry *d = &G.disks[di];
+                    if (d->lock_fd >= 0)
+                        close(d->lock_fd);
+                    d->lock_fd = lfd;
+                    lfd = -1;
+                    d->meta = new_dm;
+                    d->effective_class = new_dm.disk_class;
+                    d->sync_us = new_dm.sync_p50_us;
+                    d->size_bytes = sz;
+                    d->present = 1;
+                    d->state = META_STORE_UP;
+                    d->meta_out = 0;
+                    d->io_down = 0;
+                    d->fail_down = 0;
+                    d->damage_out = 0;
+                    d->probe_down = 0;
+                    d->probe_recovering = 0;
+                    d->out_draining = 0;
+                    d->out_no_local_room = 0;
+                    d->draining = 0;
+                    d->drain_no_space = 0;
+                    d->usage_have = 0;
+                    d->usage_size = 0;
+                    d->usage_fill_flags = 0;
+                    d->usage_full = 0;
+                    d->usage_chunk_full = 0;
+                    d->usage_chunk_rb_full = 0;
+                    int has_cap = 0;
+                    for (int j = 0; j < G.ndisks; j++)
+                        if (G.disks[j].state != META_STORE_DESTROYED && G.disks[j].effective_class == DISK_CLASS_HDD)
+                            has_cap = 1;
+                    d->uses = d->effective_class == DISK_CLASS_HDD ? META_DISK_USE_CHUNK
+                              : has_cap                            ? META_DISK_USE_LOG
+                                                                   : (META_DISK_USE_LOG | META_DISK_USE_CHUNK);
+                    if ((d->uses & META_DISK_USE_CHUNK) && G.role != META_ROLE_COMPUTE && d->chunk_slot >= 0) {
+                        d->has_chunks = 1;
+                        snprintf(d->chunks_path, sizeof d->chunks_path, "%s/chunks", todo[a].path);
+                        snprintf(cpath, sizeof cpath, "%s", d->chunks_path);
+                        attach_slot = d->chunk_slot;
+                    }
+                    adopted = 1;
+                }
+                pthread_mutex_unlock(&g_mu);
+                if (lfd >= 0)
+                    close(lfd);
+                if (!adopted)
+                    continue;
+                if (attach_slot >= 0 && cpath[0]) {
+                    uint8_t cid[16];
+                    if (chunk_store_meta_read(cpath, cid, NULL) == TSDB_ERR_NOTFOUND)
+                        (void)chunk_store_init(cpath, new_dm.store_id, NULL);
+                    uint32_t *vols = NULL;
+                    uint64_t *eps = NULL;
+                    size_t nv = 0;
+                    const struct cluster_copy *cc = cluster_copy_get();
+                    if (cc) {
+                        collect_cluster_epochs(cc, &vols, &eps, &nv);
+                        cluster_copy_put(cc);
+                    }
+                    /* Open and raise fences OFF chunksrv_cluster_hold(), then take hold only to install. */
+                    chunk_store *ns = NULL;
+                    if (chunk_store_prepare_attach(cpath, new_dm.store_id, vols, eps, nv, &ns) == 0) {
+                        struct chunksrv *cs = chunksrv_cluster_hold();
+                        if (cs) {
+                            chunk_backend *be = chunksrv_backend(cs);
+                            if (!be || chunk_be_detach_for_attach(be, attach_slot) != 0) {
+                                chunk_store_close(ns);
+                            } else if (chunk_be_install_attached(be, attach_slot, cpath, ns) == 0) {
+                                pthread_mutex_lock(&g_mu);
+                                if (G.worker_gen == my_gen && di < G.ndisks)
+                                    G.disks[di].replacing = 1;
+                                pthread_mutex_unlock(&g_mu);
+                                need_kick_rec = 1;
+                            }
+                            chunksrv_cluster_release();
+                        } else {
+                            chunk_store_close(ns);
+                        }
+                    }
+                    free(vols);
+                    free(eps);
+                }
+                disk_probe_set_up(di);
+                char nhex[33];
+                chunk_oid_hex(new_dm.store_id, nhex);
+                fprintf(stderr, "tsdbd: disks: adopted replacement disk %s (new store %s, class %s)\n", todo[a].path,
+                        nhex, disk_class_name(new_dm.disk_class));
+                need_persist = 1;
+                need_beat = 1;
+            }
+        }
+        tsdb_wipe(&me_self, sizeof me_self);
+
+        if (need_persist)
+            persist_known_from_state();
+        if (need_kick_rec)
+            kick_reconcile_unlocked();
+        if (need_beat)
+            cluster_beat_soon();
+
+        pthread_mutex_lock(&g_mu);
+        if (!G.started || G.worker_gen != my_gen) {
+            pthread_mutex_unlock(&g_mu);
+            break;
+        }
+        int still = 0;
+        for (int i = 0; i < G.ndisks; i++)
+            if (G.disks[i].state == META_STORE_DESTROYED && G.disks[i].path[0])
+                still = 1;
+        if (!still) {
+            pthread_mutex_unlock(&g_mu);
+            break;
+        }
+        struct timespec dl;
+        tsdb_cond_deadline_ns(&dl, 1000ll * 1000000ll);
+        pthread_cond_timedwait(&G.replace_cv, &g_mu, &dl);
+        pthread_mutex_unlock(&g_mu);
+    }
+
+    pthread_mutex_lock(&g_mu);
+    if (G.replace_thr_running > 0)
+        G.replace_thr_running--;
+    pthread_mutex_unlock(&g_mu);
+    return NULL;
+}
+
+static void disks_replace_ensure_locked(void)
+{
+    if (!G.started)
+        return;
+    if (!g_replace_cv_init) {
+        tsdb_cond_init_mono(&G.replace_cv);
+        g_replace_cv_init = 1;
+    }
+    if (G.replace_thr_running > 0) {
+        pthread_cond_broadcast(&G.replace_cv);
+        return;
+    }
+    pthread_t t;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &at, disks_replace_main, (void *)(uintptr_t)G.worker_gen) == 0)
+        G.replace_thr_running++;
+    pthread_attr_destroy(&at);
+}
+
+void disks_sync_copy(const struct cluster_copy *c)
+{
+    if (!c || !c->self || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+
+    const struct cluster_copy_member *me = NULL;
+    for (uint32_t m = 0; m < c->nmembers; m++) {
+        if (c->members[m].id == c->self) {
+            me = &c->members[m];
+            break;
+        }
+    }
+    if (!me)
+        return;
+
+    enum { ACT_NONE = 0, ACT_OUT_DRAIN = 1, ACT_OUT_RETIRE = 2, ACT_DESTROYED = 3 };
+    struct {
+        int disk_idx;
+        int action;
+        int slot;
+        char path[PATH_MAX];
+    } acts[DISKS_MAX];
+    int nacts = 0;
+
+    int class_changed = 0;
+    int drain_delta[DISKS_MAX] = {0};
+    int add_disks[DISKS_MAX];
+    int n_add = 0;
+    int any_destroyed = 0;
+
+    pthread_mutex_lock(&g_mu);
+    if (!G.started) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+
+    for (int i = 0; i < G.ndisks; i++) {
+        struct disk_entry *d = &G.disks[i];
+        const struct meta_disk *md = NULL;
+        for (uint32_t k = 0; k < me->ndisks && k < META_DISKS_MAX; k++) {
+            if (memcmp(me->disks[k].store_id, d->meta.store_id, 16) == 0) {
+                md = &me->disks[k];
+                break;
+            }
+        }
+        if (!md)
+            continue;
+
+        if (md->state == META_STORE_DESTROYED) {
+            int newly_destroyed = (d->state != META_STORE_DESTROYED);
+            d->meta_out = 1;
+            d->state = META_STORE_DESTROYED;
+            d->draining = 0;
+            d->out_draining = 0;
+            d->out_no_local_room = 0;
+            if (d->lock_fd >= 0) {
+                close(d->lock_fd);
+                d->lock_fd = -1;
+            }
+            if (d->path[0])
+                any_destroyed = 1;
+            if (newly_destroyed && nacts < DISKS_MAX) {
+                acts[nacts].disk_idx = i;
+                acts[nacts].action = ACT_DESTROYED;
+                acts[nacts].slot = d->chunk_slot;
+                snprintf(acts[nacts].path, sizeof acts[nacts].path, "%s", d->path);
+                nacts++;
+            }
+            continue;
+        }
+
+        if (md->state == META_STORE_OUT && !d->meta_out) {
+            d->meta_out = 1;
+            d->state = META_STORE_OUT;
+            if (d->chunk_slot >= 0 && !d->fast_only_rebuild) {
+                int readable = d->present && !d->io_down && !d->fail_down && !d->damage_out && !d->probe_down;
+                if (readable) {
+                    d->out_draining = 1;
+                    d->draining = 1;
+                    if (nacts < DISKS_MAX) {
+                        acts[nacts].disk_idx = i;
+                        acts[nacts].action = ACT_OUT_DRAIN;
+                        acts[nacts].slot = d->chunk_slot;
+                        snprintf(acts[nacts].path, sizeof acts[nacts].path, "%s", d->path);
+                        nacts++;
+                    }
+                } else {
+                    d->out_draining = 0;
+                    d->draining = 0;
+                    if (d->lock_fd >= 0) {
+                        close(d->lock_fd);
+                        d->lock_fd = -1;
+                    }
+                    if (nacts < DISKS_MAX) {
+                        acts[nacts].disk_idx = i;
+                        acts[nacts].action = ACT_OUT_RETIRE;
+                        acts[nacts].slot = d->chunk_slot;
+                        snprintf(acts[nacts].path, sizeof acts[nacts].path, "%s", d->path);
+                        nacts++;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (md->disk_class >= META_DISK_NVME && md->disk_class <= META_DISK_CLASS_LAST &&
+            (int)md->disk_class != d->effective_class) {
+            fprintf(stderr, "tsdbd: disks: disk %s class changed in metadata %s -> %s\n", d->path,
+                    meta_disk_class_name(d->effective_class), meta_disk_class_name(md->disk_class));
+            d->effective_class = (int)md->disk_class;
+            class_changed = 1;
+        }
+    }
+
+    if (class_changed)
+        (void)recompute_uses_after_class_locked(drain_delta, add_disks, &n_add);
+    if (any_destroyed)
+        disks_replace_ensure_locked();
+    pthread_mutex_unlock(&g_mu);
+
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    chunk_backend *be = cs ? chunksrv_backend(cs) : NULL;
+    int need_kick_drain = 0;
+    int need_kick_rec = 0;
+    int need_persist = 0;
+    int need_beat = 0;
+
+    if (class_changed) {
+        need_persist = 1;
+        need_beat = 1;
+        if (be) {
+            for (int i = 0; i < DISKS_MAX; i++) {
+                if (drain_delta[i] == 0)
+                    continue;
+                int slot = -1;
+                pthread_mutex_lock(&g_mu);
+                if (i < G.ndisks)
+                    slot = G.disks[i].chunk_slot;
+                pthread_mutex_unlock(&g_mu);
+                if (slot >= 0) {
+                    chunk_be_set_draining(be, slot, drain_delta[i] > 0);
+                    if (drain_delta[i] > 0)
+                        need_kick_drain = 1;
+                }
+            }
+        }
+        /* Do NOT mutate chunksrv's fixed store slot table at runtime (that would leave chunksrv->n stale and shift
+         * hash%n placement); persist DISKS and log that a restart is required for a newly chunk-capable slot. */
+        for (int k = 0; k < n_add; k++) {
+            int di = add_disks[k];
+            char dpath[PATH_MAX] = "";
+            int cls = DISK_CLASS_NONE;
+            pthread_mutex_lock(&g_mu);
+            if (di < G.ndisks && G.disks[di].present && G.disks[di].chunk_slot < 0) {
+                snprintf(dpath, sizeof dpath, "%s", G.disks[di].path);
+                cls = G.disks[di].effective_class;
+            }
+            pthread_mutex_unlock(&g_mu);
+            if (dpath[0]) {
+                fprintf(stderr,
+                        "tsdbd: disks: disk %s class changed to %s (new chunk slot requires server restart)\n", dpath,
+                        disk_class_name(cls));
+            }
+        }
+    }
+
+    for (int a = 0; a < nacts; a++) {
+        int slot = acts[a].slot;
+        if (acts[a].action == ACT_OUT_DRAIN) {
+            if (be && slot >= 0)
+                chunk_be_set_draining(be, slot, true);
+            need_kick_drain = 1;
+            need_beat = 1;
+            fprintf(stderr,
+                    "tsdbd: disks: disk %s (slot %d) marked OUT while readable: draining locally via r13-lmove\n",
+                    acts[a].path, slot);
+        } else if (acts[a].action == ACT_OUT_RETIRE) {
+            if (be && slot >= 0) {
+                (void)chunk_be_mark_lost(be, slot);
+                chunk_be_release_down(be, slot);
+            }
+            if (slot >= 0) {
+                int target = disks_pick_rebuild_store(slot);
+                fprintf(stderr,
+                        "tsdbd: disks: disk %s (slot %d) marked OUT while down/failed: local rebuild target=%d\n",
+                        acts[a].path, slot, target);
+            }
+            need_kick_rec = 1;
+            need_beat = 1;
+        } else if (acts[a].action == ACT_DESTROYED) {
+            if (be && slot >= 0) {
+                int stt = chunk_be_store_state(be, slot);
+                if (stt == CHUNK_STORE_UP || stt == CHUNK_STORE_REPLACING)
+                    (void)chunk_be_mark_lost(be, slot);
+                chunk_be_release_down(be, slot);
+            }
+        }
+    }
+
+    if (cs)
+        chunksrv_cluster_release();
+
+    if (need_persist)
+        persist_known_from_state();
+    if (need_kick_drain) {
+        pthread_mutex_lock(&g_mu);
+        if (G.drain_started && !G.drain_stop && !G.drain_thr_running) {
+            if (pthread_create(&G.drain_thr, NULL, disks_drain_main, NULL) == 0)
+                G.drain_thr_running = 1;
+        }
+        G.drain_kick = 1;
+        pthread_cond_broadcast(&G.drain_cv);
+        pthread_mutex_unlock(&g_mu);
+    }
+    if (need_kick_rec)
+        kick_reconcile_unlocked();
+    if (need_beat)
+        cluster_beat_soon();
+}
+
 void disks_stop(void)
 {
+    pthread_mutex_lock(&g_mu);
+    G.worker_gen++;
+    G.reconcile_kick = NULL;
+    if (g_replace_cv_init)
+        pthread_cond_broadcast(&G.replace_cv);
+    pthread_mutex_unlock(&g_mu);
+    /* Bounded wait (up to 500 ms in 25 ms slices, matching disk_usage_stop) only while detached workers are active. */
+    for (int i = 0; i < 20; i++) {
+        pthread_mutex_lock(&g_mu);
+        int busy = (G.attach_threads > 0 || G.replace_thr_running > 0);
+        pthread_mutex_unlock(&g_mu);
+        if (!busy)
+            break;
+        struct timespec ts = {0, 25 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
     disk_usage_stop();
     disks_drain_stop();
     disk_probe_stop();

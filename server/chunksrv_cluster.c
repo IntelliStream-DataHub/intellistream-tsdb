@@ -115,9 +115,7 @@ static int cc_on_damage(void *ctx, const chunk_scrub_damage *dmg)
 static void cc_on_out(void *ctx, int store_idx, uint64_t day_damaged)
 {
     (void)ctx;
-    (void)store_idx;
-    (void)day_damaged;
-    cluster_beat_soon();
+    disks_chunk_damaged_out(store_idx, day_damaged);
 }
 
 static void cc_on_store_fault(void *ctx, int store_idx, int err_code)
@@ -635,6 +633,7 @@ static void *cc_main(void *arg)
                 const struct cluster_copy *c = cluster_copy_get();
                 if (c) {
                     set_peers(cs, c, self);
+                    disks_sync_copy(c);
                     uint32_t nd = (!G.scrub_days_ov && c->scrub_days > 0) ? c->scrub_days : G.applied_scrub_days;
                     uint32_t nm = (!G.scrub_mb_s_ov && c->scrub_mb_s > 0) ? c->scrub_mb_s : G.applied_scrub_mb_s;
                     uint32_t no =

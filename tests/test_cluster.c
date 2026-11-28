@@ -31318,6 +31318,680 @@ static void scen_diskeio(void)
 #endif
 }
 
+/* Helpers for R13 r13-dev (`diskout` scenario). */
+static int disk_meta_state(int srv, uint32_t node_id, const uint8_t store_id[16])
+{
+    struct view vw;
+    view(leader_of(srv), &vw);
+    int st = -1;
+    const struct meta_member *mb = meta_member(&vw.m, node_id);
+    if (mb) {
+        const struct meta_disk *d = meta_member_disk(mb, store_id);
+        if (d)
+            st = (int)d->state;
+    }
+    view_free(&vw);
+    return st;
+}
+
+static int disk_meta_class(int srv, uint32_t node_id, const uint8_t store_id[16])
+{
+    struct view vw;
+    view(leader_of(srv), &vw);
+    int cls = -1;
+    const struct meta_member *mb = meta_member(&vw.m, node_id);
+    if (mb) {
+        const struct meta_disk *d = meta_member_disk(mb, store_id);
+        if (d)
+            cls = (int)d->disk_class;
+    }
+    view_free(&vw);
+    return cls;
+}
+
+static uint64_t sum_chunk_k_bounds_in(const char *disk_path, uint32_t vol, uint64_t *min_k_out, uint64_t *max_k_out)
+{
+    char dir[PATH_MAX + 64];
+    snprintf(dir, sizeof dir, "%s/chunks/s%" PRIu32, disk_path, vol);
+    DIR *d = opendir(dir);
+    if (min_k_out)
+        *min_k_out = 0;
+    if (max_k_out)
+        *max_k_out = 0;
+    if (!d)
+        return 0;
+    uint64_t total = 0, min_k = 0, max_k = 0;
+    for (struct dirent *de; (de = readdir(d)) != NULL;) {
+        size_t l = strlen(de->d_name);
+        if (l <= 6 || strcmp(de->d_name + l - 6, ".chunk") != 0)
+            continue;
+        char fp[PATH_MAX + 128];
+        if ((size_t)snprintf(fp, sizeof fp, "%s/%s", dir, de->d_name) >= sizeof fp)
+            continue;
+        int fd = open(fp, O_RDONLY);
+        if (fd < 0)
+            continue;
+        uint8_t hbuf[CHUNK_HDR_BYTES];
+        ssize_t nr = pread(fd, hbuf, sizeof hbuf, 0);
+        close(fd);
+        chunk_hdr h;
+        if (nr == (ssize_t)sizeof hbuf && chunk_hdr_decode(hbuf, &h) == 0) {
+            total += chunk_pos_len(&h.g, h.pos);
+            unsigned np = chunk_npos(&h.g);
+            uint64_t lens[CHUNK_POS_MAX];
+            unsigned n = 0;
+            for (unsigned p = 0; p < np && n < CHUNK_POS_MAX; p++)
+                if (p != h.pos)
+                    lens[n++] = chunk_pos_len(&h.g, p);
+            for (unsigned a = 0; a < n; a++)
+                for (unsigned b = a + 1; b < n; b++)
+                    if (lens[b] < lens[a]) {
+                        uint64_t tmp = lens[a];
+                        lens[a] = lens[b];
+                        lens[b] = tmp;
+                    }
+            for (unsigned i = 0; i < h.g.k && i < n; i++) {
+                min_k += lens[i];
+                max_k += lens[n - 1 - i];
+            }
+        }
+    }
+    closedir(d);
+    if (min_k_out)
+        *min_k_out = min_k;
+    if (max_k_out)
+        *max_k_out = max_k;
+    return total;
+}
+
+static int64_t sum_peer_chunk_read_bytes(const int *mports, int n, int skip_idx)
+{
+    int64_t tot = 0;
+    char mbuf[65536];
+    for (int i = 0; i < n; i++) {
+        if (i == skip_idx || mports[i] <= 0)
+            continue;
+        metrics_get(mports[i], mbuf, sizeof mbuf);
+        int64_t v = 0;
+        if (metrics_find_i64(mbuf, "\ntsdb_chunk_srv_bytes_total{op=\"read\"} ", &v))
+            tot += v;
+    }
+    return tot;
+}
+
+static int corrupt_chunks_in(const char *disk_path, uint32_t vol, int max_files)
+{
+    char dir[PATH_MAX + 64];
+    snprintf(dir, sizeof dir, "%s/chunks/s%" PRIu32, disk_path, vol);
+    DIR *d = opendir(dir);
+    if (!d)
+        return 0;
+    int done = 0;
+    for (struct dirent *de; done < max_files && (de = readdir(d)) != NULL;) {
+        size_t l = strlen(de->d_name);
+        if (l <= 6 || strcmp(de->d_name + l - 6, ".chunk") != 0)
+            continue;
+        char fp[PATH_MAX + 128];
+        if ((size_t)snprintf(fp, sizeof fp, "%s/%s", dir, de->d_name) >= sizeof fp)
+            continue;
+        int fd = open(fp, O_RDWR);
+        if (fd < 0)
+            continue;
+        uint8_t b = 0;
+        if (pread(fd, &b, 1, CHUNK_HDR_BYTES + 16) == 1) {
+            b ^= 0xffu;
+            if (pwrite(fd, &b, 1, CHUNK_HDR_BYTES + 16) == 1) {
+                (void)fsync(fd);
+                done++;
+            }
+        }
+        close(fd);
+    }
+    closedir(d);
+    return done;
+}
+
+static int rm_tree_cb(const char *p, const struct stat *sb, int tf, struct FTW *ftw)
+{
+    (void)sb;
+    (void)tf;
+    (void)ftw;
+    return remove(p);
+}
+
+/* R13 (r13-dev; E12, E27, E54, §5.5, §15.6): per-disk DOWN/OUT timers respecting member holds & r12-chunk scrub
+ * damage count, clean attach without rebuild on return before OUT, capacity-store OUT local rebuild onto sibling HDD
+ * (NEVER onto NVMe; exact k * lost peer bytes read), fast-disk OUT log replica rebuild while HDD serves reads, and
+ * CLI `disk out` (readable local drain, 0 peer decode bytes), `disk replace`, `disk class`.
+ * Planted mutants (TSDB_DISKS_MUTANT): devoutnohold, rebuildtofast, damagenoout. */
+static void scen_diskout(void)
+{
+    scenario("diskout");
+#ifndef TSDB_EC
+    printf("  skipped: no erasure codec in this build\n");
+    return;
+#else
+    const char *so, *skip = outagefs_skip(&so);
+    if (skip) {
+        printf("  skipped: %s\n", skip);
+        return;
+    }
+
+    enum { ND = 6 };
+    char n0_nv0[PATH_MAX], n0_nv1[PATH_MAX], n0_h0[PATH_MAX], n0_h1[PATH_MAX];
+    char peer_nv[ND][PATH_MAX], peer_hd[ND][PATH_MAX];
+    snprintf(n0_nv0, sizeof n0_nv0, "%s/n0_nv0", base);
+    snprintf(n0_nv1, sizeof n0_nv1, "%s/n0_nv1", base);
+    snprintf(n0_h0, sizeof n0_h0, "%s/n0_h0", base);
+    snprintf(n0_h1, sizeof n0_h1, "%s/n0_h1", base);
+    disk_make(n0_nv0, "nvme");
+    disk_make(n0_nv1, "nvme");
+    disk_make(n0_h0, "hdd");
+    disk_make(n0_h1, "hdd");
+    for (int i = 1; i < ND; i++) {
+        snprintf(peer_nv[i], sizeof peer_nv[i], "%s/n%d_nv", base, i);
+        snprintf(peer_hd[i], sizeof peer_hd[i], "%s/n%d_hd", base, i);
+        disk_make(peer_nv[i], "nvme");
+        disk_make(peer_hd[i], "hdd");
+    }
+
+    disk_meta dm_nv0, dm_nv1, dm_h0, dm_h1, dm_n1_hd;
+    if (disk_load(n0_nv0, &dm_nv0) != 0 || disk_load(n0_nv1, &dm_nv1) != 0 || disk_load(n0_h0, &dm_h0) != 0 ||
+        disk_load(n0_h1, &dm_h1) != 0 || disk_load(peer_hd[1], &dm_n1_hd) != 0)
+        die("diskout: disk_load failed");
+
+    char ctl[104];
+    int unlink_ctl = 0;
+    if ((size_t)snprintf(ctl, sizeof ctl, "%s/ofs.ctl", base) >= sizeof ctl - 4) {
+        snprintf(ctl, sizeof ctl, "/tmp/tsdb-do-%d.ctl", (int)getpid());
+        unlink_ctl = 1;
+    }
+    unlink(ctl);
+
+    static char xa[ND][PATH_MAX * 4 + 256];
+    static char pe0[PATH_MAX * 2 + 256];
+    for (int i = 0; i < ND; i++) {
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+    }
+    snprintf(xa[0], sizeof xa[0],
+             "--disk %s:nvme --disk %s:nvme --disk %s:hdd --disk %s:hdd --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             n0_nv0, n0_nv1, n0_h0, n0_h1);
+    snprintf(pe0, sizeof pe0,
+             "LD_PRELOAD=%s OUTAGEFS_ROOTS=%s OUTAGEFS_CTL=%s "
+             "TSDBD_TEST_HEALTH=read=250,write=350,recover=800,fast=400",
+             so, n0_h0, ctl);
+    xargs[0] = xa[0];
+    penv[0] = pe0;
+    for (int i = 1; i < ND; i++) {
+        snprintf(xa[i], sizeof xa[i],
+                 "--io epoll --disk %s:nvme --disk %s:hdd --metrics-port auto "
+                 "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+                 peer_nv[i], peer_hd[i]);
+        xargs[i] = xa[i];
+        if (i == 1)
+            penv[i] = "TSDB_CHUNKSCRUB_TEST=interval_ms=200,mb_s=50";
+    }
+
+    int mports[ND] = {0};
+    for (int i = 0; i < ND; i++) {
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < ND; i++)
+        node_add(0, i);
+
+    unsigned five = 5;
+    await_view(0, p_voters, &five, "diskout: 5 voters");
+    struct disks_want w0 = {ids[0], 4, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w0, "diskout: node 0 disks");
+    for (int i = 1; i < ND; i++) {
+        struct disks_want wi = {ids[i], 2, META_ROLE_BOTH, META_CAP_BOTH};
+        await_view(0, p_member_disks, &wi, "diskout: peer disks");
+    }
+
+    char cout[256];
+    for (uint64_t t0 = now_ms(); outagefs_cmd(ctl, "state", cout, sizeof cout) != 0; usleep(50000))
+        if (now_ms() - t0 > 10000)
+            die("diskout: outagefs control socket %s not ready", ctl);
+
+    char p0[META_ADDR_MAX], args[1024], out[4096];
+    peer_of(0, p0, sizeof p0);
+    snprintf(args, sizeof args,
+             "cluster settings set %s failstop_out_s=3 rebuild_after_s=15 scrub_out_count=1 balance=off "
+             "--secret-file %s",
+             p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "settings updated"))
+        die("diskout: settings set failed:\n%s", out);
+
+    /* Create EC 4+2 volume `do42` (all 6 nodes in stripe) and replicated twin `dotwin`. */
+    uint32_t ec_num = 0, tw_num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "do42", 0, 4, 2, &ec_num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("diskout: vol_add_ec 4+2: %s (%s)", cluster_strerror(rc), text);
+    if ((rc = vol_add(0, "dotwin", 3, &tw_num)) != 0)
+        die("diskout: vol_add twin: %s", cluster_strerror(rc));
+
+    struct meta_volume mv, mt;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "do42", &mv) || !mv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("diskout: no leader for do42");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "dotwin", &mt) || !mt.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("diskout: no leader for dotwin");
+    int L = server_of(mv.leader);
+    int Lt = server_of(mt.leader);
+    await_isr(0, "do42", (int)mv.nrep, 30000, "diskout: do42 ISR full");
+    await_isr(0, "dotwin", (int)mt.nrep, 30000, "diskout: dotwin ISR full");
+
+    /* Settle distinct partitions until n0/h0 has >= 2 chunks AND n0/h1 has >= 1 chunk AND n1/hd has >= 2 chunks. */
+    tsdbc *ce = client(L);
+    tsdbc *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "do.s%d", s);
+        ide[s] = ecb_series(ce, nm, "do42");
+        idt[s] = ecb_series(ct, nm, "dotwin");
+    }
+    const int64_t day0 = 1704067200000LL;
+    const int64_t part_step = 30LL * 86400000LL;
+    int days_written = 0;
+    for (int d = 0; d < 16; d++) {
+        int64_t day = day0 + (int64_t)d * part_step;
+        for (int b = 0; b < 2; b++) {
+            for (int s = 0; s < ECB_SERIES; s++) {
+                int64_t ts[ECB_ROWS];
+                float val[ECB_ROWS];
+                ecb_rows_of(s, b, day, ts, val);
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ce, ide[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("diskout: insert do42: %s", ers(rc));
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("diskout: insert twin: %s", ers(rc));
+            }
+            usleep(400000);
+        }
+        days_written++;
+        for (uint64_t t0 = now_ms();
+             count_chunk_files_in(n0_h0, ec_num) + count_chunk_files_in(n0_h1, ec_num) < days_written; usleep(200000))
+            if (now_ms() - t0 > 60000)
+                die("diskout: day %d did not settle in 60 s", d);
+        if (count_chunk_files_in(n0_h0, ec_num) >= 2 && count_chunk_files_in(n0_h1, ec_num) >= 1 &&
+            count_chunk_files_in(peer_hd[1], ec_num) >= 2)
+            break;
+    }
+    /* Wait for any trailing merge/settle of the last written partition to finish so background I/O stays quiet. */
+    {
+        int prev_tot = -1, stable = 0;
+        for (int k = 0; k < 25; k++) {
+            usleep(200000);
+            int cur_tot = count_chunk_files_in(n0_h0, ec_num) + count_chunk_files_in(n0_h1, ec_num);
+            if (cur_tot == prev_tot) {
+                if (++stable >= 8)
+                    break;
+            } else {
+                prev_tot = cur_tot;
+                stable = 0;
+            }
+        }
+    }
+    int h0_cnt = count_chunk_files_in(n0_h0, ec_num);
+    int h1_cnt = count_chunk_files_in(n0_h1, ec_num);
+    if (h0_cnt < 2 || h1_cnt < 1)
+        die("diskout: expected >=2 chunks on h0 and >=1 on h1 (got h0=%d h1=%d)", h0_cnt, h1_cnt);
+    if (count_chunk_files_in(n0_nv0, ec_num) != 0 || count_chunk_files_in(n0_nv1, ec_num) != 0)
+        die("diskout: unexpected chunks on NVMe before fault");
+    printf("  settled %d partitions: n0 h0=%d h1=%d, n1 hd=%d\n", days_written, h0_cnt, h1_cnt,
+           count_chunk_files_in(peer_hd[1], ec_num));
+
+    /* ---- 1. Member hold prevents device OUT past failstop_out_s (catches devoutnohold) ---- */
+    snprintf(args, sizeof args, "cluster node hold %s %" PRIu32 " --for 120s --secret-file %s", p0, ids[0], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "held against automatic OUT"))
+        die("diskout: node hold failed:\n%s", out);
+
+    char cmd[PATH_MAX + 32];
+    snprintf(cmd, sizeof cmd, "eio %s", n0_h0);
+    if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+        die("diskout: outagefs '%s' failed: %s", cmd, cout);
+
+    /* Wait for h0 to be committed META_STORE_DOWN in metadata. */
+    for (uint64_t t0 = now_ms(); disk_meta_state(0, ids[0], dm_h0.store_id) != META_STORE_DOWN; usleep(150000))
+        if (now_ms() - t0 > 20000)
+            die("diskout: h0 did not become META_STORE_DOWN under EIO (state=%d)",
+                disk_meta_state(0, ids[0], dm_h0.store_id));
+
+    /* Wait past failstop_out_s (3 s) + slack (3 s): h0 MUST remain META_STORE_DOWN while node 0 is held. */
+    for (int k = 0; k < 30; k++) {
+        usleep(200000);
+        int st = disk_meta_state(0, ids[0], dm_h0.store_id);
+        if (st == META_STORE_OUT)
+            die("diskout: h0 marked META_STORE_OUT while node 0 was held (devoutnohold!)");
+    }
+    printf("  1. member hold kept DOWN h0 from going OUT past failstop_out_s\n");
+
+    /* ---- 2. Store returning before OUT attaches cleanly with zero rebuild ---- */
+    int64_t peer_rd_before_ret = sum_peer_chunk_read_bytes(mports, ND, 0);
+    snprintf(cmd, sizeof cmd, "heal %s", n0_h0);
+    if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+        die("diskout: outagefs '%s' failed: %s", cmd, cout);
+
+    for (uint64_t t0 = now_ms(); disk_meta_state(0, ids[0], dm_h0.store_id) != META_STORE_UP; usleep(150000))
+        if (now_ms() - t0 > 30000)
+            die("diskout: returning h0 did not attach and return META_STORE_UP (state=%d)",
+                disk_meta_state(0, ids[0], dm_h0.store_id));
+    int64_t peer_rd_after_ret = sum_peer_chunk_read_bytes(mports, ND, 0);
+    if (peer_rd_after_ret != peer_rd_before_ret)
+        die("diskout: returning h0 before OUT read %" PRId64 " peer bytes (expected 0 rebuild)",
+            peer_rd_after_ret - peer_rd_before_ret);
+    printf("  2. returning h0 attached cleanly before OUT (0 peer rebuild bytes)\n");
+
+    /* Release node 0 hold. */
+    snprintf(args, sizeof args, "cluster node hold %s %" PRIu32 " --release --secret-file %s", p0, ids[0], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "hold released"))
+        die("diskout: node hold --release failed:\n%s", out);
+
+    /* ---- 3. Capacity store OUT rebuilds onto sibling HDD (NOT NVMe; catches rebuildtofast; peer bytes == k*lost) ---- */
+    uint64_t min_k_bytes = 0, max_k_bytes = 0;
+    uint64_t lost_cell_bytes = sum_chunk_k_bounds_in(n0_h0, ec_num, &min_k_bytes, &max_k_bytes);
+    if (lost_cell_bytes == 0 || min_k_bytes == 0)
+        die("diskout: lost_cell_bytes == 0 on h0");
+    h0_cnt = count_chunk_files_in(n0_h0, ec_num);
+    h1_cnt = count_chunk_files_in(n0_h1, ec_num);
+    int64_t peer_rd_before_out = sum_peer_chunk_read_bytes(mports, ND, 0);
+
+    snprintf(cmd, sizeof cmd, "eio %s", n0_h0);
+    if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+        die("diskout: outagefs '%s' failed: %s", cmd, cout);
+
+    /* Wait for h0 to reach META_STORE_OUT via automatic timer (failstop_out_s=3 / rebuild_after_s=15). */
+    for (uint64_t t0 = now_ms(); disk_meta_state(0, ids[0], dm_h0.store_id) != META_STORE_OUT; usleep(200000))
+        if (now_ms() - t0 > 35000)
+            die("diskout: h0 did not transition to META_STORE_OUT (state=%d)",
+                disk_meta_state(0, ids[0], dm_h0.store_id));
+
+    /* Wait for lost chunks to be rebuilt onto sibling HDD h1 (or fail fast if any chunk landed on NVMe!). */
+    for (uint64_t t0 = now_ms(); count_chunk_files_in(n0_h1, ec_num) < h1_cnt + h0_cnt; usleep(200000)) {
+        int nv_c = count_chunk_files_in(n0_nv0, ec_num) + count_chunk_files_in(n0_nv1, ec_num);
+        if (nv_c > 0)
+            die("diskout: %d rebuilt chunk(s) landed on NVMe fast disk (rebuildtofast!)", nv_c);
+        if (now_ms() - t0 > 60000)
+            die("diskout: h0 chunks did not rebuild onto sibling HDD h1 in 60 s (h1=%d, want >=%d, nv=%d)",
+                count_chunk_files_in(n0_h1, ec_num), h1_cnt + h0_cnt, nv_c);
+    }
+    if (count_chunk_files_in(n0_nv0, ec_num) != 0 || count_chunk_files_in(n0_nv1, ec_num) != 0)
+        die("diskout: rebuilt chunks landed on NVMe fast disk (rebuildtofast!)");
+
+    int64_t peer_rd_after_out = sum_peer_chunk_read_bytes(mports, ND, 0);
+    int64_t peer_rd_delta = peer_rd_after_out - peer_rd_before_out;
+    if (peer_rd_delta < (int64_t)min_k_bytes || peer_rd_delta > (int64_t)max_k_bytes)
+        die("diskout: peer chunk read bytes %" PRId64 " outside k*lost bounds [%" PRIu64 ", %" PRIu64
+            "] (lost=%" PRIu64 ")",
+            peer_rd_delta, min_k_bytes, max_k_bytes, lost_cell_bytes);
+
+    /* Verify reads of do42 match dotwin bit-exact. */
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(ct, idt[s], &b)) != 0 || (rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != b.n || a.h != b.h)
+            die("diskout: post-HDD-OUT read mismatch series %d (rc=%d)", s, rc);
+    }
+    printf("  3. HDD h0 OUT rebuilt %d chunks onto sibling HDD h1 (0 on NVMe), peer bytes=%" PRId64 " == 4*lost, "
+           "reads bit-exact\n",
+           h0_cnt, peer_rd_delta);
+
+    /* ---- 4. CLI `disk replace` adopts a newly initialised disk at h0 ---- */
+    char hex_h0[33], hex_h1[33], hex_h0_new[33];
+    chunk_oid_hex(dm_h0.store_id, hex_h0);
+    chunk_oid_hex(dm_h1.store_id, hex_h1);
+    snprintf(args, sizeof args, "cluster disk replace %s %" PRIu32 " %s --secret-file %s", p0, ids[0], hex_h0,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "marked destroyed for replacement"))
+        die("diskout: disk replace failed:\n%s", out);
+    for (uint64_t t0 = now_ms(); disk_meta_state(0, ids[0], dm_h0.store_id) != META_STORE_DESTROYED; usleep(100000))
+        if (now_ms() - t0 > 15000)
+            die("diskout: old h0 did not become META_STORE_DESTROYED");
+
+    snprintf(cmd, sizeof cmd, "heal %s", n0_h0);
+    if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+        die("diskout: outagefs '%s' failed: %s", cmd, cout);
+    /* Wait briefly for node 0's disks_sync_copy to release h0's flock, then swap in a freshly initialised DISK. */
+    usleep(300000);
+    char h0_chunks_dir[PATH_MAX + 32], h0_disk_file[PATH_MAX + 32];
+    char h0_stage[PATH_MAX + 32], h0_stage_disk[PATH_MAX + 64];
+    snprintf(h0_chunks_dir, sizeof h0_chunks_dir, "%s/chunks", n0_h0);
+    snprintf(h0_disk_file, sizeof h0_disk_file, "%s/DISK", n0_h0);
+    snprintf(h0_stage, sizeof h0_stage, "%s/n0_h0_repl", base);
+    snprintf(h0_stage_disk, sizeof h0_stage_disk, "%s/DISK", h0_stage);
+    (void)nftw(h0_chunks_dir, rm_tree_cb, 16, FTW_DEPTH | FTW_PHYS);
+    unlink(h0_disk_file);
+    disk_make(h0_stage, "hdd");
+    if (rename(h0_stage_disk, h0_disk_file) != 0)
+        die("diskout: rename replacement DISK into %s: %s", h0_disk_file, strerror(errno));
+    disk_meta dm_h0_new;
+    if (disk_load(n0_h0, &dm_h0_new) != 0)
+        die("diskout: disk_load new h0 failed");
+    chunk_oid_hex(dm_h0_new.store_id, hex_h0_new);
+
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char mbuf[65536];
+        int64_t cst0 = -1;
+        metrics_get(mports[0], mbuf, sizeof mbuf);
+        if (disk_meta_state(0, ids[0], dm_h0_new.store_id) == META_STORE_UP &&
+            metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"0\"} ", &cst0) && cst0 == 0)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("diskout: disk replace did not adopt new h0 UP (old=%d new=%d cst0=%" PRId64 ")",
+                disk_meta_state(0, ids[0], dm_h0.store_id), disk_meta_state(0, ids[0], dm_h0_new.store_id), cst0);
+    }
+    printf("  4. CLI `disk replace` marked old h0 DESTROYED and adopted new h0 (%s) UP\n", hex_h0_new);
+
+    /* ---- 5. CLI `disk out` on readable HDD h1 drains locally via r13-lmove (0 peer decode bytes) ---- */
+    int h1_before_drain = count_chunk_files_in(n0_h1, ec_num);
+    int64_t peer_rd_before_drain = sum_peer_chunk_read_bytes(mports, ND, 0);
+    snprintf(args, sizeof args, "cluster disk out %s %" PRIu32 " %s --secret-file %s", p0, ids[0], hex_h1, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "marked out"))
+        die("diskout: disk out h1 failed:\n%s", out);
+
+    for (uint64_t t0 = now_ms();
+         count_chunk_files_in(n0_h1, ec_num) > 0 || count_chunk_files_in(n0_h0, ec_num) < h1_before_drain;
+         usleep(200000)) {
+        if (now_ms() - t0 > 45000)
+            die("diskout: readable h1 did not drain locally to new h0 (h1=%d, h0=%d, want >=%d)",
+                count_chunk_files_in(n0_h1, ec_num), count_chunk_files_in(n0_h0, ec_num), h1_before_drain);
+    }
+    int64_t peer_rd_after_drain = sum_peer_chunk_read_bytes(mports, ND, 0);
+    if (peer_rd_after_drain != peer_rd_before_drain)
+        die("diskout: readable `disk out` h1 read %" PRId64 " peer bytes (expected 0 local drain)",
+            peer_rd_after_drain - peer_rd_before_drain);
+    printf("  5. CLI `disk out` on readable h1 drained %d chunks locally to new h0 (0 peer bytes)\n", h1_before_drain);
+
+    /* ---- 6. Fast disk OUT rebuilds log replicas onto sibling NVMe while HDD chunk store serves reads ---- */
+    /* Find a volume replicated on node 0 (pick whichever of do42 / dotwin sits on nv0 or nv1). */
+    uint32_t target_vol = 0;
+    const char *target_vname = NULL;
+    const char *nv_old_path = NULL, *nv_new_path = NULL;
+    const uint8_t *nv_old_sid = NULL;
+    uint32_t vchk[2] = {ec_num, tw_num};
+    const char *vnm[2] = {"do42", "dotwin"};
+    for (int vi = 0; vi < 2 && !target_vol; vi++) {
+        char vp0[PATH_MAX + 32], vp1[PATH_MAX + 32];
+        snprintf(vp0, sizeof vp0, "%s/v%" PRIu32, n0_nv0, vchk[vi]);
+        snprintf(vp1, sizeof vp1, "%s/v%" PRIu32, n0_nv1, vchk[vi]);
+        struct stat st;
+        if (stat(vp0, &st) == 0) {
+            target_vol = vchk[vi];
+            target_vname = vnm[vi];
+            nv_old_path = n0_nv0;
+            nv_new_path = n0_nv1;
+            nv_old_sid = dm_nv0.store_id;
+        } else if (stat(vp1, &st) == 0) {
+            target_vol = vchk[vi];
+            target_vname = vnm[vi];
+            nv_old_path = n0_nv1;
+            nv_new_path = n0_nv0;
+            nv_old_sid = dm_nv1.store_id;
+        }
+    }
+    if (!target_vol)
+        die("diskout: neither do42 nor dotwin has a log replica on node 0");
+
+    struct meta_volume sv_rec_before;
+    if (!vol_rec(0, target_vname, &sv_rec_before))
+        die("diskout: cannot read %s record before fast-disk OUT", target_vname);
+    uint64_t sv_before = sv_rec_before.set_version;
+
+    char hex_nv[33];
+    chunk_oid_hex(nv_old_sid, hex_nv);
+    snprintf(args, sizeof args, "cluster disk out %s %" PRIu32 " %s --secret-file %s", p0, ids[0], hex_nv, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "marked out"))
+        die("diskout: disk out fast disk failed:\n%s", out);
+
+    /* While fast disk is OUT, HDD chunk store on node 0 keeps serving do42 reads cleanly. */
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(ct, idt[s], &b)) != 0 || (rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != b.n || a.h != b.h)
+            die("diskout: read failed while node 0 NVMe was OUT (series %d rc=%d)", s, rc);
+    }
+
+    /* Wait for target_vol's log replica on node 0 to be rebuilt onto sibling NVMe nv_new_path and return to full ISR. */
+    char vnew[PATH_MAX + 32];
+    snprintf(vnew, sizeof vnew, "%s/v%" PRIu32, nv_new_path, target_vol);
+    struct meta_volume cur_after;
+    memset(&cur_after, 0, sizeof cur_after);
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        struct stat st;
+        if (stat(vnew, &st) == 0 && vol_rec(0, target_vname, &cur_after) && cur_after.nisr == cur_after.nrep &&
+            meta_volume_in_isr(&cur_after, ids[0]))
+            break;
+        if (now_ms() - t0 > 60000)
+            die("diskout: fast disk OUT did not rebuild %s (v%" PRIu32 ") onto sibling NVMe %s within 60 s",
+                target_vname, target_vol, nv_new_path);
+    }
+    if (cur_after.set_version != sv_before + 1)
+        die("diskout: fast-disk OUT proposed duplicate REPLICA_RESETs (set_version %" PRIu64 " -> %" PRIu64 ", want +1)",
+            sv_before, cur_after.set_version);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(ct, idt[s], &b)) != 0 || (rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != b.n || a.h != b.h)
+            die("diskout: post-NVMe-OUT read mismatch series %d (rc=%d)", s, rc);
+    }
+    (void)nv_old_path;
+    printf("  6. fast disk OUT rebuilt %s (v%" PRIu32 ", set_version +1) onto sibling NVMe, reads bit-exact while HDD served\n",
+           target_vname, target_vol);
+
+    /* ---- 7. CLI `disk class`: HDD metadata class update AND fast-disk `disk class ... hdd` log-replica rebuild ---- */
+    char hex_n2_hd[33];
+    disk_meta dm_n2_hd;
+    if (disk_load(peer_hd[2], &dm_n2_hd) != 0)
+        die("diskout: disk_load n2 hd failed");
+    chunk_oid_hex(dm_n2_hd.store_id, hex_n2_hd);
+    snprintf(args, sizeof args, "cluster disk class %s %" PRIu32 " %s ssd --secret-file %s", p0, ids[2], hex_n2_hd,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "class set to ssd"))
+        die("diskout: disk class failed:\n%s", out);
+    if (disk_meta_class(0, ids[2], dm_n2_hd.store_id) != META_DISK_SSD)
+        die("diskout: metadata disk_class did not update to SSD");
+    snprintf(args, sizeof args, "cluster disk class %s %" PRIu32 " %s hdd --secret-file %s", p0, ids[2], hex_n2_hd,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "class set to hdd"))
+        die("diskout: disk class restore hdd failed:\n%s", out);
+
+    /* Replace OUT fast disk nv_old_path with a fresh NVMe, then change active fast disk nv_new_path to hdd:
+     * target_vol's log replica must be set aside from the newly-HDD disk and rebuilt onto the fresh NVMe. */
+    snprintf(args, sizeof args, "cluster disk replace %s %" PRIu32 " %s --secret-file %s", p0, ids[0], hex_nv,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "marked destroyed for replacement"))
+        die("diskout: disk replace fast disk failed:\n%s", out);
+    for (uint64_t t0 = now_ms(); disk_meta_state(0, ids[0], nv_old_sid) != META_STORE_DESTROYED; usleep(100000))
+        if (now_ms() - t0 > 15000)
+            die("diskout: old NVMe did not become META_STORE_DESTROYED");
+
+    char nv_stage[PATH_MAX + 32], nv_old_meta[PATH_MAX + 32], nv_stage_meta[PATH_MAX + 48], nv_old_v[PATH_MAX + 32];
+    snprintf(nv_stage, sizeof nv_stage, "%s/do_n0_nv_stage", base);
+    (void)nftw(nv_stage, rm_tree_cb, 16, FTW_DEPTH | FTW_PHYS);
+    disk_make(nv_stage, "nvme");
+    disk_meta dm_nv_new;
+    if (disk_load(nv_stage, &dm_nv_new) != 0)
+        die("diskout: disk_load replacement NVMe failed");
+    usleep(300000);
+    snprintf(nv_old_v, sizeof nv_old_v, "%s/v%" PRIu32, nv_old_path, target_vol);
+    (void)nftw(nv_old_v, rm_tree_cb, 16, FTW_DEPTH | FTW_PHYS);
+    snprintf(nv_stage_meta, sizeof nv_stage_meta, "%s/%s", nv_stage, DISK_META_FILE);
+    snprintf(nv_old_meta, sizeof nv_old_meta, "%s/%s", nv_old_path, DISK_META_FILE);
+    unlink(nv_old_meta);
+    if (rename(nv_stage_meta, nv_old_meta) != 0)
+        die("diskout: rename replacement NVMe DISK failed: %s", strerror(errno));
+    (void)nftw(nv_stage, rm_tree_cb, 16, FTW_DEPTH | FTW_PHYS);
+    for (uint64_t t0 = now_ms(); disk_meta_state(0, ids[0], dm_nv_new.store_id) != META_STORE_UP; usleep(200000))
+        if (now_ms() - t0 > 20000)
+            die("diskout: replacement NVMe was not adopted UP within 20 s");
+
+    const uint8_t *nv_cur_sid = (nv_new_path == n0_nv0) ? dm_nv0.store_id : dm_nv1.store_id;
+    char hex_nv_cur[33];
+    chunk_oid_hex(nv_cur_sid, hex_nv_cur);
+    uint64_t sv_before_cls = cur_after.set_version;
+    snprintf(args, sizeof args, "cluster disk class %s %" PRIu32 " %s hdd --secret-file %s", p0, ids[0], hex_nv_cur,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "class set to hdd"))
+        die("diskout: disk class fast->hdd failed:\n%s", out);
+
+    /* Wait for target_vol to move off the newly-HDD nv_new_path onto the replacement NVMe nv_old_path. */
+    struct meta_volume cur_cls;
+    memset(&cur_cls, 0, sizeof cur_cls);
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        struct stat st_on_repl, st_on_hdd;
+        if (stat(nv_old_v, &st_on_repl) == 0 && stat(vnew, &st_on_hdd) != 0 && errno == ENOENT &&
+            vol_rec(0, target_vname, &cur_cls) && cur_cls.nisr == cur_cls.nrep &&
+            meta_volume_in_isr(&cur_cls, ids[0]))
+            break;
+        if (now_ms() - t0 > 60000)
+            die("diskout: disk class fast->hdd did not rebuild %s (v%" PRIu32 ") onto replacement NVMe within 60 s",
+                target_vname, target_vol);
+    }
+    if (cur_cls.set_version != sv_before_cls + 1)
+        die("diskout: disk class fast->hdd set_version %" PRIu64 " -> %" PRIu64 " (want +1)", sv_before_cls,
+            cur_cls.set_version);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(ct, idt[s], &b)) != 0 || (rc = ecb_read(ce, ide[s], &a)) != 0 || a.n != b.n || a.h != b.h)
+            die("diskout: post-disk-class read mismatch series %d (rc=%d)", s, rc);
+    }
+    printf("  7. CLI `disk class` updated HDD class AND rebuilt %s (v%" PRIu32 ", set_version +1) off fast->hdd disk\n",
+           target_vname, target_vol);
+
+    /* ---- 8. r12-chunk damage > scrub_out_count triggers immediate STORE_STATE OUT (catches damagenoout) ---- */
+    /* Raise timers to 300 s so ONLY immediate damage-triggered OUT can mark n1's HDD OUT within 20 s. */
+    snprintf(args, sizeof args, "cluster settings set %s failstop_out_s=300 rebuild_after_s=300 --secret-file %s", p0,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "settings updated"))
+        die("diskout: raise timers failed:\n%s", out);
+
+    int corrupted = corrupt_chunks_in(peer_hd[1], ec_num, 4);
+    if (corrupted < 2)
+        die("diskout: needed >= 2 chunks to corrupt on n1 hd (got %d)", corrupted);
+    for (uint64_t t0 = now_ms(); disk_meta_state(0, ids[1], dm_n1_hd.store_id) != META_STORE_OUT; usleep(200000)) {
+        if (now_ms() - t0 > 20000)
+            die("diskout: n1 HDD with %d damaged chunks (> scrub_out_count=1) did not immediately go OUT "
+                "(state=%d; damagenoout!)",
+                corrupted, disk_meta_state(0, ids[1], dm_n1_hd.store_id));
+    }
+    printf("  8. r12-chunk damage (%d > scrub_out_count=1) triggered immediate STORE_STATE OUT on n1\n", corrupted);
+
+    tsdbc_close(ce);
+    tsdbc_close(ct);
+    stop_all();
+    if (unlink_ctl)
+        unlink(ctl);
+#endif
+}
+
 static int count_live_parts_in(const char *disk_dir, uint32_t vol, char *buf, size_t cap)
 {
     char p[PATH_MAX + 64];
@@ -35218,7 +35892,7 @@ int main(int argc, char **argv)
                {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
                {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub},
                {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass},
-               {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio},
+               {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio}, {"diskout", scen_diskout},
                {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring},
                {"hddadd", scen_hddadd}, {"settings", scen_settings}, {"diskfill", scen_diskfill}, {"posbalance", scen_posbalance}};
     int n = (int)(sizeof all / sizeof all[0]);

@@ -42,8 +42,10 @@ struct rset {
     uint64_t dropped_said, said_ms;
     uint64_t defer_said;         /* the set version a deferral was said for */
     int stale_said;
-    uint64_t drop_term;          /* DROP_MEMBER: the newest Raft term heard (arg >> 8); an older one is ignored */
-    uint64_t drop_said;          /* the last command said: (node << 40) ^ (min_isr << 32) ^ epoch */
+    uint64_t drop_term;            /* DROP_MEMBER: the newest Raft term heard (arg >> 8); an older one is ignored */
+    int drop_nomove;               /* 1 while a non-move DROP_MEMBER (R13 fast-disk OUT) holds repl_leave */
+    uint64_t drop_nomove_until_ms; /* monotonic ms lease for drop_nomove (refreshed every 1 s; auto-expires in 5 s) */
+    uint64_t drop_said;            /* the last command said: (node << 40) ^ (min_isr << 32) ^ epoch */
 };
 
 static uint64_t ms_now(void)
@@ -217,6 +219,8 @@ again:
     /* a member leaves only for a move (D11), and a record with no member moving in (`replaces`) has none: a cancel's
      * REMOVE of the learner applied, so whatever its DROP_MEMBER(0) did (a lost frame is never resent once the REMOVE
      * applied), the old member is not left `leaving`, never asked back into the ISR (review F4) */
+    s->drop_nomove = 0;
+    s->drop_nomove_until_ms = 0;
     if (repl_leaving(rv->core) >= 0 && !rec_moving(n) && G.mutant != RM_SETKEEPLEAVE) {
         say("volume %" PRIu32 ": replica set version %" PRIu64 " has no move: replica %d no longer leaves", rv->number,
             n->set_version, repl_leaving(rv->core));
@@ -273,7 +277,8 @@ void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
     if (!s || !rv->core)
         return;
     uint64_t term = c->arg >> 8;
-    uint32_t min_isr = (uint32_t)(c->arg & 0xff);
+    int nomove = (c->arg & 0x80u) != 0;
+    uint32_t min_isr = (uint32_t)(c->arg & 0x7fu);
     if (term < s->drop_term) {
         say("volume %" PRIu32 ": DROP_MEMBER of node %" PRIu32 " from node %" PRIu32 " of Raft term %" PRIu64
             " ignored (term %" PRIu64 " was heard)", rv->number, c->node, from, term, s->drop_term);
@@ -281,10 +286,15 @@ void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
     }
     s->drop_term = term;
     if (c->node == 0) {
+        /* A nomove cancel (bit 0x80) only clears a non-move leave and must never cancel an active R4 move's shrink. */
+        if (nomove && (rec_moving(&rv->rec) || !s->drop_nomove))
+            return;
         if (repl_leaving(rv->core) >= 0)
             say("volume %" PRIu32 ": a move is cancelled: replica %d no longer leaves", rv->number,
                 repl_leaving(rv->core));
         repl_leave(rv->core, -1, 0);
+        s->drop_nomove = 0;
+        s->drop_nomove_until_ms = 0;
         s->drop_said = 0;
         return;
     }
@@ -294,11 +304,16 @@ void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
             idx = (int)i;
     const char *no = rv->mode != M_WRITER || !repl_is_leader(rv->core) ? "this node does not lead it"
                      : c->epoch != repl_epoch(rv->core)                 ? "another epoch"
-                     : !rec_moving(&rv->rec)                            ? "no move in the record"
+                     : (nomove && rec_moving(&rv->rec))                 ? "a move is active in the record"
+                     : (!nomove && !rec_moving(&rv->rec))               ? "no move in the record"
                      : idx < 0                                          ? "no such member"
                      : idx == rv->self                                  ? "the member is this leader"
                                                                         : NULL;
     int rc = no ? REPL_E_INVALID : repl_leave(rv->core, idx, min_isr);
+    if (!no && rc == REPL_OK) {
+        s->drop_nomove = nomove ? 1 : 0;
+        s->drop_nomove_until_ms = nomove ? (ms_now() + 5000) : 0;
+    }
     uint64_t key = (uint64_t)c->node << 40 ^ (uint64_t)min_isr << 32 ^ c->epoch;
     if (s->drop_said == key)
         return;
@@ -309,4 +324,9 @@ void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
     else
         say("volume %" PRIu32 ": node %" PRIu32 " (replica %d) leaves: the ISR without it once it keeps %" PRIu32
             " members (epoch %" PRIu64 ")", rv->number, c->node, idx, min_isr, c->epoch);
+}
+
+int rset_drop_nomove(const struct rvol *rv)
+{
+    return (rv && rv->set && rv->set->drop_nomove && ms_now() < rv->set->drop_nomove_until_ms) ? 1 : 0;
 }

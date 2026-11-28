@@ -1502,6 +1502,55 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
     return best_mi >= 0 ? sm->members[best_mi].id : 0;
 }
 
+/* R13 r13-dev: true if an UP member permanently lost compute capability (all fast disks OUT/DESTROYED or changed to
+ * HDD without log_on_hdd, with no transiently DOWN fast disk waiting to return). */
+static int member_lost_compute_out(const struct meta_state *sm, const struct meta_member *mb)
+{
+    if (!mb || mb->state != META_UP || mb->ndisks == 0)
+        return 0;
+    if (meta_member_effective_cap(mb) & META_CAP_COMPUTE)
+        return 0;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if (d->state == META_STORE_DOWN &&
+            (meta_disk_class_fast(d->disk_class) || (sm->set.log_on_hdd && d->disk_class == META_DISK_HDD)))
+            return 0; /* transiently DOWN within rebuild_after_s: wait for return or OUT */
+    }
+    return 1;
+}
+
+/* R13 r13-dev: true if an UP member holding an EC stripe position must have positions moved off it because a capacity
+ * store went OUT/DESTROYED and no other local capacity store has room (or the member lost all storage capability). */
+static int member_needs_stripe_evict(const struct place_in *in, const struct meta_member *mb, uint64_t mark_ppm)
+{
+    if (!mb || mb->state != META_UP || mb->ndisks == 0)
+        return 0;
+    int has_out_chunk = 0, has_down_chunk = 0;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if ((d->uses & META_DISK_USE_CHUNK) || d->disk_class == META_DISK_HDD) {
+            if (d->state == META_STORE_OUT || d->state == META_STORE_DESTROYED)
+                has_out_chunk = 1;
+            else if (d->state == META_STORE_DOWN)
+                has_down_chunk = 1;
+        }
+    }
+    if (!(meta_member_effective_cap(mb) & META_CAP_STORAGE))
+        return has_down_chunk ? 0 : 1;
+    if (!has_out_chunk || has_down_chunk)
+        return 0; /* wait rebuild_after_s while a sibling chunk store is transiently DOWN */
+    const struct place_member *pm = find_pm(in, mb->id);
+    if (pm && pm->disks) {
+        for (uint32_t i = 0; i < pm->ndisks; i++) {
+            if (pm->disks[i].no_local_room)
+                return 1;
+        }
+    }
+    if (!member_stripe_eval(in, mb, 1, mark_ppm, NULL, NULL))
+        return 1;
+    return 0;
+}
+
 static uint32_t log_move_sender(const struct place_in *in, const struct meta_volume *v, const uint8_t *pend_gone)
 {
     const struct meta_state *sm = in->sm;
@@ -1714,6 +1763,7 @@ void place_plan(const struct place_in *in, struct place_out *out)
     }
 
     /* 5. Collect candidate re-placement jobs (log moves and stripe fills). */
+    uint64_t evict_mark_ppm = chunk_fill_mark_ppm(in);
     for (uint32_t vi = 0; vi < nv; vi++) {
         const struct meta_volume *v = &sm->volumes[vi];
         if (v->kind != META_VOL_REPLICATED)
@@ -1740,6 +1790,8 @@ void place_plan(const struct place_in *in, struct place_out *out)
                         prio = 1;
                     }
                 } else if (!mb || mb->state == META_OUT || mb->state == META_DESTROYED) {
+                    prio = 1;
+                } else if (member_lost_compute_out(sm, mb)) {
                     prio = 1;
                 } else if (fault_req_has(faults, nfaults, v->number, a)) {
                     prio = 2;
@@ -1792,6 +1844,8 @@ void place_plan(const struct place_in *in, struct place_out *out)
                         need = 1;
                     }
                 } else if (!mb || mb->state == META_OUT || mb->state == META_DESTROYED) {
+                    need = 1;
+                } else if (member_needs_stripe_evict(in, mb, evict_mark_ppm)) {
                     need = 1;
                 } else if (mb->state == META_DRAINING) {
                     need = 1;

@@ -114,6 +114,14 @@ int chunk_be_add_store(chunk_backend *be, const char *path, const uint8_t *expec
                        bool replacing);
 int chunk_be_add_lost(chunk_backend *be, const char *path);
 int chunk_be_fence_store(chunk_backend *be, int index);
+/* R13 (r13-dev): split cluster attach so open + epoch fsyncs run off chunksrv_cluster_hold(). */
+int chunk_be_detach_for_attach(chunk_backend *be, int index);
+int chunk_store_prepare_attach(const char *path, const uint8_t *expect_id, const uint32_t *vols, const uint64_t *epochs,
+                               size_t nvols, chunk_store **out);
+int chunk_be_install_attached(chunk_backend *be, int index, const char *path, chunk_store *ns);
+int chunk_be_attach_cluster(chunk_backend *be, int index, const char *path, const uint8_t *expect_id,
+                            const uint32_t *vols, const uint64_t *epochs, size_t nvols);
+int chunk_be_promote_up(chunk_backend *be, int index);
 int chunk_be_replace_open(chunk_backend *be, int index, const char *new_path, const uint8_t expect_id[16],
                           const uint8_t *expect_db, const chunk_heal_opts *o, chunk_heal_report *rep);
 #ifdef TSDB_TEST_HOOKS

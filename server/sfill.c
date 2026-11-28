@@ -161,6 +161,7 @@ struct sfill_task {
     uint32_t pos;
     uint32_t prev_node;
     int margin;
+    int target_store; /* >= 0: write to explicit local chunk store slot (R13 r13-dev); -1: default placement */
     bool first_pass;
     bool force_write;
     bool (*cancel_cb)(void *arg);
@@ -327,7 +328,7 @@ void sfill_set_store_allow(sfill_store_allow_fn fn)
 
 /* Open a local chunk writer for `(id, obj)` at `obj->writer_epoch`, fenced at `fence_epoch`. */
 static int open_local_writer(chunk_backend *be, const chunk_ident *id, const struct sfill_obj *obj,
-                             uint64_t fence_epoch, chunk_store **st_out, chunk_wr **w_out)
+                             uint64_t fence_epoch, int target_store, chunk_store **st_out, chunk_wr **w_out)
 {
     *st_out = NULL;
     *w_out = NULL;
@@ -340,26 +341,38 @@ static int open_local_writer(chunk_backend *be, const chunk_ident *id, const str
     if (rc != 0)
         return rc;
     int n = chunk_be_nstores(be);
-    int base = chunk_be_place(be, id->oid, id->pos);
     int idx = -1;
-    int saw_full = 0;
     sfill_store_allow_fn allow = atomic_load_explicit(&g_sfill_store_allow, memory_order_acquire);
-    for (int k = 0; k < n; k++) {
-        int cand = (base + k) % n;
-        int st_state = chunk_be_store_state(be, cand);
-        if ((st_state == CHUNK_STORE_UP || st_state == CHUNK_STORE_REPLACING) && !chunk_be_store_draining(be, cand)) {
-            if (allow && !allow(cand, 1)) {
-                saw_full = 1;
-                continue;
-            }
-            idx = cand;
-            break;
-        }
-    }
-    if (idx < 0) {
-        if (saw_full || (allow && !allow(base, 1)))
+    if (target_store >= 0) {
+        if (target_store >= n)
+            return TSDB_ERR_UNAVAILABLE;
+        int st_state = chunk_be_store_state(be, target_store);
+        if (st_state != CHUNK_STORE_UP && st_state != CHUNK_STORE_REPLACING)
+            return TSDB_ERR_UNAVAILABLE;
+        if (allow && !allow(target_store, 1))
             return CHUNK_ERR_FULL;
-        idx = base; /* preserve original fallback to base store when no non-draining UP/REPLACING store exists */
+        idx = target_store;
+    } else {
+        int base = chunk_be_place(be, id->oid, id->pos);
+        int saw_full = 0;
+        for (int k = 0; k < n; k++) {
+            int cand = (base + k) % n;
+            int st_state = chunk_be_store_state(be, cand);
+            if ((st_state == CHUNK_STORE_UP || st_state == CHUNK_STORE_REPLACING) &&
+                !chunk_be_store_draining(be, cand)) {
+                if (allow && !allow(cand, 1)) {
+                    saw_full = 1;
+                    continue;
+                }
+                idx = cand;
+                break;
+            }
+        }
+        if (idx < 0) {
+            if (saw_full || (allow && !allow(base, 1)))
+                return CHUNK_ERR_FULL;
+            idx = base; /* preserve original fallback to base store when no non-draining UP/REPLACING store exists */
+        }
     }
     chunk_store *st = chunk_be_open_store(be, idx);
     if (!st)
@@ -391,7 +404,7 @@ static int try_copy_from_prev(struct sfill *sf, struct sfill_task *t, chunk_back
 
     chunk_store *st = NULL;
     chunk_wr *w = NULL;
-    int rc = open_local_writer(be, id, obj, vol_epoch, &st, &w);
+    int rc = open_local_writer(be, id, obj, vol_epoch, t->target_store, &st, &w);
     if (rc != 0) {
         free(buf);
         return SFILL_OBJ_UNAVAILABLE;
@@ -484,7 +497,7 @@ static int decode_from_survivors(struct sfill *sf, struct sfill_task *t, chunk_b
 
     chunk_store *st = NULL;
     chunk_wr *w = NULL;
-    int orc = open_local_writer(be, id, obj, vol_epoch, &st, &w);
+    int orc = open_local_writer(be, id, obj, vol_epoch, t->target_store, &st, &w);
     if (orc != 0)
         return SFILL_OBJ_UNAVAILABLE;
 
@@ -1150,6 +1163,7 @@ static void *coord_main(void *arg)
                 t->pos = pos;
                 t->prev_node = prev;
                 t->margin = margin;
+                t->target_store = -1;
                 t->first_pass = first_pass;
                 memcpy(t->vuuid, pick->vuuid, 16);
                 t->obj_bytes = chunk_geom_valid(&items[i].g) ? chunk_pos_len(&items[i].g, pos) : 0;
@@ -1411,9 +1425,10 @@ void sfill_stop(struct sfill *sf, uint32_t volume, uint32_t pos)
         publish_reports(sf);
 }
 
-int sfill_enqueue_obj(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t prev_node, int margin,
-                      uint32_t concurrency, const uint8_t vuuid[16], struct sfill_obj *obj, bool force_write,
-                      bool (*cancel_cb)(void *arg), void (*done_cb)(void *arg, int rc), void *done_arg)
+int sfill_enqueue_obj_store(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t prev_node, int margin,
+                            uint32_t concurrency, const uint8_t vuuid[16], struct sfill_obj *obj, bool force_write,
+                            int target_store, bool (*cancel_cb)(void *arg), void (*done_cb)(void *arg, int rc),
+                            void *done_arg)
 {
     if (!sf || !sf->has_ops || !vuuid || !obj || pos >= CHUNK_POS_MAX)
         return -1;
@@ -1427,6 +1442,7 @@ int sfill_enqueue_obj(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t 
     t->pos = pos;
     t->prev_node = prev_node;
     t->margin = margin;
+    t->target_store = target_store;
     t->first_pass = true;
     t->force_write = force_write;
     t->cancel_cb = cancel_cb;
@@ -1449,6 +1465,14 @@ int sfill_enqueue_obj(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t 
     pthread_cond_signal(&sf->work_cv);
     pthread_mutex_unlock(&sf->mu);
     return 0;
+}
+
+int sfill_enqueue_obj(struct sfill *sf, uint32_t volume, uint32_t pos, uint32_t prev_node, int margin,
+                      uint32_t concurrency, const uint8_t vuuid[16], struct sfill_obj *obj, bool force_write,
+                      bool (*cancel_cb)(void *arg), void (*done_cb)(void *arg, int rc), void *done_arg)
+{
+    return sfill_enqueue_obj_store(sf, volume, pos, prev_node, margin, concurrency, vuuid, obj, force_write, -1,
+                                   cancel_cb, done_cb, done_arg);
 }
 
 uint32_t sfill_report(struct sfill *sf, struct sfill_report *out, uint32_t cap)

@@ -802,11 +802,12 @@ int chunksrv_store_info(struct chunksrv *cs, int idx, char *path_out, size_t pat
     if (state_out)
         *state_out = st;
     if (id_out) {
-        chunk_store *s = chunk_be_store(cs->be, idx);
-        if (s && st == CHUNK_STORE_UP)
+        chunk_store *s = chunk_be_store_ref(cs->be, idx);
+        if (s && (st == CHUNK_STORE_UP || st == CHUNK_STORE_REPLACING))
             memcpy(id_out, chunk_store_id(s), 16);
         else
             memset(id_out, 0, 16);
+        chunk_store_unref(s);
     }
     return 0;
 }

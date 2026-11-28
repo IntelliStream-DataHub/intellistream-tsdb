@@ -399,6 +399,10 @@ int cvolfs_prepare_disks(const char *meta_root, const struct cvolfs_disk *disks,
     for (int i = 0; i < nlim; i++) {
         if (is_scan[i] || !disks[i].path[0])
             continue;
+        /* R13 r13-dev: an OUT or DESTROYED disk is retired from hosting replicas; ignore any leftover v<N> on it so
+         * the server can create/open the rebuilt replica on another UP fast disk without a duplicate-directory error. */
+        if (disks[i].state == META_STORE_OUT || disks[i].state == META_STORE_DESTROYED)
+            continue;
         if ((size_t)snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, disks[i].path, r->number) >= sizeof vdir)
             continue;
         struct stat sb;
@@ -416,12 +420,27 @@ int cvolfs_prepare_disks(const char *meta_root, const struct cvolfs_disk *disks,
     }
     if (nfound == 0 && nfound_down > 0) {
         const struct cvolfs_disk *dd = &disks[found_down[0]];
-        if (out)
-            memcpy(out->store_id, dd->store_id, 16);
-        say("volume %" PRIu32 ": existing replica directory %s/v%" PRIu32
-            " is on a non-UP or ineligible disk (state=%s, class=%s): refusing to open or make a copy elsewhere",
-            r->number, dd->path, r->number, store_state_str(dd->state), disk_class_name(dd->disk_class));
-        return TSDB_ERR_UNAVAILABLE;
+        /* R13 r13-dev: if a single UP disk became ineligible for log replicas (e.g. `disk class ... hdd` while another
+         * UP fast disk exists) and a REPLICA_RESET changed this server's rid, let cvolset_prepare set aside the old
+         * v<N> (different rid) so Pass 3 can create the fresh reset replica on a surviving UP fast disk. */
+        int cleared_ineligible = 0;
+        if (nfound_down == 1 && dd->state == META_STORE_UP && nscan > 0) {
+            if (cvolset_prepare(dd->path, r->number, r) != 0)
+                return -1;
+            if ((size_t)snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, dd->path, r->number) < sizeof vdir) {
+                struct stat sb;
+                if (lstat(vdir, &sb) != 0 && errno == ENOENT)
+                    cleared_ineligible = 1;
+            }
+        }
+        if (!cleared_ineligible) {
+            if (out)
+                memcpy(out->store_id, dd->store_id, 16);
+            say("volume %" PRIu32 ": existing replica directory %s/v%" PRIu32
+                " is on a non-UP or ineligible disk (state=%s, class=%s): refusing to open or make a copy elsewhere",
+                r->number, dd->path, r->number, store_state_str(dd->state), disk_class_name(dd->disk_class));
+            return TSDB_ERR_UNAVAILABLE;
+        }
     }
     if (nscan == 0) {
         say("volume %" PRIu32 ": no UP eligible disk available (log_on_hdd=%u): the volume is not opened", r->number,

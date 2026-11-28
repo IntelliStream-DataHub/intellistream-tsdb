@@ -678,7 +678,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs 
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
-    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio \
+    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio diskout \
     ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill posbalance
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
 	CRASHFS_SO=$(B)/libcrashfs.so OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
@@ -1087,7 +1087,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants tierscrub-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants balance-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak sim-place-soak-classes sim-place-class-mutants place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants diskout-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants tierscrub-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants balance-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak sim-place-soak-classes sim-place-class-mutants place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1343,6 +1343,11 @@ diskfault-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/liboutagefs.so
 	    TSDB_CLI=$(B)/tsdb OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_cluster @D@ diskstall
 	$(if $(EC_OBJ),$(MUT) --name diskeio --uring --list "storeeioexit" -- env TSDB_DISKS_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_cluster @D@ diskeio)
+# R13 (r13-dev) device OUT timers, hold respect, local capacity rebuild and scrub damage OUT mutants (TSDB_DISKS_MUTANT)
+diskout-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/liboutagefs.so
+	@$(if $(EC_OBJ),true,echo "diskout-mutants: this build has no erasure codec (NO_EC=1): diskout skips, nothing to plant"; false)
+	$(MUT) --name diskout --uring --list "devoutnohold rebuildtofast damagenoout" -- env TSDB_DISKS_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_cluster @D@ diskout
 # R13 (r13-cvolfs) multi-disk log replica placement and duplicate-copy planted bugs, each must fail test_cvolfs and test_cluster twodisks
 cvolfs-mutants: $(B)/test_cvolfs $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
 	$(MUT) --name test_cvolfs_r13 --list "cvolfirstdisk cvoldupok" -- ./$(B)/test_cvolfs --mutant @M@ @D@

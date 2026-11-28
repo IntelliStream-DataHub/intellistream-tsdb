@@ -46,8 +46,9 @@ struct place_disk_usage {
     uint8_t store_id[16];
     uint8_t disk_class; /* enum meta_disk_class */
     uint8_t uses;       /* enum meta_disk_uses bitmask */
-    uint8_t state;      /* enum meta_store_state */
-    uint8_t have_usage; /* 1 when young_bytes/chunk_bytes are reported (r13-fill or test knob) */
+    uint8_t state;         /* enum meta_store_state */
+    uint8_t have_usage;    /* 1 when young_bytes/chunk_bytes are reported (r13-fill or test knob) */
+    uint8_t no_local_room; /* R13 r13-dev: 1 if OUT chunk store has no local capacity store with room */
     uint64_t size_bytes;
     uint64_t young_bytes;
     uint64_t chunk_bytes;

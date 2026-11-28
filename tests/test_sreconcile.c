@@ -121,6 +121,9 @@ struct mock_env {
     uint8_t store_disk_id_override[16];
     bool use_id_override;
     int force_place_store; /* -1: use oid[0] % nstores */
+    bool store_is_out[2];
+    int pick_target_result;
+    uint32_t pick_target_calls;
 
     struct mock_obj objs[16];
     uint32_t nobjs;
@@ -549,8 +552,20 @@ static int op_store_info(void *arg, int idx, struct sreconcile_store_info *out)
         out->disk_ok = e->use_disk_override[idx] ? e->store_disk_ok_override[idx]
                                                  : (chunk_store_meta_read(e->store_paths[idx], out->disk_id, NULL) == 0);
     }
+    out->is_out = e->store_is_out[idx];
     pthread_mutex_unlock(&e->mu);
     return 0;
+}
+
+static int op_pick_target_store(void *arg, int lost_slot)
+{
+    (void)lost_slot;
+    struct mock_env *e = arg;
+    pthread_mutex_lock(&e->mu);
+    e->pick_target_calls++;
+    int res = e->pick_target_result;
+    pthread_mutex_unlock(&e->mu);
+    return res;
 }
 
 static int op_place_store(void *arg, const uint8_t oid[16], unsigned pos)
@@ -1327,6 +1342,101 @@ static void test_note_missing_and_stop(void)
     mock_env_free(&env);
 }
 
+/* ------------------------------------------------------------------ Case 6: R13 OUT store no-local-room parking */
+
+static void test_out_no_room_parking(void)
+{
+    char sdir0[PATH_MAX + 64], sdir1[PATH_MAX + 64], stdir[PATH_MAX + 64];
+    snprintf(sdir0, sizeof sdir0, "%s/c6_store0", root_dir);
+    snprintf(sdir1, sizeof sdir1, "%s/c6_store1", root_dir);
+    snprintf(stdir, sizeof stdir, "%s/c6_state", root_dir);
+    rm_tree(stdir);
+    mkdir(stdir, 0755);
+
+    const char *paths[2] = {sdir0, sdir1};
+    struct mock_env env;
+    mock_env_init_n(&env, paths, 2, 12, 0, 1);
+    env.store_is_out[0] = true;
+    env.force_place_store = 0; /* placed on OUT store 0 */
+    env.pick_target_result = -1; /* no local room initially */
+    mock_obj_build(&env.objs[0], 71, 4, 2, 65536, 200000, 5, 1, 0x3fu, 7101);
+    env.nobjs = 1;
+
+    struct sfill_ops sops = make_sfill_ops(&env);
+    struct sreconcile_ops rops = make_rec_ops(&env);
+    rops.pick_target_store = op_pick_target_store;
+    struct sfill *sf = sfill_new_with_ops(&sops);
+    struct sreconcile *rec = sreconcile_new(sf, &rops, stdir);
+
+    /* 1. Initial pass finds no local room and parks WITHOUT spinning OBJLIST across multiple store polls. */
+    sreconcile_on_start_ex(rec);
+    uint64_t t0 = now_ms();
+    for (;;) {
+        pthread_mutex_lock(&env.mu);
+        uint32_t oc = env.objlist_calls;
+        pthread_mutex_unlock(&env.mu);
+        if (oc >= 1 || now_ms() - t0 > 3000)
+            break;
+        sleep_ms(10);
+    }
+    sleep_ms(300); /* >10 store polls at retry_ms=20: must stay parked on waiting_room with 0 extra OBJLISTs! */
+    pthread_mutex_lock(&env.mu);
+    uint32_t oc_parked = env.objlist_calls;
+    pthread_mutex_unlock(&env.mu);
+    CHECK(oc_parked == 1, "c6: expected exactly 1 OBJLIST while parked on waiting_room, got %" PRIu32, oc_parked);
+
+    /* 2. Once room opens up (pick_target_store returns store 1), poll wakes reconcile and fills onto store 1. */
+    pthread_mutex_lock(&env.mu);
+    env.pick_target_result = 1;
+    pthread_mutex_unlock(&env.mu);
+
+    t0 = now_ms();
+    for (;;) {
+        struct sreconcile_stats rst;
+        sreconcile_get_stats(rec, &rst);
+        if (rst.passes_ok >= 1 || now_ms() - t0 > 5000)
+            break;
+        sleep_ms(10);
+    }
+    struct sreconcile_stats rst;
+    sreconcile_get_stats(rec, &rst);
+    CHECK(rst.passes_ok >= 1, "c6: reconcile did not wake and complete when local room opened");
+    CHECK(chunk_exists_on_disk(sdir1, 12, env.objs[0].oid, 0), "c6: rebuilt chunk missing on target store 1");
+    CHECK(!chunk_exists_on_disk(sdir0, 12, env.objs[0].oid, 0), "c6: rebuilt chunk landed on OUT store 0");
+
+    /* 3. A missing chunk placed on a healthy non-draining UP store (store 1) must NOT call pick_target_store
+     * even while store 0 is OUT. */
+    mock_obj_build(&env.objs[1], 72, 4, 2, 65536, 200000, 5, 1, 0x3fu, 7102);
+    pthread_mutex_lock(&env.mu);
+    env.nobjs = 2;
+    env.force_place_store = 1; /* healthy UP store 1 */
+    env.pick_target_result = -1;
+    env.pick_target_calls = 0;
+    pthread_mutex_unlock(&env.mu);
+
+    uint64_t prev_ok = rst.passes_ok;
+    sreconcile_trigger_ex(rec, 12, 0, 2);
+    t0 = now_ms();
+    for (;;) {
+        sreconcile_get_stats(rec, &rst);
+        if (rst.passes_ok > prev_ok || now_ms() - t0 > 5000)
+            break;
+        sleep_ms(10);
+    }
+    pthread_mutex_lock(&env.mu);
+    uint32_t ptc = env.pick_target_calls;
+    pthread_mutex_unlock(&env.mu);
+    CHECK(rst.passes_ok > prev_ok, "c6: missing chunk on healthy store 1 did not complete");
+    CHECK(ptc == 0, "c6: missing chunk on healthy store 1 unexpectedly called pick_target_store (%" PRIu32 " times)",
+          ptc);
+    CHECK(chunk_exists_on_disk(sdir1, 12, env.objs[1].oid, 0), "c6: chunk 72 missing on healthy store 1");
+
+    sreconcile_stop(rec);
+    sfill_free(sf);
+    sreconcile_free(rec);
+    mock_env_free(&env);
+}
+
 int main(int argc, char **argv)
 {
     const char *mutant = NULL;
@@ -1360,6 +1470,7 @@ int main(int argc, char **argv)
     test_store_down();
     test_note_missing_and_stop();
     test_review_edge_cases();
+    test_out_no_room_parking();
 
     rm_tree(root_dir);
     if (fails) {

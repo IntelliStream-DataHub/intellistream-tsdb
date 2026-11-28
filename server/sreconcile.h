@@ -46,6 +46,8 @@ struct sreconcile_store_info {
     uint8_t live_id[16]; /* store_id of open chunk_store (zeroed if not UP) */
     uint8_t disk_id[16]; /* store_id currently on disk META (zeroed if unreadable) */
     bool disk_ok;        /* true if META on disk parsed cleanly */
+    bool is_out;         /* R13 r13-dev: true if store is committed OUT/DESTROYED (rebuild lost chunks locally) */
+    bool is_draining;    /* R13 r13-lmove/r13-dev: true if store is draining (regular puts skip to another store) */
 };
 
 /* Current metadata view for one (volume, pos) on this member. */
@@ -97,6 +99,10 @@ struct sreconcile_ops {
     int (*store_count)(void *arg);
     int (*store_info)(void *arg, int idx, struct sreconcile_store_info *out);
     int (*place_store)(void *arg, const uint8_t oid[16], unsigned pos);
+    /* R13 r13-dev: pick a local target store for chunks lost on OUT store `lost_slot` (-1 if none has room). Optional. */
+    int (*pick_target_store)(void *arg, int lost_slot);
+    /* R13 r13-dev: invoked once all held positions have reconciled cleanly for CHUNK_STORE_REPLACING slots. Optional. */
+    void (*on_replacing_settled)(void *arg, uint64_t settled_mask);
 
     /* Nudge the current holder of (volume, pos) after a degraded settle (sreconcile_note_missing).
      * Returns 1 when dispatched or no longer needed (remove from pending queue), 0 to keep waiting. Optional. */

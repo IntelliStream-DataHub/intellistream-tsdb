@@ -471,6 +471,143 @@ void cnode_move_pos_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, si
         cl_say("%s", ok);
 }
 
+void cnode_disk_out_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
+{
+    uint32_t node = 0;
+    uint8_t sid[16];
+    if (cluster_disk_op_decode(body, n, &node, sid) != 0) {
+        reply(conn, reqid, META_ERR_INVALID, "disk out: a body of 20 bytes is expected (got %zu)", n);
+        return;
+    }
+    const struct meta_state *sm = cl_meta();
+    const struct meta_member *mb = meta_member(sm, node);
+    if (!mb) {
+        reply(conn, reqid, META_ERR_NOTFOUND, "disk out: unknown node %" PRIu32, node);
+        return;
+    }
+    if (mb->state == META_DESTROYED) {
+        reply(conn, reqid, META_ERR_STATE, "disk out: node %" PRIu32 " is destroyed", node);
+        return;
+    }
+    char hex[33];
+    cl_sid_hex(sid, hex);
+    const struct meta_disk *d = meta_member_disk(mb, sid);
+    if (!d) {
+        reply(conn, reqid, META_ERR_NOTFOUND, "disk out: unknown store %s on node %" PRIu32, hex, node);
+        return;
+    }
+    if (d->state == META_STORE_DESTROYED) {
+        reply(conn, reqid, META_ERR_STATE, "disk out: store %s on node %" PRIu32 " is destroyed (final)", hex, node);
+        return;
+    }
+    if (d->state == META_STORE_OUT) {
+        reply(conn, reqid, META_ERR_STATE, "disk out: store %s on node %" PRIu32 " is already out", hex, node);
+        return;
+    }
+    struct meta_entry e;
+    meta_entry_init(&e);
+    if (d->state == META_STORE_UP)
+        meta_op_store_state(&e, node, sid, META_STORE_DOWN);
+    meta_op_store_state(&e, node, sid, META_STORE_OUT);
+    char ok[192];
+    snprintf(ok, sizeof ok, "node %" PRIu32 " store %s: marked out (reason: operator)", node, hex);
+    if (cl_propose_reply(&e, conn, reqid, node, ok) == 0) {
+        cl_disk_out_mark(node, sid);
+        cl_say("%s", ok);
+    }
+}
+
+void cnode_disk_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
+{
+    uint32_t node = 0;
+    uint8_t sid[16];
+    if (cluster_disk_op_decode(body, n, &node, sid) != 0) {
+        reply(conn, reqid, META_ERR_INVALID, "disk replace: a body of 20 bytes is expected (got %zu)", n);
+        return;
+    }
+    const struct meta_state *sm = cl_meta();
+    const struct meta_member *mb = meta_member(sm, node);
+    if (!mb) {
+        reply(conn, reqid, META_ERR_NOTFOUND, "disk replace: unknown node %" PRIu32, node);
+        return;
+    }
+    if (mb->state == META_DESTROYED) {
+        reply(conn, reqid, META_ERR_STATE, "disk replace: node %" PRIu32 " is destroyed", node);
+        return;
+    }
+    char hex[33];
+    cl_sid_hex(sid, hex);
+    const struct meta_disk *d = meta_member_disk(mb, sid);
+    if (!d) {
+        reply(conn, reqid, META_ERR_NOTFOUND, "disk replace: unknown store %s on node %" PRIu32, hex, node);
+        return;
+    }
+    if (d->state == META_STORE_DESTROYED) {
+        reply(conn, reqid, META_ERR_STATE, "disk replace: store %s on node %" PRIu32 " is already destroyed", hex, node);
+        return;
+    }
+    if (d->state == META_STORE_UP) {
+        reply(conn, reqid, META_ERR_STATE,
+              "disk replace: store %s on node %" PRIu32 " is up (mark it out first with `disk out`)", hex, node);
+        return;
+    }
+    struct meta_entry e;
+    meta_entry_init(&e);
+    if (d->state == META_STORE_DOWN)
+        meta_op_store_state(&e, node, sid, META_STORE_OUT);
+    meta_op_store_state(&e, node, sid, META_STORE_DESTROYED);
+    char ok[224];
+    snprintf(ok, sizeof ok, "node %" PRIu32 " store %s: marked destroyed for replacement", node, hex);
+    if (cl_propose_reply(&e, conn, reqid, node, ok) == 0) {
+        cl_disk_out_mark(node, sid);
+        cl_say("%s", ok);
+    }
+}
+
+void cnode_disk_class_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
+{
+    uint32_t node = 0;
+    uint8_t sid[16], cls = 0;
+    if (cluster_disk_class_decode(body, n, &node, sid, &cls) != 0) {
+        reply(conn, reqid, META_ERR_INVALID, "disk class: a body of 21 bytes is expected (got %zu)", n);
+        return;
+    }
+    if (cls < META_DISK_NVME || cls > META_DISK_CLASS_LAST) {
+        reply(conn, reqid, META_ERR_INVALID, "disk class: invalid class %u (expected nvme, ssd, or hdd)",
+              (unsigned)cls);
+        return;
+    }
+    const struct meta_state *sm = cl_meta();
+    const struct meta_member *mb = meta_member(sm, node);
+    if (!mb) {
+        reply(conn, reqid, META_ERR_NOTFOUND, "disk class: unknown node %" PRIu32, node);
+        return;
+    }
+    if (mb->state == META_DESTROYED) {
+        reply(conn, reqid, META_ERR_STATE, "disk class: node %" PRIu32 " is destroyed", node);
+        return;
+    }
+    char hex[33];
+    cl_sid_hex(sid, hex);
+    const struct meta_disk *d = meta_member_disk(mb, sid);
+    if (!d) {
+        reply(conn, reqid, META_ERR_NOTFOUND, "disk class: unknown store %s on node %" PRIu32, hex, node);
+        return;
+    }
+    if (d->state == META_STORE_DESTROYED) {
+        reply(conn, reqid, META_ERR_STATE, "disk class: store %s on node %" PRIu32 " is destroyed", hex, node);
+        return;
+    }
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_store_class(&e, node, sid, cls);
+    char ok[192];
+    snprintf(ok, sizeof ok, "node %" PRIu32 " store %s: class set to %s (was %s)", node, hex, meta_disk_class_name(cls),
+             meta_disk_class_name(d->disk_class));
+    if (cl_propose_reply(&e, conn, reqid, node, ok) == 0)
+        cl_say("%s", ok);
+}
+
 void cnode_duty(uint64_t now)
 {
     if (!cl_leading())

@@ -91,6 +91,12 @@ enum cluster_admin_op {
     CLUSTER_OP_SETTINGS = 21,
     /* R9 (D19, r9-balance): body u32 flags (0 = dry-run plan summary, CLUSTER_BALANCE_APPLY = override 25% cap). */
     CLUSTER_OP_BALANCE = 22,
+    /* R13 (D19, r13-dev; server/cnode.c): per-disk operator ops on the Raft leader. Reply: text.
+     * DISK_OUT / DISK_REPLACE: u32 node, u8 store_id[16] (20 bytes).
+     * DISK_CLASS: u32 node, u8 store_id[16], u8 disk_class (21 bytes). */
+    CLUSTER_OP_DISK_OUT = 23,
+    CLUSTER_OP_DISK_REPLACE = 24,
+    CLUSTER_OP_DISK_CLASS = 25,
 };
 enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
 enum { CLUSTER_HOLD_RELEASE = 1 };                      /* CLUSTER_OP_NODE_HOLD's flags */
@@ -268,7 +274,8 @@ typedef void (*cluster_fence_fn)(void *arg, uint32_t volume, uint64_t fence, uin
 void cluster_set_fence_handler(cluster_fence_fn fn, void *arg);
 /* VOLCMD (R4): the Raft leader's command to a volume's member, frame F_VOLCMD {u8 kind, u32 volume, u64 epoch, u32 node,
  * u64 arg}: TRANSFER (to the volume leader: drain and report READY for a transfer to `node`), DROP_MEMBER (a move's
- * shrink of `node`), CANCEL (a transfer is off: admit again). Handed to the handler (repld_volcmd) by the cluster
+ * shrink of `node`, or a non-move R13 fast-disk rebuild shrink when bit 0x80 is set in `arg`:
+ * `arg = (raft_term << 8) | (nomove ? 0x80 : 0) | (min_isr & 0x7f)`; senders keep `min_isr < 128`), CANCEL (a transfer is off: admit again). Handed to the handler (repld_volcmd) by the cluster
  * thread; sent by server/ctransfer.c and cmove.c (cluster_int.h cl_volcmd_send). The frame carries no Raft term: `from`
  * (the connection's member, or this server for its own) is all a receiver knows of the sender, and a deposed Raft
  * leader's TRANSFER or CANCEL at the volume's current epoch looks like the new one's. The receiving track (r4-transfer,
@@ -698,6 +705,11 @@ int cluster_volume_move_pos_decode(const uint8_t *p, size_t n, uint32_t *volume,
 /* R9 (D19): CLUSTER_OP_BALANCE body (4 bytes: u32 flags). */
 size_t cluster_balance_encode(uint32_t flags, uint8_t *out);
 int cluster_balance_decode(const uint8_t *p, size_t n, uint32_t *flags);
+/* R13 (D19, r13-dev): DISK_OUT/DISK_REPLACE (20 bytes: u32 node + store_id[16]) and DISK_CLASS (21 bytes: + u8 cls). */
+size_t cluster_disk_op_encode(uint32_t node, const uint8_t store_id[16], uint8_t *out);
+int cluster_disk_op_decode(const uint8_t *p, size_t n, uint32_t *node, uint8_t store_id[16]);
+size_t cluster_disk_class_encode(uint32_t node, const uint8_t store_id[16], uint8_t disk_class, uint8_t *out);
+int cluster_disk_class_decode(const uint8_t *p, size_t n, uint32_t *node, uint8_t store_id[16], uint8_t *disk_class);
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

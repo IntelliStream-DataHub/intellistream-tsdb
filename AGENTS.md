@@ -694,6 +694,21 @@ cgroup, so `nice` does not keep your work out of its way.
   `disk.<id>.*` / `vol.<N>.early_releases` / `vol.<N>.merges_held` and Raft leader `cluster.disks.<class>.*` in STATUS.
   Tests: `test_chunksrv` (`test_fill_mark`), `test_cluster diskfill`, `make diskfill-mutants`
   (`TSDB_DISKS_MUTANT`: `fullall fullmergeon fullnorelease`).
+  R13 `r13-dev` (E12, E27, E54, `docs/design-cluster-data.md` §5.5, §15.6, `PLAN.md` D6/D19): per-disk `DOWN`/`OUT`
+  timers on the Raft leader (`server/cluster.c` `propose_disks`, respecting `hold_until_ms`, mass-OUT guard,
+  `failstop_out_s`, `rebuild_after_s`, and immediate `OUT` on `HBS_DISK_DF_DAMAGED` from `r12-chunk` daily damage >
+  `scrub_out_count`, carried in `HBS_DISKS` v3 `dev_flags` byte `e[94]`); returning stores before `OUT` attach via
+  `chunk_be_attach_cluster` (`src/chunkheal.c`, fences raised durably before `CHUNK_STORE_REPLACING`) and promote to
+  `UP` via `chunk_be_promote_up` once `sreconcile` completes cleanly; capacity store `OUT` rebuilds chunks locally onto
+  sibling UP capacity stores below fill mark via `sfill_enqueue_obj_store` (never onto fast disks, E50; parks on
+  `waiting_room` and lets `place.c` evict off-node when no local capacity room exists); fast-disk `OUT` or class change
+  to `hdd` rebuilds log replicas (`dev_fast_rebuild_duty`, endangered-first, `CL_VOLCMD_DROP_MEMBER` nomove +
+  `REPLICA_RESET` onto a sibling fast disk with room, or `cmove_start_auto` off-node, never lowering ISR below
+  `min_isr`); operator admin ops `CLUSTER_OP_DISK_OUT=23` (readable chunk stores drain locally via `r13-lmove`),
+  `CLUSTER_OP_DISK_REPLACE=24` (marks `DESTROYED` and adopts newly initialised replacement disk on a background worker),
+  `CLUSTER_OP_DISK_CLASS=25` (`STORE_CLASS`, triggering drains/rebuilds) exposed as `tsdb cluster disk out|replace|class`
+  in `tools/cluster-cli.c`. Tests: `test_cluster diskout`, `test_sreconcile` (`test_out_no_room_parking`),
+  `test-cluster-cli`, `make diskout-mutants` (`TSDB_DISKS_MUTANT`: `devoutnohold rebuildtofast damagenoout`).
 - `server/chunkpeer.[ch]`, `server/chunkpeer_cluster.c` (R8 r8f/r8k): `coldops_peer`, the `cold_ops` implementation for
   cluster EC volumes (`requires=tier,ec` set by `chunkpeer_cluster_prepare` before `cvol` open). `put_stream` stages each
   position as an unlinked temporary (`mkstemp` + `unlink`, sums then cells), writes the leader's own position locally

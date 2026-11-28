@@ -48,6 +48,8 @@ static const char cl_help[] =
     "       tsdb cluster node out|destroyed PEER NODE --secret-file F\n"
     "       tsdb cluster node drain PEER NODE [--cancel] --secret-file F\n"
     "       tsdb cluster node replace PEER OLD (NEW | --cancel) --secret-file F\n"
+    "       tsdb cluster disk out|replace PEER NODE STORE --secret-file F\n"
+    "       tsdb cluster disk class PEER NODE STORE nvme|ssd|hdd --secret-file F\n"
     "       tsdb cluster volume add PEER NAME [--replicas N | --redundancy ec=K+M|replicas=N] --secret-file F\n"
     "       tsdb cluster volume gc resume PEER VOLUME --secret-file F\n"
     "       tsdb cluster volume force-leader PEER VOLUME NODE --secret-file F\n"
@@ -88,6 +90,12 @@ static const char cl_help[] =
     "                      --cancel clears an active replace and releases OLD's hold.\n"
     "  node destroyed PEER NODE  declare an OUT node permanently destroyed (final; frees its peer address and\n"
     "                      identity; more than M destroyed stripe holders mark an EC volume LOST).\n"
+    "  disk out PEER NODE STORE  mark store STORE (32 hex chars) on NODE out immediately; readable chunk stores\n"
+    "                      drain locally onto sibling capacity stores, failed stores rebuild locally or elsewhere.\n"
+    "  disk replace PEER NODE STORE  mark an OUT or DOWN store destroyed so a newly initialised replacement disk\n"
+    "                      at the same path takes its uses.\n"
+    "  disk class PEER NODE STORE nvme|ssd|hdd  change store STORE's recorded class and drain/move data that no\n"
+    "                      longer belongs on that class.\n"
     "  volume add PEER NAME  a replicated volume called NAME on N servers (the cluster's --replication by default).\n"
     "                      The leader of the group picks its number and its servers; each of them makes the\n"
     "                      volume's directory (v<number> in its --dir) and opens it. Clients create and find\n"
@@ -220,6 +228,25 @@ static const char help_node_destroyed[] =
     "usage: tsdb cluster node destroyed PEER NODE --secret-file F\n"
     "\n"
     "  Declare an OUT node permanently destroyed (irreversible; > M destroyed stripe holders mark an EC volume LOST).\n"
+    "  Exit codes: 0 ok, 1 refused/failed, 2 usage.\n";
+
+static const char help_disk_out[] =
+    "usage: tsdb cluster disk out PEER NODE STORE --secret-file F\n"
+    "\n"
+    "  Mark store STORE (32 hex chars) on NODE out immediately. Readable chunk stores drain locally onto sibling\n"
+    "  capacity stores (0 peer decode bytes); failed/down stores rebuild onto sibling capacity stores or other nodes.\n"
+    "  Exit codes: 0 ok, 1 refused/failed, 2 usage.\n";
+
+static const char help_disk_replace[] =
+    "usage: tsdb cluster disk replace PEER NODE STORE --secret-file F\n"
+    "\n"
+    "  Mark an OUT or DOWN store STORE (32 hex chars) on NODE destroyed so a newly initialised disk at that path\n"
+    "  is adopted and takes its uses. Exit codes: 0 ok, 1 refused/failed, 2 usage.\n";
+
+static const char help_disk_class[] =
+    "usage: tsdb cluster disk class PEER NODE STORE (nvme | ssd | hdd) --secret-file F\n"
+    "\n"
+    "  Change store STORE's recorded class on NODE and drain/move data that no longer belongs on that class.\n"
     "  Exit codes: 0 ok, 1 refused/failed, 2 usage.\n";
 
 static const char help_volume_add[] =
@@ -3166,6 +3193,75 @@ static const char help_balance[] =
     "  With --apply, overrides the 25% automatic cap (and balance=off) and runs the plan at 5% concurrent bounds.\n"
     "  Refused while any rebuild is queued or active. Follows once to the Raft leader if PEER is a follower.\n";
 
+static int parse_store_hex(const char *s, uint8_t out[16])
+{
+    if (!s || strlen(s) != 32) {
+        fprintf(stderr, "tsdb cluster: STORE '%s' must be 32 hex characters\n", s ? s : "");
+        return -1;
+    }
+    for (int i = 0; i < 16; i++) {
+        unsigned v = 0;
+        for (int k = 0; k < 2; k++) {
+            char c = s[2 * i + k];
+            unsigned d;
+            if (c >= '0' && c <= '9')
+                d = (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f')
+                d = (unsigned)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F')
+                d = (unsigned)(c - 'A' + 10);
+            else {
+                fprintf(stderr, "tsdb cluster: STORE '%s' must be 32 hex characters\n", s);
+                return -1;
+            }
+            v = (v << 4) | d;
+        }
+        out[i] = (uint8_t)v;
+    }
+    return 0;
+}
+
+static int enc_disk_op(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
+{
+    if (cap < 20)
+        return 1;
+    ctx->peer = ctx->pos[0];
+    uint32_t node = 0;
+    uint8_t sid[16];
+    if (num("NODE", ctx->pos[1], &node) != 0)
+        return 2;
+    if (parse_store_hex(ctx->pos[2], sid) != 0)
+        return 2;
+    *req_len = cluster_disk_op_encode(node, sid, req);
+    return 0;
+}
+
+static int enc_disk_class(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
+{
+    if (cap < 21)
+        return 1;
+    ctx->peer = ctx->pos[0];
+    uint32_t node = 0;
+    uint8_t sid[16];
+    if (num("NODE", ctx->pos[1], &node) != 0)
+        return 2;
+    if (parse_store_hex(ctx->pos[2], sid) != 0)
+        return 2;
+    uint8_t cls = 0;
+    if (strcmp(ctx->pos[3], "nvme") == 0)
+        cls = META_DISK_NVME;
+    else if (strcmp(ctx->pos[3], "ssd") == 0)
+        cls = META_DISK_SSD;
+    else if (strcmp(ctx->pos[3], "hdd") == 0)
+        cls = META_DISK_HDD;
+    else {
+        fprintf(stderr, "tsdb cluster: CLASS '%s' must be nvme, ssd, or hdd\n", ctx->pos[3]);
+        return 2;
+    }
+    *req_len = cluster_disk_class_encode(node, sid, cls, req);
+    return 0;
+}
+
 static int enc_balance(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
 {
     if (cap < 4)
@@ -3192,6 +3288,12 @@ static const struct cl_verb cl_verbs[] = {
      enc_node_replace, prt_text_reply, help_node_replace},
     {{"node", "destroyed", NULL}, 2, 2, 2, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_NODE_DESTROYED, 30000, NULL,
      enc_node_single, prt_text_reply, help_node_destroyed},
+    {{"disk", "out", NULL}, 2, 3, 3, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_DISK_OUT, 30000, NULL, enc_disk_op,
+     prt_text_reply, help_disk_out},
+    {{"disk", "replace", NULL}, 2, 3, 3, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_DISK_REPLACE, 30000, NULL, enc_disk_op,
+     prt_text_reply, help_disk_replace},
+    {{"disk", "class", NULL}, 2, 4, 4, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_DISK_CLASS, 30000, NULL, enc_disk_class,
+     prt_text_reply, help_disk_class},
     {{"volume", "gc", "resume"}, 3, 2, 2, CL_VF_PRINT_ERR_BODY | CL_VF_SECRET_IN_ENCODE, CLUSTER_OP_VOLUME_GC_RESUME,
      30000, NULL, enc_volume_gc_resume, prt_volume_gc_resume, help_volume_gc_resume},
     {{"volume", "add", NULL}, 2, 2, 2, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_VOLUME_ADD, 30000, parse_flag_volume_add,

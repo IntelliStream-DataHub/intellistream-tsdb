@@ -1919,11 +1919,27 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
                     return;
                 }
             }
-            /* Future r9-return hook (takebackwhole): never take back a position that is already WHOLE and UP
-             * to put it back into FILLING, which would lower settled margin. */
+            /* r9-return hook (takebackwhole): never take back a position that is already WHOLE and UP to put it back
+             * into FILLING, which would lower settled margin. Non-return evictions off an UP member are permitted only
+             * for node replace (forced_target) or R13 r13-dev device-OUT eviction (lost storage cap or OUT chunk disk). */
             if (v->stripe_pos[p->pos].state == META_STRIPE_WHOLE && p->reason == META_STRIPE_FILLING) {
                 const struct meta_member *cur = meta_member(sm, v->stripe[p->pos]);
-                if (cur && cur->state == META_UP && !chk_forced_target(in, cur->id)) {
+                int dev_evict = 0;
+                if (!p->is_return && cur && cur->state == META_UP && cur->ndisks > 0) {
+                    int has_out = 0, has_down = 0;
+                    for (uint32_t di = 0; di < cur->ndisks && di < META_DISKS_MAX; di++) {
+                        const struct meta_disk *d = &cur->disks[di];
+                        if ((d->uses & META_DISK_USE_CHUNK) || d->disk_class == META_DISK_HDD) {
+                            if (d->state == META_STORE_OUT || d->state == META_STORE_DESTROYED)
+                                has_out = 1;
+                            else if (d->state == META_STORE_DOWN)
+                                has_down = 1;
+                        }
+                    }
+                    if (!has_down && (!(meta_member_effective_cap(cur) & META_CAP_STORAGE) || has_out))
+                        dev_evict = 1;
+                }
+                if (cur && cur->state == META_UP && (p->is_return || (!chk_forced_target(in, cur->id) && !dev_evict))) {
                     sim_fail(s, "STRIPE_SET took back WHOLE UP position vol %" PRIu32 " pos %" PRIu32
                                 " (cur=%" PRIu32 " -> new=%" PRIu32 ")",
                              p->volume, p->pos, cur->id, p->node);

@@ -349,7 +349,7 @@ static void damaged_leader_sync_locked(struct rvol *rv)
     for (uint32_t k = 0; k < rv->rec.nrep && k < META_REPLICAS_MAX; k++)
         if (rv->rec.rep[k].replaces)
             move_active = 1;
-    if (move_active)
+    if (move_active || rset_drop_nomove(rv))
         return;
 
     int lv = repl_leaving(rv->core);

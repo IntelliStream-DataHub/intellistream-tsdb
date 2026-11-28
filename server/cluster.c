@@ -5624,6 +5624,40 @@ int cluster_balance_decode(const uint8_t *p, size_t n, uint32_t *flags)
     return 0;
 }
 
+size_t cluster_disk_op_encode(uint32_t node, const uint8_t store_id[16], uint8_t *out)
+{
+    for (int j = 0; j < 4; j++)
+        out[j] = (uint8_t)(node >> (8 * j));
+    memcpy(out + 4, store_id, 16);
+    return 20;
+}
+
+int cluster_disk_op_decode(const uint8_t *p, size_t n, uint32_t *node, uint8_t store_id[16])
+{
+    if (!p || n != 20)
+        return -1;
+    *node = le32(p);
+    memcpy(store_id, p + 4, 16);
+    return 0;
+}
+
+size_t cluster_disk_class_encode(uint32_t node, const uint8_t store_id[16], uint8_t disk_class, uint8_t *out)
+{
+    cluster_disk_op_encode(node, store_id, out);
+    out[20] = disk_class;
+    return 21;
+}
+
+int cluster_disk_class_decode(const uint8_t *p, size_t n, uint32_t *node, uint8_t store_id[16], uint8_t *disk_class)
+{
+    if (!p || n != 21)
+        return -1;
+    *node = le32(p);
+    memcpy(store_id, p + 4, 16);
+    *disk_class = p[20];
+    return 0;
+}
+
 /* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
 static int text_ok_cl(const char *s)
 {
@@ -5706,6 +5740,7 @@ static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, 
                         dst[d].uses = hd->disks[d].uses;
                         dst[d].state = hd->disks[d].state;
                         dst[d].have_usage = hd->disks[d].have_usage;
+                        dst[d].no_local_room = (hd->disks[d].dev_flags & HBS_DISK_DF_NO_LOCAL_ROOM) != 0 ? 1u : 0u;
                         dst[d].size_bytes = hd->disks[d].size_bytes;
                         dst[d].young_bytes = hd->disks[d].young_bytes;
                         dst[d].chunk_bytes = hd->disks[d].chunk_bytes;
@@ -6908,6 +6943,9 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_VOLUME_MOVE_POS: r4_admin(c, reqid, r, cnode_move_pos_admin); break;
     case CLUSTER_OP_SETTINGS: admin_settings_set(c, reqid, r); break;
     case CLUSTER_OP_BALANCE: admin_balance(c, reqid, r); break;
+    case CLUSTER_OP_DISK_OUT: r4_admin(c, reqid, r, cnode_disk_out_admin); break;
+    case CLUSTER_OP_DISK_REPLACE: r4_admin(c, reqid, r, cnode_disk_replace_admin); break;
+    case CLUSTER_OP_DISK_CLASS: r4_admin(c, reqid, r, cnode_disk_class_admin); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -8274,6 +8312,101 @@ static int sm_store_known(const struct meta_state *m, const uint8_t store_id[16]
     return 0;
 }
 
+/* R13 (r13-dev): per-device DOWN -> OUT timer tracking on the Raft leader (mirrors R9's member timers). */
+#define DEV_TIMERS_MAX 512
+struct dev_timer {
+    uint32_t node;
+    uint8_t store_id[16];
+    uint64_t down_since_ns;
+    uint64_t hold_logged_ns;
+};
+static struct dev_timer dev_timers[DEV_TIMERS_MAX];
+static uint32_t ndev_timers;
+static uint64_t dev_timers_term;
+
+static struct dev_timer *dev_timer_find_or_add(uint32_t node, const uint8_t sid[16], uint64_t now)
+{
+    for (uint32_t i = 0; i < ndev_timers; i++) {
+        if (dev_timers[i].node == node && memcmp(dev_timers[i].store_id, sid, 16) == 0)
+            return &dev_timers[i];
+    }
+    if (ndev_timers >= DEV_TIMERS_MAX)
+        return NULL;
+    struct dev_timer *dt = &dev_timers[ndev_timers++];
+    memset(dt, 0, sizeof *dt);
+    dt->node = node;
+    memcpy(dt->store_id, sid, 16);
+    dt->down_since_ns = now;
+    return dt;
+}
+
+static void dev_timer_clear(uint32_t node, const uint8_t sid[16])
+{
+    for (uint32_t i = 0; i < ndev_timers; i++) {
+        if (dev_timers[i].node == node && memcmp(dev_timers[i].store_id, sid, 16) == 0) {
+            dev_timers[i] = dev_timers[--ndev_timers];
+            return;
+        }
+    }
+}
+
+/* Track in-flight STORE_STATE OUT/DESTROYED proposals on the Raft leader so propose_disks never races a DOWN -> UP
+ * proposal behind an operator `disk out` or timer-triggered OUT before it applies. */
+#define DISK_OUT_INFLIGHT_MAX 256
+struct disk_out_inflight {
+    uint32_t node;
+    uint8_t store_id[16];
+    uint64_t term;
+};
+static struct disk_out_inflight disk_out_inflight[DISK_OUT_INFLIGHT_MAX];
+static uint32_t ndisk_out_inflight;
+static uint64_t disk_out_inflight_term;
+
+void cl_disk_out_mark(uint32_t node, const uint8_t store_id[16])
+{
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
+        return;
+    uint64_t term = raft_get_term(C.r);
+    if (term != disk_out_inflight_term) {
+        ndisk_out_inflight = 0;
+        disk_out_inflight_term = term;
+    }
+    for (uint32_t i = 0; i < ndisk_out_inflight; i++) {
+        if (disk_out_inflight[i].node == node && memcmp(disk_out_inflight[i].store_id, store_id, 16) == 0) {
+            disk_out_inflight[i].term = term;
+            return;
+        }
+    }
+    if (ndisk_out_inflight >= DISK_OUT_INFLIGHT_MAX)
+        return;
+    struct disk_out_inflight *x = &disk_out_inflight[ndisk_out_inflight++];
+    x->node = node;
+    memcpy(x->store_id, store_id, 16);
+    x->term = term;
+}
+
+static int disk_out_inflight_has(uint32_t node, const uint8_t store_id[16], uint64_t term)
+{
+    if (term != disk_out_inflight_term)
+        return 0;
+    for (uint32_t i = 0; i < ndisk_out_inflight; i++) {
+        if (disk_out_inflight[i].node == node && disk_out_inflight[i].term == term &&
+            memcmp(disk_out_inflight[i].store_id, store_id, 16) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void disk_out_inflight_clear(uint32_t node, const uint8_t store_id[16])
+{
+    for (uint32_t i = 0; i < ndisk_out_inflight; i++) {
+        if (disk_out_inflight[i].node == node && memcmp(disk_out_inflight[i].store_id, store_id, 16) == 0) {
+            disk_out_inflight[i] = disk_out_inflight[--ndisk_out_inflight];
+            return;
+        }
+    }
+}
+
 static void propose_disks(uint64_t now)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
@@ -8292,6 +8425,27 @@ static void propose_disks(uint64_t now)
         if (ndisk_sent < DISK_SENT_CAP)
             disk_sent_rot = 0;
     }
+    if (term != dev_timers_term) {
+        ndev_timers = 0;
+        dev_timers_term = term;
+    }
+    int settled = leader_settled(now);
+    uint64_t wall_ms = cl_wall_ms();
+    struct pout_guard pg;
+    memset(&pg, 0, sizeof pg);
+    if (settled) {
+        uint32_t gpct = C.sm.set.out_guard_pct ? C.sm.set.out_guard_pct : 25;
+        uint32_t ghold = C.sm.set.out_guard_hold_s ? C.sm.set.out_guard_hold_s : 7200;
+        pout_guard_eval(&C.sm, gpct, ghold, wall_ms, &pg);
+    }
+    int mut_nohold = 0, mut_damagenoout = 0;
+#ifdef TSDB_TEST_HOOKS
+    {
+        int dm = disks_mutant_env();
+        mut_nohold = (dm == DISKS_MUT_DEVOUTNOHOLD);
+        mut_damagenoout = (dm == DISKS_MUT_DAMAGENOOUT);
+    }
+#endif
     for (uint32_t i = 0; i < C.sm.nmembers && C.r && raft_get_role(C.r) == RAFT_LEADER && raft_get_term(C.r) == term;
          i++) {
         const struct meta_member *mb = &C.sm.members[i];
@@ -8359,6 +8513,95 @@ static void propose_disks(uint64_t now)
                 post_chunk = 1;
         }
 
+        /* R13 (r13-dev): per-device DOWN/UP/OUT state transitions mirroring R9 member timers. */
+        uint8_t pend_clear[META_DISKS_MAX][16];
+        uint32_t npend_clear = 0;
+        uint8_t pend_out_mark[META_DISKS_MAX][16];
+        uint32_t npend_out_mark = 0;
+
+        int held = (!mut_nohold && mb->hold_until_ms > 0 && wall_ms < mb->hold_until_ms);
+        for (uint32_t k = 0; k < mb->ndisks && k < META_DISKS_MAX; k++) {
+            const struct meta_disk *d = &mb->disks[k];
+            if (d->state == META_STORE_DESTROYED || d->state == META_STORE_OUT) {
+                dev_timer_clear(mb->id, d->store_id);
+                disk_out_inflight_clear(mb->id, d->store_id);
+                continue;
+            }
+            const struct hbs_disk_row *r = NULL;
+            for (uint32_t j = 0; j < hd->ndisks; j++) {
+                if (memcmp(hd->disks[j].store_id, d->store_id, 16) == 0) {
+                    r = &hd->disks[j];
+                    break;
+                }
+            }
+            int is_damaged = (!mut_damagenoout && r && (r->dev_flags & HBS_DISK_DF_DAMAGED)) ? 1 : 0;
+            int is_failed = (r && (r->dev_flags & HBS_DISK_DF_FAILED)) ? 1 : 0;
+            int rep_down = (r && r->state == META_STORE_DOWN) ? 1 : 0;
+            int rep_up = (r && r->state == META_STORE_UP && !is_damaged) ? 1 : 0;
+
+            if (d->state == META_STORE_UP) {
+                if (is_damaged && settled && !held && !pg.holding) {
+                    char hex[33];
+                    cl_sid_hex(d->store_id, hex);
+                    meta_op_store_state(&e, mb->id, d->store_id, META_STORE_DOWN);
+                    meta_op_store_state(&e, mb->id, d->store_id, META_STORE_OUT);
+                    if (npend_out_mark < META_DISKS_MAX)
+                        memcpy(pend_out_mark[npend_out_mark++], d->store_id, 16);
+                    if (npend_clear < META_DISKS_MAX)
+                        memcpy(pend_clear[npend_clear++], d->store_id, 16);
+                    say("proposes node %" PRIu32 " store %s OUT immediately (reason: scrub damage > scrub_out_count)",
+                        mb->id, hex);
+                } else if (rep_down || is_damaged) {
+                    char hex[33];
+                    cl_sid_hex(d->store_id, hex);
+                    meta_op_store_state(&e, mb->id, d->store_id, META_STORE_DOWN);
+                    (void)dev_timer_find_or_add(mb->id, d->store_id, now);
+                    say("proposes node %" PRIu32 " store %s DOWN%s", mb->id, hex,
+                        is_damaged ? " (scrub damaged)" : is_failed ? " (failed)" : "");
+                } else {
+                    dev_timer_clear(mb->id, d->store_id);
+                }
+            } else if (d->state == META_STORE_DOWN) {
+                if (rep_up) {
+                    if (!disk_out_inflight_has(mb->id, d->store_id, term)) {
+                        char hex[33];
+                        cl_sid_hex(d->store_id, hex);
+                        meta_op_store_state(&e, mb->id, d->store_id, META_STORE_UP);
+                        if (npend_clear < META_DISKS_MAX)
+                            memcpy(pend_clear[npend_clear++], d->store_id, 16);
+                        say("proposes node %" PRIu32 " store %s UP (returned before OUT)", mb->id, hex);
+                    }
+                } else if (settled) {
+                    struct dev_timer *dt = dev_timer_find_or_add(mb->id, d->store_id, now);
+                    uint32_t timeout_s = is_damaged ? 0u
+                                         : is_failed ? (C.sm.set.failstop_out_s ? C.sm.set.failstop_out_s : 60u)
+                                                     : (C.sm.set.rebuild_after_s ? C.sm.set.rebuild_after_s : 1800u);
+                    int due = is_damaged || (dt && since(now, dt->down_since_ns) >= (uint64_t)timeout_s * 1000000000ull);
+                    if (due) {
+                        if (held) {
+                            if (dt && (dt->hold_logged_ns == 0 || since(now, dt->hold_logged_ns) >= 30000ull * MS)) {
+                                char hex[33];
+                                cl_sid_hex(d->store_id, hex);
+                                say("node %" PRIu32 " store %s: automatic OUT held by member hold (%" PRIu64 " s left)",
+                                    mb->id, hex, (uint64_t)((mb->hold_until_ms - wall_ms) / 1000ull));
+                                dt->hold_logged_ns = now;
+                            }
+                        } else if (!pg.holding) {
+                            char hex[33];
+                            cl_sid_hex(d->store_id, hex);
+                            meta_op_store_state(&e, mb->id, d->store_id, META_STORE_OUT);
+                            if (npend_out_mark < META_DISKS_MAX)
+                                memcpy(pend_out_mark[npend_out_mark++], d->store_id, 16);
+                            if (npend_clear < META_DISKS_MAX)
+                                memcpy(pend_clear[npend_clear++], d->store_id, 16);
+                            say("proposes node %" PRIu32 " store %s OUT (reason: %s)", mb->id, hex,
+                                is_damaged ? "scrub damage" : is_failed ? "failstop" : "timeout");
+                        }
+                    }
+                }
+            }
+        }
+
         if (hd->role <= META_ROLE_LAST && hd->role != mb->role) {
             uint32_t post_nd = mb->ndisks + added;
             uint8_t post_cap = META_CAP_NONE;
@@ -8376,6 +8619,10 @@ static void propose_disks(uint64_t now)
         if (e.nops > 0) {
             uint32_t nops = e.nops;
             if (propose(&e, 0, 0, 0) == ISO_OK) {
+                for (uint32_t j = 0; j < npend_out_mark; j++)
+                    cl_disk_out_mark(mb->id, pend_out_mark[j]);
+                for (uint32_t j = 0; j < npend_clear; j++)
+                    dev_timer_clear(mb->id, pend_clear[j]);
                 if (!ds) {
                     if (ndisk_sent < DISK_SENT_CAP)
                         ds = &disk_sent[ndisk_sent++];
@@ -9243,6 +9490,12 @@ static uint64_t balance_trigger_sig(uint64_t now)
                       ((uint64_t)ever_heard << 16) | (uint64_t)(mb->ndisks & 0xffffu);
         h ^= mv;
         h *= 1099511628211ull;
+        for (uint32_t k = 0; k < mb->ndisks && k < META_DISKS_MAX; k++) {
+            uint8_t dst = mb->disks[k].state == META_STORE_DOWN ? META_STORE_UP : mb->disks[k].state;
+            uint64_t dv = ((uint64_t)dst << 8) | (uint64_t)mb->disks[k].disk_class;
+            h ^= dv;
+            h *= 1099511628211ull;
+        }
     }
     return h;
 }
@@ -9510,6 +9763,366 @@ static void admin_balance(struct conn *c, uint32_t reqid, struct rd *r)
     free(pm);
 }
 
+/* R13 (r13-dev): fast-disk OUT / class-change log replica rebuild on the Raft leader.
+ * Rebuilds log replicas hosted on an OUT/DESTROYED disk (or a disk changed to HDD while fast disks exist / !log_on_hdd)
+ * onto another UP fast disk of the SAME server (via planned transfer -> DROP_MEMBER -> REPLICA_RESET) when the server
+ * still has another UP fast disk below young_move_pct and remaining healthy ISR >= min_isr; otherwise moves the
+ * replica to another compute-capable server via cmove_start_auto (never lowering ISR below min_isr). */
+static int cl_vol_store_id(uint32_t node, uint32_t vol, uint64_t now, uint8_t store_id_out[16]);
+
+struct fast_rb_cand {
+    uint32_t vol;
+    uint32_t node;
+    uint8_t cur_sid[16];
+    int margin;
+};
+
+#define FAST_RB_SENT_MAX 128
+struct fast_rb_sent {
+    uint32_t vol;
+    uint32_t node;
+    uint64_t set_version;
+    uint64_t epoch;
+    uint64_t sent_ns;
+    int kind; /* 1=DROP_MEMBER, 2=REPLICA_RESET, 3=MOVE */
+};
+static struct fast_rb_sent fast_rb_sent[FAST_RB_SENT_MAX];
+static uint32_t nfast_rb_sent;
+static uint64_t fast_rb_term;
+
+static struct fast_rb_sent *fast_rb_find(uint32_t vol, uint32_t node)
+{
+    for (uint32_t i = 0; i < nfast_rb_sent; i++) {
+        if (fast_rb_sent[i].vol == vol && fast_rb_sent[i].node == node)
+            return &fast_rb_sent[i];
+    }
+    return NULL;
+}
+
+static struct fast_rb_sent *fast_rb_upsert(uint32_t vol, uint32_t node)
+{
+    struct fast_rb_sent *x = fast_rb_find(vol, node);
+    if (x)
+        return x;
+    if (nfast_rb_sent >= FAST_RB_SENT_MAX)
+        return NULL;
+    x = &fast_rb_sent[nfast_rb_sent++];
+    memset(x, 0, sizeof *x);
+    x->vol = vol;
+    x->node = node;
+    return x;
+}
+
+/* True iff member `nid` has another UP fast disk (nvme/ssd, distinct from `exclude_sid`) below young_move_pct. */
+static int cl_member_has_other_fast_disk(uint32_t nid, const uint8_t exclude_sid[16], uint64_t now)
+{
+    const struct meta_member *mb = meta_member(&C.sm, nid);
+    if (!mb || mb->state != META_UP || !(mb->flags & META_MF_VOLUMES_OK))
+        return 0;
+    if (!cl_heard_fresh(nid, now))
+        return 0;
+    struct heard *h = heard_get(nid);
+    const struct hbs_disks *hd = h ? creport_heard_get(&h->ext, HBS_DISKS) : NULL;
+    uint32_t move_pct = C.sm.set.young_move_pct ? C.sm.set.young_move_pct : 80u;
+    for (uint32_t k = 0; k < mb->ndisks && k < META_DISKS_MAX; k++) {
+        const struct meta_disk *d = &mb->disks[k];
+        if (d->state != META_STORE_UP || !meta_disk_class_fast(d->disk_class))
+            continue;
+        if (memcmp(d->store_id, exclude_sid, 16) == 0)
+            continue;
+        if (hd) {
+            const struct hbs_disk_row *r = NULL;
+            for (uint32_t j = 0; j < hd->ndisks; j++) {
+                if (memcmp(hd->disks[j].store_id, d->store_id, 16) == 0) {
+                    r = &hd->disks[j];
+                    break;
+                }
+            }
+            if (r) {
+                if (r->state != META_STORE_UP)
+                    continue;
+                if (r->fill_flags & (HBS_DISK_F_MOVE | HBS_DISK_F_FULL))
+                    continue;
+                if (r->have_usage && r->young_fill_pct >= move_pct)
+                    continue;
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int fast_rb_cmp(const void *a, const void *b)
+{
+    const struct fast_rb_cand *x = a, *y = b;
+    if (x->margin != y->margin)
+        return x->margin < y->margin ? -1 : 1;
+    if (x->vol != y->vol)
+        return x->vol < y->vol ? -1 : 1;
+    return x->node < y->node ? -1 : (x->node > y->node ? 1 : 0);
+}
+
+static uint32_t pick_alt_compute_node(const struct meta_volume *v, uint32_t exclude, uint64_t now)
+{
+    uint32_t best = 0;
+    uint32_t best_holds = UINT32_MAX;
+    for (uint32_t i = 0; i < C.sm.nmembers; i++) {
+        const struct meta_member *mb = &C.sm.members[i];
+        if (mb->id == exclude || mb->state != META_UP || !(mb->flags & META_MF_VOLUMES_OK))
+            continue;
+        if (!cl_heard_fresh(mb->id, now))
+            continue;
+        if (meta_replica(v, mb->id))
+            continue;
+        if (!cl_member_log_ok(mb->id, now, NULL))
+            continue;
+        uint32_t holds = 0;
+        for (uint32_t vi = 0; vi < C.sm.nvolumes; vi++)
+            if (meta_replica(&C.sm.volumes[vi], mb->id))
+                holds++;
+        if (holds < best_holds || (holds == best_holds && mb->id < best)) {
+            best = mb->id;
+            best_holds = holds;
+        }
+    }
+    return best;
+}
+
+static void dev_fast_rebuild_duty(uint64_t now)
+{
+    if (!cl_leading())
+        return;
+    uint64_t term = cl_term();
+    if (term != fast_rb_term) {
+        nfast_rb_sent = 0;
+        fast_rb_term = term;
+    }
+
+    /* Scan replicated volumes for replicas hosted on OUT/DESTROYED disks or class-changed HDD disks. */
+    struct fast_rb_cand cands[64];
+    uint32_t ncands = 0;
+    for (uint32_t vi = 0; vi < C.sm.nvolumes && ncands < 64; vi++) {
+        const struct meta_volume *v = &C.sm.volumes[vi];
+        if (v->kind != META_VOL_REPLICATED || v->nrep == 0)
+            continue;
+        if (ctr_running(v->number) || cl_promo_running(v->number))
+            continue;
+        int busy = 0;
+        for (uint32_t k = 0; k < v->nrep; k++)
+            if (v->rep[k].learner || v->rep[k].replaces != 0)
+                busy = 1;
+        if (busy)
+            continue;
+
+        for (uint32_t k = 0; k < v->nrep && ncands < 64; k++) {
+            uint32_t nid = v->rep[k].node;
+            const struct meta_member *mb = meta_member(&C.sm, nid);
+            if (!mb || mb->state != META_UP || mb->ndisks == 0 || !cl_heard_fresh(nid, now))
+                continue;
+            uint8_t sid[16];
+            int have_sid = cl_vol_store_id(nid, v->number, now, sid);
+            const struct meta_disk *md = have_sid ? meta_member_disk(mb, sid) : NULL;
+            int need = 0;
+            if (md) {
+                if (md->state == META_STORE_OUT || md->state == META_STORE_DESTROYED)
+                    need = 1;
+                else if (md->disk_class == META_DISK_HDD && (!C.sm.set.log_on_hdd || meta_member_has_fast_disk(mb)))
+                    need = 1;
+            } else if (!have_sid && v->rep[k].open_gen > 0 && cl_vol_health(nid, v->number, now, NULL) != 0) {
+                /* After a tsdbd restart with a lost/OUT fast disk, cvolfs refuses open_gen > 0 and reports no
+                 * store_id: if the member has an OUT/DESTROYED fast disk, rebuild the refused replica automatically. */
+                for (uint32_t dk = 0; dk < mb->ndisks && dk < META_DISKS_MAX; dk++) {
+                    const struct meta_disk *od = &mb->disks[dk];
+                    if ((od->state == META_STORE_OUT || od->state == META_STORE_DESTROYED) &&
+                        meta_disk_class_fast(od->disk_class)) {
+                        memcpy(sid, od->store_id, 16);
+                        need = 1;
+                        break;
+                    }
+                }
+            }
+            if (!need)
+                continue;
+            int ym = (int)v->nisr - (int)v->min_isr;
+            struct fast_rb_cand *c = &cands[ncands++];
+            c->vol = v->number;
+            c->node = nid;
+            memcpy(c->cur_sid, sid, 16);
+            c->margin = ym;
+            break; /* at most one replica per volume per tick */
+        }
+    }
+
+    /* Prune completed/obsolete fast_rb_sent entries, and send an eager nomove cancel ONLY when no R4 move is active
+     * and a fresh heartbeat confirms the replica's disk no longer needs rebuild (rset's 5 s drop_nomove lease also
+     * guarantees automatic cleanup on packet loss or Raft leader change). */
+    uint32_t dst = 0;
+    for (uint32_t i = 0; i < nfast_rb_sent; i++) {
+        struct fast_rb_sent *s = &fast_rb_sent[i];
+        const struct meta_volume *v = meta_volume(&C.sm, s->vol);
+        if (!v || v->set_version != s->set_version)
+            continue;
+        int vol_moving = 0;
+        for (uint32_t k = 0; k < v->nrep; k++)
+            if (v->rep[k].replaces != 0)
+                vol_moving = 1;
+        if (vol_moving)
+            continue; /* never cancel an active R4 move's leave */
+        int still_cand = 0;
+        for (uint32_t ci = 0; ci < ncands; ci++) {
+            if (cands[ci].vol == s->vol && cands[ci].node == s->node) {
+                still_cand = 1;
+                break;
+            }
+        }
+        if (!still_cand) {
+            const struct meta_member *mb = meta_member(&C.sm, s->node);
+            uint8_t cur_sid[16];
+            int confirmed_clear = 0;
+            if (mb && mb->state == META_UP && cl_heard_fresh(s->node, now) &&
+                cl_vol_store_id(s->node, s->vol, now, cur_sid)) {
+                const struct meta_disk *md = meta_member_disk(mb, cur_sid);
+                if (md && md->state != META_STORE_OUT && md->state != META_STORE_DESTROYED &&
+                    !(md->disk_class == META_DISK_HDD && (!C.sm.set.log_on_hdd || meta_member_has_fast_disk(mb))))
+                    confirmed_clear = 1;
+            }
+            if (confirmed_clear) {
+                if (s->kind == 1 && v->leader) {
+                    struct cluster_volcmd cancel = {
+                        .kind = CL_VOLCMD_DROP_MEMBER,
+                        .volume = v->number,
+                        .epoch = v->epoch,
+                        .node = 0,
+                        .arg = (term << 8) | 0x80u,
+                    };
+                    (void)cl_volcmd_send(v->leader, &cancel);
+                }
+                continue;
+            }
+            if (since(now, s->sent_ns) >= 10000ull * MS)
+                continue;
+        }
+        fast_rb_sent[dst++] = *s;
+    }
+    nfast_rb_sent = dst;
+
+    if (ncands == 0)
+        return;
+    if (ncands > 1)
+        qsort(cands, ncands, sizeof *cands, fast_rb_cmp);
+
+    uint32_t limit = C.sm.set.rebuild_max ? C.sm.set.rebuild_max : 2;
+    uint32_t started = 0;
+    /* Count all active in-flight drops, resets, and off-node moves against rebuild_max. */
+    for (uint32_t i = 0; i < nfast_rb_sent; i++)
+        if (fast_rb_sent[i].kind == 1 || fast_rb_sent[i].kind == 2 || fast_rb_sent[i].kind == 3)
+            started++;
+
+    for (uint32_t ci = 0; ci < ncands && cl_leading(); ci++) {
+        const struct meta_volume *v = meta_volume(&C.sm, cands[ci].vol);
+        if (!v)
+            continue;
+        uint32_t nid = cands[ci].node;
+        struct fast_rb_sent *prev = fast_rb_find(v->number, nid);
+        if (prev && prev->kind == 2 && prev->set_version == v->set_version && since(now, prev->sent_ns) < 10000ull * MS)
+            continue; /* REPLICA_RESET already proposed for this set_version: wait for apply */
+        int already_counted = (prev && (prev->kind == 1 || prev->kind == 2) && prev->set_version == v->set_version);
+        if (!already_counted && started >= limit)
+            continue;
+
+        uint32_t good_isr = 0, healthy_peer = 0;
+        for (uint32_t j = 0; j < v->nisr; j++) {
+            uint32_t u = v->isr[j];
+            if (u == nid)
+                continue;
+            const struct meta_member *um = meta_member(&C.sm, u);
+            if (um && um->state == META_UP && cl_heard_fresh(u, now)) {
+                good_isr++;
+                if (!healthy_peer)
+                    healthy_peer = u;
+            }
+        }
+        int same_server_ok =
+            cl_member_has_other_fast_disk(nid, cands[ci].cur_sid, now) && good_isr >= v->min_isr && healthy_peer != 0;
+        if (same_server_ok) {
+            if (v->leader == nid) {
+                if (ctr_move_start(v->number, healthy_peer, now) == NULL) {
+                    say("volume %" PRIu32 ": fast-disk rebuild transferring leader off node %" PRIu32 " to node %" PRIu32,
+                        v->number, nid, healthy_peer);
+                    started++;
+                }
+            } else if (meta_volume_in_isr(v, nid)) {
+                if (v->leader) {
+                    int resend_due = (!prev || prev->kind != 1 || prev->epoch != v->epoch ||
+                                      since(now, prev->sent_ns) >= 1000ull * MS);
+                    if (resend_due) {
+                        struct cluster_volcmd cmd = {
+                            .kind = CL_VOLCMD_DROP_MEMBER,
+                            .volume = v->number,
+                            .epoch = v->epoch,
+                            .node = nid,
+                            .arg = (term << 8) | 0x80u | (v->min_isr & 0x7fu),
+                        };
+                        if (cl_volcmd_send(v->leader, &cmd) == 0) {
+                            int first = (!prev || prev->kind != 1 || prev->epoch != v->epoch);
+                            struct fast_rb_sent *s = fast_rb_upsert(v->number, nid);
+                            if (s) {
+                                s->set_version = v->set_version;
+                                s->epoch = v->epoch;
+                                s->sent_ns = now;
+                                s->kind = 1;
+                            }
+                            if (first) {
+                                say("volume %" PRIu32 ": fast-disk rebuild asking leader %" PRIu32 " to drop node %" PRIu32
+                                    " from ISR",
+                                    v->number, v->leader, nid);
+                            }
+                            if (!already_counted)
+                                started++;
+                        }
+                    }
+                }
+            } else {
+                struct meta_entry e;
+                meta_entry_init(&e);
+                uint64_t rid = cset_fresh_rid(v);
+                meta_op_replica_reset(&e, v->number, v->epoch, nid, rid);
+                if (cl_propose(&e) == 0) {
+                    struct fast_rb_sent *s = fast_rb_upsert(v->number, nid);
+                    if (s) {
+                        s->set_version = v->set_version;
+                        s->epoch = v->epoch;
+                        s->sent_ns = now;
+                        s->kind = 2;
+                    }
+                    say("volume %" PRIu32 ": fast-disk rebuild resetting replica on node %" PRIu32 " (rid %" PRIu64
+                        ") onto surviving fast disk",
+                        v->number, nid, rid);
+                    if (!already_counted)
+                        started++;
+                }
+            }
+        } else {
+            /* No other fast disk with room on `nid`, or shrinking would drop below min_isr: move to another compute node. */
+            if (prev && prev->kind == 3 && prev->set_version == v->set_version && since(now, prev->sent_ns) < 1000ull * MS)
+                continue;
+            uint32_t target = pick_alt_compute_node(v, nid, now);
+            if (target && cmove_start_auto(v->number, nid, target, now) == NULL) {
+                struct fast_rb_sent *s = fast_rb_upsert(v->number, nid);
+                if (s) {
+                    s->set_version = v->set_version;
+                    s->epoch = v->epoch;
+                    s->sent_ns = now;
+                    s->kind = 3;
+                }
+                say("volume %" PRIu32 ": fast-disk rebuild moving replica from node %" PRIu32 " to node %" PRIu32,
+                    v->number, nid, target);
+                started++;
+            }
+        }
+    }
+}
+
 /* R9 (D7): once a second on the Raft leader, run the pure planners in order — pout_plan (timers), place_plan
  * (re-placement / whole / return), balance_plan — and propose their output (one proposal per member/position at a
  * time). Waits until the Raft leader is settled (same wait as member_states) before proposing OUT or moves. */
@@ -9658,6 +10271,8 @@ static void leader_duties(uint64_t now)
     ctr_duty(now); /* R4: transfers, moves (cluster_int.h; each checks cl_leading itself) */
     cmove_duty(now);
     cheal_duty(now); /* R12 (D8): automatic transfer/reset for DAMAGED replicas */
+    if (leader_settled(now))
+        dev_fast_rebuild_duty(now);
     if (C.volcmd_file && cl_leading())
         volcmd_file_send();
     if (C.setop_file && cl_leading())
@@ -10415,6 +11030,50 @@ int cl_vol_health(uint32_t node, uint32_t vol, uint64_t now, uint64_t *rid_out)
         }
     }
     return -1;
+}
+
+static int cl_vol_store_id(uint32_t node, uint32_t vol, uint64_t now, uint8_t store_id_out[16])
+{
+    static struct cluster_report own;
+    static uint64_t own_now;
+    static int own_valid;
+    memset(store_id_out, 0, 16);
+    if (node == C.id) {
+        if (!own_valid || own_now != now) {
+            memset(&own, 0, sizeof own);
+            if (g_reporter)
+                g_reporter(g_reporter_arg, &own);
+            own_now = now;
+            own_valid = 1;
+        }
+        for (uint32_t j = 0; j < own.nvols && j < CLUSTER_REPORT_VOLS; j++) {
+            if (own.vols[j].volume == vol) {
+                int nz = 0;
+                for (int b = 0; b < 16; b++)
+                    nz |= own.vols[j].store_id[b];
+                if (!nz)
+                    return 0;
+                memcpy(store_id_out, own.vols[j].store_id, 16);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (!heard_fresh(node, now))
+        return 0;
+    const struct heard *h = heard_get(node);
+    for (uint32_t j = 0; h && j < h->nvols; j++) {
+        if (h->vols[j].v.volume == vol) {
+            int nz = 0;
+            for (int b = 0; b < 16; b++)
+                nz |= h->vols[j].v.store_id[b];
+            if (!nz)
+                return 0;
+            memcpy(store_id_out, h->vols[j].v.store_id, 16);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int cl_heard_fresh(uint32_t id, uint64_t now) { return heard_fresh(id, now); }

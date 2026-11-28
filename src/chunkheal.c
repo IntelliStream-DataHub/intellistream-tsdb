@@ -1021,6 +1021,120 @@ int chunk_be_attach(chunk_backend *be, int index, const char *path, const uint8_
     return chunk_be_settle(be, index, o, rep);
 }
 
+int chunk_be_detach_for_attach(chunk_backend *be, int index)
+{
+    if (!be || be->read_only)
+        return TSDB_ERR_READONLY;
+    if (index < 0 || index >= chunk_be_nstores(be))
+        return TSDB_ERR_INVALID;
+    int stt = chunk_be_store_state(be, index);
+    if (stt == CHUNK_STORE_UP || stt == CHUNK_STORE_REPLACING)
+        return TSDB_ERR_INVALID;
+    if (chunk_be_raw_store(be, index) != NULL)
+        (void)chunk_be_mark_lost(be, index);
+    chunk_be_release_down(be, index);
+    return 0;
+}
+
+int chunk_store_prepare_attach(const char *path, const uint8_t *expect_id, const uint32_t *vols, const uint64_t *epochs,
+                               size_t nvols, chunk_store **out)
+{
+    if (!path || !out)
+        return TSDB_ERR_INVALID;
+    *out = NULL;
+    chunk_store *ns = NULL;
+    int rc = chunk_store_open_quiet(path, expect_id, &ns);
+    if (rc != 0)
+        return rc;
+    if (vols && epochs) {
+        for (size_t i = 0; i < nvols && rc == 0; i++) {
+            if (epochs[i] == 0)
+                continue;
+            rc = chunk_store_raise(ns, vols[i], epochs[i]);
+        }
+    }
+    if (rc != 0) {
+        chunk_store_close(ns);
+        return rc;
+    }
+    *out = ns;
+    return 0;
+}
+
+int chunk_be_install_attached(chunk_backend *be, int index, const char *path, chunk_store *ns)
+{
+    if (!be || !ns || !path) {
+        if (ns)
+            chunk_store_close(ns);
+        return TSDB_ERR_INVALID;
+    }
+    if (be->read_only) {
+        chunk_store_close(ns);
+        return TSDB_ERR_READONLY;
+    }
+    if (index < 0 || index >= chunk_be_nstores(be)) {
+        chunk_store_close(ns);
+        return TSDB_ERR_INVALID;
+    }
+    if (id_taken(be, index, chunk_store_id(ns))) {
+        chunk_store_close(ns);
+        return TSDB_ERR_INVALID;
+    }
+
+    uint32_t *svols = NULL;
+    uint64_t *seps = NULL;
+    size_t snv = 0;
+    int rc = chunk_store_volumes(ns, &svols, &seps, &snv);
+    if (rc == 0) {
+        for (size_t i = 0; i < snv && rc == 0; i++)
+            rc = chunk_be_see_epoch(be, svols[i], seps[i]);
+        free(svols);
+        free(seps);
+    }
+    if (rc == 0)
+        rc = fence_new_store(be, ns);
+    if (rc == 0)
+        rc = install(be, index, ns, path);
+    if (rc != 0) {
+        chunk_store_close(ns);
+        return rc;
+    }
+    return 0;
+}
+
+int chunk_be_attach_cluster(chunk_backend *be, int index, const char *path, const uint8_t *expect_id,
+                            const uint32_t *vols, const uint64_t *epochs, size_t nvols)
+{
+    int rc = chunk_be_detach_for_attach(be, index);
+    if (rc != 0)
+        return rc;
+    chunk_store *ns = NULL;
+    rc = chunk_store_prepare_attach(path, expect_id, vols, epochs, nvols, &ns);
+    if (rc != 0)
+        return rc;
+    return chunk_be_install_attached(be, index, path, ns);
+}
+
+int chunk_be_promote_up(chunk_backend *be, int index)
+{
+    if (!be)
+        return TSDB_ERR_INVALID;
+    int bn = chunk_be_nstores(be);
+    if (index < 0 || index >= bn)
+        return TSDB_ERR_INVALID;
+    pthread_mutex_lock(&be->st_mu);
+    int stt = atomic_load_explicit(&be->state[index], memory_order_relaxed);
+    chunk_store *st = atomic_load_explicit(&be->st[index], memory_order_relaxed);
+    bool failed = atomic_load_explicit(&be->st_failed[index], memory_order_relaxed);
+    if (stt != CHUNK_STORE_REPLACING || !st || failed) {
+        pthread_mutex_unlock(&be->st_mu);
+        return TSDB_ERR_INVALID;
+    }
+    atomic_store_explicit(&be->state[index], CHUNK_STORE_UP, memory_order_release);
+    pthread_mutex_unlock(&be->st_mu);
+    return 0;
+}
+
 /* Counts live single-copy (m = 0) objects on a retiring store that is still open (failed in service) via its open
  * dirfd: they have no other position to rebuild from, so replacing the store counts them unrecoverable and writes
  * nothing. Any listing or header-read failure on the retiring store is counted in rep->failed (and unreadable pos-0

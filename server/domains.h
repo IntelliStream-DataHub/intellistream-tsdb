@@ -826,9 +826,17 @@ static void dom_on_disk_change(void *ctx, int disk_idx, const uint8_t store_id[1
 
     if (new_state == TSDB_DOM_RECOVERING) {
         if (!(uses & META_DISK_USE_LOG)) {
-            disk_probe_set_up(disk_idx);
+            if (uses & META_DISK_USE_CHUNK) {
+                int arc = disks_chunk_attach_async(disk_idx);
+                if (arc < 0)
+                    disk_probe_set_up(disk_idx);
+            } else {
+                disk_probe_set_up(disk_idx);
+            }
             return;
         }
+        if (uses & META_DISK_USE_CHUNK)
+            (void)disks_chunk_attach_async(disk_idx);
         uint32_t nv = 0;
         pthread_mutex_lock(&dom.disk_mu);
         nv = dom.disks[disk_idx].nvols;
