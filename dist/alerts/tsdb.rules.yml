@@ -53,3 +53,28 @@ groups:
             Inserts, appends, and replaces are refused with UNAVAILABLE (TSDB_WHY_FULL) before the
             WAL hits ENOSPC; deletes and drops remain allowed. Free space or restore tier settling
             to clear FULL (below young_high_pct - 2).
+
+      - alert: TsdbTierScrubUnrepairable
+        expr: increase(tsdb_tier_scrub_unrepairable_total[24h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "tsdb tier scrub found unrepairable damage on store {{ $labels.store }}"
+          description: >-
+            Background tier scrub detected at least one unrepairable chunk on store
+            {{ $labels.store }} (single-copy store or insufficient surviving chunks for erasure
+            reconstruction). Check tsdbd logs for the affected volume, object, and partition and
+            run `tsdb DIR tier salvage` if needed.
+
+      - alert: TsdbTierScrubOverdue
+        expr: tsdb_tier_scrub_oldest_age_seconds > 28 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "tsdb tier scrub pass age exceeds 28 days ({{ $value }}s)"
+          description: >-
+            The oldest tier store scrub pass age has exceeded 28 days (2x the default 14-day
+            scrub_days schedule). Check whether scrub is blocked by a DOWN store, a long rebuild
+            or shrink, or an overly low scrub_mb_s limit.

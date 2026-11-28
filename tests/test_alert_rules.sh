@@ -16,14 +16,14 @@ if [ ! -f "$RULES" ]; then
 fi
 
 # Structural check: required alerts and metrics must be present and match server/metrics.c.
-for alert in TsdbTierFull7d TsdbTierStoreDown TsdbInsertsRefusedFull; do
+for alert in TsdbTierFull7d TsdbTierStoreDown TsdbInsertsRefusedFull TsdbTierScrubUnrepairable TsdbTierScrubOverdue; do
     if ! grep -q "alert: $alert" "$RULES"; then
         echo "test_alert_rules: FAIL: $RULES missing alert $alert" >&2
         exit 1
     fi
 done
 
-for metric in tsdb_tier_bytes tsdb_tier_store_state tsdb_volume_full; do
+for metric in tsdb_tier_bytes tsdb_tier_store_state tsdb_volume_full tsdb_tier_scrub_unrepairable_total tsdb_tier_scrub_oldest_age_seconds; do
     if ! grep -q "$metric" "$RULES"; then
         echo "test_alert_rules: FAIL: $RULES does not reference metric $metric" >&2
         exit 1
@@ -79,6 +79,12 @@ tests:
         values: '0x24 1x6'
       - series: 'tsdb_volume_full{volume="1"}'
         values: '0x30'
+      - series: 'tsdb_tier_scrub_unrepairable_total{store="0"}'
+        values: '0x24 1x6'
+      - series: 'tsdb_tier_scrub_unrepairable_total{store="1"}'
+        values: '0x30'
+      - series: 'tsdb_tier_scrub_oldest_age_seconds'
+        values: '2500000x30'
 
     alert_rule_test:
       - eval_time: 26h
@@ -118,6 +124,25 @@ tests:
             exp_annotations:
               summary: "tsdb volume 0 is FULL and refusing inserts"
               description: "Volume 0 filesystem fill reached young_high_pct (90% default). Inserts, appends, and replaces are refused with UNAVAILABLE (TSDB_WHY_FULL) before the WAL hits ENOSPC; deletes and drops remain allowed. Free space or restore tier settling to clear FULL (below young_high_pct - 2)."
+
+      - eval_time: 25h
+        alertname: TsdbTierScrubUnrepairable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              store: "0"
+            exp_annotations:
+              summary: "tsdb tier scrub found unrepairable damage on store 0"
+              description: "Background tier scrub detected at least one unrepairable chunk on store 0 (single-copy store or insufficient surviving chunks for erasure reconstruction). Check tsdbd logs for the affected volume, object, and partition and run \`tsdb DIR tier salvage\` if needed."
+
+      - eval_time: 25h
+        alertname: TsdbTierScrubOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "tsdb tier scrub pass age exceeds 28 days (2.5e+06s)"
+              description: "The oldest tier store scrub pass age has exceeded 28 days (2x the default 14-day scrub_days schedule). Check whether scrub is blocked by a DOWN store, a long rebuild or shrink, or an overly low scrub_mb_s limit."
 EOF
 
 promtool test rules "$tmp/test.yml"

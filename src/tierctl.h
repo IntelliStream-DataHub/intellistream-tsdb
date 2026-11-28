@@ -58,6 +58,13 @@ int tierctl_count_shrink_objects(const struct tiers_view *tv, const char *const 
 /* Waits until no TIERS reload or replacement rebuild is pending (0) or timeout expires (TSDB_ERR_UNAVAILABLE). */
 int tierctl_wait_idle(struct tier *t, int timeout_ms);
 
+/* Helpers used by src/tierscrub.c running on the tierctl nice-19 worker thread (R15 r15-scrub). */
+bool tierctl_is_closing(const struct tier *t);
+bool tierctl_scrub_should_yield(struct tier *t);
+bool tierctl_wait_interruptible_ms(struct tier *t, uint64_t wait_ms);
+uint32_t tierctl_scrub_mb_s(const struct tier *t);
+uint32_t tierctl_scrub_days(const struct tier *t);
+
 /* Records STATE LOST and either:
  *  - replace_path != NULL: validates/initializes the replacement store with db_id binding and durable REBUILDING
  *    marker, then appends STATE REPLACED_BY to TIERS under the VOLUMES OFD write lock; or

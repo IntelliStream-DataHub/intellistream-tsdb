@@ -16,6 +16,7 @@
 #include "settle.h"
 #include "tier.h"
 #include "tiers.h"
+#include "tierscrub.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -738,6 +739,8 @@ static void apply_tiers_changes(struct tierctl *ctl)
         ctl->slots[i].fails = 0;
         ctl->nslots = i + 1;
         pthread_mutex_unlock(&ctl->mu);
+        if (new_be_idx >= 0 && !is_rebuilding && !is_shrinking && ts->state != TIERS_STATE_LOST)
+            tierscrub_on_store_changed(t, new_be_idx, ts->path);
         fprintf(stderr, "tsdb: tier: opened newly added store %d (%s)\n", i, ts->path);
     }
 
@@ -912,6 +915,7 @@ static void run_rebuild(struct tierctl *ctl, int idx)
 
     if (rc == 0 && !atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire)) {
         tier_health_store_replaced(t, be_idx, path, expect_id);
+        tierscrub_on_store_changed(t, be_idx, path);
         eccache_reopen_all(t);
         tier_resume_if_all_up(t);
         /* If another slot is still REPLACING or SHRINKING waiting for this store to come UP, retry it immediately. */
@@ -1608,6 +1612,10 @@ static void *worker_main(void *arg)
                 do_stat = true;
             }
             pthread_mutex_unlock(&ctl->mu);
+        } else {
+            pthread_mutex_lock(&ctl->mu);
+            ctl->check_tiers_now = false;
+            pthread_mutex_unlock(&ctl->mu);
         }
         if (do_stat) {
             int pms = ctl_poll_ms();
@@ -1659,8 +1667,11 @@ static void *worker_main(void *arg)
         else if (t->from_tiers && next_stat_ms <= now)
             wait_ms = 0;
 
+        bool any_rb_or_sh = false;
         pthread_mutex_lock(&ctl->mu);
         for (int i = 0; i < ctl->nslots; i++) {
+            if (ctl->slots[i].needs_rebuild || ctl->slots[i].needs_shrink)
+                any_rb_or_sh = true;
             if (!ctl->slots[i].needs_rebuild || ctl->slots[i].wait_other_up)
                 continue;
             if (now >= ctl->slots[i].retry_after_ms) {
@@ -1687,15 +1698,25 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&ctl->mu);
 
         if (pick_rb >= 0) {
+            tierscrub_set_paused(t, true);
             run_rebuild(ctl, pick_rb);
             continue;
         }
         if (pick_sh >= 0) {
+            tierscrub_set_paused(t, true);
             run_shrink(ctl, pick_sh);
             continue;
         }
 
-        /* 5. Sleep until next poll, retry, or wakeup. */
+        /* 5. Background chunk scrub (R15 r15-scrub): runs only when no rebuild, shrink, or attach is active/pending. */
+        if (!any_rb_or_sh && !tier_health_busy(t) && !tier_health_has_pending(t)) {
+            if (tierscrub_step(t, &wait_ms))
+                continue;
+        } else {
+            tierscrub_set_paused(t, true);
+        }
+
+        /* 6. Sleep until next poll, retry, or wakeup. */
         pthread_mutex_lock(&ctl->mu);
         if (!ctl->closing && !ctl->check_tiers_now && wait_ms > 0)
             tsdb_cond_timedwait_ms(&ctl->cv, &ctl->mu, (uint64_t)wait_ms);
@@ -1775,6 +1796,10 @@ int tierctl_open(tier *t)
     atomic_init(&ctl->scrub_days, sc_days);
 
     atomic_store_explicit(&t->ctl, ctl, memory_order_release);
+    if (tierscrub_open(t) != 0) {
+        tierctl_close(t);
+        return TSDB_ERR_NOMEM;
+    }
     tier_health_set_wake(t, ctl_wake_from_health, ctl);
 
     if (tsdb_thread_create(&ctl->worker_th, worker_main, ctl) != 0) {
@@ -1818,6 +1843,7 @@ void tierctl_quiesce(tier *t)
     pthread_cond_broadcast(&ctl->cv);
     pthread_cond_broadcast(&ctl->idle_cv);
     pthread_mutex_unlock(&ctl->mu);
+    tierscrub_quiesce(t);
 
     struct timespec dl;
     tsdb_cond_deadline_ms(&dl, 2000);
@@ -1856,6 +1882,7 @@ bool tierctl_close(tier *t)
         return false;
     if (ctl->worker_stuck)
         return true;
+    tierscrub_close(t);
     atomic_store_explicit(&t->ctl, NULL, memory_order_release);
     for (int i = 0; i < ctl->nslots; i++)
         free(ctl->slots[i].path);
@@ -1876,7 +1903,8 @@ void tierctl_wake(tier *t)
         return;
     pthread_mutex_lock(&ctl->mu);
     if (!ctl->closing) {
-        ctl->check_tiers_now = true;
+        if (t->from_tiers && t->dir)
+            ctl->check_tiers_now = true;
         pthread_cond_signal(&ctl->cv);
     }
     pthread_mutex_unlock(&ctl->mu);
@@ -1924,6 +1952,85 @@ int tierctl_wait_idle(tier *t, int timeout_ms)
             return TSDB_ERR_UNAVAILABLE;
         }
     }
+}
+
+bool tierctl_is_closing(const tier *t)
+{
+    if (!t)
+        return true;
+    struct tierctl *ctl = atomic_load_explicit(&((tier *)t)->ctl, memory_order_acquire);
+    return !ctl || atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire);
+}
+
+bool tierctl_scrub_should_yield(tier *t)
+{
+    if (!t)
+        return true;
+    struct tierctl *ctl = atomic_load_explicit(&t->ctl, memory_order_acquire);
+    if (!ctl || atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire))
+        return true;
+    if (tier_health_has_pending(t) || tier_health_busy(t))
+        return true;
+    bool busy = false;
+    int64_t due = 0;
+    pthread_mutex_lock(&ctl->mu);
+    if (ctl->closing || ctl->check_tiers_now || ctl->checking_tiers || ctl->prog.active || ctl->prog.shrink_active)
+        busy = true;
+    for (int i = 0; !busy && i < ctl->nslots; i++)
+        if (ctl->slots[i].needs_rebuild || ctl->slots[i].needs_shrink)
+            busy = true;
+    due = ctl->next_stat_ms;
+    pthread_mutex_unlock(&ctl->mu);
+    if (busy)
+        return true;
+    if (t->from_tiers && ctl_mono_ms() >= due) {
+        if (tiers_file_changed_stat(ctl)) {
+            pthread_mutex_lock(&ctl->mu);
+            ctl->check_tiers_now = true;
+            pthread_mutex_unlock(&ctl->mu);
+            return true;
+        }
+        pthread_mutex_lock(&ctl->mu);
+        ctl->next_stat_ms = ctl_mono_ms() + ctl_poll_ms();
+        pthread_mutex_unlock(&ctl->mu);
+    }
+    return false;
+}
+
+bool tierctl_wait_interruptible_ms(tier *t, uint64_t wait_ms)
+{
+    if (!t)
+        return false;
+    struct tierctl *ctl = atomic_load_explicit(&t->ctl, memory_order_acquire);
+    if (!ctl)
+        return false;
+    pthread_mutex_lock(&ctl->mu);
+    if (!ctl->closing && !ctl->check_tiers_now && wait_ms > 0)
+        (void)tsdb_cond_timedwait_ms(&ctl->cv, &ctl->mu, wait_ms);
+    bool ok = !ctl->closing;
+    pthread_mutex_unlock(&ctl->mu);
+    return ok;
+}
+
+uint32_t tierctl_scrub_mb_s(const tier *t)
+{
+    if (!t)
+        return TIERS_SCRUB_MB_S_DEFAULT;
+    struct tierctl *ctl = atomic_load_explicit(&((tier *)t)->ctl, memory_order_acquire);
+    if (!ctl)
+        return TIERS_SCRUB_MB_S_DEFAULT;
+    uint32_t v = atomic_load_explicit(&ctl->scrub_mb_s, memory_order_relaxed);
+    return v ? v : TIERS_SCRUB_MB_S_DEFAULT;
+}
+
+uint32_t tierctl_scrub_days(const tier *t)
+{
+    if (!t)
+        return TIERS_SCRUB_DAYS_DEFAULT;
+    struct tierctl *ctl = atomic_load_explicit(&((tier *)t)->ctl, memory_order_acquire);
+    if (!ctl)
+        return TIERS_SCRUB_DAYS_DEFAULT;
+    return atomic_load_explicit(&ctl->scrub_days, memory_order_relaxed);
 }
 
 /* ---------------------------------------------------------------- tsdb_tier_lost / tierctl_lost_impl */
@@ -2769,6 +2876,31 @@ int tierctl_wait_idle(struct tier *t, int timeout_ms)
     (void)t;
     (void)timeout_ms;
     return 0;
+}
+bool tierctl_is_closing(const struct tier *t)
+{
+    (void)t;
+    return true;
+}
+bool tierctl_scrub_should_yield(struct tier *t)
+{
+    (void)t;
+    return true;
+}
+bool tierctl_wait_interruptible_ms(struct tier *t, uint64_t wait_ms)
+{
+    (void)t, (void)wait_ms;
+    return false;
+}
+uint32_t tierctl_scrub_mb_s(const struct tier *t)
+{
+    (void)t;
+    return TIERS_SCRUB_MB_S_DEFAULT;
+}
+uint32_t tierctl_scrub_days(const struct tier *t)
+{
+    (void)t;
+    return TIERS_SCRUB_DAYS_DEFAULT;
 }
 int tierctl_lost_impl(int rootfd, const char *root, bool sync, const char *store, const char *replace_path,
                       const char *opt_class, uint32_t flags, uint8_t new_id_out[16], int *slot_out)

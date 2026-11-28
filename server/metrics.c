@@ -1011,6 +1011,41 @@ static void render(sb *b)
             family(b, "tsdb_tier_salvaged_rows_total", "counter",
                    "Rows lost in erasure-coded parts retired by local tier salvage (from the local index).");
             sb_add(b, "tsdb_tier_salvaged_rows_total %llu\n", (unsigned long long)tm->salvaged_rows);
+            if (tm->has_scrub) {
+                family(b, "tsdb_tier_scrub_chunks_checked_total", "counter",
+                       "Total local tier chunks verified by background scrub per store.");
+                for (int i = 0; i < tm->nstores; i++)
+                    if (tm->stores[i].has_scrub)
+                        sb_add(b, "tsdb_tier_scrub_chunks_checked_total{store=\"%d\"} %llu\n", tm->stores[i].index,
+                               (unsigned long long)tm->stores[i].scrub_chunks_checked);
+                family(b, "tsdb_tier_scrub_damaged_total", "counter",
+                       "Total damaged local tier chunks detected by background scrub per store.");
+                for (int i = 0; i < tm->nstores; i++)
+                    if (tm->stores[i].has_scrub)
+                        sb_add(b, "tsdb_tier_scrub_damaged_total{store=\"%d\"} %llu\n", tm->stores[i].index,
+                               (unsigned long long)tm->stores[i].scrub_damaged);
+                family(b, "tsdb_tier_scrub_repaired_total", "counter",
+                       "Total damaged local tier chunks repaired by background scrub per store.");
+                for (int i = 0; i < tm->nstores; i++)
+                    if (tm->stores[i].has_scrub)
+                        sb_add(b, "tsdb_tier_scrub_repaired_total{store=\"%d\"} %llu\n", tm->stores[i].index,
+                               (unsigned long long)tm->stores[i].scrub_repaired);
+                family(b, "tsdb_tier_scrub_unrepairable_total", "counter",
+                       "Total damaged local tier chunks that could not be repaired (single-copy or past redundancy) per store.");
+                for (int i = 0; i < tm->nstores; i++)
+                    if (tm->stores[i].has_scrub)
+                        sb_add(b, "tsdb_tier_scrub_unrepairable_total{store=\"%d\"} %llu\n", tm->stores[i].index,
+                               (unsigned long long)tm->stores[i].scrub_unrepairable);
+                family(b, "tsdb_tier_scrub_age_seconds", "gauge",
+                       "Seconds since the start of the last completed scrub pass (or first pass start) for each local tier store.");
+                for (int i = 0; i < tm->nstores; i++)
+                    if (tm->stores[i].has_scrub)
+                        sb_add(b, "tsdb_tier_scrub_age_seconds{store=\"%d\"} %llu\n", tm->stores[i].index,
+                               (unsigned long long)tm->stores[i].scrub_age_s);
+                family(b, "tsdb_tier_scrub_oldest_age_seconds", "gauge",
+                       "Age in seconds of the oldest unscrubbed pass across active local tier stores.");
+                sb_add(b, "tsdb_tier_scrub_oldest_age_seconds %llu\n", (unsigned long long)tm->scrub_oldest_age_s);
+            }
         }
         if (tm)
             free(tm->vol_full);

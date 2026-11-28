@@ -128,6 +128,7 @@
 #include "../src/tiers.h"
 #include "../src/tier.h"
 #include "../src/tiersalv.h"
+#include "../src/tierscrub.h"
 #include "../src/settle.h"
 #include "../src/chunk.h"
 #include "fwd.h"
@@ -947,6 +948,19 @@ static bool tsdbd_tier_metrics(metrics_tier *out)
     tiersalv_get_counters(t, &sc);
     out->salvaged_parts = sc.parts;
     out->salvaged_rows = sc.rows_lost;
+    tierscrub_snapshot scrub;
+    if (tierscrub_get_snapshot(t, &scrub)) {
+        out->has_scrub = true;
+        out->scrub_oldest_age_s = scrub.oldest_age_s;
+        for (int i = 0; i < ns && i < scrub.nstores; i++) {
+            out->stores[i].has_scrub = true;
+            out->stores[i].scrub_chunks_checked = scrub.stores[i].chunks_checked;
+            out->stores[i].scrub_damaged = scrub.stores[i].damaged;
+            out->stores[i].scrub_repaired = scrub.stores[i].repaired;
+            out->stores[i].scrub_unrepairable = scrub.stores[i].unrepairable;
+            out->stores[i].scrub_age_s = scrub.stores[i].oldest_age_s;
+        }
+    }
     uint32_t nv = db ? (uint32_t)tsdb_volume_count(db) : 0;
     if (nv > 0) {
         out->vol_full = calloc(nv, 1);

@@ -14,6 +14,7 @@
 #include "../src/ecunsettle.h"
 #include "../src/tierctl.h"
 #include "../src/tiersalv.h"
+#include "../src/tierscrub.h"
 #include "../src/tiers.h"
 #include "tsdb_calendar.h"
 
@@ -2550,6 +2551,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
     bool *store_has_fs = calloc(nstores ? nstores : 1, sizeof *store_has_fs);
     bool *store_partial = calloc(nstores ? nstores : 1, sizeof *store_partial);
     const char **store_state = calloc(nstores ? nstores : 1, sizeof *store_state);
+    tierscrub_store_stats *store_scrub = calloc(nstores ? nstores : 1, sizeof *store_scrub);
     uint64_t *vol_tier_bytes = calloc(nvols, sizeof *vol_tier_bytes);
     uint64_t *vol_ec_parts = calloc(nvols, sizeof *vol_ec_parts);
     uint64_t *vol_ec_bytes = calloc(nvols, sizeof *vol_ec_bytes);
@@ -2557,11 +2559,11 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
     int *vol_used_pct = calloc(nvols, sizeof *vol_used_pct);
     uint64_t *vol_store_bytes = calloc(nvols * (nstores ? nstores : 1), sizeof *vol_store_bytes);
     if (!vol_paths || !store_bytes || !store_fs_tot || !store_fs_free || !store_has_fs || !store_partial ||
-        !store_state || !vol_tier_bytes || !vol_ec_parts || !vol_ec_bytes || !vol_partial || !vol_used_pct ||
-        !vol_store_bytes) {
+        !store_state || !store_scrub || !vol_tier_bytes || !vol_ec_parts || !vol_ec_bytes || !vol_partial ||
+        !vol_used_pct || !vol_store_bytes) {
         free(vol_paths), free(store_bytes), free(store_fs_tot), free(store_fs_free), free(store_has_fs);
-        free(store_partial), free(store_state), free(vol_tier_bytes), free(vol_ec_parts), free(vol_ec_bytes);
-        free(vol_partial), free(vol_used_pct), free(vol_store_bytes);
+        free(store_partial), free(store_state), free(store_scrub), free(vol_tier_bytes), free(vol_ec_parts);
+        free(vol_ec_bytes), free(vol_partial), free(vol_used_pct), free(vol_store_bytes);
         tiers_view_free(&tv);
         tier_free_paths(extra_vols, nextra);
         die("tier status", TSDB_ERR_NOMEM);
@@ -2640,6 +2642,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
                 store_fs_free[i] = (uint64_t)sv.f_bavail * fr;
                 store_has_fs[i] = true;
             }
+            (void)tierscrub_read_store_file(st->path, &store_scrub[i]);
         }
     }
     size_t n_live = nstores - n_removed;
@@ -2697,6 +2700,30 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
     int margin = have_ec_vol ? min_m - (int)n_unavail : 0;
     uint64_t settles_waiting = 0;
     uint64_t damaged_cells = 0;
+    uint64_t scrub_checked = 0, scrub_damaged = 0, scrub_repaired = 0, scrub_unrepairable = 0;
+    uint64_t scrub_oldest_s = 0;
+    bool have_scrub_data = false, have_scrub_age = false;
+    int scrub_active_store = -1;
+    for (size_t i = 0; i < nstores; i++) {
+        if (!store_scrub[i].has_data)
+            continue;
+        have_scrub_data = true;
+        scrub_checked += store_scrub[i].chunks_checked;
+        scrub_damaged += store_scrub[i].damaged;
+        scrub_repaired += store_scrub[i].repaired;
+        scrub_unrepairable += store_scrub[i].unrepairable;
+        uint64_t outstanding = store_scrub[i].damaged > store_scrub[i].repaired
+                                   ? store_scrub[i].damaged - store_scrub[i].repaired
+                                   : store_scrub[i].unrepairable;
+        damaged_cells += outstanding;
+        if (store_scrub[i].cursor_valid && scrub_active_store < 0)
+            scrub_active_store = (int)i;
+        uint64_t ref_s = store_scrub[i].last_pass_s ? store_scrub[i].last_pass_s : store_scrub[i].first_pass_s;
+        if (ref_s > 0 && (!have_scrub_age || store_scrub[i].oldest_age_s > scrub_oldest_s)) {
+            scrub_oldest_s = store_scrub[i].oldest_age_s;
+            have_scrub_age = true;
+        }
+    }
 
     char db_hex[33] = "";
     if (has_db_id)
@@ -2749,7 +2776,21 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
                    shrink_store, shrink_objects_left);
         else
             fputs("  \"shrink\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
-        fputs("  \"scrub\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
+        if (scrub_active_store >= 0) {
+            printf("  \"scrub\": {\"active\": true, \"state\": \"scrubbing\", \"store\": %d, "
+                   "\"chunks_checked\": %" PRIu64 ", \"damaged\": %" PRIu64 ", \"repaired\": %" PRIu64
+                   ", \"unrepairable\": %" PRIu64 ", \"oldest_unscrubbed_s\": ",
+                   scrub_active_store, scrub_checked, scrub_damaged, scrub_repaired, scrub_unrepairable);
+        } else {
+            printf("  \"scrub\": {\"active\": false, \"state\": \"idle\", \"store\": null, "
+                   "\"chunks_checked\": %" PRIu64 ", \"damaged\": %" PRIu64 ", \"repaired\": %" PRIu64
+                   ", \"unrepairable\": %" PRIu64 ", \"oldest_unscrubbed_s\": ",
+                   scrub_checked, scrub_damaged, scrub_repaired, scrub_unrepairable);
+        }
+        if (have_scrub_age)
+            printf("%" PRIu64 "},\n", scrub_oldest_s);
+        else
+            fputs("null},\n", stdout);
         fputs("  \"stores\": [", stdout);
         for (size_t i = 0; i < nstores; i++) {
             const tiers_store *st = &tv.stores[i];
@@ -2761,11 +2802,21 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
                                : st->state == TIERS_STATE_SHRINKING   ? "shrinking"
                                : st->state == TIERS_STATE_REMOVED     ? "removed"
                                                                       : "active";
+            const tierscrub_store_stats *ss = &store_scrub[i];
+            uint64_t ref_s = ss->has_data ? (ss->last_pass_s ? ss->last_pass_s : ss->first_pass_s) : 0;
+            uint64_t st_outstanding = ss->damaged > ss->repaired ? ss->damaged - ss->repaired : ss->unrepairable;
             printf("%s\n    {\"index\": %zu, \"id\": \"%s\", \"class\": \"%s\", \"single_copy\": %s, "
                    "\"tiers_state\": \"%s\", \"state\": \"%s\", \"bytes\": %" PRIu64 ", \"bytes_partial\": %s, "
-                   "\"damaged_cells\": 0, \"fs_total_bytes\": ",
+                   "\"damaged_cells\": %" PRIu64 ", \"scrub_chunks_checked\": %" PRIu64 ", \"scrub_damaged\": %" PRIu64
+                   ", \"scrub_repaired\": %" PRIu64 ", \"scrub_unrepairable\": %" PRIu64
+                   ", \"scrub_passes\": %" PRIu64 ", \"scrub_oldest_s\": ",
                    i ? "," : "", i, shex, tiers_class_name(st->cls), st->single_copy ? "true" : "false", tstate,
-                   store_state[i], store_bytes[i], store_partial[i] ? "true" : "false");
+                   store_state[i], store_bytes[i], store_partial[i] ? "true" : "false", st_outstanding,
+                   ss->chunks_checked, ss->damaged, ss->repaired, ss->unrepairable, ss->passes_done);
+            if (ref_s > 0)
+                printf("%" PRIu64 ", \"fs_total_bytes\": ", ss->oldest_age_s);
+            else
+                fputs("null, \"fs_total_bytes\": ", stdout);
             if (store_has_fs[i])
                 printf("%" PRIu64 ", \"fs_free_bytes\": %" PRIu64, store_fs_tot[i], store_fs_free[i]);
             else
@@ -2869,7 +2920,22 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
         }
         if (shrink_store >= 0)
             printf("shrink: store %d shrinking (%" PRIu64 " object(s) left)\n", shrink_store, shrink_objects_left);
-        puts("scrub: idle");
+        if (scrub_active_store >= 0) {
+            printf("scrub: store %d scrubbing (checked=%" PRIu64 " damaged=%" PRIu64 " repaired=%" PRIu64
+                   " unrepairable=%" PRIu64,
+                   scrub_active_store, scrub_checked, scrub_damaged, scrub_repaired, scrub_unrepairable);
+            if (have_scrub_age)
+                printf(" oldest=%" PRIu64 "s", scrub_oldest_s);
+            puts(")");
+        } else if (have_scrub_data) {
+            printf("scrub: idle (checked=%" PRIu64 " damaged=%" PRIu64 " repaired=%" PRIu64 " unrepairable=%" PRIu64,
+                   scrub_checked, scrub_damaged, scrub_repaired, scrub_unrepairable);
+            if (have_scrub_age)
+                printf(" oldest=%" PRIu64 "s", scrub_oldest_s);
+            puts(")");
+        } else {
+            puts("scrub: idle");
+        }
         puts("stores:");
         for (size_t i = 0; i < nstores; i++) {
             const tiers_store *st = &tv.stores[i];
@@ -2877,8 +2943,21 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             char shex[33], sb[32];
             chunk_oid_hex(cur_id, shex);
             human((double)store_bytes[i], sb, sizeof sb);
-            printf("  %zu\t%s\t%s\t%s%s\t%s%s\tdamage=0\t%s\n", i, shex, tiers_class_name(st->cls), store_state[i],
-                   st->single_copy ? " (single-copy)" : "", sb, store_partial[i] ? " (partial)" : "", st->path);
+            const tierscrub_store_stats *ss = &store_scrub[i];
+            if (ss->has_data) {
+                uint64_t ref_s = ss->last_pass_s ? ss->last_pass_s : ss->first_pass_s;
+                printf("  %zu\t%s\t%s\t%s%s\t%s%s\tdamage=%" PRIu64 "\tchecked=%" PRIu64 "\trepaired=%" PRIu64
+                       "\tunrepairable=%" PRIu64,
+                       i, shex, tiers_class_name(st->cls), store_state[i], st->single_copy ? " (single-copy)" : "", sb,
+                       store_partial[i] ? " (partial)" : "", ss->damaged, ss->chunks_checked, ss->repaired,
+                       ss->unrepairable);
+                if (ref_s > 0)
+                    printf("\toldest=%" PRIu64 "s", ss->oldest_age_s);
+                printf("\t%s\n", st->path);
+            } else {
+                printf("  %zu\t%s\t%s\t%s%s\t%s%s\tdamage=0\t%s\n", i, shex, tiers_class_name(st->cls), store_state[i],
+                       st->single_copy ? " (single-copy)" : "", sb, store_partial[i] ? " (partial)" : "", st->path);
+            }
         }
         puts("volumes:");
         for (size_t v = 0; v < nvols; v++) {
@@ -2916,8 +2995,8 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
     }
 
     free(vol_paths), free(store_bytes), free(store_fs_tot), free(store_fs_free), free(store_has_fs);
-    free(store_partial), free(store_state), free(vol_tier_bytes), free(vol_ec_parts), free(vol_ec_bytes);
-    free(vol_partial), free(vol_used_pct), free(vol_store_bytes);
+    free(store_partial), free(store_state), free(store_scrub), free(vol_tier_bytes), free(vol_ec_parts);
+    free(vol_ec_bytes), free(vol_partial), free(vol_used_pct), free(vol_store_bytes);
     tiers_view_free(&tv);
     tier_free_paths(extra_vols, nextra);
     return 0;

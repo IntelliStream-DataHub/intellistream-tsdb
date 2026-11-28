@@ -90,6 +90,13 @@ typedef struct metrics_tier_store {
     int state; /* CHUNK_STORE_* (0=up, 1=missing, 2=other_id, 3=damaged, 4=ioerr, 5=replacing, 6=stalled) */
     bool has_bytes;
     uint64_t used_bytes, free_bytes, total_bytes;
+    /* R15 r15-scrub per-store counters and oldest pass age */
+    bool has_scrub;
+    uint64_t scrub_chunks_checked;
+    uint64_t scrub_damaged;
+    uint64_t scrub_repaired;
+    uint64_t scrub_unrepairable;
+    uint64_t scrub_age_s;
 } metrics_tier_store;
 typedef struct metrics_tier {
     int nstores;
@@ -97,6 +104,8 @@ typedef struct metrics_tier {
     uint64_t settles_waiting;
     uint64_t salvaged_parts;
     uint64_t salvaged_rows;
+    uint64_t scrub_oldest_age_s;
+    bool has_scrub;
     uint32_t nvols;
     uint8_t *vol_full; /* malloc'ed by cfg.tier callback (length nvols), freed by metrics.c */
 } metrics_tier;

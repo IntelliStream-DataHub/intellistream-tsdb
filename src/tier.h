@@ -72,6 +72,7 @@ typedef struct tier {
     struct ecsettle_tier *settle; /* r7-settle: the settle thread (src/settle.c) */
     _Atomic(struct tier_health *) health; /* r15-health: probes & domain hooks (freed only in tier_put) */
     _Atomic(struct tierctl *) ctl;        /* r15-lost: single tier worker, TIERS re-read, paced rebuild */
+    _Atomic(struct tierscrub *) scrub;    /* r15-scrub: local tier chunk scrubber (runs on tierctl worker) */
     /* r7-tier: the backend over cfg.dirs, opened once by tier_open (chunk_be_open2, min_up = stores - m) and closed by
      * the last tier_put: a store flocks its directory, so one backend per engine would make the second volume BUSY.
      * halted: settles and chunk deletes are paused while any store is not UP (cleared when all stores return to UP,

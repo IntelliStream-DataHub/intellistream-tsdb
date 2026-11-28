@@ -89,7 +89,7 @@ directory) and `path`.
 
 ### Local tier metrics (single server, R15)
 
-When a standalone server opens a database with a local settled tier (`TIERS`), `/metrics` also emits six tier families (omitted on standalone servers without a tier, and in cluster mode):
+When a standalone server opens a database with a local settled tier (`TIERS`), `/metrics` also emits twelve tier families (omitted on standalone servers without a tier, and in cluster mode):
 
 | metric | type | meaning |
 |---|---|---|
@@ -99,6 +99,12 @@ When a standalone server opens a database with a local settled tier (`TIERS`), `
 | `tsdb_volume_full{volume}` | gauge | `1` while the tiered volume is FULL (volume filesystem integer fill percent `>= young_high_pct`, 90% default; clears below `young_high_pct - 2`), refusing inserts, appends, and non-empty replaces with `UNAVAILABLE` (`TSDB_WHY_FULL`) while deletes and drops pass; `TsdbInsertsRefusedFull` alerts on `== 1` |
 | `tsdb_tier_salvaged_parts_total` | counter | lost erasure-coded `.ec` parts retired by local tier salvage past `m` `LOST` stores (E15, §15.7) |
 | `tsdb_tier_salvaged_rows_total` | counter | upper-bound raw rows lost in erasure-coded parts retired by local tier salvage (sum of `rows` from the intact local `.ec` indices) |
+| `tsdb_tier_scrub_chunks_checked_total{store}` | counter | total local tier chunks verified by background scrub per store (0-based store index; persisted across restarts in `<store>/SCRUB`) (E25, §15.7) |
+| `tsdb_tier_scrub_damaged_total{store}` | counter | total damaged local tier chunks detected by background scrub per store (repaired, unrepairable, or failed) (E25, §15.7) |
+| `tsdb_tier_scrub_repaired_total{store}` | counter | total damaged local tier chunks repaired from surviving positions by background scrub per store (E25, §15.7) |
+| `tsdb_tier_scrub_unrepairable_total{store}` | counter | total damaged local tier chunks that could not be repaired (`--single-copy` report-only stores or objects past redundancy) per store (E25, §15.7) |
+| `tsdb_tier_scrub_age_seconds{store}` | gauge | seconds since the start of the last completed scrub pass (or first pass start) for each local tier store (E25, §15.7) |
+| `tsdb_tier_scrub_oldest_age_seconds` | gauge | maximum scrub pass age in seconds across all active UP local tier stores (oldest unscrubbed object/pass) (E25, §15.7) |
 
 Alert rules for these metrics ship in `dist/alerts/tsdb.rules.yml`.
 

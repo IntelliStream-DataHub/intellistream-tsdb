@@ -312,6 +312,7 @@ int chunk_be_list_names(chunk_backend *be, uint32_t volume, chunk_list_fn fn, vo
  * fsync, rename over the old name, directory fsync: after a power loss the old file or the whole new one), at the
  * epoch the object's chunks were written at (the header says so: a delete below it stays refused), then read back
  * and verified. Which positions a store holds is the placement's: (chunk_be_place + pos) mod n, by index. */
+struct chunk_heal_report;
 typedef struct chunk_heal_opts {
     uint64_t epoch; /* the caller's epoch: below the volume's fence the heal is refused (CHUNK_ERR_FENCED) like any put,
                      * above it the fence is raised first. The rebuilt chunks keep their own writer epoch. */
@@ -334,6 +335,17 @@ typedef struct chunk_heal_opts {
      * durable REBUILDING marker and fsync). Non-zero leaves the store REPLACING and is returned. */
     int (*before_up)(void *ctx, int store);
     void *before_up_ctx;
+    /* Optional (R15 r15-scrub): resume cursor and per-object reporting for chunk_be_heal.
+     * When start_after_oid is non-NULL, objects with oid <= start_after_oid (bytewise) are skipped without opening or
+     * reading their chunks. Objects are visited in strict ascending oid order (both m > 0 and m = 0). */
+    const uint8_t *start_after_oid;
+    /* Optional (R15 r15-scrub): called after each object processed cleanly with its per-object report delta. */
+    void (*on_object)(void *ctx, const uint8_t oid[16], const struct chunk_heal_report *delta);
+    void *on_object_ctx;
+#ifdef TSDB_TEST_HOOKS
+    /* Optional (R15 r15-scrub): during scrub, detect damage without repairing the chunk (for planted mutant). */
+    bool scrub_no_repair;
+#endif
 } chunk_heal_opts;
 
 typedef struct chunk_heal_report {
@@ -353,6 +365,7 @@ typedef struct chunk_heal_report {
     uint64_t failed;           /* chunks or objects that failed (I/O, the chunks disagree, the read-back differed): the
                                 * old file is still there, a second heal retries */
     uint64_t bytes;            /* chunk bytes written */
+    uint64_t bytes_checked;    /* chunk bytes read and checksummed by scrub */
 } chunk_heal_report;
 
 /* Heals one volume of the store at index `store` (UP or REPLACING). The objects are those that the listings of the OTHER

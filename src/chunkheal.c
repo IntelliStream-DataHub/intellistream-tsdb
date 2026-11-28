@@ -151,6 +151,20 @@ static bool any_gone(chunk_backend *be, int except)
     return false;
 }
 
+typedef struct heal_scrub_cb_ctx {
+    const chunk_heal_opts *o;
+} heal_scrub_cb_ctx;
+
+static int heal_scrub_cell_cb(void *ctx, size_t bytes)
+{
+    const heal_scrub_cb_ctx *sc = ctx;
+    if (sc->o->pace && bytes > 0)
+        sc->o->pace(sc->o->pace_ctx, (uint64_t)bytes);
+    if ((sc->o->cancel && sc->o->cancel(sc->o->cancel_ctx)) || (sc->o->yield && sc->o->yield(sc->o->yield_ctx)))
+        return TSDB_ERR_STOPPED;
+    return 0;
+}
+
 /* Heals the positions of the object that are placed on the target store (only_pos >= 0: just that one, always with a
  * scrub). When obs_store/obs_pos are given (nobs > 0, from listing other open stores), infers the object's original
  * store count so objects settled before a `tier add` still map missing positions to their true stores and never
@@ -205,19 +219,31 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
             if (memcmp(&hd->g, g, sizeof *g) != 0)
                 rc = TSDB_ERR_CORRUPT; /* another encoding's chunk under this name */
             else if (scrub || only_pos >= 0) {
-                int sr = chunk_rd_scrub(r, &nbad);
+                uint64_t cbytes = 0;
+                uint64_t fsz = chunk_file_size(g, p);
+                heal_scrub_cb_ctx sctx = {.o = h->o};
+                int sr = chunk_rd_scrub_ex(r, &nbad, NULL, &cbytes,
+                                           (h->o->pace || h->o->cancel || h->o->yield) ? heal_scrub_cell_cb : NULL,
+                                           &sctx);
+                if (sr == TSDB_ERR_STOPPED) {
+                    chunk_rd_close(r);
+                    return TSDB_ERR_STOPPED;
+                }
+                rep->bytes_checked += fsz;
                 if (sr)
                     rc = sr; /* a cell that could not be read is not a whole one: counted failed below, never ok */
                 else if (nbad > 0)
                     rc = TSDB_ERR_CORRUPT;
-                if (h->o->pace)
-                    h->o->pace(h->o->pace_ctx, chunk_file_size(g, p));
+                if (h->o->pace && fsz > cbytes)
+                    h->o->pace(h->o->pace_ctx, fsz - cbytes);
             }
             chunk_rd_close(r);
             if (rc == 0) {
                 rep->chunks_ok++;
                 continue;
             }
+        } else if (rc == TSDB_ERR_CORRUPT && (scrub || only_pos >= 0)) {
+            rep->bytes_checked += CHUNK_HDR_BYTES;
         }
         if (rc == TSDB_ERR_NOTFOUND) {
             need[p] = miss[p] = true;
@@ -244,6 +270,13 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
                     miss[0] ? "missing" : "damaged");
         return 0;
     }
+#ifdef TSDB_TEST_HOOKS
+    if (h->o->scrub_no_repair) {
+        /* Planted mutant (scrubnorepair): detect damage without repairing the chunk. */
+        rep->failed += nneed;
+        return 0;
+    }
+#endif
 
     chunk_obj *ob = NULL;
     int rc = chunk_obj_open(h->be, h->vol, vuuid, oid, g, NULL, &ob);
@@ -351,7 +384,9 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
         }
     }
     done = result == 0;
-    /* the caller's records once more, right before a name is made (a delete may have come in while this ran) */
+    /* The caller's records once more, right before a name is made (a delete may have come in while this ran).
+     * A concurrent GC delete in the narrow window after this check and before chunk_wr_commit leaves at most an
+     * unreferenced orphan chunk that the next open's orphan sweep removes, matching the rebuild path. */
     if (done && !is_live(h, oid)) {
         rep->not_live++;
         done = false;
@@ -444,6 +479,8 @@ static void note_target_m0_err(const heal_ctx *h, const uint8_t oid[16], bool da
     }
 }
 
+static void report_add(chunk_heal_report *to, const chunk_heal_report *r);
+
 /* ---------------------------------------------------------------- one store, one volume */
 int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_heal_opts *o, chunk_heal_report *rep)
 {
@@ -481,77 +518,127 @@ int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_hea
         rc = chunk_store_list(st, volume, false, ent_add, &ev);
         chunk_store_unref(st);
     }
+    /* Single-copy (m = 0) objects live only at pos 0 on this store and are never listed by other stores. List target
+     * pos-0 names up front and merge-walk with ev in strict ascending oid order so start_after_oid resume cursors
+     * cover both m > 0 and m = 0 objects deterministically. */
+    oid_vec tv = {.pos0_only = true};
+    if (rc == 0)
+        rc = chunk_store_list_names(tgt, volume, oid_vec_add, &tv);
     if (rc) {
+        free(tv.v);
         free(ev.v);
         chunk_store_unref(tgt);
         return rc;
     }
     if (ev.n > 1)
         qsort(ev.v, ev.n, sizeof *ev.v, ent_cmp);
-    heal_ctx h = {be, volume, store, tgt, o, rep};
-    for (size_t i = 0; i < ev.n && rc == 0;) {
+    if (tv.n > 1)
+        qsort(tv.v, tv.n, 16, ent_cmp);
+
+    size_t ei = 0, ti = 0;
+    while ((ei < ev.n || ti < tv.n) && rc == 0) {
+        bool take_ev;
+        if (ei < ev.n && ti < tv.n) {
+            int cmp = memcmp(ev.v[ei].oid, tv.v[ti], 16);
+            if (cmp == 0) {
+                /* Already listed by another store: skip duplicate(s) in tv. */
+                const uint8_t *dup_oid = ev.v[ei].oid;
+                while (ti < tv.n && memcmp(tv.v[ti], dup_oid, 16) == 0)
+                    ti++;
+                take_ev = true;
+            } else {
+                take_ev = cmp < 0;
+            }
+        } else {
+            take_ev = ei < ev.n;
+        }
+
+        uint8_t cur_oid[16];
+        size_t ej = ei;
+        if (take_ev) {
+            memcpy(cur_oid, ev.v[ei].oid, 16);
+            while (ej < ev.n && memcmp(ev.v[ej].oid, cur_oid, 16) == 0)
+                ej++;
+        } else {
+            memcpy(cur_oid, tv.v[ti], 16);
+            while (ti < tv.n && memcmp(tv.v[ti], cur_oid, 16) == 0)
+                ti++;
+        }
+
+        if (o->start_after_oid && memcmp(cur_oid, o->start_after_oid, 16) <= 0) {
+            if (take_ev)
+                ei = ej;
+            continue;
+        }
         if ((o->cancel && o->cancel(o->cancel_ctx)) || (o->yield && o->yield(o->yield_ctx))) {
             rc = TSDB_ERR_STOPPED;
             break;
         }
-        size_t j = i;
-        while (j < ev.n && memcmp(ev.v[j].oid, ev.v[i].oid, 16) == 0)
-            j++;
-        chunk_hdr hd;
-        bool got = false;
-        int obs_st[CHUNK_POS_MAX];
-        unsigned obs_pos[CHUNK_POS_MAX];
-        size_t nobs = 0;
-        for (size_t x = i; x < j; x++) {
-            if (nobs < CHUNK_POS_MAX && ev.v[x].pos < CHUNK_POS_MAX) {
-                obs_st[nobs] = ev.v[x].store;
-                obs_pos[nobs] = ev.v[x].pos;
-                nobs++;
-            }
-            if (!got) { /* the first chunk of the object whose header reads */
-                chunk_store *st = chunk_be_store_ref(be, ev.v[x].store);
-                got = st && chunk_store_peek(st, volume, ev.v[x].oid, ev.v[x].pos, &hd) == 0;
-                chunk_store_unref(st);
-            }
-        }
-        if (!got) {
-            rep->failed++;
-        } else {
-            rc = heal_object(&h, hd.vuuid, ev.v[i].oid, &hd.g, hd.epoch, -1, o->scrub, obs_st, obs_pos, nobs);
-            if (chunk_store_failed(tgt) && rc == 0)
-                rc = TSDB_ERR_IO;
-        }
-        i = j;
-    }
-    if (rc == 0) {
-        /* Single-copy (m = 0) objects live only at pos 0 on this store and are never listed by other stores. Scan only
-         * this store's open dirfd (names only), skip oids already seen in ev, and peek each remaining candidate's
-         * header once so live m > 0 objects cost zero extra opens or reads and m > 0 orphans cost one header peek. */
-        oid_vec tv = {.pos0_only = true};
-        rc = chunk_store_list_names(tgt, volume, oid_vec_add, &tv);
-        for (size_t i = 0; i < tv.n && rc == 0; i++) {
-            if ((o->cancel && o->cancel(o->cancel_ctx)) || (o->yield && o->yield(o->yield_ctx))) {
-                rc = TSDB_ERR_STOPPED;
-                break;
-            }
-            if (ev.n > 0 && bsearch(tv.v[i], ev.v, ev.n, sizeof *ev.v, ent_cmp))
-                continue;
+
+        chunk_heal_report delta;
+        memset(&delta, 0, sizeof delta);
+        heal_ctx h = {be, volume, store, tgt, o, &delta};
+
+        if (take_ev) {
             chunk_hdr hd;
-            int pr = chunk_store_peek(tgt, volume, tv.v[i], 0, &hd);
-            if (pr == TSDB_ERR_NOTFOUND)
-                continue;
-            if (pr == 0) {
-                if (hd.g.m != 0)
-                    continue; /* m > 0 chunk found only here: an E14 orphan, never rebuilt */
-                rc = heal_object(&h, hd.vuuid, tv.v[i], &hd.g, hd.epoch, -1, o->scrub, NULL, NULL, 0);
+            bool got = false;
+            bool any_peek_err = false;
+            int obs_st[CHUNK_POS_MAX];
+            unsigned obs_pos[CHUNK_POS_MAX];
+            size_t nobs = 0;
+            for (size_t x = ei; x < ej; x++) {
+                if (nobs < CHUNK_POS_MAX && ev.v[x].pos < CHUNK_POS_MAX) {
+                    obs_st[nobs] = ev.v[x].store;
+                    obs_pos[nobs] = ev.v[x].pos;
+                    nobs++;
+                }
+                if (!got) { /* the first chunk of the object whose header reads */
+                    chunk_store *st = chunk_be_store_ref(be, ev.v[x].store);
+                    if (!st) {
+                        any_peek_err = true;
+                    } else {
+                        int pr = chunk_store_peek(st, volume, ev.v[x].oid, ev.v[x].pos, &hd);
+                        chunk_store_unref(st);
+                        if (pr == 0)
+                            got = true;
+                        else if (pr != TSDB_ERR_NOTFOUND)
+                            any_peek_err = true;
+                    }
+                }
+            }
+            if (!got) {
+                /* An object deleted by GC between the initial listing and this peek is not damaged: check liveness
+                 * and only count failed when the object is still live and a peer peek hit real I/O or corruption. */
+                if (!is_live(&h, cur_oid))
+                    delta.not_live++;
+                else if (any_peek_err)
+                    delta.failed++;
+            } else {
+                rc = heal_object(&h, hd.vuuid, cur_oid, &hd.g, hd.epoch, -1, o->scrub, obs_st, obs_pos, nobs);
                 if (chunk_store_failed(tgt) && rc == 0)
                     rc = TSDB_ERR_IO;
-            } else {
-                note_target_m0_err(&h, tv.v[i], pr == TSDB_ERR_CORRUPT);
+            }
+            ei = ej;
+        } else {
+            chunk_hdr hd;
+            int pr = chunk_store_peek(tgt, volume, cur_oid, 0, &hd);
+            if (pr == 0) {
+                if (hd.g.m == 0) {
+                    rc = heal_object(&h, hd.vuuid, cur_oid, &hd.g, hd.epoch, -1, o->scrub, NULL, NULL, 0);
+                    if (chunk_store_failed(tgt) && rc == 0)
+                        rc = TSDB_ERR_IO;
+                }
+                /* else: m > 0 chunk found only here: an E14 orphan, never rebuilt */
+            } else if (pr != TSDB_ERR_NOTFOUND) {
+                note_target_m0_err(&h, cur_oid, pr == TSDB_ERR_CORRUPT);
             }
         }
-        free(tv.v);
+
+        report_add(rep, &delta);
+        if (rc == 0 && o->on_object)
+            o->on_object(o->on_object_ctx, cur_oid, &delta);
     }
+    free(tv.v);
     free(ev.v);
     chunk_store_unref(tgt);
     return rc;
@@ -719,6 +806,7 @@ static void report_add(chunk_heal_report *to, const chunk_heal_report *r)
     to->not_live += r->not_live;
     to->failed += r->failed;
     to->bytes += r->bytes;
+    to->bytes_checked += r->bytes_checked;
 }
 
 static int be_settle(chunk_backend *be, int store, const chunk_heal_opts *o, chunk_heal_report *rep,
