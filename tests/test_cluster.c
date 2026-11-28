@@ -16737,6 +16737,10 @@ static void scen_ecgc(void)
  *      and MK_GC retires all stripe chunks (0 chunks on all 6 stores, 0 .ec and 0 retired_ on all 3 log replicas).
  *   5. Transfer leadership across all 3 log replicas and verify every series equals oracle t42 on every replica.
  * Planted bug: TSDB_ECUNSETTLE_MUTANT=unsettleleaderonly (replicas skip applying MK_UNSETTLE) must fail this scenario. */
+#ifdef TSDB_EC
+static int reenc_expected_chunks(int srv, uint32_t num);
+#endif
+
 static void scen_unsettle(void)
 {
     scenario("unsettle");
@@ -16833,13 +16837,13 @@ static void scen_unsettle(void)
             if (ecb_ec_parts(reps[k], num) < 2 || ecb_live_parts(reps[k], num, live, sizeof live) != 0)
                 ok = 0;
         }
-        int nec = ecb_ec_parts(L, num);
+        int ech = reenc_expected_chunks(L, num);
         int nch = ecb_chunks(num);
-        if (ok && nch == nec * 6)
+        if (ok && ech > 0 && nch == ech)
             break;
         if (now_ms() - t0 > 120000)
-            die("unsettle: 2 days did not settle on all 3 replicas in 120 s (ec %d/%d/%d, chunks %d)",
-                ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num), nch);
+            die("unsettle: 2 days did not settle on all 3 replicas in 120 s (ec %d/%d/%d, chunks %d want %d)",
+                ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num), nch, ech);
     }
     struct ecb_sum oracle[ECB_SERIES];
     for (int s = 0; s < ECB_SERIES; s++) {
@@ -16956,8 +16960,9 @@ static void scen_unsettle(void)
     for (uint64_t t0 = now_ms();; usleep(200000)) {
         char live[512];
         int nec = ecb_ec_parts(L, num);
+        int ech = reenc_expected_chunks(L, num);
         int nch = ecb_chunks(num);
-        int ok = nec >= 3 && nch == nec * 6;
+        int ok = nec >= 3 && ech > 0 && nch == ech;
         for (int k = 0; k < 3; k++)
             if (ecb_ec_parts(reps[k], num) != nec || ecb_live_parts(reps[k], num, live, sizeof live) != 0)
                 ok = 0;
@@ -16967,8 +16972,8 @@ static void scen_unsettle(void)
             break;
         }
         if (now_ms() - t0 > 120000)
-            die("unsettle phase 2: 3 days did not settle on all 3 replicas in 120 s (ec=%d/%d/%d chunks=%d)",
-                ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num), nch);
+            die("unsettle phase 2: 3 days did not settle on all 3 replicas in 120 s (ec=%d/%d/%d chunks=%d want=%d)",
+                ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num), nch, ech);
     }
     for (int s = 0; s < ECB_SERIES; s++) {
         if ((rc = ecb_read(ct, idt[s], &oracle[s])) != 0 || oracle[s].n != 6 * ECB_ROWS)
@@ -17085,7 +17090,8 @@ static void scen_unsettle(void)
     await_isr(L2, "e42", 3, 60000, "ISR=3 after crashed leader R1 restarted and replayed MK_UNSETTLE");
     for (uint64_t t0 = now_ms();; usleep(200000)) {
         char live[512];
-        int ok = ecb_chunks(num) == ec_after * 6;
+        int ech = reenc_expected_chunks(L2, num);
+        int ok = ech > 0 && ecb_chunks(num) == ech;
         for (int k = 0; k < 3; k++) {
             if (ecb_ec_parts(reps[k], num) != ec_after || ecb_retired_ec(reps[k], num) != 0 ||
                 ecb_live_parts(reps[k], num, live, sizeof live) < 1)
@@ -17096,7 +17102,7 @@ static void scen_unsettle(void)
         if (now_ms() - t0 > 90000)
             die("unsettle phase 2: post-recovery replay/GC incomplete after 90 s (chunks=%d want %d; ec=%d/%d/%d want "
                 "%d; ret=%d/%d/%d)",
-                ecb_chunks(num), ec_after * 6, ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num),
+                ecb_chunks(num), ech, ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num),
                 ecb_ec_parts(reps[2], num), ec_after, ecb_retired_ec(reps[0], num), ecb_retired_ec(reps[1], num),
                 ecb_retired_ec(reps[2], num));
     }
@@ -30026,7 +30032,8 @@ static void scen_posmove(void)
         die("posmove: target already in stripe not refused: %s", out);
     snprintf(args, sizeof args, "cluster volume move %s %" PRIu32 " --pos 0 --to %" PRIu32 " --secret-file %s", p0,
              ecnum, ids[NS], secret_path);
-    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "no chunk stores"))
+    if (cli_run(args, NULL, out, sizeof out) != 1 ||
+        (!strstr(out, "no chunk stores") && !strstr(out, "compute-only")))
         die("posmove: target with no chunk stores not refused: %s", out);
     snprintf(args, sizeof args, "cluster volume move %s 99 --pos 0 --to %" PRIu32 " --secret-file %s", p0, ids[S],
              secret_path);

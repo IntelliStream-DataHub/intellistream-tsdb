@@ -1250,7 +1250,7 @@ static void start_server_run(bool faulty)
         cur_step = -1;
         if (settle_steps && faulty && crashfs && attempt == 0) { /* this server ends at a settle step, as a power cut */
             uint64_t q = mix(seed * 7919 + (uint64_t)restarts * 31 + 5);
-            cur_step = (int)(q % NSTEPS);
+            cur_step = (int)(((uint64_t)restarts + (seed % NSTEPS)) % NSTEPS);
             snprintf(arm, sizeof arm, "%s:%d", settle_step_names[cur_step], 1 + (int)((q >> 20) % 3));
             step_armed[cur_step]++;
         }
@@ -1288,8 +1288,9 @@ static void start_server_run(bool faulty)
                 setenv("CRASHFS_SEED", sd, 1);
                 setenv("CRASHFS_PROB", crash_prob(), 1);
                 setenv("CRASHFS_WARMUP", "200", 1);
-                if ((!strcmp(nemesis, "power") || settle_steps) && restarts % 2 == 1)
-                    setenv("CRASHFS_TEAR", "1", 1); /* every other server: keep what a real disk may keep */
+                if ((!strcmp(nemesis, "power") && restarts % 2 == 1) ||
+                    (settle_steps && (restarts % 2 == 1 || cur_step == 3)))
+                    setenv("CRASHFS_TEAR", "1", 1); /* every other server, and always on between-renames: keep what a real disk may keep */
                 if (arm[0]) { /* no random power loss: the settle step is the cut, and the shim rolls back at exit */
                     setenv("CRASHFS_PROB", "0", 1);
                     setenv("CRASHFS_AT_EXIT", "1", 1);

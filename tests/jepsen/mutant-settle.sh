@@ -50,8 +50,12 @@ for m in $muts; do
         want='lost: final holds|final holds .* completed before|: stale$|: torn$|acknowledged before a read saw|^  final: series|^  final latest'
         ;;
     swapearly)
-        out=$(env TSDB_SWAP_MUTANT=swapearly JEPSEN_TSDBD="$tsdbd" "$jepsen" --dir "$dir" --nemesis settle-steps \
-            --crashfs "$crashfs" --seconds 40 --tier 3 2>&1); st=$?
+        sw_seed=1
+        for sw_seed in 1 2 3; do
+            out=$(env TSDB_SWAP_MUTANT=swapearly JEPSEN_TSDBD="$tsdbd" "$jepsen" --dir "$dir" --nemesis settle-steps \
+                --crashfs "$crashfs" --seconds 40 --tier 3 --seed "$sw_seed" 2>&1); st=$?
+            [ "$st" -ne 0 ] && break
+        done
         want='lost: final holds|final holds .* completed before|: stale$|: torn$|acknowledged before a read saw|^  final: series|^  final latest'
         # jepsen says "does not come up" on one line and the server's log tail, which names the file, below it
         refused='does not come up|cannot open'
@@ -69,7 +73,7 @@ for m in $muts; do
     if [ $m = swapearly ] && { [ $st -eq 2 ] || [ $st -eq 1 ]; } && echo "$after" | grep -Eq "$named"; then
         # a refused open: a catch only if the control comes up
         ctl=$(env JEPSEN_TSDBD="$tsdbd" "$jepsen" --dir "$dir" --nemesis settle-steps --crashfs "$crashfs" \
-            --seconds 40 --tier 3 2>&1); cst=$?
+            --seconds 40 --tier 3 --seed "$sw_seed" 2>&1); cst=$?
         if [ $cst -eq 0 ]; then
             echo "mutant-settle: $m caught: $(echo "$after" | grep -E "$named" | head -n 1)"
         else

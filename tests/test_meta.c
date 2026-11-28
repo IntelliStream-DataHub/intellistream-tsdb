@@ -2739,7 +2739,6 @@ static void test_r13_meta(void)
             CHECK(dm4 && dm4->state == META_DESTROYED && dm4->ndisks == 1 &&
                   dm4->disks[0].state == META_STORE_DESTROYED && dm4->capability == META_CAP_NONE);
             struct meta_state bad_d;
-            meta_init(&bad_d);
             meta_copy(&bad_d, &ma);
             ((struct meta_member *)meta_member(&bad_d, 4))->disks[0].state = META_STORE_UP;
             CHECK(meta_check_step(&ma, &bad_d, why, sizeof why) != 0);
