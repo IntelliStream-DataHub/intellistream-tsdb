@@ -9610,8 +9610,17 @@ static void scen_reopenhold(void)
         die("dropbulk wake check did not exercise drop + fetch on server %d", R);
     if (isr_of(L, "plant", NULL) != 3)
         die("replica dropped from ISR during dropbulk fetch/wake (wake %" PRIu64 " ms)", wake_ms);
-    if (wake_ms > 800)
-        die("dropbulk fetch + IN_WAKE took %" PRIu64 " ms (expected < 800 ms; IN_WAKE missed?)", wake_ms);
+    uint64_t wake_lim = 800;
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    wake_lim = 1500; /* sanitizer builds instrument the 66k-row bulk transfer and fdatasync */
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    wake_lim = 1500;
+#endif
+#endif
+    if (wake_ms > wake_lim)
+        die("dropbulk fetch + IN_WAKE took %" PRIu64 " ms (expected < %" PRIu64 " ms; IN_WAKE missed?)", wake_ms,
+            wake_lim);
     if (ws3 - ws2 > 10)
         die("dropbulk fetch/wake spun WAL syncs: +%" PRIu64, ws3 - ws2);
     tsdbc_close(c);
@@ -17019,10 +17028,26 @@ static void scen_unsettle(void)
                 die("unsettle phase 2: transfer e42 to R1 (%d): %s (%s)", R1, cluster_strerror(rc), why);
         for (uint64_t t0 = now_ms();; usleep(100000)) {
             struct meta_volume mv;
-            if (vol_rec(R1, "e42", &mv) && mv.leader == ids[R1])
-                break;
+            if (vol_rec(R1, "e42", &mv) && mv.leader == ids[R1]) {
+                /* Wait until R1 has finished M_PROMOTING -> M_WRITER (CL_ROLE_OWNER) so the concurrent small write
+                 * below does not race its reopen and get UNAVAILABLE (seen under TSan). */
+                struct view vw = {0};
+                view(R1, &vw);
+                int is_owner = 0;
+                for (uint32_t k = 0; k < vw.st.nheard; k++) {
+                    if (vw.st.heard[k].id != ids[R1])
+                        continue;
+                    for (uint32_t j = 0; j < vw.st.heard[k].nvols; j++)
+                        if (vw.st.heard[k].vols[j].v.volume == num &&
+                            vw.st.heard[k].vols[j].v.role == CL_ROLE_OWNER)
+                            is_owner = 1;
+                }
+                view_free(&vw);
+                if (is_owner)
+                    break;
+            }
             if (now_ms() - t0 > 30000)
-                die("unsettle phase 2: R1 (%d) did not become leader in 30 s", R1);
+                die("unsettle phase 2: R1 (%d) did not become active owner in 30 s", R1);
         }
     }
     unlink(trig_out);
@@ -19194,20 +19219,36 @@ static void scen_ecadd(void)
         if (Lm < 0 && now_ms() - t0 > 30000)
             die("no leader of the metadata group 30 s after server %d restarted", L);
     }
+    /* the server restarted above holds a replica of e42 too: it may still be failing over to a new leader (epoch 2)
+     * right after the restart, and right after the add the record's ISR still names all three while the leader may
+     * already have asked to drop that one until it catches up (seen in a NO_EC run: the write after the cut then met
+     * an ISR of one). So wait until the current leader creates the series (re-reading the record on MOVED/UNAVAILABLE),
+     * then write a row held by both other replicas, then await the ISR. */
     struct meta_volume f;
-    if (!vol_rec(Lm, "e42", &f))
-        die("no record of e42");
-    int Lv = server_of(f.leader), Cs = -1, B = -1;
-    for (uint32_t k = 0; k < f.nrep; k++)
-        if (f.rep[k].node != f.leader)
-            *(Cs < 0 ? &Cs : &B) = server_of(f.rep[k].node);
-    if (Lv < 0 || Cs < 0 || B < 0)
-        die("e42: leader %u", f.leader);
-    /* the server restarted above holds a replica of e42 too: right after the add the record's ISR still names all
-     * three while the leader may already have asked to drop that one until it catches up (seen in a NO_EC run: the
-     * write after the cut then met an ISR of one). So a row first, held by both other replicas, then the ISR. */
-    tsdbc *c = client(Lv);
-    tsdb_sid sid = rep_series(c, rep_names[0], "e42", 30000);
+    int Lv = -1, Cs = -1, B = -1;
+    tsdbc *c = NULL;
+    tsdb_sid sid = 0;
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        if (now_ms() - t0 > 30000)
+            die("e42 did not settle on a writable leader 30 s after server %d restarted", L);
+        if (!vol_rec(Lm, "e42", &f) || !f.leader)
+            continue;
+        Lv = server_of(f.leader);
+        Cs = B = -1;
+        for (uint32_t k = 0; k < f.nrep; k++)
+            if (f.rep[k].node != f.leader)
+                *(Cs < 0 ? &Cs : &B) = server_of(f.rep[k].node);
+        if (Lv < 0 || Cs < 0 || B < 0)
+            continue;
+        c = client(Lv);
+        rc = tsdbc_series_at(c, rep_names[0], "e42", &sid);
+        if (rc == 0)
+            break;
+        tsdbc_close(c);
+        c = NULL;
+        if (rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED)
+            die("series %s in e42: %s", rep_names[0], ers(rc));
+    }
     int64_t ts = 999000;
     float val = 0;
     if ((rc = tsdbc_insert_series(c, sid, &ts, &val, 1)) != 0)
@@ -27068,6 +27109,22 @@ static void scen_youngscrub(void)
     if (!r2_kept_dmg)
         die("youngscrub: R2 cleared CL_HEALTH_DAMAGED after priority part vanished");
 
+    /* Confirm L accepts writes stably after R2a's restart before flipping L's part (avoids racing R2a's
+     * reconnect window; L MUST stay leader — a false depose of L fails the test immediately). */
+    for (t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(0, "ys", &v) && v.leader != ids[L])
+            die("youngscrub: leader %d was falsely deposed to node %" PRIu32 " after R2a restart", L, v.leader);
+        int64_t pts = 2999000;
+        float pv = 10.5f;
+        rc = tsdbc_insert_series(c, id, &pts, &pv, 1);
+        if (rc == 0)
+            break;
+        if (now_ms() - t0 > 15000)
+            die("youngscrub: leader %d not ready after R2a restart: %s", L, ers(rc));
+        tsdbc_close(c);
+        c = client(L);
+    }
+
     /* 5. Flip a granule byte on leader L: leader reports CL_HEALTH_DAMAGED and keeps leading cleanly. */
     char ldir[PATH_MAX + 80], lvdir[PATH_MAX + 128], lpname[128] = "";
     server_dir(L, ldir, sizeof ldir);
@@ -29915,11 +29972,20 @@ static void scen_nodedestroyed(void)
     if (member_state_of(leader_of(0), ids[3], NULL, NULL) != META_DESTROYED)
         die("nodedestroyed: node 4 not META_DESTROYED");
 
-    start(3);
-    usleep(2500000);
+    int rport = start_try(3);
+    if (rport > 0) {
+        __atomic_store_n(&cports[3], rport, __ATOMIC_RELAXED);
+        pports[3] = th_pport;
+        usleep(2500000);
+        if (member_state_of(leader_of(0), ids[3], NULL, NULL) != META_DESTROYED)
+            die("nodedestroyed: restarted destroyed node 4 left META_DESTROYED!");
+        stop(3, SIGKILL);
+    } else if (rport != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 ||
+               (!log_has(3, "DESTROYED") && !log_has(3, "destroyed"))) {
+        die("nodedestroyed: restarted destroyed node 4 failed unexpectedly (rport=%d, %s)", rport, th_why);
+    }
     if (member_state_of(leader_of(0), ids[3], NULL, NULL) != META_DESTROYED)
-        die("nodedestroyed: restarted destroyed node 4 left META_DESTROYED!");
-    stop(3, SIGKILL);
+        die("nodedestroyed: node 4 left META_DESTROYED after restart attempt!");
 
     /* Destroy 2 more stripe holders (watchers 4 and 5) -> m+1 = 3 holders DESTROYED! */
     for (int s = 4; s <= 5; s++) {
@@ -31055,14 +31121,22 @@ static void scen_disks(void)
         die("disks: shared st_dev without --allow-shared-device did not refuse (%d, 0x%x)", rc, th_status);
     printf("  shared st_dev without --allow-shared-device refused\n");
 
-    /* 3. Accepted with --allow-shared-device; form 3-node cluster (node 2 starts --role compute). */
+    /* 3. Accepted with --allow-shared-device; form 3-node cluster (node 2 starts --role compute).
+     * Isolate node 0's /sys detection via an empty TSDB_DISK_SYSROOT so tsdb_disk_class_mismatch == 0 does not
+     * depend on whether the host's scratch filesystem sits on a real NVMe/SSD block device (step 7 tests mismatch). */
+    char nosys[PATH_MAX + 32], penv0[PATH_MAX + 64];
+    snprintf(nosys, sizeof nosys, "%s/nosys", base);
+    (void)mkdir(nosys, 0755);
+    snprintf(penv0, sizeof penv0, "TSDB_DISK_SYSROOT=%s", nosys);
     no_shared_dev[0] = 0;
     envs[0] = "setop_file=1";
     envs[1] = "setop_file=1";
     envs[2] = "setop_file=1";
+    penv[0] = penv0;
     snprintf(xa0, sizeof xa0, "--disk %s:nvme --disk %s:hdd --metrics-port auto", d0a, d0b);
     xargs[0] = xa0;
     start(0);
+    penv[0] = NULL;
     int mport0 = th_mport;
     if (mport0 <= 0)
         die("disks: server 0 reported no metrics port");

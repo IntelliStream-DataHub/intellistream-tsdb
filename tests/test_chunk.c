@@ -3121,6 +3121,23 @@ static void test_known_erasures(void)
     CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, 0, &rep) == TSDB_ERR_CORRUPT);
     CHECK(kc.read_calls[1] == 0);
 
+    /* 5b. Two written LOST (pos 2, pos 3) + 1 UNWRITTEN (pos 1): lost + unwritten = 3 > m=2 -> TSDB_ERR_IO */
+    m.fail[2] = CHUNK_ST_LOST;
+    m.fail[3] = CHUNK_ST_LOST;
+    CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, 0, &rep) == TSDB_ERR_IO);
+    CHECK(kc.read_calls[1] == 0);
+
+    /* 5c. Boundary: 1 LOST (pos 2) + 1 UNWRITTEN (pos 1) = m=2 + 1 DOWN (pos 3) -> UNAVAILABLE, not TSDB_ERR_IO */
+    m.fail[3] = CHUNK_ST_DOWN;
+    CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, 0, &rep) == TSDB_ERR_UNAVAILABLE);
+    CHECK(kc.read_calls[1] == 0);
+
+    /* 5d. Boundary: 0 LOST + 3 UNWRITTEN (> m=2) -> CORRUPT, not TSDB_ERR_IO (lost > 0 guard) */
+    m.fail[2] = CHUNK_ST_UNWRITTEN;
+    m.fail[3] = CHUNK_ST_UNWRITTEN;
+    CHECK(chunk_read_range(&src, &g, m.rec, 0, g.len, out, 0, &rep) == TSDB_ERR_CORRUPT);
+    CHECK(kc.read_calls[1] == 0);
+
     /* 6. chunk_obj_open_pos on a real 6-store backend where pos 1 was never written */
     char dir[PATH_MAX + 32], sp[6][PATH_MAX + 64];
     const char *pp[6];

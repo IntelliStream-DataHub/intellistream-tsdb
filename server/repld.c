@@ -1855,7 +1855,12 @@ static const char *msg_refused(struct rvol *rv, const struct rw_msg *c)
     uint64_t known = repl_epoch(rv->core);
     if (rv->rec.epoch > known)
         known = rv->rec.epoch;
-    if (G.mutant != RM_NOEPOCHBOUND && (m->epoch > known || m->last_epoch > known || m->prev_epoch > known))
+    /* Allow REPL_M_REFUSE at known + 1: if a Raft leader fenced a follower to e + 1 and stopped before committing
+     * VOLUME_LEADER while the epoch e leader missed the FENCE, the follower refuses APPEND(e) with REFUSE(e + 1);
+     * dropping that REFUSE wedges the follower out of the ISR permanently, whereas accepting +1 deposes the leader
+     * so leader_deposed() advances the volume cleanly to e + 1. High-bit and >= +2 flips remain rejected. */
+    uint64_t max_ep = (m->type == REPL_M_REFUSE && known < UINT64_MAX) ? known + 1 : known;
+    if (G.mutant != RM_NOEPOCHBOUND && (m->epoch > max_ep || m->last_epoch > known || m->prev_epoch > known))
         return "an epoch above the highest this member knows";
     switch (m->type) {
     case REPL_M_ACK:

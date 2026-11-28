@@ -8180,8 +8180,9 @@ static void member_states(uint64_t now)
     uint64_t to = (uint64_t)s->node_timeout_ms * MS;
     /* A new leader does not know when the others last heard from anyone, nor the leases given before: it proposes
      * nothing but a member it hears itself coming back (DOWN, or a new incarnation: a restart, whose volumes open
-     * only once the group holds that incarnation) or a fresh fail-stop beat until the wait is over. A restarted volume
-     * leader resigns only then, and its restart often is what made this server the Raft leader (test_cluster resign). */
+     * only once the group holds that incarnation), a fresh address change (`moved`), or a fresh fail-stop beat until
+     * the wait is over. A restarted volume leader resigns only then, and its restart often is what made this server
+     * the Raft leader (test_cluster resign). */
     int settled = leader_settled(now);
     if (!settled && cl_mutant() == CLM_UPWAITS)
         return;
@@ -8189,6 +8190,14 @@ static void member_states(uint64_t now)
         const struct meta_member *m = &C.sm.members[i];
         if (m->state == META_DESTROYED || pend_member(m->id))
             continue;
+        if (m->id == C.id && C.adv[0] && C.padv[0]) {
+            /* Before the first heartbeat timer fires, a newly elected Raft leader that just restarted on a new port
+             * still needs its own advertised addresses in `heard` so `comes_back` proposes MEMBER_ADDR alongside
+             * MEMBER_STATE instead of advertising its old dead port until leader_settled(). */
+            struct heard *sh = heard_get(C.id);
+            if (!sh || !sh->addr[0] || !sh->peer[0])
+                heard_set(C.id, now, C.incarnation, C.sm.applied, C.adv, C.padv);
+        }
         uint64_t last = heard_ns(m->id, now);
         struct heard *h = heard_get(m->id);
         uint64_t inc = m->id == C.id ? C.incarnation : h ? h->inc : 0;
@@ -8228,7 +8237,7 @@ static void member_states(uint64_t now)
         int back_st = (st == META_DRAINING || (st == META_DOWN && m->down_reason == META_DOWN_DRAIN))
                           ? META_DRAINING
                           : META_UP;
-        if (!settled && !comes_back && !down_opening_inc && !fs)
+        if (!settled && !comes_back && !down_opening_inc && !fs && !moved)
             continue;
         if (down_opening_inc)
             propose_member_r(id, META_DOWN, inc, keep_reason, keep_since, moved, now);

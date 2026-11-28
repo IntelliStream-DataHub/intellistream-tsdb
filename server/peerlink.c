@@ -702,6 +702,7 @@ struct plink {
     _Atomic uint64_t reset_gen; /* plink_reset: the connection to end */
     _Atomic int stopped; /* plink_stop */
     _Atomic int paused;  /* plink_pause: the link's thread reads nothing from the socket meanwhile */
+    _Atomic int addr_changed; /* plink_set_addr: wake dial_main and reset backoff immediately */
 };
 
 struct peerlink {
@@ -3672,14 +3673,22 @@ static void *dial_main(void *arg)
         } else if (fd >= 0) {
             close(fd);
         }
-        /* a jittered gap, cut short by a close */
+        if (atomic_exchange_explicit(&l->addr_changed, 0, memory_order_acq_rel)) {
+            gap = lo;
+            continue;
+        }
+        /* a jittered gap, cut short by a close or a new peer address */
         uint64_t rnd;
         tsdb_random(&rnd, sizeof rnd);
         uint64_t until = now_ns() + gap / 2 + rnd % (gap / 2 + 1);
+        int reset_gap = 0;
         while (!atomic_load(&pl->closing) && !atomic_load(&l->stopped) && now_ns() < until) {
             atomic_store_explicit(&l->wake_state, WAKE_SLEEPING, memory_order_seq_cst);
-            if (atomic_load(&pl->closing) || atomic_load(&l->stopped)) {
+            if (atomic_load(&pl->closing) || atomic_load(&l->stopped) ||
+                atomic_load_explicit(&l->addr_changed, memory_order_acquire)) {
                 atomic_store_explicit(&l->wake_state, WAKE_AWAKE, memory_order_relaxed);
+                if (atomic_exchange_explicit(&l->addr_changed, 0, memory_order_acq_rel))
+                    reset_gap = 1;
                 break;
             }
             struct pollfd pf = {l->evfd, POLLIN, 0};
@@ -3687,8 +3696,12 @@ static void *dial_main(void *arg)
             atomic_store_explicit(&l->wake_state, WAKE_AWAKE, memory_order_relaxed);
             if (pf.revents & POLLIN)
                 wake_read(l);
+            if (atomic_exchange_explicit(&l->addr_changed, 0, memory_order_acq_rel)) {
+                reset_gap = 1;
+                break;
+            }
         }
-        gap = gap * 2 > hi ? hi : gap * 2;
+        gap = reset_gap ? lo : (gap * 2 > hi ? hi : gap * 2);
     }
     return NULL;
 }
@@ -3949,8 +3962,14 @@ int plink_set_addr(struct plink *l, const char *addr)
     if (!l->dialed || strlen(addr) >= sizeof l->addr)
         return -1;
     pthread_mutex_lock(&pl->mu);
-    snprintf(l->addr, sizeof l->addr, "%s", addr);
+    int changed = strcmp(l->addr, addr) != 0;
+    if (changed) {
+        snprintf(l->addr, sizeof l->addr, "%s", addr);
+        atomic_store_explicit(&l->addr_changed, 1, memory_order_release);
+    }
     pthread_mutex_unlock(&pl->mu);
+    if (changed)
+        wake(l);
     return 0;
 }
 

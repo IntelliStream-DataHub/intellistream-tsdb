@@ -1045,6 +1045,121 @@ static void case_forget(h *x)
            "concurrent race\n");
 }
 
+/* Regression test for stall-detach in eccache: a reader parked in CO_OPENING or CE_LOADING when a store newly
+ * transitions to DOWN_STALLED must be detached so a concurrent reader completes promptly from parity. */
+static pthread_mutex_t sd_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sd_cv = PTHREAD_COND_INITIALIZER;
+static const uint8_t *sd_oid;
+static int sd_where, sd_entered, sd_release, sd_t2_done, sd_t1_rc, sd_t2_rc;
+static h *sd_h;
+static part *sd_part;
+static int sd_s;
+static hsum sd_h1, sd_h2;
+
+static void sd_hook(struct tier *t, int where, const uint8_t oid[16])
+{
+    (void)t;
+    if (where != sd_where || memcmp(oid, sd_oid, 16) != 0)
+        return;
+    pthread_mutex_lock(&sd_mu);
+    if (!sd_entered) {
+        sd_entered = 1;
+        pthread_cond_broadcast(&sd_cv);
+        while (!sd_release)
+            pthread_cond_wait(&sd_cv, &sd_mu);
+    }
+    pthread_mutex_unlock(&sd_mu);
+}
+
+static void *sd_thr1(void *arg)
+{
+    (void)arg;
+    sd_t1_rc = read_part(sd_h->db, sd_part, sd_s, &sd_h1);
+    return NULL;
+}
+
+static void *sd_thr2(void *arg)
+{
+    (void)arg;
+    sd_t2_rc = read_part(sd_h->db, sd_part, sd_s, &sd_h2);
+    pthread_mutex_lock(&sd_mu);
+    sd_t2_done = 1;
+    pthread_cond_broadcast(&sd_cv);
+    pthread_mutex_unlock(&sd_mu);
+    return NULL;
+}
+
+static void case_stall_detach(h *x)
+{
+    int s;
+    part *p = obj_part(x->db, 1, &s);
+    CHECK(p);
+    if (!p)
+        return;
+    hsum want;
+    CHECK(read_part(x->db, p, s, &want) == 0);
+    sd_h = x;
+    sd_part = p;
+    sd_s = s;
+    sd_oid = objs[1].rec.oid;
+
+    for (int where = ECC_HOOK_OPENED; where <= ECC_HOOK_FILLED; where++) {
+        int st_idx = where - ECC_HOOK_OPENED; /* distinct UP store per iteration (0, then 1; both <= m=2) */
+        eccache_test_drop(x->t);
+        pthread_mutex_lock(&sd_mu);
+        sd_where = where;
+        sd_entered = 0;
+        sd_release = 0;
+        sd_t2_done = 0;
+        sd_t1_rc = -1;
+        sd_t2_rc = -1;
+        pthread_mutex_unlock(&sd_mu);
+        eccache_test_hook = sd_hook;
+
+        pthread_t t1, t2;
+        CHECK(pthread_create(&t1, NULL, sd_thr1, NULL) == 0);
+        pthread_mutex_lock(&sd_mu);
+        while (!sd_entered)
+            pthread_cond_wait(&sd_cv, &sd_mu);
+        pthread_mutex_unlock(&sd_mu);
+
+        /* Store st_idx transitions UP -> DOWN_STALLED after t1 entered CO_OPENING/CE_LOADING: t2 must detach and
+         * finish from the surviving stores while t1 is still parked inside the hook. */
+        tier_store_set_down(x->t, st_idx, CHUNK_STORE_DOWN_STALLED);
+        CHECK(pthread_create(&t2, NULL, sd_thr2, NULL) == 0);
+
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += 3;
+        pthread_mutex_lock(&sd_mu);
+        while (!sd_t2_done) {
+            if (pthread_cond_timedwait(&sd_cv, &sd_mu, &dl) == ETIMEDOUT)
+                break;
+        }
+        int ok = sd_t2_done;
+        sd_release = 1;
+        pthread_cond_broadcast(&sd_cv);
+        pthread_mutex_unlock(&sd_mu);
+
+        pthread_join(t2, NULL);
+        pthread_join(t1, NULL);
+        eccache_test_hook = NULL;
+        eccache_reopen_all(x->t);
+
+        CHECK(ok == 1);
+        CHECK(sd_t2_rc == 0 && sd_h2.h == want.h && sd_h2.n == want.n);
+        CHECK(sd_t1_rc == 0 && sd_h1.h == want.h && sd_h1.n == want.n);
+    }
+    /* Wait for tier_health to auto-reattach stores 0 and 1 back to UP before subsequent cases run. */
+    for (int w = 0; w < 1000 && (chunk_be_store_state(x->t->be, 0) != CHUNK_STORE_UP ||
+                                 chunk_be_store_state(x->t->be, 1) != CHUNK_STORE_UP);
+         w++)
+        usleep(10000);
+    eccache_reopen_all(x->t);
+    CHECK(chunk_be_store_state(x->t->be, 0) == CHUNK_STORE_UP && chunk_be_store_state(x->t->be, 1) == CHUNK_STORE_UP);
+    printf("test_seam: stall_detach: reader bypasses parked CO_OPENING and CE_LOADING after DOWN_STALLED\n");
+}
+
 /* more than m chunks of one object gone: CORRUPT, with the line; the other parts still answer */
 static void case_lost(h *x)
 {
@@ -2249,6 +2364,8 @@ static void run(void)
         case_heal(&x);
     if (x.db)
         case_forget(&x);
+    if (x.db)
+        case_stall_detach(&x);
     if (x.db)
         case_damage(&x);
     if (x.db)

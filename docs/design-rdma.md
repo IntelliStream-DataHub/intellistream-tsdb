@@ -853,7 +853,9 @@ second pass over every byte costs; on RDMA that pass is the CPU zero copy saves,
 receive paths must be safe on any bytes, which fuzz-replframe checks per level): a replication message is checked
 against its log before the core sees it (an ACK beyond the log, a record unlike its descriptor (`wal_record`), a
 metadata-only type (FENCE, FENCE_REPLY, META, ISR_REQ, RESIGN) from a peer, an epoch above the highest the member knows
-(the record's or the core's: a flipped high bit would fence the replica durably above every epoch the group hands out),
+(the record's or the core's: a flipped high bit would fence the replica durably above every epoch the group hands out;
+one exception is `REFUSE` at `known + 1` with `last_epoch`/`prev_epoch <= known`, so an old leader that missed a
+`FENCE(e + 1)` still steps down when a fenced follower answers instead of wedging it out of the ISR),
 a descriptor epoch outside [prev_epoch, the message's epoch]: dropped and counted, the resend repairs it;
 `test_cluster replflip replmeta replepoch repldesc`, `test_repl ack_bound`); a driver frame on a bulk link ends that link
 (`replbulk`); a DONE or RESUME with a status no version sends ends the connection (`test_peerlink donestatus`); a

@@ -64,6 +64,7 @@ typedef struct chunk_loc_ent {
 struct chunk_backend {
     atomic_int n;
     int cap;                     /* allocated slots (>= n; fixed across runtime store additions for lock-free reads) */
+    _Atomic uint64_t stall_gen;  /* incremented on each UP/REPLACING -> DOWN_STALLED transition (eccache stall-detach) */
     bool read_only;              /* R15 D13: opened read-only (no flock, no EPOCH write, no put/del) */
     _Atomic(chunk_store *) *st;  /* NULL while DOWN; guarded by st_mu for swaps and ref acquisition */
     atomic_int *state;           /* CHUNK_STORE_* (an open store that failed in service reads as DOWN_IOERR) */

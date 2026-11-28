@@ -1835,10 +1835,12 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
         o->g = *expect;
     } else { /* the geometry from the first header found (positions are placed whatever k' is: E9) */
         uint32_t probe_nodes[CHUNK_POS_MAX];
-        unsigned probe_pos[CHUNK_POS_MAX], nprobe = 0, probe_lost = 0;
+        unsigned probe_pos[CHUNK_POS_MAX], nprobe = 0, probe_lost = 0, probe_unw = 0;
         for (unsigned i = 0; i < v.nstripe; i++) {
-            if (positions != 0 && !(positions & (1u << i)))
+            if (positions != 0 && !(positions & (1u << i))) {
+                probe_unw++;
                 continue;
+            }
             if (is_destroyed[i]) {
                 probe_lost++;
                 continue;
@@ -1851,7 +1853,9 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
         }
         if (nprobe == 0) {
             p_obj_close(o);
-            return probe_lost > v.m ? TSDB_ERR_IO : any_filling_skip ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
+            return (probe_lost > 0 && probe_lost + probe_unw > v.m) ? TSDB_ERR_IO
+                   : any_filling_skip                               ? TSDB_ERR_UNAVAILABLE
+                                                                    : TSDB_ERR_CORRUPT;
         }
         fan *f = fan_new(p->cp, o->volume, o->epoch, probe_nodes, nprobe);
         if (!f) {
@@ -1890,10 +1894,11 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
     }
     uint32_t active_nodes[CHUNK_POS_MAX];
     unsigned active_pos[CHUNK_POS_MAX];
-    unsigned nactive = 0, lost_cnt = 0;
+    unsigned nactive = 0, lost_cnt = 0, unw_cnt = 0;
     for (unsigned i = 0; i < o->npos; i++) {
         if (positions != 0 && !(positions & (1u << i))) {
             o->st[i] = CHUNK_ST_UNWRITTEN; /* E10: known erasure, never asked */
+            unw_cnt++;
             continue;
         }
         if (is_destroyed[i]) {
@@ -1914,11 +1919,11 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
             nactive++;
         }
     }
-    if (lost_cnt > o->g.m) {
+    if (lost_cnt > 0 && lost_cnt + unw_cnt > o->g.m) {
         char hex[33];
         chunk_oid_hex(oid, hex);
-        fprintf(stderr, "tsdb: object %s: %u of %u positions are on destroyed members (> m=%u): data lost\n", hex,
-                lost_cnt, o->npos, o->g.m);
+        fprintf(stderr, "tsdb: object %s: %u destroyed + %u unwritten of %u positions (> m=%u): data lost\n", hex,
+                lost_cnt, unw_cnt, o->npos, o->g.m);
         p_obj_close(o);
         return TSDB_ERR_IO;
     }
@@ -2031,10 +2036,12 @@ static int p_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsign
     memset(rep, 0, sizeof *rep);
     uint32_t lost_mask = 0;
     if (o->node_state) {
-        unsigned lost_cnt = 0;
+        unsigned lost_cnt = 0, unw_cnt = 0;
         for (unsigned p = 0; p < o->npos && p < CHUNK_POS_MAX; p++) {
-            if (o->st[p] == CHUNK_ST_UNWRITTEN)
+            if (o->st[p] == CHUNK_ST_UNWRITTEN) {
+                unw_cnt++;
                 continue;
+            }
             if (o->st[p] == CHUNK_ST_LOST || o->node_state(o->node_state_arg, o->node[p]) == CP_NODE_DESTROYED) {
                 lost_cnt++;
                 if (p < 32u)
@@ -2042,7 +2049,7 @@ static int p_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsign
                 rep->st[p] = CHUNK_ST_LOST;
             }
         }
-        if (lost_cnt > o->g.m)
+        if (lost_cnt > 0 && lost_cnt + unw_cnt > o->g.m)
             return TSDB_ERR_IO;
     }
     read_ctx rctx;

@@ -12,6 +12,7 @@
 #include "chunk_priv.h"
 #include "eccache.h"
 #include "ecgc.h"
+#include "ecpart.h"
 #include "internal.h"
 #include "settle.h"
 #include "tier.h"
@@ -360,6 +361,47 @@ static int count_and_scrub_store_chunks(const char *store_path, uint64_t *bytes_
     if (cs)
         chunk_store_close(cs);
     return count;
+}
+
+/* Inserts and settles at least min_parts days (up to 64) until target_store holds at least min_chunks chunk files. */
+static int populate_and_settle_on_store(tsdb *db, int min_parts, int rows_per_part, const char *target_store,
+                                        int min_chunks, tsdb_sid *s0_out, tsdb_sid *s1_out)
+{
+    const int64_t day_ms = 86400000LL;
+    tsdb_sid s0 = 0, s1 = 0;
+    CHECK(tsdb_series_create(db, "metric_a", TSDB_FLOAT64, NULL, &s0) == 0);
+    CHECK(tsdb_series_create(db, "metric_b", TSDB_FLOAT64, NULL, &s1) == 0);
+    int64_t *ts = malloc((size_t)rows_per_part * sizeof *ts);
+    double *va = malloc((size_t)rows_per_part * sizeof *va);
+    double *vb = malloc((size_t)rows_per_part * sizeof *vb);
+    CHECK(ts && va && vb);
+    int nparts = 0;
+    while (nparts < 64) {
+        int batch = nparts == 0 ? min_parts : 1;
+        for (int b = 0; b < batch && nparts < 64; b++, nparts++) {
+            int64_t base_ts = (int64_t)nparts * day_ms + 1000LL;
+            for (int r = 0; r < rows_per_part; r++) {
+                ts[r] = base_ts + (int64_t)r * 1000LL;
+                va[r] = det_val(nparts, r, 0);
+                vb[r] = det_val(nparts, r, 1);
+            }
+            tsdb_values val_a = {.type = TSDB_FLOAT64, .values = va, .valid = NULL};
+            tsdb_values val_b = {.type = TSDB_FLOAT64, .values = vb, .valid = NULL};
+            CHECK(tsdb_insert_series_values(db, s0, ts, &val_a, (size_t)rows_per_part) == 0);
+            CHECK(tsdb_insert_series_values(db, s1, ts, &val_b, (size_t)rows_per_part) == 0);
+            CHECK(tsdb_flush(db) == 0);
+        }
+        size_t settled = 0;
+        CHECK(tsdb_test_settle(db, pick_all, NULL, &settled) == 0);
+        if (count_and_scrub_store_chunks(target_store, NULL, false) >= min_chunks)
+            break;
+    }
+    free(ts);
+    free(va);
+    free(vb);
+    *s0_out = s0;
+    *s1_out = s1;
+    return nparts;
 }
 
 static bool wait_store_state(tier *t, int idx, int want, int timeout_ms)
@@ -1369,8 +1411,8 @@ static void t_shrink_7to6(void)
     setup_7store_db(base, dbdir, stores, &db);
 
     tsdb_sid s0 = 0, s1 = 0;
-    populate_and_settle(db, 6, 20000, &s0, &s1);
-    verify_rows(db, s0, s1, 6, 20000);
+    int nparts = populate_and_settle_on_store(db, 6, 20000, stores[2], 1, &s0, &s1);
+    verify_rows(db, s0, s1, nparts, 20000);
 
     int orig_s2_chunks = count_and_scrub_store_chunks(stores[2], NULL, false);
     CHECK(orig_s2_chunks >= 1);
@@ -1383,10 +1425,10 @@ static void t_shrink_7to6(void)
     CHECK(tsdb_tier_lost(db, "s2", NULL, 0) == 0);
 
     /* Reads must answer bit-exact during the shrink as well as after. */
-    verify_rows(db, s0, s1, 6, 20000);
+    verify_rows(db, s0, s1, nparts, 20000);
 
     CHECK(tierctl_wait_idle(t, 30000) == 0);
-    verify_rows(db, s0, s1, 6, 20000);
+    verify_rows(db, s0, s1, nparts, 20000);
 
     tierctl_progress prog;
     CHECK(tierctl_get_progress(t, &prog));
@@ -1420,7 +1462,7 @@ static void t_shrink_7to6(void)
     t = tier_find_by_dir(dbdir);
     CHECK(t != NULL);
     CHECK(tier_store_count(t) == 6);
-    verify_rows(db, s0, s1, 6, 20000);
+    verify_rows(db, s0, s1, nparts, 20000);
 
     /* Drop granule cache and take 2 of the 6 remaining stores DOWN -> reads MUST succeed using the 4 surviving stores
      * (double-kills `shrinkearly` and verifies post-reopen placement matches chunk_be_place!). */
@@ -1428,7 +1470,7 @@ static void t_shrink_7to6(void)
     tier_store_set_down(t, 0, CHUNK_STORE_DOWN_STALLED);
     tier_store_set_down(t, 1, CHUNK_STORE_DOWN_STALLED);
     eccache_reopen_all(t);
-    verify_rows(db, s0, s1, 6, 20000);
+    verify_rows(db, s0, s1, nparts, 20000);
 
     tier_put(t);
     CHECK(tsdb_close(db) == 0);
@@ -1439,10 +1481,10 @@ static void t_shrink_7to6(void)
         if (i == 2)
             continue;
         int c = count_and_scrub_store_chunks(stores[i], NULL, true);
-        CHECK(c >= 6);
+        CHECK(c >= nparts);
         total_remaining += c;
     }
-    CHECK(total_remaining >= 36);
+    CHECK(total_remaining >= 6 * nparts);
     printf("  shrink_7to6: ok (7->6 at 4+2, refusal below k+m verified, reopen=6 stores, 2-down read ok)\n");
 }
 
@@ -1453,7 +1495,7 @@ static void t_kill_mid_shrink(void)
     tsdb *db = NULL;
     setup_7store_db(base, dbdir, stores, &db);
     tsdb_sid s0 = 0, s1 = 0;
-    populate_and_settle(db, 8, 20000, &s0, &s1);
+    int nparts = populate_and_settle_on_store(db, 8, 20000, stores[2], 2, &s0, &s1);
     CHECK(tsdb_close(db) == 0);
 
     /* Lose store 2 offline and record STATE LOST + STATE SHRINKING in TIERS. */
@@ -1534,7 +1576,7 @@ static void t_kill_mid_shrink(void)
     tier_put(t);
     CHECK(tsdb_close(db) == 0);
 
-    /* Final reopen opens 6 stores cleanly and passes 2-store-DOWN read check across all 8 parts. */
+    /* Final reopen opens 6 stores cleanly and passes 2-store-DOWN read check across all parts. */
     CHECK(open_db(dbdir, &db) == 0 && db != NULL);
     t = tier_find_by_dir(dbdir);
     CHECK(t != NULL && tier_store_count(t) == 6);
@@ -1542,7 +1584,7 @@ static void t_kill_mid_shrink(void)
     tier_store_set_down(t, 2, CHUNK_STORE_DOWN_STALLED);
     tier_store_set_down(t, 3, CHUNK_STORE_DOWN_STALLED);
     eccache_reopen_all(t);
-    verify_rows(db, s0, s1, 8, 20000);
+    verify_rows(db, s0, s1, nparts, 20000);
     tier_put(t);
     CHECK(tsdb_close(db) == 0);
     printf("  kill_mid_shrink: ok (killed mid-shrink, resumed on reopen, finished to REMOVED, 6 stores ok)\n");
@@ -1557,23 +1599,41 @@ static void t_shrink_damaged(void)
     tsdb *db = NULL;
     setup_7store_db(base, dbdir, stores, &db);
     tsdb_sid s0 = 0, s1 = 0;
-    populate_and_settle(db, 3, 10000, &s0, &s1);
+    (void)populate_and_settle_on_store(db, 5, 10000, stores[2], 2, &s0, &s1);
 
-    /* Mark the first live .ec part as damaged in memory. */
+    /* Mark the first live .ec part that actually holds a chunk on store 2 as damaged in memory. */
     eng *e0 = tsdb_test_engine(db, 0);
     CHECK(e0 != NULL);
     bool marked = false;
+    uint64_t on_s2 = 0;
     pthread_mutex_lock(&e0->lock);
     for (size_t i = 0; i < e0->nparts; i++) {
         part *p = e0->parts[i];
-        if (!p->dropped && atomic_load_explicit(&p->ec, memory_order_acquire) != NULL) {
-            atomic_store_explicit(&p->damaged, true, memory_order_release);
-            marked = true;
-            break;
+        struct ecpart *ep = atomic_load_explicit(&p->ec, memory_order_acquire);
+        if (p->dropped || !ep)
+            continue;
+        char hex[33];
+        chunk_oid_hex(ep->rec.oid, hex);
+        bool has_s2 = false;
+        unsigned npos = (unsigned)ep->rec.k + (unsigned)ep->rec.m;
+        for (unsigned pos = 0; pos < npos; pos++) {
+            char cp[PATH_MAX + 64];
+            snprintf(cp, sizeof cp, "%s/s0/o%s.%u.chunk", stores[2], hex, pos);
+            if (access(cp, F_OK) == 0) {
+                has_s2 = true;
+                break;
+            }
+        }
+        if (has_s2) {
+            on_s2++;
+            if (!marked) {
+                atomic_store_explicit(&p->damaged, true, memory_order_release);
+                marked = true;
+            }
         }
     }
     pthread_mutex_unlock(&e0->lock);
-    CHECK(marked);
+    CHECK(marked && on_s2 >= 2);
 
     CHECK(sh("rm -rf '%s'", stores[2]) == 0);
     tier *t = tier_find_by_dir(dbdir);
@@ -1586,7 +1646,7 @@ static void t_shrink_damaged(void)
     bool saw_backed_off = false;
     while (mono_ms() < dl) {
         tierctl_progress prog;
-        if (tierctl_get_progress(t, &prog) && !prog.shrink_active && prog.shrink_objects_done >= 2 &&
+        if (tierctl_get_progress(t, &prog) && !prog.shrink_active && prog.shrink_objects_done >= on_s2 - 1 &&
             prog.shrink_objects_left == 1) {
             saw_backed_off = true;
             break;
@@ -1702,7 +1762,7 @@ static void t_shrink_crashfs(void)
     tsdb *db = NULL;
     setup_7store_db(work, dbdir, stores, &db);
     tsdb_sid s0 = 0, s1 = 0;
-    populate_and_settle(db, 2, 10000, &s0, &s1);
+    int nparts = populate_and_settle_on_store(db, 2, 10000, stores[2], 1, &s0, &s1);
     CHECK(tsdb_close(db) == 0);
     CHECK(sh("rm -rf '%s'", stores[2]) == 0);
     CHECK(tierctl_lost_dir(dbdir, "s2", NULL, NULL, 0, NULL, NULL) == 0);
@@ -1743,7 +1803,7 @@ static void t_shrink_crashfs(void)
             tier_store_set_down(t, 0, CHUNK_STORE_DOWN_STALLED);
             tier_store_set_down(t, 1, CHUNK_STORE_DOWN_STALLED);
             eccache_reopen_all(t);
-            verify_rows(db, s0, s1, 2, 10000);
+            verify_rows(db, s0, s1, nparts, 10000);
             tier_put(t);
             CHECK(tsdb_close(db) == 0);
         } else if (rc == 0) {
@@ -1778,21 +1838,42 @@ static void t_shrink_salvage_s0(void)
     tsdb *db = NULL;
     setup_7store_db(base, dbdir, stores, &db);
     tsdb_sid s0 = 0, s1 = 0;
-    populate_and_settle(db, 4, 10000, &s0, &s1);
+    int nparts = populate_and_settle_on_store(db, 6, 10000, stores[0], 2, &s0, &s1);
 
-    /* Mark partition 0's .ec part damaged so shrink re-encodes partitions 1..3 onto the 6 remaining stores
-     * while store 0 remains in TIERS_STATE_SHRINKING (LOST). */
+    /* Mark one .ec part that actually holds a chunk on store 0 damaged so shrink re-encodes the other s0-resident
+     * parts onto the 6 remaining stores while store 0 stays in TIERS_STATE_SHRINKING (LOST). */
     eng *e0 = tsdb_test_engine(db, 0);
     CHECK(e0 != NULL);
+    int64_t damaged_part = -1;
+    uint64_t on_s0 = 0;
     pthread_mutex_lock(&e0->lock);
     for (size_t i = 0; i < e0->nparts; i++) {
         part *p = e0->parts[i];
-        if (!p->dropped && p->partition == 0 && atomic_load_explicit(&p->ec, memory_order_acquire) != NULL) {
-            atomic_store_explicit(&p->damaged, true, memory_order_release);
-            break;
+        struct ecpart *ep = atomic_load_explicit(&p->ec, memory_order_acquire);
+        if (p->dropped || !ep)
+            continue;
+        char hex[33];
+        chunk_oid_hex(ep->rec.oid, hex);
+        bool has_s0 = false;
+        unsigned npos = (unsigned)ep->rec.k + (unsigned)ep->rec.m;
+        for (unsigned pos = 0; pos < npos; pos++) {
+            char cp[PATH_MAX + 64];
+            snprintf(cp, sizeof cp, "%s/s0/o%s.%u.chunk", stores[0], hex, pos);
+            if (access(cp, F_OK) == 0) {
+                has_s0 = true;
+                break;
+            }
+        }
+        if (has_s0) {
+            on_s0++;
+            if (damaged_part < 0) {
+                damaged_part = p->partition;
+                atomic_store_explicit(&p->damaged, true, memory_order_release);
+            }
         }
     }
     pthread_mutex_unlock(&e0->lock);
+    CHECK(damaged_part >= 0 && on_s0 >= 2);
 
     CHECK(sh("rm -rf '%s'", stores[0]) == 0);
     tier *t = tier_find_by_dir(dbdir);
@@ -1803,7 +1884,7 @@ static void t_shrink_salvage_s0(void)
     bool ready = false;
     while (mono_ms() < dl) {
         tierctl_progress prog;
-        if (tierctl_get_progress(t, &prog) && !prog.shrink_active && prog.shrink_objects_done >= 3 &&
+        if (tierctl_get_progress(t, &prog) && !prog.shrink_active && prog.shrink_objects_done >= on_s0 - 1 &&
             prog.shrink_objects_left == 1) {
             ready = true;
             break;
@@ -1813,15 +1894,17 @@ static void t_shrink_salvage_s0(void)
     }
     CHECK(ready);
 
-    /* Run tier salvage while s0 is SHRINKING (LOST) and parts 1..3 are on active-store placement (-1).
-     * Salvage MUST NOT retire healthy re-encoded parts 1..3! */
+    /* Run tier salvage while s0 is SHRINKING (LOST) and healthy parts are on active-store placement (-1).
+     * Salvage MUST NOT retire healthy re-encoded parts! */
     CHECK(tsdb_tier_salvage(db, 0, 1, 0) == 0);
 
     const int64_t day_ms = 86400000LL;
     int64_t *ts = malloc(10000 * sizeof *ts);
     double *va = malloc(10000 * sizeof *va);
     CHECK(ts && va);
-    for (int p = 1; p < 4; p++) {
+    for (int p = 0; p < nparts; p++) {
+        if (p == damaged_part)
+            continue;
         size_t n = 0;
         CHECK(query_f64(db, s0, (int64_t)p * day_ms, (int64_t)(p + 1) * day_ms, ts, va, 10000, &n) == 0);
         CHECK(n == 10000);
@@ -1866,7 +1949,7 @@ static void t_shrink_eng_halt(void)
     tsdb *db = NULL;
     setup_7store_db(base, dbdir, stores, &db);
     tsdb_sid s0 = 0, s1 = 0;
-    populate_and_settle(db, 4, 10000, &s0, &s1);
+    (void)populate_and_settle_on_store(db, 4, 10000, stores[2], 1, &s0, &s1);
 
     eng *e0 = tsdb_test_engine(db, 0);
     tier *t = tier_find_by_dir(dbdir);

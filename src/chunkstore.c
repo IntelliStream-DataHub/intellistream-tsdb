@@ -2022,12 +2022,19 @@ int chunk_be_set_down(chunk_backend *be, int i, int reason)
             }
         }
         snprintf(pbuf, sizeof pbuf, "%s", be->path[i] ? be->path[i] : "-");
+        if (reason == CHUNK_STORE_DOWN_STALLED)
+            atomic_fetch_add_explicit(&be->stall_gen, 1, memory_order_release);
         changed = true;
     }
     pthread_mutex_unlock(&be->st_mu);
     if (changed)
         fprintf(stderr, "tsdb: chunk backend: store %d (%s) is %s\n", i, pbuf, chunk_store_state_name(reason));
     return 0;
+}
+
+uint64_t chunk_be_stall_gen(const chunk_backend *be)
+{
+    return be ? atomic_load_explicit(&be->stall_gen, memory_order_acquire) : 0;
 }
 
 void chunk_be_set_ioerr_cb(chunk_backend *be, void (*fn)(void *ctx, int store), void *ctx)

@@ -24,6 +24,7 @@
 #include "stats_priv.h"
 #include "tier.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -75,8 +76,9 @@ typedef struct ce {
     _Atomic bool listed; /* in the shard's hash table */
     bool pf;             /* read ahead and not yet hit: its cost is in c->pf_bytes */
     uint8_t shard;       /* stripe index in c->shards[] */
-    uint8_t *data;       /* owned buffer (slab == NULL) or direct slice into slab->buf */
-    ec_slab *slab;       /* shared prefetch slab, or NULL for standalone entries */
+    uint8_t *data;      /* owned buffer (slab == NULL) or direct slice into slab->buf */
+    ec_slab *slab;      /* shared prefetch slab, or NULL for standalone entries */
+    uint64_t stall_gen; /* chunk_be_stall_gen when CE_LOADING began */
 } ce;
 
 _Static_assert(sizeof(ce) + BLK_SLACK + 32 + 2 * sizeof(ce *) <= ECCACHE_ENTRY_OVERHEAD,
@@ -95,7 +97,8 @@ typedef struct co {
     uint32_t pins;
     unsigned fds; /* counted against the fd budget from the reservation (OPENING) on */
     int state;
-    bool listed; /* in the table: found by readers; an object taken out of it is closed by its last reader */
+    bool listed;        /* in the table: found by readers; an object taken out of it is closed by its last reader */
+    uint64_t stall_gen; /* chunk_be_stall_gen when CO_OPENING began */
 } co;
 
 /* The entries of one object (by oid) within one shard, so that eccache_forget walks them and not the whole table. */
@@ -634,6 +637,13 @@ static int map_rc(int rc)
     return rc <= -100 ? TSDB_ERR_IO : rc;
 }
 
+/* Lock-free stall generation of the tier's backend (atomic loads only, safe under leaf locks). */
+static uint64_t eccache_stall_gen(const struct eccache_tier *c)
+{
+    chunk_backend *be = atomic_load_explicit(&((struct eccache_tier *)c)->be, memory_order_acquire);
+    return chunk_be_stall_gen(be);
+}
+
 /* Gives the reader the object of e, open and pinned (obj_put lets go of it). When `lost_out` is non-NULL, sets it to
  * true only when obj_open itself reported TSDB_ERR_IO (E15: > m positions on LOST stores), not a mapped CHUNK_ERR_*. */
 static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, co **out, bool *lost_out)
@@ -652,8 +662,18 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, 
         co *o = co_find(c, e->volume, r->oid);
         if (o && o->state == CO_OPENING) {
             c->obj_waiters++;
-            pthread_cond_wait(&c->obj_cv, &c->obj_mu);
+            int wrc = tsdb_cond_timedwait_ms(&c->obj_cv, &c->obj_mu, 200);
             c->obj_waiters--;
+            if (wrc == ETIMEDOUT) {
+                co *o2 = co_find(c, e->volume, r->oid);
+                if (o2 && o2->state == CO_OPENING && eccache_stall_gen(c) != o2->stall_gen) {
+                    /* A store transitioned to DOWN_STALLED after this opener entered CO_OPENING, so it may be hung
+                     * on that store's fd: detach it once so readers open around the stalled store immediately. */
+                    co_remove(c, o2);
+                    if (c->obj_waiters)
+                        pthread_cond_broadcast(&c->obj_cv);
+                }
+            }
             continue;
         }
         if (o) {
@@ -684,6 +704,7 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, 
     nw->state = CO_OPENING;
     nw->pins = 1;
     nw->fds = need;
+    nw->stall_gen = eccache_stall_gen(c);
     c->fds += need;
     if (c->fds > c->fds_peak)
         c->fds_peak = c->fds;
@@ -1094,6 +1115,7 @@ static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart
                 y->state = CE_LOADING;
                 y->pins = 1;
                 y->pf = true;
+                y->stall_gen = eccache_stall_gen(c);
                 ce_insert(sh, y, h, &spare);
                 pthread_mutex_unlock(&sh->mu);
                 win[k] = y;
@@ -1309,14 +1331,28 @@ int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi
     unsigned pfcap = 0;
     bool loader = false;
     bool try_detach = false;
+    bool counted_wait = false;
     pthread_mutex_lock(&sh->mu);
     for (;;) {
         x = ce_find(sh, e->rec.oid, g->off, h);
         if (x && x->state == CE_LOADING) {
-            sh->waits++;
+            if (!counted_wait) {
+                sh->waits++;
+                counted_wait = true;
+            }
             sh->waiters++;
-            pthread_cond_wait(&sh->cv, &sh->mu);
+            int wrc = tsdb_cond_timedwait_ms(&sh->cv, &sh->mu, 200);
             sh->waiters--;
+            if (wrc == ETIMEDOUT) {
+                ce *x2 = ce_find(sh, e->rec.oid, g->off, h);
+                if (x2 && x2->state == CE_LOADING && eccache_stall_gen(c) != x2->stall_gen) {
+                    /* A store transitioned to DOWN_STALLED after this loader entered CE_LOADING, so it may be hung
+                     * on that store's fd: detach it once so readers bypass the stalled store immediately. */
+                    ce_unhash(c, sh, x2);
+                    if (sh->waiters)
+                        pthread_cond_broadcast(&sh->cv);
+                }
+            }
             continue;
         }
         if (x) {
@@ -1339,6 +1375,7 @@ int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi
             nw = NULL;
             x->state = CE_LOADING;
             x->pins = 1;
+            x->stall_gen = eccache_stall_gen(c);
             ce_insert(sh, x, h, &spare);
             sh->misses++;
             pfcap = atomic_load_explicit(&c->pf_cap, memory_order_relaxed);
@@ -1570,7 +1607,7 @@ int eccache_tier_open(struct tier *t)
             break;
         }
         pthread_mutex_init(&s->mu, NULL);
-        pthread_cond_init(&s->cv, NULL);
+        tsdb_cond_init_mono(&s->cv);
         s->lru.next = s->lru.prev = &s->lru;
     }
     if (init_shards < ECCACHE_SHARDS) {
@@ -1588,7 +1625,7 @@ int eccache_tier_open(struct tier *t)
     }
 
     pthread_mutex_init(&c->obj_mu, NULL);
-    pthread_cond_init(&c->obj_cv, NULL);
+    tsdb_cond_init_mono(&c->obj_cv);
     c->olru.next = c->olru.prev = &c->olru;
 
     uint64_t budget;

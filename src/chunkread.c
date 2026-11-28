@@ -444,7 +444,7 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
             /* a position whose store was declared permanently LOST (E15: > m lost -> TSDB_ERR_IO) */
             lost += pst == CHUNK_ST_LOST;
         }
-        bool is_lost = lost > m;
+        bool is_lost = (lost > 0) && (lost + unwritten > m);
         bool away = !is_lost && (ngood + down >= k);
         if (!chunk_log_quiet)
             fprintf(stderr, "tsdb: object %s: stripe %llu has %u good chunks of the %u it needs (%u of %u positions "
@@ -872,36 +872,85 @@ static void obj_update_place_n(chunk_obj *o)
     }
 }
 
-/* Lazily opens a deferred parity position (k .. k+m-1) on first use (degrade() or heal); lock-free once tried. */
+/* Lazily opens a deferred parity position (k .. k+m-1) on first use (degrade() or heal); lock-free once tried.
+ * Opens the chunk file outside o->mu so a thread blocked on a newly-stalled store cannot stall concurrent readers
+ * opening parity positions on healthy stores. */
 static void obj_ensure_pos(chunk_obj *o, unsigned pos)
 {
     if (pos >= CHUNK_POS_MAX || atomic_load_explicit(&o->tried[pos], memory_order_acquire))
         return;
+    if (!pos_written(o->positions, pos)) {
+        pthread_mutex_lock(&o->mu);
+        if (!atomic_load_explicit(&o->tried[pos], memory_order_relaxed)) {
+            o->st[pos] = CHUNK_ST_UNWRITTEN;
+            atomic_store_explicit(&o->tried[pos], true, memory_order_release);
+        }
+        pthread_mutex_unlock(&o->mu);
+        return;
+    }
+    unsigned np = chunk_npos(&o->g);
+    chunk_rd *rd = NULL;
+    int st_idx = -1;
+    int open_rc = TSDB_ERR_NOTFOUND;
+    if (pos < np) {
+        chunk_ident id = {.volume = o->volume, .pos = (uint16_t)pos};
+        memcpy(id.vuuid, o->vuuid, 16);
+        memcpy(id.oid, o->oid, 16);
+        open_rc = chunk_be_rd_open_at(o->be, &id, &rd, &st_idx);
+        if (open_rc == 0) {
+            const chunk_geom *hg = &chunk_rd_hdr(rd)->g;
+            if (memcmp(hg, &o->g, sizeof *hg) != 0) {
+                chunk_rd_close(rd);
+                rd = NULL;
+                st_idx = -1;
+                open_rc = TSDB_ERR_CORRUPT;
+            }
+        }
+    }
     pthread_mutex_lock(&o->mu);
     if (!atomic_load_explicit(&o->tried[pos], memory_order_relaxed)) {
-        if (!pos_written(o->positions, pos)) {
-            o->st[pos] = CHUNK_ST_UNWRITTEN;
-        } else if (pos < chunk_npos(&o->g)) {
-            bool have = true;
-            (void)obj_open_pos(o, pos, &have, NULL);
-            if (o->rd[pos]) {
-                obj_update_place_n(o);
-            } else if (o->st[pos] == CHUNK_ST_ABSENT || o->st[pos] == CHUNK_ST_DOWN) {
+        if (pos >= np) {
+            o->st[pos] = CHUNK_ST_ABSENT;
+        } else if (open_rc == 0 && rd) {
+            o->rd[pos] = rd;
+            o->rd_store[pos] = st_idx;
+            o->st[pos] = CHUNK_ST_OK;
+            rd = NULL;
+            obj_update_place_n(o);
+        } else {
+            int st = st_of(open_rc);
+            if (st == CHUNK_ST_ABSENT || st == CHUNK_ST_DOWN) {
                 int pn = atomic_load_explicit(&o->place_n, memory_order_acquire);
                 int sidx = chunk_be_place_for_obj(o->be, o->oid, pos, pn);
                 if (chunk_be_store_is_lost(o->be, sidx))
-                    o->st[pos] = CHUNK_ST_LOST;
+                    st = CHUNK_ST_LOST;
                 else if (chunk_be_store_state(o->be, sidx) != CHUNK_STORE_UP)
-                    o->st[pos] = CHUNK_ST_DOWN;
+                    st = CHUNK_ST_DOWN;
                 else
-                    o->st[pos] = CHUNK_ST_ABSENT;
+                    st = CHUNK_ST_ABSENT;
             }
-        } else {
-            o->st[pos] = CHUNK_ST_ABSENT;
+            o->st[pos] = st;
         }
         atomic_store_explicit(&o->tried[pos], true, memory_order_release);
     }
     pthread_mutex_unlock(&o->mu);
+    if (rd)
+        chunk_rd_close(rd);
+}
+
+static int obj_missing_st(const chunk_obj *o, unsigned pos)
+{
+    int st = o->st[pos];
+    if (st == 0 || st == CHUNK_ST_ABSENT || st == CHUNK_ST_DOWN || st == CHUNK_ST_LOST) {
+        int pn = atomic_load_explicit(&o->place_n, memory_order_acquire);
+        int sidx = chunk_be_place_for_obj(o->be, o->oid, pos, pn);
+        if (chunk_be_store_is_lost(o->be, sidx))
+            return CHUNK_ST_LOST;
+        if (chunk_be_store_state(o->be, sidx) != CHUNK_STORE_UP)
+            return CHUNK_ST_DOWN;
+        return st == CHUNK_ST_DOWN ? CHUNK_ST_DOWN : CHUNK_ST_ABSENT;
+    }
+    return st;
 }
 
 static int obj_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len)
@@ -911,7 +960,7 @@ static int obj_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len
         return CHUNK_ST_IOERR;
     obj_ensure_pos(o, pos);
     if (!o->rd[pos])
-        return o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
+        return obj_missing_st(o, pos);
     int st_idx = o->rd_store[pos];
     if (chunk_be_store_is_lost(o->be, st_idx))
         return CHUNK_ST_LOST;
@@ -936,7 +985,7 @@ static const uint64_t *obj_sums(void *ctx, unsigned pos, int *status)
     }
     obj_ensure_pos(o, pos);
     if (!o->rd[pos]) {
-        *status = o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
+        *status = obj_missing_st(o, pos);
         return NULL;
     }
     if (chunk_be_store_is_lost(o->be, o->rd_store[pos])) {
@@ -971,14 +1020,16 @@ int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[1
     if (have)
         o->g = *expect;
     bool alive = false;
+    unsigned alive_cnt = 0;
     int worst = TSDB_ERR_NOTFOUND;
     /* Healthy path: open only data positions 0 .. k-1; parity positions k .. k+m-1 open lazily in obj_ensure_pos()
      * when degrade() or heal actually needs them. If geometry is unknown (!have), scan until the first valid header
-     * discovers o->g (then finish up to k-1). If all data positions failed (!alive), scan parity too so an object
-     * surviving only on parity chunks still opens. Positions cleared in `positions` are known erasures (never opened). */
+     * discovers o->g (then finish up to k-1). If any data position failed (alive_cnt < o->g.k), scan parity too so an
+     * object surviving on parity chunks opens with all surviving positions observed before obj_update_place_n() infers
+     * placement after tier add / shrink. Positions cleared in `positions` are known erasures (never opened). */
     unsigned p = 0;
     for (; p < CHUNK_POS_MAX; p++) {
-        if (have && alive && p >= o->g.k)
+        if (have && alive_cnt >= o->g.k && p >= o->g.k)
             break;
         if (have && p >= chunk_npos(&o->g))
             break;
@@ -989,8 +1040,10 @@ int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[1
         }
         int rc = obj_open_pos(o, p, &have, &worst);
         atomic_store_explicit(&o->tried[p], true, memory_order_relaxed);
-        if (rc == 0)
+        if (rc == 0) {
             alive = true;
+            alive_cnt++;
+        }
     }
     bool away = false; /* a store that is not UP: what it holds may be what this object lacks */
     bool any_lost = false;

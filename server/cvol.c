@@ -105,6 +105,8 @@ struct mvol {
     uint8_t fault_reason; /* enum cluster_fault_reason when state == MV_REFUSED (R9, D6) */
     int opened_once;      /* 1 once open_engine ran for this volume in this process */
     int writer;   /* opened as the writer */
+    int rec_is_leader; /* 1 when the latest metadata record names this server as leader */
+    uint64_t wait_since_ns; /* monotonic ns when this volume entered MV_WAIT (bounds CL_ROLE_PROMOTING report) */
     uint64_t rid; /* the directory's */
     uint64_t gen; /* the generation this open saved */
     uint64_t nonce; /* and its draw */
@@ -311,6 +313,13 @@ static int build_cvolfs_disks(struct cvolfs_disk *out, int cap, uint32_t exclude
     return nd;
 }
 
+static uint64_t cvol_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 /* step 1 and 2 for a record not seen yet (the disk side is cvolfs_prepare_disks); the new state under mu */
 static void prepare(const struct cluster_vol_rec *r)
 {
@@ -321,6 +330,7 @@ static void prepare(const struct cluster_vol_rec *r)
     uint32_t self = M.self;
     int stale_first = M.stale_first;
     pthread_mutex_unlock(&M.mu);
+    m.rec_is_leader = (r->leader == self);
     int rc = tsdb_cvol_declare(M.t, r->number, r->name);
     if (rc != 0) {
         if (rc == TSDB_ERR_CORRUPT)
@@ -358,6 +368,7 @@ static void prepare(const struct cluster_vol_rec *r)
             snprintf(m.disk_root, sizeof m.disk_root, "%s", o.disk_root[0] ? o.disk_root : M.dir);
             memcpy(m.store_id, o.store_id, 16);
             m.state = MV_WAIT;
+            m.wait_since_ns = cvol_mono_ns();
             m.fault_reason = CL_FAULT_NONE;
             say("volume %" PRIu32 " (%s): open generation %" PRIu64 ", waiting for the metadata group to record it",
                 r->number, r->name, m.gen);
@@ -562,8 +573,10 @@ static void *mgr_main(void *arg)
                 pthread_mutex_unlock(&M.op);
                 continue;
             }
-            if (m)
+            if (m) {
                 m->epoch = r->epoch;
+                m->rec_is_leader = (r->leader == M.self);
+            }
             uint64_t mrid = m ? m->rec_rid : 0;
             if (m)
                 m->unnamed = 0;
@@ -706,6 +719,7 @@ static void on_watch(void *arg, uint32_t self, const struct cluster_vol_rec *v, 
 }
 
 #define UNREACH_MS 1000 /* a peer unheard this long on every data link is reported unreachable (repld heartbeats: 5 ms) */
+#define MV_WAIT_PROMOTING_NS (30ull * 1000000000ull) /* 10x DEPOSED_HOLD_NS: bounds CL_ROLE_PROMOTING during MV_WAIT */
 static void on_report(void *arg, struct cluster_report *out)
 {
     (void)arg;
@@ -719,7 +733,11 @@ static void on_report(void *arg, struct cluster_report *out)
         struct cluster_vol_report *v = &out->vols[out->nvols++];
         v->volume = m->number;
         int writer = m->writer || (m->state == MV_OPEN && tsdb_cvol_role(M.t, m->number) == CVOL_WRITER);
-        v->role = m->state == MV_OPEN && writer ? CL_ROLE_OWNER : CL_ROLE_NONE;
+        int wait_promoting = !M.writes && m->state == MV_WAIT && m->rec_is_leader && m->wait_since_ns &&
+                             cvol_mono_ns() - m->wait_since_ns < MV_WAIT_PROMOTING_NS;
+        v->role = (m->state == MV_OPEN && writer) ? CL_ROLE_OWNER
+                  : wait_promoting                ? CL_ROLE_PROMOTING
+                                                  : CL_ROLE_NONE;
         v->health = m->state == MV_REFUSED ? CL_HEALTH_LOCAL_FAULT : CL_HEALTH_OK;
         v->fault_reason = m->state == MV_REFUSED ? m->fault_reason : CL_FAULT_NONE;
         v->epoch = m->epoch;

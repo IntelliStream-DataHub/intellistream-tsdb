@@ -1282,9 +1282,9 @@ static void do_read(struct chunksrv *cs, int kind, const struct cs_req *r, cs_re
         b[8] = CS_OP_READ;
         put32(b + 9, 0);
         cs_resp_seal(b, RESP_HDR + r->len);
-        reply(arg, b, RESP_HDR + r->len);
         STAT(cs, reads);
         STATN(cs, read_bytes, r->len);
+        reply(arg, b, RESP_HDR + r->len);
     } else {
         reply_rc(reply, arg, r->rid, CS_OP_READ, rc, NULL, 0);
     }
@@ -1701,7 +1701,6 @@ static void put_answer(struct cs_put *p, int rc)
     uint8_t b[8] = {0};
     if (rc == 0)
         put64(b, cs_put_answer_hash_len(p->meta, p->meta_len, cs_sums_hash(p->sums, p->ncells)));
-    reply_rc(p->reply, p->arg, p->file, CS_OP_PUT, rc, b, rc == 0 ? 8 : 0);
     if (rc == 0) {
         STAT(p->cs, puts_ok);
     } else {
@@ -1709,6 +1708,7 @@ static void put_answer(struct cs_put *p, int rc)
         if (rc == CHUNK_ERR_FENCED)
             STAT(p->cs, fenced);
     }
+    reply_rc(p->reply, p->arg, p->file, CS_OP_PUT, rc, b, rc == 0 ? 8 : 0);
 }
 
 static void put_free(struct cs_put *p)

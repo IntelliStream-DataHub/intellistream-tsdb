@@ -268,6 +268,7 @@ void chunk_be_close(chunk_backend *be);
 int chunk_be_nstores(const chunk_backend *be);
 chunk_store *chunk_be_store(chunk_backend *be, int i); /* NULL while DOWN */
 int chunk_be_store_state(const chunk_backend *be, int i); /* CHUNK_STORE_*; -1 for an index out of range */
+uint64_t chunk_be_stall_gen(const chunk_backend *be);     /* monotonic counter incremented on DOWN_STALLED transitions */
 /* Transitions store i from UP or REPLACING to DOWN_IOERR or DOWN_STALLED at runtime (R15 D8). Safe against concurrent
  * readers and writers: each holds a reference on the chunk_store until its call returns (never UAF). Idempotent when
  * store i is already DOWN (returns 0 without altering its DOWN reason). Returns TSDB_ERR_INVALID for an index out of
