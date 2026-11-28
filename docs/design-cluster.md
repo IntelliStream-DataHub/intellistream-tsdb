@@ -334,14 +334,17 @@ move never lowers the number of in-sync copies. Moves happen when a server is ad
 `rebuild_after_s` on 2026-11-09, with operator holds and a mass-OUT guard*, [design-cluster-data.md](design-cluster-data.md)
 E12; an EC volume moves its log replicas this way and its stripe positions by §6 there).
 
-*Built in R4 (2026-11-24) and left to R9.* R4 built the moves as an operator's verb (`tsdb cluster volume move PEER V --log
---from A --to B`), not the greedy pass that finds them: what is not built, and stays R9's (docs/design-ha-modes.md), is
-the pass itself and its triggers (a server added, `node drain`, a server declared lost or down for `rebuild_after_s`,
-the mass-OUT guard), the rebuild of a lost server's replicas elsewhere, the balancer and `balance_mb_s`, and §8.4's
-priorities. A move of the replica of an EC volume's stripe position stays R8's (`--pos`); `--log` is required until
-then. No verb changes a volume's number of copies: REPLICA_ADD and REPLICA_REMOVE are driven by a move, and by the tests
-through a file the server reads (`setop_file`, a test hook). `tsdb cluster replica reset` (§8.5) is the operator's rebuild
-of one copy.
+*Built in R4 (2026-11-24) and completed in R9 (2026-11-27).* R4 built the moves as an operator's verb (`tsdb cluster volume move PEER V --log
+--from A --to B`) and `tsdb cluster replica reset` (§8.5). R9 built the pure greedy placement, timeout and balancer
+modules (`server/pout.c`, `server/place.c`, `server/balance.c`, driven once a second on the Raft leader by `place_duty`
+and deterministically by `tests/sim_place.c`): automatic DOWN-to-OUT timers (`rebuild_after_s`, `opening_hold_s`,
+`failstop_out_s`, bounded operator holds <= 24 h, computed mass-OUT guard `out_guard_pct` / `out_guard_hold_s`),
+per-replica `LOCAL_FAULT` replacement (D6), automatic re-placement after `node out`, `node drain`, `node replace` and
+OUT in endangered-first margin order with E9 rack survivability, stripe position moves (`volume move PEER V --pos P --to
+B`, `server/cnode.c`), and the greedy balancer (`server/balance.c`, live setting `balance` on by default, `tsdb cluster
+balance [--apply]`, 5% concurrent / 25% automatic plan cap, paced by `balance_mb_s`, yielding to any active rebuild and
+leaving R4's `leader_balance_s` untouched when non-zero). No verb changes a volume's copy count directly except online
+redundancy conversion (R10 `volume redundancy`).
 
 **Leader balance.** When a server comes back and its replicas are in sync again, leadership moves back to the preferred
 leader with a planned transfer: the old leader stops admitting writes to that volume, waits until the target's log end
@@ -1217,12 +1220,27 @@ in the cutter's epoch or earlier**; "a cut never removes a committed record" is 
 therefore not treat such a cut as damage, and a replica's commit floor never covers what it cuts (the core refuses a
 cut below the applied end).
 
+*Built in R9 (r9-meta, r9-return, r9-reconcile; E28, D2, D13, D15; `server/meta.c`, `server/place.c` `place_return`,
+`server/cmove.c` `cmove_cancel_auto`, `server/sreconcile.c`).* `OUT` is reversible: a server heard again after `OUT`
+returns to `UP` under a strictly higher incarnation while keeping its peer address and identity reserved; only
+`DESTROYED` (operator `node destroyed`, allowed from `OUT` only) is final. When an `OUT` server returns during an active
+rebuild, `place_return` takes back any EC stripe position whose replacement is still `META_STRIPE_FILLING` via
+`STRIPE_SET` (`CP_RETURN_SET`, never after `WHOLE`; the displaced replacement's partial fill is released only by
+committed `MK_GC_RELEASE` after the returned holder reaches `WHOLE`) and cancels any unjoined log replica move
+(`PLACE_PROP_MOVE_CANCEL` -> `cmove_cancel_auto`) while the returning replica is UP, healthy, and its `log_end` is still
+covered by the leader's retained `log_start` (carried in `HBS_VOLUMES`). On every start and return, `server/sreconcile.c`
+verifies local chunk store ids against `<state-dir>/chunk_stores` and runs `CHUNK_LIST` both ways against the leader's
+`CS_OP_OBJLIST`, filling only missing/degraded chunks at margin priority and leaving `MK_GC` deletes to `ecgcmk`.
+
 ### 8.3 Retained segments
 
 The leader keeps sealed WAL segments of each volume after they are in parts, for catch-up: up to
 `repl_retain_mb` per server (4 GB by default, split over its volumes by write rate) and at most 30 min.
 *Built in R3 (r3d-isr), per volume:* `repl_retain_mb` (4096) and `repl_retain_s` (1800) are caps of each volume, not
-split per server yet. The leader keeps what the slowest member still needs (the driver's keep bound) only while the
+split per server yet. *Extended in R9 (r9-retain, E29, D16; `server/repld.c`):* while a volume member is `DOWN` or held
+(`hold_until_ms`), the leader and replicas ignore `repl_retain_s` for it within the per-server atomic
+`repl_retain_down_gb` budget (64 GB default, summed across all volumes held by the server); past the budget a volume
+falls back to R3's caps, and the extended retention ends once the member goes `OUT` or its hold expires. The leader keeps what the slowest member still needs (the driver's keep bound) only while the
 kept segments, newest first, stay within both caps; past them it unlinks as if that member had caught up
 (`eng_leader_keep_cap`), and the member, once back, is told to install a snapshot (R4: it asks the leader for one and installs it, §8.1;
 before R4 it stayed a learner). `test_cluster keepcap` (`repl_retain_s` 2, seven flushes a second
@@ -1311,9 +1329,14 @@ Tests: `test_cluster addreplica removereplica removeindex removedown setstale re
 
 ### 8.4 Priorities
 
-*(Not built: R4 rebuilds on request, R9 orders them.)* Rebuilds run in this order: volumes whose ISR has 1 member, then volumes with 2, then moves for balance. A rebuild
-yields to foreground work: the token bucket is halved while the server's query p99 or WAL sync p99 is above twice its
-1-hour median.
+*Built in R9 (r9-plan, r9-pace; E13, D8, D18; `server/place.c`, `server/pace.[ch]`, `server/rsnap.c`, `server/sfill.c`,
+`server/peerlink.c`).* Rebuilds are ordered most endangered first (`meta_vol_margins`: smallest young/settled margin,
+then volume bytes), before balancer moves. `server/pace.c` runs one token bucket per server and direction (`PACE_SEND`,
+`PACE_RECV`) over `PL_KIND_SNAP` (kind 5) and `PL_KIND_CHUNKR` (kind 8): margin 0 runs unlimited and is exempt from
+halving; margin 1 of an `m >= 2` volume runs at least 4 × `rebuild_mb_s`; margin >= 2 runs at `rebuild_mb_s` (200 MB/s
+default); balancer moves run at `balance_mb_s` (0: = `rebuild_mb_s`) and yield (`PACE_REFUSED`) whenever any rebuild job
+is active. Non-emergency rates halve while the server's 1-minute query p99 or WAL sync p99 exceeds twice its 1-hour
+median (`pace_set_p99_halved`, exported as `tsdb_pace_*` in `docs/metrics.md`).
 
 Time: a server's hot replicas are rebuilt on all the others at once. With 2 TB of hot data per server, 6 survivors,
 200 MB/s each: 2 TB / 6 / 200 MB/s ≈ 28 min.
@@ -1322,8 +1345,13 @@ Time: a server's hot replicas are rebuilt on all the others at once. With 2 TB o
 
 - A damaged part found by a query or a scrub (`verify_checksums`, or the scrub of §10.3) makes that replica
   rebuild the partition: the source sends its parts of that partition key as of a position, and the replica swaps
-  them in under `publish_lock` (the cold move of §9 uses the same swap).
-- A replaced disk: the replicas on it are learners again and are rebuilt (§8.1), on the same server or elsewhere.
+  them in under `publish_lock` (the cold move of §9 uses the same swap). *As built (R9 D6, R12):* R9 replaces a
+  replicated volume's whole replica when an UP server reports `CL_HEALTH_LOCAL_FAULT` (fail-stop or corrupt open) for
+  `failstop_out_s` (`server/pout.c` -> R4 log move `replaces` = faulted node), setting its directory aside permanently
+  as `v<N>.fault-<rid>` (`server/cvolset.c`, never opened or deleted automatically so the evidence stays intact).
+  Young-part and `.ec` scrubbing with automatic `DAMAGED` replica healing (`server/cheal.c`) and EC cell repair
+  (`server/chunkrepair.c`) landed in R12.
+- A replaced disk or server: the replicas on it are learners again and are rebuilt (§8.1), on the same server or elsewhere.
   Each gets a new `rid` (gap 3): its old entry in the ISR does not match it, so it is neither counted nor promoted
   until it has caught up and joined again. *Built in R4 (r4-setchg, D13):* `tsdb cluster replica reset PEER V NODE`
   commits REPLICA_RESET(V, epoch, NODE, a new rid), allowed only for a member that is neither the leader nor in the ISR
@@ -1331,8 +1359,13 @@ Time: a server's hot replicas are rebuilt on all the others at once. With 2 TB o
   `v<N>.stale-<rid>` when it was down for the reset and cannot tell it from a REMOVE and an ADD, makes a fresh one, and
   it is rebuilt by a snapshot. It is never automatic, not even for a missing directory (the server refuses that one with a
   line naming the command); a removed replica's directory goes the other way, deleted once the REMOVE is committed
-  (§8.3, D12). The reset is the lost-disk case of §8.1 on one replica: the hardware replacement's other half, rebuilding
-  elsewhere after `node out`, is R9's.
+  (§8.3, D12). *Built in R9 (r9-meta, r9-out, r9-plan, r9-ops; D2, D4, D22; `server/pout.c`, `server/place.c`,
+  `server/cnode.c`):* the other half — rebuilding a lost server's log and stripe positions elsewhere after automatic
+  `OUT` (at `rebuild_after_s`, or `failstop_out_s` on fail-stop, with bounded holds and the mass-OUT guard) or operator
+  `node out` / `node drain` / `node replace OLD NEW`. `OUT` is reversible (`OUT -> UP` on a new incarnation); only
+  operator `node destroyed` (from `OUT`, refused while still heard) moves the member to final `DESTROYED` (which frees
+  its peer address and identity and feeds E15 `LOST` accounting). Per-disk `DOWN`/`OUT`/`DESTROYED` and `disk
+  out|replace|class` landed in R13.
 - **A restored replica directory** (*decided 2026-11-06 in this revision, gap 14; the user may change it*; review
   seed 6 of cluster-s2, the rest reasoning).
   A directory restored from a backup or a ZFS snapshot keeps its `rid` but rolls back `led`, its log and its fence:
@@ -1548,9 +1581,10 @@ no containers needed). Workloads `kv` and `classes`, as today, through clients i
 | `slow` | a slow disk. *Built in R4 differently:* the outagefs shim delays every call under one node's data root and state directory by 10, 30 or 100 ms for 5 to 30 s; crashfs `fdatasync` delays of 0.1-2 s are not exercised |
 | `skew` | a server's monotonic clock runs fast or slow within the configured drift, and beyond it (only stale reads may appear) |
 | `midcommit` | crash points: after the leader's WAL write and before sending; after replicas acked and before the client's OK; between PREPARED and the `COMMIT` marker; during a class switch; between `put` and the `COLD` marker |
-| `rebuild` | declare a server out under load, and add a new one. *R4's `rebuild` is smaller (a lost directory, one replica):* a stopped replica's `v<N>` removed, the server started (it must refuse the volume with the line naming `replica reset`), the reset, rebuilt by a snapshot. The server-out version stays R9's |
+| `rebuild` | declare a server out under load, and add a new one. *R4's `rebuild` is smaller (a lost directory, one replica):* a stopped replica's `v<N>` removed, the server started (it must refuse the volume with the line naming `replica reset`), the reset, rebuilt by a snapshot. The server-out version is R9's `out` nemesis below |
 | `longdown` | (R4) a replica of the replicated kv volume down past `repl_retain_s` (3 s in this run) under writes, then back: it must take a snapshot, seen as another inode of its `v<N>`; a run in which none did fails |
 | `churn` | (R4) `volume transfer` and `volume move --log` at random under the workloads, a move now and then cancelled; with churn alone, every node's trace of the volume is followed and the moved-from member must not leave the ISR before the new one joined, nor with fewer members than before |
+| `out`, `back`, `two`, `mfail`, `m1`, `slowloss`, `hold`, `stripeset`, `full` | (R9, `tests/jepsen/cluster_r9.h`) permanent server kill past `rebuild_after` + `node add` + fill to `WHOLE` + `fillnocheck` probe (`out`); return mid-fill taking back `FILLING` positions without early deletion (`back`); two nodes down checking the mass-OUT guard (`two`); `m` stripe holders down with full-width cold reads (`mfail`); `m + 1` down expecting `UNAVAILABLE` only plus end-of-run `node destroyed` `tier=lost` check (`m1`); `outagefs` slow follower + leader directory loss (`slowloss`); `node hold` under ingest with degraded EC settles and 0 snapshots (`hold`); `volume move --pos` during active settles (`stripeset`); `TSDB_WHY_FULL` backpressure and resume (`full`) |
 | `eio`, `rot`, `misdirect` | as today, on one server at a time |
 
 *Built in R4 (r4-jepsen, `tests/jepsen/jepsen_cluster.c`).* `kill2` (the first round and half the others take two of the
@@ -1576,6 +1610,17 @@ compared, none is a learner and no `v<N>.snap`, `v<N>.old`, `v<N>.removed-*` or 
 points are terminal points of kv and classes runs: `snap-received`, `snap-swapped`, `snap-halfswap`, `set-removed`,
 `transfer-ready`, `move-added`, `move-shrunk` (`server/crashpt.h`). `classes` runs with the default retention caps
 (r4-replay), no longer capped at 30 s.
+
+*Built in R9 (r9-jc, `tests/jepsen/cluster_r9.h`, `make jepsen-cluster-r9`).* `--geometry 4+2|8+2|8+4|16+4|r3` sizes
+the cluster (7/11/13/21/5 nodes), scales init timers (`rebuild_after_s=15`, `failstop_out_s=3`, `opening_hold_s=20`,
+`out_guard_hold_s=30`, `voter_replace_s=10`), and caps `io_uring` at 2 nodes (`epoll` on the rest). Runs the 9 R9
+nemeses above across `r3` and all four EC geometries (`JEPSEN_R9=none` skips). The checker fails on any non-rot
+`DIVERGED` or `LOCAL_FAULT` sample and requires every EC stripe position at end of run to be `WHOLE` or `FILLING` with
+reported progress (`r9_stripe_end_check`), alongside full logical scrub and per-member live read equality. The selftest
+(`make jepsen-cluster-selftest`) plants and kills `noguard` (`TSDB_PLACE_MUTANT` under `two`), `wholeearly`
+(`TSDB_SFILL_MUTANT` under `out`), `fillnocheck` (`TSDB_SFILL_MUTANT` under `out`), and `partialdelnow`
+(`TSDB_PLACE_MUTANT` under `back`). R9 crash points in `server/crashpt.h`: `out-proposed`, `fill-written`,
+`whole-proposed`, `return-set`, `release-gc`.
 
 Checks: the existing checks 1-4 over the whole cluster, plus: no acknowledged write lost across any failover; reads
 on leaders monotonic per session; `min_pos` reads see the write; at the end, every replica of every volume holds the

@@ -40,6 +40,48 @@ disk format and the wire protocol.
     Embedded Rust, Python, and Java bindings on x86-64 now compile `src/ec` with `TSDB_EC` so tiered databases open
     embedded (non-x86-64 and `NO_EC=1` builds refuse `requires=tier`).
 
+- **Cluster failure handling, checked stripe rebuilds, backpressure, return-during-rebuild, balancer, and `sim_place`
+  (R9; `RW_VERSION` 3, `META_SNAP_VERSION` 7/8/12).** Completes automatic failure handling and rebalancing for
+  replicated and erasure-coded cluster volumes (pre-1.0 clusters are initialised again across snapshot/wire bumps; no
+  new `tsdbd` config keys were added beyond adding `chunkr` to `cluster.peer.rdma.kinds`):
+  - **Timers, holds, guard, and replica faults (`r9-hb`, `r9-out`).** Pure `server/pout.c` drives automatic `DOWN ->
+    OUT` at `rebuild_after_s` (1800 s, renaming `out_after_s`), `opening_hold_s` (3600 s while `HBS_NODE.opening`),
+    `failstop_out_s` (60 s after a fail-stop last-gasp beat up to 100 ms before exit 1), bounded operator holds (<= 24 h),
+    the computed mass-OUT guard (`out_guard_pct` 25% or a whole multi-server rack DOWN, bounded by `out_guard_hold_s`
+    7200 s, counted in `tsdb_cluster_out_guard_passed_total`), and per-replica `LOCAL_FAULT` replacement setting aside
+    `v<N>.fault-<rid>` permanently as evidence (`server/cvolset.c`).
+  - **Pure placement, `sim_place`, and MTTDL (`r9-plan`, `r9-simplace`).** `server/place.c` moves initial placement
+    (`place_volume`, `place_stripe`, E9 rack rule `place_rack_survivable`) and endangered-first re-placement after OUT,
+    faults, drains, and replaces into a pure module driven deterministically by `tests/sim_place.c` (`make place-soak`,
+    `make place-mutants`, and `tests/sim_place.sh mttdl` producing the MTTDL table in `docs/design-cluster-data.md` §5.3).
+  - **Retention for DOWN/held members & `FULL` backpressure (`r9-retain`, `r9-full`).** `server/repld.c` ignores
+    `repl_retain_s` for DOWN or held members within a per-server atomic `repl_retain_down_gb` (64 GB) budget. Raises
+    replication wire version to `RW_VERSION` 3 (`RW_ACK_FULL` bit 1 on ACKs): when a leader or any ISR member reaches
+    `young_high_pct` (90%, clearing 2 points lower), writes are refused before WAL append / `lw_enter` with definite
+    `UNAVAILABLE` (`TSDB_WHY_FULL`, `tsdb_cluster_node_full`, `tsdb_cluster_full_refusals_total{volume}`), while settles,
+    GC, digests, and drops continue.
+  - **Degraded settles, checked stripe fills, version barrier, `MK_GC_RELEASE`, and reconcile (`r9-degsettle`,
+    `r9-fill`, `r9-whole`, `r9-reconcile`, `r9-return`).** Cluster EC settles wait up to `ec.settle_wait_max_s` with
+    exact 1 position DOWN (`m >= 2`) before settling degraded across `k'+m-1` positions (`src/eccold.c`, `.ec`
+    `positions` bitmap). `server/sfill.c` (`rebuild_concurrency` 4, `PL_KIND_CHUNKR` = 8, `CS_OP_OBJLIST`) copies 1x
+    from `prev` or decodes whole cells from `k` sum-verified survivors, checks rebuilt cells, scrubs on read-back,
+    notifies log replicas (`CS_OP_REOPEN` -> `eccache_reopen`), and reports `whole` once all objects below barrier
+    `stripe_version` `V` are verified (`META_OP_STRIPE_WHOLE` conditional on `V`; `tsdb_sfill_objects_total{method}`).
+    Every chunk delete — partial fills and replaced holders included — goes through committed `MK_GC_RELEASE` /
+    `MK_GC_RELEASE_DONE` (`src/ecgcmk.c`) and guarded `CS_OP_DEL_REL` (`server/chunksrv.c`). `server/sreconcile.c` runs
+    two-way `CHUNK_LIST` reconciliation against `OBJLIST` and `<state-dir>/chunk_stores` on start and return. Returning
+    servers take back `FILLING` stripe positions (`place_return`) and cancel unjoined log moves (`cmove_cancel_auto`).
+  - **Margin pacing, operator verbs, balancer, and Jepsen (`r9-pace`, `r9-ops`, `r9-balance`, `r9-jc`).**
+    `server/pace.c` paces rebuild and balance traffic on separate `PACE_SEND`/`PACE_RECV` buckets by lowest active margin
+    (margin 0 unlimited, margin 1 >= 4x `rebuild_mb_s`, margin >= 2 at `rebuild_mb_s`, balance at `balance_mb_s`
+    yielding to rebuilds, halved on foreground query/WAL-sync p99 load; `tsdb_pace_*`). `server/balance.c` adds the pure
+    greedy balancer across log, stripe, and leader lists (5% concurrent, 25% automatic cap, live setting `balance`
+    default `on`, bumping `META_SNAP_VERSION` to 12 / `"TME9"`, CLI `tsdb cluster balance [--apply]`). `server/cnode.c`
+    and `tools/cluster-cli.c` expose `node hold|out|drain|replace|destroyed` and `volume move --pos`. `make
+    jepsen-cluster-r9` (`tests/jepsen/cluster_r9.h`) adds 9 R9 nemeses (`out`, `back`, `two`, `mfail`, `m1`, `slowloss`,
+    `hold`, `stripeset`, `full`) across `--geometry 4+2|8+2|8+4|16+4|r3` and 4 selftest mutants (`noguard`, `wholeearly`,
+    `fillnocheck`, `partialdelnow`).
+
 - **Cluster disk flags, start checks, binding, and `HBS_DISKS` (`r13-start`).** Replaces `--chunk-dir`
   (`cluster.chunk.dir`) and `tsdb chunk-store init` with `--disk PATH[:CLASS]` (`storage.disks`, initialised with
   `tsdb disk init`), `--role compute|storage|both` (`cluster.role`), and `--allow-shared-device`

@@ -25,19 +25,21 @@ leader; copies can be moved to other servers and the leader handed over (step 10
 
 What the preview does **not** do yet. Please do not skip this list:
 
-- **Automatic failure handling and operator verbs (R9) are in progress.** `node hold`, `node out`, `node drain`,
-  `node replace`, `node destroyed`, and `volume move --pos` are built alongside automatic DOWN-to-OUT timers and
-  re-placement; stripe fill execution and balancer tracks are landing next.
+- **Automatic failure handling, rebuilds, and operator verbs (R9) are built.** DOWN-to-OUT timers (`rebuild_after_s`,
+  `opening_hold_s`, `failstop_out_s`), bounded operator holds (`node hold`), the mass-OUT guard (`out_guard_pct`,
+  `out_guard_hold_s`), degraded EC settles, DOWN WAL retention (`repl_retain_down_gb`), `TSDB_WHY_FULL` backpressure,
+  checked stripe rebuilds paced by margin, return-during-rebuild, the balancer (`balance`, `balance_mb_s`), and the
+  operator verbs (`node hold|out|drain|replace|destroyed`, `volume move --pos`, `balance [--apply]`) are on main.
 - **Clients name the volume.** The client port and the protocol are as without `--cluster`, but a series is made in
   a cluster volume, named like any volume (`tsdbc_series_at` with the volume's name). A request may go to any
   server ([Writes through any server](#writes-through-any-server)). Logins use the cluster's users, the same on
   every server ([Logins](#logins)).
 - **It is not for production.** The format of the metadata and the peer protocol may change in a later 0.x
   release. A build of the preview does not talk to a build from before such a change: you start the cluster again
-  with `tsdb cluster init`, you do not upgrade it. This build's metadata is version 10 and its peer protocol version 11;
+  with `tsdb cluster init`, you do not upgrade it. This build's metadata is snapshot version 12 (`TME9`), its
+  replication wire version (`RW_VERSION`) is 3, and its peer protocol version (`PL_CL_VERSION`) is 11;
   a server that finds a state directory or a peer of another version stops, or refuses the peer, with a line naming both
-  versions. The changes of replica sets, moves and rebuilds (R4) are in those versions, so a cluster made before them
-  must be made again.
+  versions. A cluster made before a version bump must be made again.
 
 Why ship it then? The group is the part everything else stands on, and it is the part that is hardest to get right.
 It has its own simulator, a checker and fault tests, and now you can run it yourself. What comes next is at the
@@ -489,8 +491,9 @@ line until the group has confirmed it.
 | `stale ...` | This is the copy this server saved before a restart; no one has confirmed it yet. |
 | `cluster UUID replication ... mode M failover F read_barrier B lease_s ... restore_gen R` | The cluster's id, settings (`init` fixes them; see the reference below) and restore generation. |
 | `group voters 1,2,3 learners -` | Who votes, and who is catching up to join the vote. |
-| `member N STATE incarnation I addr A peer P rack R heard H feed F voter_ok V volumes_ok W core_dropped D read_barrier B` | One line per member. `STATE`: `up` or `down` (the group also knows `draining` and `out`, which nothing sets in the preview). `I`: how many times this member has started (it goes up at every restart). `A`: where clients reach it. `P`: where servers reach it. `R`, `F`: its `--rack` and `--power-feed`, `-` for none. `H`: how long ago the server you asked last heard from it. `V`, `W`: whether it may vote and may hold volumes (1/0; a witness has `volumes_ok 0`). `D`: 1 when its Raft core was dropped after a log fault (it goes on as a watcher). `B`: its read barrier setting; `?` when you have not heard it yet. |
-| `replicated lease_ms ...` | The settings of replicated volumes (`init` fixes them; see the reference below). |
+| `member N STATE incarnation I addr A peer P rack R heard H feed F voter_ok V volumes_ok W core_dropped D read_barrier B [...]` | One line per member. `STATE`: `up`, `down`, `draining`, `out` (reversible on a new incarnation), or `destroyed` (final, operator-only). `I`: how many times this member has started (it goes up at every restart). `A`: where clients reach it. `P`: where servers reach it. `R`, `F`: its `--rack` and `--power-feed`, `-` for none. `H`: how long ago the server you asked last heard from it. `V`, `W`: whether it may vote and may hold volumes (1/0; a witness has `volumes_ok 0`). `D`: 1 when its Raft core was dropped after a log fault (it goes on as a watcher). `B`: its read barrier setting; `?` when you have not heard it yet. Additional fields show `down_reason`, `down_age`, `out_in`, `hold_left`, `replaced_by`, and disk/role capability when active. |
+| `guard ...` | Shown when the mass-OUT guard is active (`out_guard_pct` or whole-rack down), with the hold time remaining before automatic `out` proceeds. |
+| `replicated lease_ms ...` | The settings of replicated volumes and R9 failure/rebuild/balancer timers (`init` sets them; live operational keys can be updated with `tsdb cluster settings set`, see the reference below). |
 | `volume-report ...`, `domain-report ...` | Per member, what it says about its volumes and storage domains. |
 | `volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I set_version S [preferred P] redundancy ...` | One line per cluster volume: its number and name, the node that leads it, the nodes that hold its copies, and its redundancy (`replicas=N` or `ec=K+M stripe ... stripe_version V gc_suspended 0\|1`). `preferred P`: the node that should lead it (the first copy in the list); leadership goes back to it once it is in sync again. `I` goes up at every change of the in-sync set, `S` at every change of the set of copies (a copy added, removed or made again). |
 | `replica volume N node X rid R open_gen G [replaces Y]` | One line per copy: the copy's replica id (drawn once, when its directory is made; a new id means a new, empty copy) and its open generation (one more at every start of its server, recorded by the group before the copy answers). `replaces Y`: this copy is being built to take the place of node Y's copy (a move); it takes Y's position in the list once Y's copy is removed. |
@@ -570,11 +573,18 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster secret FILE` | Make a new secret: 32 random bytes as hex, mode 0600. Never overwrites a file. |
 | `tsdb cluster init PEER --secret-file F [options]` | Make the cluster on one server that is in no cluster yet. It becomes node 1 and the leader. The options fix the settings (below). |
 | `tsdb cluster node add PEER NEW_PEER --secret-file F` | Add the server at `NEW_PEER` (running with `--cluster`, in no cluster yet). `PEER` is any member; the command follows to the leader. A server that is already a member is added again without harm (the same number). |
+| `tsdb cluster node hold PEER NODE (--for DUR \| --release) --secret-file F` | Hold `NODE` against automatic `out` for `DUR` (e.g. `600s`, `30m`, `2h`, `1d`; at most 1 day), or `--release` an active hold. |
+| `tsdb cluster node out PEER NODE --secret-file F` | Mark `NODE` `out` immediately so its log replicas and EC stripe positions rebuild elsewhere. Reversible if `NODE` comes back with a new incarnation. |
+| `tsdb cluster node drain PEER NODE [--cancel] --secret-file F` | Mark `NODE` `draining` so every log replica and EC stripe position moves off it before automatic `out`. `--cancel` returns a live draining node to `up`. |
+| `tsdb cluster node replace PEER OLD (NEW \| --cancel) --secret-file F` | Move every log replica and EC stripe position of `OLD` directly onto `NEW` (which must be `up`, accept volumes, have chunk stores if `OLD` holds stripe positions, and hold none of `OLD`'s volumes); `OLD` is held while the replace runs and marked `out` once empty. `--cancel` clears the replace and releases `OLD`'s hold. |
+| `tsdb cluster node destroyed PEER NODE --secret-file F` | Declare an `out` node permanently `destroyed` (final; refused while still heard; frees its peer address and identity; more than `M` destroyed stripe holders mark an EC volume `LOST`). |
 | `tsdb cluster volume add PEER NAME [--replicas N] --secret-file F` | Add a cluster volume called `NAME` on `N` servers (default: the cluster's `--replication`), in different racks where it can. Answers with its number. Refused when fewer than `N` members are up and may hold volumes. A name is never used twice. |
 | `tsdb cluster volume add PEER NAME --redundancy ec=K+M --secret-file F` | An erasure-coded volume (K 1 to 16, M 1 to 4): its settled parts are coded K+M across a stripe group of K+M members, each with a chunk store up (`tsdbd --disk PATH[:CLASS]`), which the leader picks once; positions are never renumbered. Its log is kept on M+1 servers and `min_isr` is M. Refused, naming how many members qualify, when fewer than K+M do. `--redundancy replicas=N` is `--replicas N`. `tsdb cluster status` shows `redundancy ec=K+M stripe A,B,... stripe_version V gc_suspended 0\|1`. |
 | `tsdb cluster volume gc resume PEER VOLUME --secret-file F` | Turn the orphan collection of an erasure-coded volume (a name, else a number) back on. A `force-leader` (and a restore, once built) stops it (`gc_suspended 1`), because a chunk that a lost log tail still needs would look like an orphan; resume it once the volume is checked. |
-| `tsdb cluster status PEER --secret-file F` | What that server knows (see above). |
+| `tsdb cluster status PEER --secret-file F` | What that server knows (see above). Views: `status volumes`, `status volume V`, `status disks`; `--json` on each. |
 | `tsdb cluster volume move PEER VOLUME --log --from A --to B --secret-file F` | Move volume `VOLUME`'s copy on node `A` to node `B` (up, allowed to hold volumes, no copy of it yet). It answers at once and runs in the background: `B` gets a new copy, fills it and joins the in-sync set; then, if `A` leads the volume, leadership moves first; then `A` leaves the in-sync set and its copy is removed, `B` taking its place in the list. The number of in-sync copies never goes below what it was before `B` joined, so a lagging copy makes the move wait. A new group leader carries a move on, but once `B` has joined it waits until every other copy is in sync (it no longer knows the smaller size from before the join), so with another copy down such a move waits for it to come back. One move per volume at a time. With `--cancel` instead, `B`'s copy is removed and the old set stays (a move already past its last step ends anyway). `status` shows it. |
+| `tsdb cluster volume move PEER VOLUME --pos P --to B --secret-file F` | Move EC stripe position `P` of volume `VOLUME` to storage-capable node `B`. `B` enters `filling` (taking new settles at once and copying 1x from the previous holder where readable, else decoding), commits `STRIPE_WHOLE` at the barrier version, and releases the old holder via committed `MK_GC_RELEASE`. |
+| `tsdb cluster balance PEER [--apply] --secret-file F` | Show the cluster balancer's planned moves across log replicas, EC stripe positions, and leaders (dry-run by default). With `--apply`, override the 25% automatic plan cap (or `balance=off`) and run the plan at 5% concurrent bounds. |
 | `tsdb cluster volume transfer PEER VOLUME NODE --secret-file F` | Hand the leadership of volume number `VOLUME` to `NODE`, a copy that is in the in-sync set and up. The leader stops taking writes (they answer `UNAVAILABLE`, retry after about 50 ms: nothing was done), waits until `NODE` has everything it has written (at most `transfer_wait_ms`), and the group then makes `NODE` the leader under a higher epoch. The command answers when `NODE` leads: `node N leads at epoch E (T ms, READY at X)`. A transfer that cannot finish is cancelled and the old leader goes on; refused at once, with the reason, when `NODE` already leads, is not in the in-sync set or not up, the old leader is not up, or another transfer or a promotion of the volume is under way. |
 | `tsdb cluster replica reset PEER VOLUME NODE --secret-file F` | For a copy whose directory is lost, or that you do not trust: give the copy on `NODE` a new replica id and rebuild it from a snapshot of the leader. Allowed only for a copy that neither leads nor is in the in-sync set (the leader or a copy that is in sync is refused, with the reason). A directory that is still there is set aside as `v<N>.lost-<old rid>` (as `v<N>.stale-<old rid>` when its server was down for the reset) and never deleted by tsdb; a missing one is simply made again. Never done by itself: a server whose directory for a volume is missing starts, says so in its log and names this command, because an unmounted disk looks the same. |
 | `tsdb cluster user add\|passwd\|drop PEER NAME --secret-file F` | Add a user (`--superuser`, `--password-file F`), change a password, drop a user, for every server at once ([Logins](#logins)). |
@@ -582,10 +592,11 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster user list PEER [NAME] --secret-file F` | The users and their grants. |
 | `tsdb cluster user import PEER DIR... [--from-node DIR] --secret-file F` | Bring the users of servers that ran on their own into the cluster ([Logins](#logins)). |
 
-Options of `init`. Each number is a whole number above 0. The settings are fixed when the cluster is made and shown by
-`status`; changing one on a running cluster is not built (to change one, make the cluster again). Those about
-replication, leases, rebuilds and transfers are acted on; `--rebuild-after-s`, `--volumes-per-server`, `--lease-s` and `--read-barrier` are only
-stored, and `--mode shared` and `--failover` (the shared side of the cluster) are not built. Members are only `up` or `down` in the preview: `draining` and `out` are for later.
+Options of `init`. Each number is a whole number above 0 (unless 0 means off). Init-only settings (`replication`,
+`min_isr`, `voters`, lease/fence/heartbeat/commit timings, `failover`, `read_barrier`) stay fixed for the cluster's life;
+live operational settings (R9 failure timers, holds, pacing, retention, balancer, scrub, disk thresholds) can also be
+changed online with `tsdb cluster settings set` (`tsdb cluster help settings`). `--volumes-per-server`, `--lease-s`,
+and `--read-barrier` are stored only, and `--mode shared` and `--failover` (the shared side of the cluster) are not built.
 
 | Option | Default | Meaning |
 |---|---:|---|
@@ -594,7 +605,16 @@ stored, and `--mode shared` and `--failover` (the shared side of the cluster) ar
 | `--node-timeout-ms MS` | 3000 | A server is marked down after this long without a heartbeat. |
 | `--heartbeat-ms MS` | 500 | How often servers report. Below `--node-timeout-ms`. |
 | `--isr-lag-ms MS` | 1000 | A copy this far behind (or silent this long) leaves the in-sync set, and comes back once it has caught up. At least 500. |
-| `--rebuild-after-s S` | 1800 | A server down this long is marked `out`. Stored; in the preview no server is ever marked `out`. |
+| `--rebuild-after-s S` | 1800 | A server down this long is marked `out` and its log replicas and stripe positions rebuild elsewhere (unless held, opening, or paused by the mass-OUT guard). |
+| `--opening-hold-s S` | 3600 | Extra hold from automatic `out` while a restarting server reports `opening` (0 to 86400). |
+| `--failstop-out-s S` | 60 | Fast path to `out` after a fail-stop last-gasp beat, or to replace a replica reporting `LOCAL_FAULT`. |
+| `--out-guard-pct N` | 25 | Mass-OUT guard threshold (% of non-OUT members down; also triggers if an entire multi-server rack is down). |
+| `--out-guard-hold-s S` | 7200 | Upper bound of the mass-OUT guard before automatic `out` proceeds with a log line and metric (1 to 86400). |
+| `--repl-retain-down-gb GB` | 64 | Per-server WAL retention budget for `down` or held members (ignores `repl_retain_s` until `out` or hold expiry). |
+| `--young-high-pct N` | 90 | Fill % at which a member/disk enters `FULL` backpressure (`UNAVAILABLE` `TSDB_WHY_FULL`; clears 2 points lower). |
+| `--balance on\|off` | on | Automatic greedy balancer after `node add`, `node drain`, and rebuilds (5% concurrent, 25% plan cap). |
+| `--balance-mb-s MB` | 0 | Balancer move rate in MB/s (0: equals `--rebuild-mb-s`; yields to any active rebuild). |
+| `--rebuild-concurrency N` | 4 | EC objects filled in flight per server (1 to 64). |
 | `--voter-replace-s S` | 600 | A voter down this long is replaced by another member. |
 | `--voters N` | 5 | The most voters the group has (an even number counts as one less). |
 | `--volumes-per-server N` | 16 | Volumes led per server. |
@@ -609,12 +629,12 @@ stored, and `--mode shared` and `--failover` (the shared side of the cluster) ar
 | `--repl-retain-mb MB` | 4096 | Log kept for a copy that fell behind, at most, per volume. A copy further behind needs a snapshot. The bound is per volume: a server leading V volumes may keep V times this, and a full disk stops the volume's writes for good (a failed log write is fail-stop), so leave room for it. |
 | `--repl-retain-s S` | 1800 | And for at most this long. |
 | `--idle-seal-ms MS` | 1000 | An idle leader closes its log segment after this. At least 100. A volume written more slowly than once per this interval gets one small part per write on every copy until merges combine them (a write every 2 s: about 1800 parts an hour), and an idle leader syncs one small log record a second on each copy. Raise it for slow writers. |
-| `--rebuild-mb-s MB` | 200 | How fast a server sends a snapshot (a rebuilt copy's files), per link, in megabytes a second. The limit is on the sending side: a receiving server is not limited, and a server that sends to several others uses this rate for each. Snapshots have a link of their own, so a write's files never wait behind one. |
+| `--rebuild-mb-s MB` | 200 | Base rebuild pace in megabytes a second per server (send and receive buckets in `server/pace.c`: margin 0 unlimited, margin 1 >= 4x, margin >= 2 at this rate, halved when foreground query or WAL sync p99 exceeds twice its 1-hour median). Snapshots (`kind 5`) and rebuild reads (`kind 8`) have links of their own, so a write's files never wait behind them. |
 | `--rebuild-max N` | 2 | Snapshots a server sends at once, and, counted apart, snapshots it receives at once (at most 16). Another waits and asks again. A receiving server also needs free space on the disk of the volume for the whole snapshot plus a tenth of it (and at least 1 GiB more), because the old directory stays until the new one is in place; otherwise it refuses the copy and says so in its log, and asks again later. |
 | `--transfer-wait-ms MS` | 2000 | How long a leader drains for a transfer (100 to 60000): the time writes wait, at most, before it goes on as leader. |
 | `--leader-balance-s S` | 0 | 0: off. Otherwise a volume whose first copy (`preferred`) is not its leader is handed back to that copy, by a transfer, once the copy has been in the in-sync set for this long (at most 86400). One transfer at a time on a server and one a second in the cluster; after a failed one the copy is left alone for `S`, doubling up to 10 minutes. Off by default until the pause of a transfer on a busy volume has been measured on real servers (the test-machine figures are in design-cluster.md 3.2). |
 
-The design lists more commands (`restore`, `adopt` and others) that are not built yet; `tsdb cluster` prints what exists.
+The design lists more commands (`restore` and others) that are not built yet; `tsdb cluster` prints what exists.
 
 ## What's next
 
@@ -625,12 +645,15 @@ The preview is the first step of a longer plan. The designs are written; the wor
   preview. The group's state machine (S1) and what a single server does while its storage
   is away (UNAVAILABLE, in N1) are already in 0.10.0, and users and grants kept in the group, with logins on every
   server ([Logins](#logins)), are in this preview; the proposer's rules for ownership and the time rules come with N7.
-- **Replicated mode (R1 to R4) and erasure coding (R5 to R8) are built**: each volume on servers with their own
-  disks, with replication, the in-sync set, promotion, transfer, move, snapshot rebuild, and erasure-coded settled
-  parts. Raft stays off the insert path.
+- **Replicated mode (R1 to R4), erasure coding (R5 to R8), and failure handling/rebuilds/balancer (R9) are built**:
+  each volume on servers with their own disks, with replication, the in-sync set, promotion, transfer, move, snapshot
+  rebuild, erasure-coded settled parts, DOWN/OUT timers, holds, mass-OUT guard, degraded settles, FULL backpressure,
+  checked stripe rebuilds, return-during-rebuild, operator node verbs, and greedy balancing (alongside R10 conversion,
+  R12 scrub/repair, R13 device classes, R14 live settings/status/salvage, and R15 local tiers). Raft stays off the
+  insert path.
 - **Shared mode** (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume,
   fenced by the group (the design of [ha.md](ha.md)); this is what production on NFSv4 needs first.
-- Then clients that talk to the volume leader directly, and device classes / storage tiers (R10, R14).
+- Then direct-mode clients (S3) and production upgrade/backup/alert/soak gates (P1 to P6).
 
 Read more:
 

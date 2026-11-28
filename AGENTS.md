@@ -156,6 +156,9 @@ make dist-test            # the tarball's own test suite, at every CPU level (TS
 make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
 make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere/SandyBridge if installed
 make meta-soak            # the metadata simulator (tests/test_meta.c) over META_SOAK_SEEDS=5000 seeds of 30 virtual s
+make place-soak           # the placement/timer/balancer simulator (tests/sim_place.c over real server/place.c, pout.c,
+                          # balance.c) over PLACE_SEEDS=10000 seeds plus mutants (`tests/sim_place.sh mttdl` prints the MTTDL table)
+make place-mutants        # planted bugs in server/place.c, pout.c and balance.c via tests/sim_place.sh (standard + --classes)
 make check-version        # VERSION, tsdb.h, tsdbd/tsdb --version and the client manifests agree (make test runs it)
 make test-clients         # Rust, Python and Java clients (network and embedded) against build/tsdbd, and test-licenses
                           # (needs cargo, python3, mvn); make test-spdx: the licence line of every file (part of make test)
@@ -333,9 +336,27 @@ cgroup, so `nice` does not keep your work out of its way.
   validation at both proposer (`CLUSTER_OP_SETTINGS` = 21) and `meta_apply`, live settings watch on consumers,
   `tsdb cluster settings show|set`, `test_cluster settings`, `make settings-mutants` (`settingsany`, `settingsnocas`);
   snapshot version 12 and entry magic "TME9": a state directory or log of another version is refused naming both, never upgraded);
-  R9 operator ops (`server/cnode.c`: Raft leader handlers for `node hold|out|drain|replace|destroyed` and
+  R9 failure handling, placement, rebuilds, pacing, and operator ops (`docs/design-cluster-data.md` §5, §6.2):
+  `server/place.c`, `server/pout.c`, and `server/balance.c` (`server/place.h`) are pure modules (no I/O, no clock,
+  no locks) called once a second on the Raft leader (`place_duty`) and driven deterministically by `tests/sim_place.c`
+  (`make place-soak`, `make place-mutants`, `tests/sim_place.sh mttdl`): `pout.c` evaluates DOWN/OUT timers
+  (`rebuild_after_s`, `opening_hold_s`, `failstop_out_s`, bounded holds <= 24 h, computed mass-OUT guard `out_guard_pct` /
+  `out_guard_hold_s`) and per-replica `LOCAL_FAULT` escalation (`v<N>.fault-<rid>` set-aside in `server/cvolset.c`, D6);
+  `place.c` handles initial placement (`place_volume`, `place_stripe`, E9 rack rule `place_rack_survivable`),
+  endangered-first re-placement after OUT/fault/drain/replace, `STRIPE_WHOLE` / `MK_GC_RELEASE` proposals, and
+  return-during-rebuild (`place_return`); `balance.c` runs greedy log/stripe/leader balancing within 5% concurrent and
+  25% automatic plan caps (`balance` setting default `on`, `tsdb cluster balance [--apply]`). `server/sfill.[ch]` runs
+  the checked stripe fill worker (`rebuild_concurrency` objects in flight, `CS_OP_OBJLIST`, 1x copy from `prev` before
+  whole-cell RS decode over `PL_KIND_CHUNKR` = 8, encode-time sum checks on survivors and rebuilt cells, read-back scrub,
+  `CP_FILL_WRITTEN`, `CS_OP_REOPEN` -> `eccache_reopen`, `HBS_FILL`). `server/sreconcile.[ch]` runs startup and return
+  two-way `CHUNK_LIST` reconciliation against `OBJLIST` and `<state-dir>/chunk_stores` (plus `sreconcile_note_missing`
+  for E10 degraded settles). `server/pace.[ch]` provides per-server `PACE_SEND`/`PACE_RECV` token buckets paced by
+  lowest active margin (margin 0 unlimited and exempt from halving, margin 1 >= 4x `rebuild_mb_s`, margin >= 2 at
+  `rebuild_mb_s`, balance at `balance_mb_s` yielding to any rebuild, and 1-min query/WAL-sync p99 > 2x 1-hr median
+  halving; wired into `server/rsnap.c`, `server/sfill.c`, `server/peerlink.c`, `server/metrics.c`).
+  `server/cnode.c` implements the Raft leader handlers for `node hold|out|drain|replace|destroyed` and
   `volume move --pos`, answered after commit, plus `cnode_duty` DRAINING->OUT, replace completion/abandon, and live
-  OUT leader handoff; `test_cluster nodehold nodeout nodedrain nodereplace nodedestroyed posmove`; `make ops-mutants`
+  OUT leader handoff (`test_cluster nodehold nodeout nodedrain nodereplace nodedestroyed posmove`; `make ops-mutants`
   for `drainleaves` and `replaceclear`).
   `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
@@ -1070,6 +1091,26 @@ cgroup, so `nice` does not keep your work out of its way.
   a `v<N>` the record does not name is never opened, and one that is missing while the group recorded an open of it is
   refused, never made again by itself. One move per volume; a move's shrink never takes the ISR below the size it had
   before the new member joined (`repl_leave`, `min_isr`).
+- **Cluster failure handling, stripe rebuilds, and backpressure (R9)** (`server/meta.c`, `server/pout.c`, `server/place.c`,
+  `server/sfill.c`, `server/sreconcile.c`, `server/repld.c`, `server/tsdbd.c`, `src/ecgcmk.c`, `server/chunksrv.c`):
+  - **Every chunk delete is a committed `MK_GC`, releases included** (E14, D12): partial fills on a displaced
+    replacement and chunks on a replaced holder are never deleted on `STRIPE_SET` alone; `src/ecgcmk.c` commits
+    `MK_GC_RELEASE` (`CP_RELEASE_GC`) only after the current holder is `WHOLE` and its `CHUNK_LIST` matches `OBJLIST`
+    on a caught-up copy, deletes via guarded `CS_OP_DEL_REL` (`rel_guard` in `server/chunksrv.c`), and commits
+    `MK_GC_RELEASE_DONE` (mutants `releasenomark`, `partialdelnow`).
+  - **Whole only at the current version** (D10): `stripe_version` `V` is the barrier; `server/sfill.c` reports
+    `whole = 1` only after every committed object with `stripe_version < V` is durably written and sum-verified
+    (mutant `wholeearly`), and `server/meta.c` `META_OP_STRIPE_WHOLE` refuses any `sv != v->stripe_version` with
+    `META_ERR_STALE` (mutant `wholeanyversion`).
+  - **`OUT` is reversible, `DESTROYED` is final** (D2): `server/meta.c` permits `OUT -> UP` only on a strictly higher
+    incarnation (`inc > mb->incarnation`) while keeping peer address and identity reserved, permits `DESTROYED` only
+    from `OUT` (operator `node destroyed`, refused while still heard), and rejects every transition out of `DESTROYED`
+    (mutants `outfinal`, `destroyedback`).
+  - **`FULL` refuses before anything is appended** (E30, D17): `server/repld.c` `op_admit` checks `vol_full_locked`
+    before `repl_write` / WAL append for client writes and `MK_COMMIT` (while `MK_COLD`, `MK_GC`, `MK_DIGEST`, drops,
+    and `MK_NOW` pass so young data drains; mutant `fullafteradmit`), and `server/tsdbd.c` refuses large writes before
+    `lw_enter` with definite `TSDB_ERR_UNAVAILABLE` (`TSDB_WHY_FULL`, `retry_after` 1000 ms). Replica FULL travels in
+    every ACK (`RW_ACK_FULL` bit 1, `RW_VERSION` 3).
 - **Settled parts** (R7 single-server, R8-1 cluster EC, R10 single-server re-encode; `src/ecpart.c`, `src/ecswap.c`,
   `src/settle.c`, `src/eccold.c`, `src/ecapply.c`, `src/ppos.c`, `src/ecdigest.c`, `src/ecdiverge.c`, `src/eckeep.c`,
   `src/ecgc.c`, `src/ecgcmk.c`; `docs/design-cluster-data.md` §2.3). On one server (R7, D2) a settle turns
