@@ -12804,14 +12804,25 @@ static void scen_fwdload(void)
  * the leader holding every row at the end; the entry node must have forwarded frames (STATUS), the numbers must be
  * printed (hop, mean and sd over the reps, CPU per 1000 requests of the three processes). A bench that is given an
  * entry that is no server must fail, not print numbers. */
+static uint64_t metrics_repl_peerlink_out(int port)
+{
+    static char buf[1 << 20];
+    metrics_get(port, buf, sizeof buf);
+    const char *k = "\ntsdb_repl_peerlink_bytes_total{dir=\"out\"} ";
+    const char *l = strstr(buf, k);
+    return l ? strtoull(l + strlen(k), NULL, 10) : 0;
+}
+
 static void scen_viabench(void)
 {
     scenario("viabench");
     strict_reads = 1;
     fwd_on = 1;
+    int mports[3] = {0};
     for (int i = 0; i < 3; i++) {
-        xargs[i] = "--workers 2";
+        xargs[i] = "--workers 2 --metrics-port auto";
         start(i);
+        mports[i] = th_mport;
     }
     init_cluster(0, 600);
     node_add(0, 1);
@@ -12831,6 +12842,7 @@ static void scen_viabench(void)
     int L = server_of(v.leader), R = (L + 1) % 3;
     tsdbc *cr = client(R);
     uint64_t f0 = fw_frames(cr, v.leader);
+    uint64_t rb0 = metrics_repl_peerlink_out(mports[L]);
 
     const char *bench = getenv("TSDBC_BENCH") ? getenv("TSDBC_BENCH") : "./build/tsdbc-bench";
     char cmd[PATH_MAX + 512], line[1024], text[16384];
@@ -12855,6 +12867,11 @@ static void scen_viabench(void)
         if (!strstr(text, must[k]))
             die("the bench's output lacks '%s':\n%s", must[k], text);
     uint64_t f1 = fw_frames(cr, v.leader);
+    uint64_t rb1 = metrics_repl_peerlink_out(mports[L]);
+    if (rb1 <= rb0 || rb1 - rb0 < 16384)
+        die("tsdb_repl_peerlink_bytes_total{dir=\"out\"} on leader %d did not rise meaningfully across replicated "
+            "writes (%" PRIu64 " -> %" PRIu64 ", delta %" PRIu64 " < 16384)",
+            L, rb0, rb1, rb1 > rb0 ? rb1 - rb0 : 0);
     if (f1 <= f0 + 10)
         die("the bench ran through server %d and it forwarded %" PRIu64 " frames to the leader %d (STATUS "
             "peer.<id>.fwd.frames %" PRIu64 " to %" PRIu64 ")", R, f1 - f0, L, f0, f1);

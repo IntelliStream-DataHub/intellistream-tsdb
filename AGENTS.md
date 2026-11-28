@@ -1766,6 +1766,8 @@ tsdb-bench, tsdbd (started with `--port 0 --port-file`) with tsdbc-bench, insert
 | tool | measures |
 |---|---|
 | `tools/bench-tsdb.sh` | all of the below except dbcmp and hydraulic, repeated, with a summary; see above |
+| `tools/bench-cluster.sh` | cluster benchmarks per mode (`replicas=3`, `ec=4+2`, `8+2`, `8+4`, `16+4`, `--reps`, `--quick`): load, settle throughput & fence length, logical digest cost per GiB, peer-link network bytes/row, warm/cold/1-down/m-down query suite, 1-node rebuild against foreground p50/p99, durable cluster inserts; summarized by `tools/bench-summary.py` |
+| `build/dropcache` | drops OS page cache over files/directory trees without root (`posix_fadvise(POSIX_FADV_DONTNEED)`) and verifies remaining residency with `mincore()` (D31) |
 | `tools/auth-bench.sh` | what login and grants cost: main before, main without auth and the auth build (`--no-auth`, a superuser, 8 prefix, 5,000 name and 64 glob grants), each built from `git archive`; queries, QUERY_MULTI, inserts and logins on 1 and 32 connections, repeated and interleaved (`--quick`, `--reps N`, `--lock FILE`); `tools/auth-bench-client.c` has the insert and login workloads |
 | `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed; `--file F` for raw float32 values from a file |
 | `build/type-bench` | the float64, int64, bool and state codecs; `--file F float32\|float64` for raw values from a file |

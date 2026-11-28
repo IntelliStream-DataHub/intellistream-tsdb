@@ -112,6 +112,7 @@
 
 #include "repld.h"
 #include "chunkpeer.h"
+#include "creport.h"
 #include "disks.h"
 #include "tsdb_protocol.h"
 #include "crashpt.h"
@@ -157,6 +158,27 @@ static int pl_send_enter(void)
 static void pl_send_leave(void)
 {
     atomic_fetch_sub_explicit(&pl_inflight, 1, memory_order_seq_cst);
+}
+
+static void repld_collect_peerlink_bytes(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    if (!pl_send_enter())
+        return;
+    pthread_mutex_lock(&G.mu);
+    struct peerlink *pl = G.pl;
+    pthread_mutex_unlock(&G.mu);
+    if (pl) {
+        struct pl_stats ps;
+        peerlink_stats(pl, &ps);
+        struct creport_label l_out = {"dir", "out"};
+        struct creport_label l_in = {"dir", "in"};
+        struct creport_label l_bulk = {"dir", "bulk"};
+        creport_sink_put_u64(sink, &l_out, 1, ps.bytes_out);
+        creport_sink_put_u64(sink, &l_in, 1, ps.bytes_in);
+        creport_sink_put_u64(sink, &l_bulk, 1, ps.bulk_bytes);
+    }
+    pl_send_leave();
 }
 
 void say(const char *fmt, ...)
@@ -3803,6 +3825,9 @@ void repld_init(tsdb *t, const char *dir)
 #endif
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
+    (void)creport_metric_collector("tsdb_repl_peerlink_bytes_total", CREPORT_COUNTER,
+                                   "Bytes sent/received/bulk on this server's replication peerlink.",
+                                   repld_collect_peerlink_bytes, NULL);
 }
 
 /* The index, the history and a new core from what the volume's directory and REPL hold: at the open, and after a
@@ -4392,6 +4417,7 @@ void repld_wake_vol(uint32_t v)
 
 void repld_stop(void)
 {
+    creport_metric_collector_del("tsdb_repl_peerlink_bytes_total");
     pthread_mutex_lock(&G.mu);
     uint32_t n = G.nvols;
     pthread_mutex_unlock(&G.mu);

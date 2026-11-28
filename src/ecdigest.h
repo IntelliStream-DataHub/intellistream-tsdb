@@ -84,6 +84,11 @@ int ecd_freeze(struct eng *db, struct part **set, size_t n, int64_t key, int64_t
  * TSDB_ERR_INDETERMINATE (deposed), or another error (the engine failed, or nothing was appended). */
 int ecdigest_leader(struct eng *db, int64_t key, uint64_t z, struct part **set, size_t n, const uint8_t *oids,
                     size_t noids);
+/* Same as ecdigest_leader, also reporting pure logical-digest computation time in microseconds (excluding MK_DIGEST
+ * append and replication commit wait) when compute_us_out is non-NULL; on a ret_gen retry, *compute_us_out records
+ * the final attempt's compute duration. */
+int ecdigest_leader_timed(struct eng *db, int64_t key, uint64_t z, struct part **set, size_t n, const uint8_t *oids,
+                          size_t noids, int64_t *compute_us_out);
 /* A leader after a re-encode's swap (r10-crepl): computes the logical digest of in_set (retired .ec + young parts + Y)
  * and compares it against out_set (new output + Y, read back through the chunk store). On mismatch sets durable
  * DIVERGED without appending MK_DIGEST (retired chunks stay held); on match appends and commits MK_DIGEST (returning

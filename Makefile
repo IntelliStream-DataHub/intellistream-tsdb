@@ -172,7 +172,7 @@ LIB  := $(B)/libtsdb.a
 CLIB := $(B)/libtsdbclient.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/wtail-bench $(B)/decode-bench $(B)/link-bench $(B)/tier-bench $(EC_BENCH)
+all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/wtail-bench $(B)/decode-bench $(B)/link-bench $(B)/tier-bench $(B)/dropcache $(EC_BENCH)
 
 $(B)/%.o: src/%.c src/internal.h src/scrub.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h $(R7_HDR) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -1621,6 +1621,9 @@ $(B)/wtail-bench: tools/wtail-bench.c src/internal.h $(LIB)
 
 $(B)/twa-bench: tools/twa-bench.c tools/common.h include/tsdb.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+$(B)/dropcache: tools/dropcache.c | $(B)
+	$(CC) $(CFLAGS) -o $@ $<
 
 $(B)/scale-bench: tools/scale-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(LIB) $(LDLIBS)

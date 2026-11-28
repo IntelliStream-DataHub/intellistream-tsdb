@@ -2,22 +2,30 @@
 /*
  * Network benchmark against tsdbd.
  *
- *   tsdbc-bench load  FILE.rowbinary [--conns 4] [--batch 1000000] [--compression 1]
+ *   tsdbc-bench load  FILE.rowbinary [--volume NAME] [--conns 4] [--batch 1000000] [--compression 1]
  *   tsdbc-bench verify FILE.rowbinary     the server holds exactly the rows of FILE (count, sum, every timestamp and value)
  *   tsdbc-bench optimize                  flush and merge, as tsdb-bench does after its load
- *   tsdbc-bench query [--series 100] [--points 1000000] [--conns 1] [--seconds 3] [--multi K [--multi-one]]
+ *   tsdbc-bench query [--volume NAME] [--series 100] [--points 1000000] [--conns 1] [--seconds 3]
+ *                     [--multi K [--multi-one]] [--lat] [--class ID[,ID...]] [--stop-file PATH] [--retry-unavail]
+ *   tsdbc-bench insert [--volume NAME] [--series 200] [--batch 1000] [--conns 4] [--seconds 2] [--compression 1]
  *   tsdbc-bench latest [--series 100] [--ids 4096] [--conns 1] [--seconds 3] [--sorted] [--flush] [--with-nulls] [--dataset]
  *   tsdbc-bench connections --conns 5000 [--seconds 5]
  *   tsdbc-bench via --host H --port P --via H2:P2 --volume NAME [--conns 4] [--rows 100] [--seconds 3] [--reps 5]
  *                   [--pids PID,PID,...]
  *
  * load sends a RowBinary file (u32 series, i64 ts, f32 value per row), split
- * into contiguous slices, one per connection, with up to 4 batches in flight.
+ * into contiguous slices, one per connection, with up to 4 batches in flight. --volume NAME creates series in the
+ * named cluster volume (tsdbc_series_at) rather than the default volume.
  * query runs the random windows of cbench.h (mixed dataset intervals); tsdb-bench --qps runs the same ones
  * in-process, and the Rust, Python and Java query benchmarks the same again; then TWA by the hour and the whole
  * range. --multi K sends K windows per QUERY_MULTI request; 0 is one request per window as always, 1 the plain op
  * that QUERY_MULTI wraps (QUERY_VALUES for raw rows), and --multi-one with K = 1 QUERY_MULTI of one series (its
- * overhead over the plain op).
+ * overhead over the plain op). --lat records per-query latency (p50, p99, max in us); --class filters which classes
+ * run (comma-separated: raw, agg300, agg3600, twa3600, full0); --stop-file stops workers cleanly when PATH appears;
+ * --retry-unavail retries transient UNAVAILABLE/connection drops (for foreground query load during rebuilds).
+ * insert sends synchronous durable batches of --batch rows across --conns connections into unique series
+ * (ins.b<batch>.c<conns>.<kind>.<i>, optionally in --volume NAME) for --seconds and reports calls/s, rows/s, and
+ * p50/p99/max latency in ms.
  * latest sends QUERY_LATEST requests of --ids random ids on --conns connections and reports p50, p99 and max of
  * a request, with a connection writing and flushing every series in a loop under --flush (see run_latest).
  * connections holds --conns connections open at once (from up to 64 threads)
@@ -50,6 +58,34 @@ static uint64_t points = 1000000;
 static double seconds = CB_DEFAULT_SECONDS;
 static int compression = 1; /* zstd level of insert batches; 0 sends plain arrays */
 static tsdbc_options login;  /* user NULL: no login */
+static const char *via_addr, *via_volume, *via_pids;
+static int via_reps = 5, via_rows = 100;
+static int query_lat = 0, retry_unavail = 0;
+static const char *query_class = NULL, *stop_file = NULL;
+
+typedef struct lat {
+    uint32_t *a; /* microseconds */
+    size_t n, cap;
+} lat;
+
+static void die(const char *what, int rc);
+
+static void lat_add(lat *l, uint32_t v)
+{
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 4096;
+        l->a = realloc(l->a, l->cap * sizeof *l->a);
+        if (!l->a)
+            die("out of memory", TSDB_ERR_NOMEM);
+    }
+    l->a[l->n++] = v;
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
 
 static int bench_connect(const char *h, int p, tsdbc **out)
 {
@@ -79,7 +115,8 @@ static void resolve_ids(tsdbc *c, uint32_t n, int create)
     for (uint32_t i = 0; i < n; i++) {
         char name[64];
         snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
-        int rc = tsdbc_series(c, name, create, &sids[i]);
+        int rc = (create && via_volume && *via_volume) ? tsdbc_series_at(c, name, via_volume, &sids[i])
+                                                       : tsdbc_series(c, name, create, &sids[i]);
         if (rc)
             die(name, rc);
     }
@@ -237,8 +274,9 @@ static const cb_class extra_classes[] = {
 typedef struct qjob {
     const cb_class *k;
     int seed;
-    uint64_t queries, rows;
+    uint64_t queries, rows, errors;
     double secs;
+    lat l;
 } qjob;
 
 static int count_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
@@ -306,11 +344,13 @@ static void *querier(void *arg)
     tsdb_sid *ss = malloc((size_t)kk * sizeof *ss);
     int64_t *st = malloc((size_t)kk * 3 * sizeof *st), *en = st + kk, *iv = en + kk;
     double t0 = now_s();
-    while (now_s() - t0 < seconds) {
-        for (int k = 0; k < 16; k++) {
+    int inner = (query_lat || stop_file) ? 1 : 16;
+    while (now_s() - t0 < seconds && (!stop_file || access(stop_file, F_OK) != 0)) {
+        for (int k = 0; k < inner; k++) {
             tsdb_sid s;
             uint32_t ix;
             int64_t start, end;
+            double qa = query_lat ? now_s() : 0.0;
             if (use_multi) {
                 for (int i = 0; i < kk; i++) {
                     uint32_t ix;
@@ -322,8 +362,17 @@ static void *querier(void *arg)
                                                                 : TSDB_MULTI_BUCKETS,
                                        .starts = st, .ends = en, .intervals = q->k->agg ? iv : NULL, .twa = twa};
                 multi_ctx mc = {q->k->agg, 0};
-                if ((rc = tsdbc_query_multi(c, &mq, ss, (size_t)kk, NULL, multi_fn, &mc)) != 0)
+                rc = tsdbc_query_multi(c, &mq, ss, (size_t)kk, NULL, multi_fn, &mc);
+                if (rc != 0) {
+                    if (retry_unavail && (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED)) {
+                        q->errors++;
+                        usleep(10000);
+                        continue;
+                    }
                     die("query multi", rc);
+                }
+                if (query_lat)
+                    lat_add(&q->l, (uint32_t)((now_s() - qa) * 1e6));
                 q->rows += mc.rows;
                 q->queries += (uint64_t)kk;
                 continue;
@@ -331,27 +380,50 @@ static void *querier(void *arg)
             next_window(&r, q->k, &ix, &s, &start, &end);
             if (!q->k->agg) {
                 uint64_t n = 0; /* --multi 1: QUERY_VALUES, the op QUERY_MULTI wraps; else QUERY_RAW as always */
-                if ((rc = multi_k == 1 ? tsdbc_query_values(c, s, start, end, NULL, values_cb, &n)
-                                       : tsdbc_query_raw(c, s, start, end, count_cb, &n)) != 0)
+                rc = multi_k == 1 ? tsdbc_query_values(c, s, start, end, NULL, values_cb, &n)
+                                  : tsdbc_query_raw(c, s, start, end, count_cb, &n);
+                if (rc != 0) {
+                    if (retry_unavail && (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED)) {
+                        q->errors++;
+                        usleep(10000);
+                        continue;
+                    }
                     die("query", rc);
+                }
                 q->rows += n;
             } else if (q->k->agg == 2) {
                 tsdb_twa_bucket *b;
                 size_t nb;
-                if ((rc = tsdbc_query_twa(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(ix), &twa, &b, &nb)) != 0)
+                rc = tsdbc_query_twa(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(ix), &twa, &b, &nb);
+                if (rc != 0) {
+                    if (retry_unavail && (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED)) {
+                        q->errors++;
+                        usleep(10000);
+                        continue;
+                    }
                     die("query", rc);
+                }
                 for (size_t i = 0; i < nb; i++)
                     q->rows += b[i].count;
                 free(b);
             } else {
                 tsdb_bucket *b;
                 size_t nb;
-                if ((rc = tsdbc_query_agg(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(ix), &b, &nb)) != 0)
+                rc = tsdbc_query_agg(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(ix), &b, &nb);
+                if (rc != 0) {
+                    if (retry_unavail && (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED)) {
+                        q->errors++;
+                        usleep(10000);
+                        continue;
+                    }
                     die("query", rc);
+                }
                 for (size_t i = 0; i < nb; i++)
                     q->rows += b[i].count;
                 free(b);
             }
+            if (query_lat)
+                lat_add(&q->l, (uint32_t)((now_s() - qa) * 1e6));
             q->queries++;
         }
     }
@@ -368,15 +440,18 @@ static int run_queries(const cb_class *k)
     qjob jobs[256];
     double cpu0 = cb_cpu_s();
     for (int i = 0; i < conns; i++) {
-        jobs[i] = (qjob){k, i, 0, 0, 0};
+        jobs[i] = (qjob){k, i, 0, 0, 0, 0, {0, 0, 0}};
         pthread_create(&th[i], NULL, querier, &jobs[i]);
     }
-    uint64_t nq = 0, rows = 0;
+    uint64_t nq = 0, rows = 0, errs = 0;
     double secs = 0;
+    size_t nlat = 0;
     for (int i = 0; i < conns; i++) {
         pthread_join(th[i], NULL);
         nq += jobs[i].queries;
         rows += jobs[i].rows;
+        errs += jobs[i].errors;
+        nlat += jobs[i].l.n;
         secs = jobs[i].secs > secs ? jobs[i].secs : secs;
     }
     cb_class shown = *k;
@@ -387,10 +462,58 @@ static int run_queries(const cb_class *k)
         shown.id = id;
         shown.label = label;
     }
-    cb_report_query("c", &shown, "conn", conns, nq, rows, secs, cb_cpu_s() - cpu0);
+    double cpu = cb_cpu_s() - cpu0;
+    if (query_lat) {
+        uint32_t *all = nlat ? malloc(nlat * sizeof *all) : NULL;
+        size_t pos = 0;
+        for (int i = 0; i < conns; i++) {
+            if (all && jobs[i].l.n) {
+                memcpy(all + pos, jobs[i].l.a, jobs[i].l.n * sizeof *all);
+                pos += jobs[i].l.n;
+            }
+            free(jobs[i].l.a);
+        }
+        double p50 = 0, p99 = 0, mx = 0;
+        if (all && pos) {
+            qsort(all, pos, sizeof *all, cmp_u32);
+            p50 = (double)all[pos / 2];
+            p99 = (double)all[(pos * 99) / 100];
+            mx = (double)all[pos - 1];
+        }
+        free(all);
+        printf("  %-44s %3d conn %10.0f q/s  %8.1f us/q  p50 %7.1f us  p99 %7.1f us  max %7.1f us  %7.1f Mrows/s\n",
+               shown.label, conns, secs > 0 ? nq / secs : 0.0, nq ? secs * conns / nq * 1e6 : 0.0, p50, p99, mx,
+               secs > 0 ? rows / secs / 1e6 : 0.0);
+        printf("RESULT kind=query client=c class=%s threads=%d queries=%" PRIu64 " rows=%" PRIu64
+               " secs=%.4f cpu=%.4f p50_us=%.1f p99_us=%.1f max_us=%.1f errors=%" PRIu64 "\n",
+               shown.id, conns, nq, rows, secs, cpu, p50, p99, mx, errs);
+        fflush(stdout);
+    } else {
+        for (int i = 0; i < conns; i++)
+            free(jobs[i].l.a);
+        cb_report_query("c", &shown, "conn", conns, nq, rows, secs, cpu);
+    }
     if (rows == 0) {
         fprintf(stderr, "query: class %s returned no rows: the server is empty or does not hold the data set\n", k->id);
         return 1;
+    }
+    return 0;
+}
+
+static int class_wanted(const char *id)
+{
+    if (!query_class || !*query_class)
+        return 1;
+    size_t len = strlen(id);
+    const char *p = query_class;
+    while (*p) {
+        const char *c = strchr(p, ',');
+        size_t n = c ? (size_t)(c - p) : strlen(p);
+        if (n == len && memcmp(p, id, len) == 0)
+            return 1;
+        if (!c)
+            break;
+        p = c + 1;
     }
     return 0;
 }
@@ -687,24 +810,6 @@ static int connections(void)
 
 /* ---- via: the forwarding hop (see the header) */
 #define VIA_T0 1700000000000LL
-static const char *via_addr, *via_volume, *via_pids;
-static int via_reps = 5, via_rows = 100;
-
-typedef struct lat {
-    uint32_t *a; /* microseconds */
-    size_t n, cap;
-} lat;
-
-static void lat_add(lat *l, uint32_t v)
-{
-    if (l->n == l->cap) {
-        l->cap = l->cap ? l->cap * 2 : 4096;
-        l->a = realloc(l->a, l->cap * sizeof *l->a);
-        if (!l->a)
-            die("out of memory", TSDB_ERR_NOMEM);
-    }
-    l->a[l->n++] = v;
-}
 
 typedef struct via_job {
     const char *h;
@@ -796,12 +901,6 @@ static void *via_run(void *arg)
     free(v);
     tsdbc_close(c);
     return NULL;
-}
-
-static int cmp_u32(const void *a, const void *b)
-{
-    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
-    return x < y ? -1 : x > y;
 }
 
 /* the clock ticks of user + system time of the processes in via_pids ("1,2,3"), -1 when one cannot be read */
@@ -1029,6 +1128,132 @@ static int run_via(void)
     return via_jobs_free(jobs, conns, 0);
 }
 
+/* ---- insert: synchronous durable batch inserts over TCP (cluster / server counterpart to insert-bench) */
+typedef struct ins_job {
+    int idx;
+    uint32_t s0, s1;
+    tsdb_sid *sids;
+    uint64_t calls, rows, sent;
+    double secs;
+    lat l;
+} ins_job;
+
+static void *inserter(void *arg)
+{
+    ins_job *j = arg;
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect", rc);
+    if ((rc = tsdbc_set_compression(c, compression)) != 0)
+        die("compression", rc);
+    uint32_t ns = j->s1 - j->s0;
+    ds_state *st = calloc(ns, sizeof *st);
+    tsdb_sid *sv = malloc(batch * sizeof *sv);
+    int64_t *tv = malloc(batch * sizeof *tv);
+    float *vv = malloc(batch * sizeof *vv);
+    if (!st || !sv || !tv || !vv)
+        die("out of memory", TSDB_ERR_NOMEM);
+    for (uint32_t i = 0; i < ns; i++) {
+        uint32_t sid_ix = j->s0 + i;
+        ds_init(&st[i], (ds_kind)(sid_ix % (DS_KINDS - 1)), sid_ix + 100000u, 1735689600000LL);
+    }
+    uint64_t pos = 0;
+    double t0 = now_s();
+    while (now_s() - t0 < seconds) {
+        for (size_t k = 0; k < batch; k++, pos++) {
+            uint32_t i = (uint32_t)(pos % ns);
+            sv[k] = j->sids[j->s0 + i];
+            ds_next(&st[i], &tv[k], &vv[k]);
+        }
+        double a = now_s();
+        if ((rc = tsdbc_insert(c, sv, tv, vv, batch)) != 0)
+            die("insert", rc);
+        lat_add(&j->l, (uint32_t)((now_s() - a) * 1e6));
+        j->calls++;
+        j->rows += batch;
+    }
+    j->secs = now_s() - t0;
+    j->sent = tsdbc_bytes_sent(c);
+    tsdbc_close(c);
+    free(st);
+    free(sv);
+    free(tv);
+    free(vv);
+    return NULL;
+}
+
+static int run_insert(void)
+{
+    uint32_t ns = nseries < (uint32_t)conns ? (uint32_t)conns : nseries;
+    tsdb_sid *isids = calloc(ns, sizeof *isids);
+    if (!isids)
+        die("out of memory", TSDB_ERR_NOMEM);
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect", rc);
+    for (uint32_t i = 0; i < ns; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "ins.b%zu.c%d.%s.%u", batch, conns, ds_info[i % (DS_KINDS - 1)].name, i);
+        rc = (via_volume && *via_volume) ? tsdbc_series_at(c, name, via_volume, &isids[i])
+                                         : tsdbc_series(c, name, 1, &isids[i]);
+        if (rc)
+            die(name, rc);
+    }
+    tsdbc_close(c);
+
+    pthread_t th[256];
+    ins_job jobs[256];
+    double cpu0 = cb_cpu_s();
+    for (int i = 0; i < conns; i++) {
+        uint32_t s0 = (uint32_t)((uint64_t)ns * (uint64_t)i / (uint64_t)conns);
+        uint32_t s1 = (uint32_t)((uint64_t)ns * (uint64_t)(i + 1) / (uint64_t)conns);
+        jobs[i] = (ins_job){i, s0, s1, isids, 0, 0, 0, 0, {0, 0, 0}};
+        pthread_create(&th[i], NULL, inserter, &jobs[i]);
+    }
+    uint64_t calls = 0, rows = 0;
+    double secs = 0, sent = 0;
+    size_t nlat = 0;
+    for (int i = 0; i < conns; i++) {
+        pthread_join(th[i], NULL);
+        calls += jobs[i].calls;
+        rows += jobs[i].rows;
+        sent += (double)jobs[i].sent;
+        nlat += jobs[i].l.n;
+        if (jobs[i].secs > secs)
+            secs = jobs[i].secs;
+    }
+    double cpu = cb_cpu_s() - cpu0;
+    uint32_t *all = nlat ? malloc(nlat * sizeof *all) : NULL;
+    size_t pos = 0;
+    for (int i = 0; i < conns; i++) {
+        if (all && jobs[i].l.n) {
+            memcpy(all + pos, jobs[i].l.a, jobs[i].l.n * sizeof *all);
+            pos += jobs[i].l.n;
+        }
+        free(jobs[i].l.a);
+    }
+    double p50 = 0, p99 = 0, mx = 0;
+    if (all && pos) {
+        qsort(all, pos, sizeof *all, cmp_u32);
+        p50 = (double)all[pos / 2] / 1000.0;
+        p99 = (double)all[(pos * 99) / 100] / 1000.0;
+        mx = (double)all[pos - 1] / 1000.0;
+    }
+    free(all);
+    free(isids);
+    double cs = secs > 0 ? (double)calls / secs : 0.0;
+    double rs = secs > 0 ? (double)rows / secs : 0.0;
+    printf("  insert batch=%zu conns=%d: %.1f calls/s  %.0f rows/s  p50 %.3f ms  p99 %.3f ms  max %.3f ms\n", batch,
+           conns, cs, rs, p50, p99, mx);
+    printf("RESULT kind=insert client=c batch=%zu conns=%d calls=%" PRIu64 " rows=%" PRIu64
+           " secs=%.4f calls_s=%.1f rows_s=%.1f p50_ms=%.3f p99_ms=%.3f max_ms=%.3f bytes=%.0f cpu=%.4f\n",
+           batch, conns, calls, rows, secs, cs, rs, p50, p99, mx, sent, cpu);
+    fflush(stdout);
+    return calls == 0 ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     static struct option opts[] = {{"host", required_argument, 0, 'h'},   {"port", required_argument, 0, 'p'},
@@ -1042,6 +1267,8 @@ int main(int argc, char **argv)
                                    {"via", required_argument, 0, 0x100}, {"volume", required_argument, 0, 0x101},
                                    {"reps", required_argument, 0, 0x102}, {"rows", required_argument, 0, 0x103},
                                    {"pids", required_argument, 0, 0x104},
+                                   {"lat", no_argument, 0, 0x105}, {"class", required_argument, 0, 0x106},
+                                   {"stop-file", required_argument, 0, 0x107}, {"retry-unavail", no_argument, 0, 0x108},
                                    {"user", required_argument, 0, 'u'},  {"password-file", required_argument, 0, 'w'},
                                    {0, 0, 0, 0}};
     int ch;
@@ -1067,6 +1294,10 @@ int main(int argc, char **argv)
         case 0x102: via_reps = atoi(optarg); break;
         case 0x103: via_rows = atoi(optarg); break;
         case 0x104: via_pids = optarg; break;
+        case 0x105: query_lat = 1; break;
+        case 0x106: query_class = optarg; break;
+        case 0x107: stop_file = optarg; break;
+        case 0x108: retry_unavail = 1; break;
         case 'u': login.user = optarg; break;
         case 'w': login.password_file = optarg; break;
         default: return 2;
@@ -1095,17 +1326,20 @@ int main(int argc, char **argv)
     }
     if (conns < 1 || conns > 256 || optind >= argc || multi_k < 0 || multi_k > 65536 ||
         lat_ids < 1 || lat_ids > (1 << 20)) {
-        fprintf(stderr, "usage: tsdbc-bench load FILE [--conns N] [--batch ROWS] [--compression LEVEL]\n"
+        fprintf(stderr, "usage: tsdbc-bench load FILE [--conns N] [--batch ROWS] [--compression LEVEL] [--volume NAME]\n"
+                        "       tsdbc-bench insert [--series N] [--batch ROWS] [--conns N] [--seconds S] [--volume NAME]\n"
                         "       tsdbc-bench verify FILE | optimize\n"
-                        "       tsdbc-bench query [--series N] [--points N] [--conns N] [--seconds S] [--multi K [--multi-one]]\n"
+                        "       tsdbc-bench query [--series N] [--points N] [--conns N] [--seconds S] [--multi K [--multi-one]] [--lat] [--class ID] [--stop-file F] [--retry-unavail]\n"
                         "       tsdbc-bench latest [--series N] [--ids N] [--conns N] [--seconds S] [--sorted] [--flush] [--with-nulls] [--dataset]\n"
                         "       tsdbc-bench connections --conns N [--seconds S]\n"
                         "       tsdbc-bench via --via H:P --volume NAME [--conns N] [--rows N] [--seconds S] [--reps N] [--pids P,P]\n"
-                        "       [--host H] [--port P] [--via H:P] [--user U --password-file F]\n");
+                        "       [--host H] [--port P] [--via H:P] [--volume NAME] [--user U --password-file F]\n");
         return 2;
     }
     if (strcmp(argv[optind], "load") == 0 && optind + 1 < argc)
         return load(argv[optind + 1]);
+    if (strcmp(argv[optind], "insert") == 0)
+        return run_insert();
     if (strcmp(argv[optind], "verify") == 0 && optind + 1 < argc)
         return verify(argv[optind + 1]);
     if (strcmp(argv[optind], "optimize") == 0)
@@ -1116,9 +1350,11 @@ int main(int argc, char **argv)
         resolve_query_ids();
         int bad = 0;
         for (int k = 0; k < CB_NCLASSES; k++)
-            bad |= run_queries(&cb_classes[k]);
+            if (class_wanted(cb_classes[k].id))
+                bad |= run_queries(&cb_classes[k]);
         for (int k = 0; k < EXTRA_NCLASSES; k++)
-            bad |= run_queries(&extra_classes[k]);
+            if (class_wanted(extra_classes[k].id))
+                bad |= run_queries(&extra_classes[k]);
         return bad;
     }
     return 2;

@@ -554,8 +554,10 @@ static int take_y_locked(eng *db, int64_t key, part **pin, size_t np, part **y, 
 /* After the swap: a failed digest or append changes nothing of the settle (deposed: the next leader's replicas hold
  * their retired copies, ecdigest.h; the engine failed: it acknowledges nothing more) */
 static void leader_digest(eng *db, int64_t key, uint64_t z, part **pin, size_t np, part **y, size_t ny,
-                          const ec_record *recs)
+                          const ec_record *recs, int64_t *compute_us_out)
 {
+    if (compute_us_out)
+        *compute_us_out = 0;
     part **set = malloc((np + ny) * sizeof *set);
     uint8_t *oids = malloc(np * 16 + 1);
     if (!set || !oids) {
@@ -566,7 +568,7 @@ static void leader_digest(eng *db, int64_t key, uint64_t z, part **pin, size_t n
             memcpy(set + np, y, ny * sizeof *set);
         for (size_t i = 0; i < np; i++)
             memcpy(oids + 16 * i, recs[i].oid, 16);
-        (void)ecdigest_leader(db, key, z, set, np + ny, oids, np);
+        (void)ecdigest_leader_timed(db, key, z, set, np + ny, oids, np, compute_us_out);
     }
     free(set);
     free(oids);
@@ -597,7 +599,13 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     int rc = 0;
     uint64_t epoch = 0, sv = stripe_of(cv);
     cut.stripe_version = sv;
+    int64_t t_settle0 = 0;
     int64_t t_gate = 0;
+    uint64_t settle_bytes = 0, settle_rows = 0;
+    for (size_t i = 0; i < np; i++) {
+        settle_bytes += pin[i]->map_len;
+        settle_rows += pin[i]->rows;
+    }
     bool degraded = false;
     bool put_counted = false;
     uint32_t posmask = 0;
@@ -692,7 +700,9 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
         rc = TSDB_ERR_UNAVAILABLE;
         goto out;
     }
-    /* 1: the objects, no engine lock held */
+    /* 1: the objects, no engine lock held (total_us covers encode + chunk puts + write fence + MK_COLD commit + swap,
+     * excluding any degraded-settle wait above and the post-swap logical digest below) */
+    t_settle0 = mono_us();
     atomic_fetch_add_explicit(&db->cold_put_active, 1, memory_order_seq_cst);
     put_counted = true;
     for (; nput < np; nput++) {
@@ -854,7 +864,19 @@ out:
             }
         }
         /* 7: E26's digest of I and Y and its marker (src/ecdigest.c): the gate released, Y still pinned */
-        leader_digest(db, key, cut.z, pin, np, y, ny, recs);
+        uint64_t dig_bytes = settle_bytes;
+        for (size_t i = 0; i < ny; i++)
+            dig_bytes += y[i]->map_len;
+        int64_t settle_us = t_settle0 ? (mono_us() - t_settle0) : 0;
+        int64_t dig_us = 0;
+        leader_digest(db, key, cut.z, pin, np, y, ny, recs, &dig_us);
+        const char *stats_env = getenv("TSDB_SETTLE_STATS");
+        if (stats_env && stats_env[0] && strcmp(stats_env, "0") != 0)
+            fprintf(stderr,
+                    "tsdb: %s: settle stats: key=%lld parts=%zu bytes=%" PRIu64 " rows=%" PRIu64
+                    " total_us=%" PRId64 " fence_us=%" PRId64 " digest_us=%" PRId64 " digest_bytes=%" PRIu64 "\n",
+                    db->dir, (long long)key, np, settle_bytes, settle_rows, settle_us, cut.hold_us, dig_us,
+                    dig_bytes);
     }
     if (ny) {
         pthread_mutex_lock(&db->lock);

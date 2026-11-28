@@ -317,11 +317,20 @@ int ecd_freeze(eng *db, part **set, size_t n, int64_t key, int64_t now_ms, ecd_c
 
 /* ------------------------------------------------------------ the leader */
 
+static int64_t dig_mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+}
+
 static int leader_digest_ex(eng *db, int64_t key, uint64_t z, part **set, size_t n, part **out_set, size_t nout,
-                            const uint8_t *oids, size_t noids, uint64_t *pos_out)
+                            const uint8_t *oids, size_t noids, uint64_t *pos_out, int64_t *compute_us_out)
 {
     if (pos_out)
         *pos_out = 0;
+    if (compute_us_out)
+        *compute_us_out = 0;
     if (noids > MK_FILES_MAX)
         return TSDB_ERR_INVALID;
     /* The clock, the cutoffs and the tombstone decision are taken under ret_lock, the rows are read without it, and the
@@ -346,10 +355,13 @@ static int leader_digest_ex(eng *db, int64_t key, uint64_t z, part **set, size_t
         rc = ecd_freeze(db, set, n, key, now, &cuts, &nc);
         if (!under)
             pthread_mutex_unlock(&db->ret_lock);
+        int64_t t0 = compute_us_out ? dig_mono_us() : 0;
         if (rc == 0)
             rc = ec_logical_digest_frozen(db, set, n, key, cuts, nc, tombs, &d_in);
         if (rc == 0 && out_set)
             rc = ec_logical_digest_frozen(db, out_set, nout, key, cuts, nc, tombs, &d_out);
+        if (compute_us_out)
+            *compute_us_out = dig_mono_us() - t0;
         free(cuts);
         if (!under)
             pthread_mutex_lock(&db->ret_lock);
@@ -397,13 +409,19 @@ static int leader_digest_ex(eng *db, int64_t key, uint64_t z, part **set, size_t
 
 int ecdigest_leader(eng *db, int64_t key, uint64_t z, part **set, size_t n, const uint8_t *oids, size_t noids)
 {
-    return leader_digest_ex(db, key, z, set, n, NULL, 0, oids, noids, NULL);
+    return leader_digest_ex(db, key, z, set, n, NULL, 0, oids, noids, NULL, NULL);
+}
+
+int ecdigest_leader_timed(eng *db, int64_t key, uint64_t z, part **set, size_t n, const uint8_t *oids, size_t noids,
+                          int64_t *compute_us_out)
+{
+    return leader_digest_ex(db, key, z, set, n, NULL, 0, oids, noids, NULL, compute_us_out);
 }
 
 int ecdigest_leader_reencode(eng *db, int64_t key, uint64_t z, part **in_set, size_t nin, part **out_set, size_t nout,
                              const uint8_t *oids, size_t noids, uint64_t *pos_out)
 {
-    return leader_digest_ex(db, key, z, in_set, nin, out_set, nout, oids, noids, pos_out);
+    return leader_digest_ex(db, key, z, in_set, nin, out_set, nout, oids, noids, pos_out, NULL);
 }
 
 /* ------------------------------------------------------------ a replica's jobs */

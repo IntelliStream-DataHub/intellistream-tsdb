@@ -229,7 +229,7 @@ def parse_tcp(sec, kind, text, rep):
             sec.add("connections", "queries while holding them", "failed", "queries", float(m.group(6)), rep)
 
 
-def parse_tcp_query(sec, text, rep):
+def parse_tcp_query(sec, text, rep, table="queries"):
     """RESULT lines come right after their human line, which has the class label."""
     label = None
     for line in text.splitlines():
@@ -241,9 +241,99 @@ def parse_tcp_query(sec, text, rep):
             d = kv(line)
             th, q, secs = int(d["threads"]), float(d["queries"]), float(d["secs"])
             row = "%s, %d connection%s" % (label or d["class"], th, "" if th == 1 else "s")
-            sec.add("queries", row, "queries", "q/s", q / secs, rep)
-            sec.add("queries", row, "latency", "us/q", secs * th / q * 1e6, rep)
-            sec.add("queries", row, "rate", "M rows/s", float(d["rows"]) / secs / 1e6, rep)
+            sec.add(table, row, "queries", "q/s", q / secs if secs > 0 else 0.0, rep)
+            sec.add(table, row, "latency", "us/q", secs * th / q * 1e6 if q > 0 else 0.0, rep)
+            if "p50_us" in d:
+                sec.add(table, row, "p50", "us", float(d["p50_us"]), rep)
+            if "p99_us" in d:
+                sec.add(table, row, "p99", "us", float(d["p99_us"]), rep)
+            sec.add(table, row, "rate", "M rows/s", float(d["rows"]) / secs / 1e6 if secs > 0 else 0.0, rep)
+
+
+def parse_cluster_settle(sec, text, rep):
+    for line in text.splitlines():
+        if not line.startswith("RESULT "):
+            continue
+        d = kv(line)
+        if d.get("kind") == "settle":
+            sec.add("settle", "settle throughput", "rate", "MiB/s", float(d["mib_s"]), rep)
+            sec.add("settle", "settle throughput", "time", "s", float(d["secs"]), rep)
+            sec.add("settle", "settle throughput", "size", "MiB", float(d["bytes"]) / 1048576.0, rep)
+            sec.add("settle", "settle throughput", "partitions", "partitions", float(d["partitions"]), rep)
+            sec.add("fence", "settle fence hold", "mean", "ms", float(d["fence_mean_ms"]), rep)
+            sec.add("fence", "settle fence hold", "p50", "ms", float(d["fence_p50_ms"]), rep)
+            sec.add("fence", "settle fence hold", "p99", "ms", float(d["fence_p99_ms"]), rep)
+            sec.add("fence", "settle fence hold", "max", "ms", float(d["fence_max_ms"]), rep)
+        elif d.get("kind") == "digest":
+            sec.add("digest", "logical digest", "cost", "s/GiB", float(d["s_per_gib"]), rep)
+            sec.add("digest", "logical digest", "rate", "MiB/s", float(d["mib_s"]), rep)
+            sec.add("digest", "logical digest", "time", "s", float(d["secs"]), rep)
+            sec.add("digest", "logical digest", "size", "MiB", float(d["bytes"]) / 1048576.0, rep)
+
+
+def parse_cluster_net(sec, text, rep):
+    for line in text.splitlines():
+        if line.startswith("RESULT ") and "kind=network" in line:
+            d = kv(line)
+            sec.add("network", "peer link network (total out)", "bytes/row", "bytes/row",
+                    float(d["bytes_per_row"]), rep)
+            sec.add("network", "peer link network (total out)", "total", "MiB",
+                    float(d["total_bytes"]) / 1048576.0, rep)
+            sec.add("network", "replication links (log/bulk)", "bytes/row", "bytes/row",
+                    float(d["repl_bytes_per_row"]), rep)
+            sec.add("network", "replication links (log/bulk)", "total", "MiB",
+                    float(d["repl_bytes"]) / 1048576.0, rep)
+            sec.add("network", "chunk links (EC)", "bytes/row", "bytes/row",
+                    float(d["chunk_bytes_per_row"]), rep)
+            sec.add("network", "chunk links (EC)", "total", "MiB",
+                    float(d["chunk_bytes"]) / 1048576.0, rep)
+            sec.add("network", "storage on disk (all nodes)", "bytes/row", "bytes/row",
+                    float(d["disk_bytes_per_row"]), rep)
+            sec.add("network", "storage on disk (all nodes)", "total", "MiB",
+                    float(d["disk_bytes"]) / 1048576.0, rep)
+
+
+def parse_cluster_insert(sec, text, rep):
+    for line in text.splitlines():
+        if line.startswith("RESULT ") and "kind=insert" in line:
+            d = kv(line)
+            b, c = d["batch"], d["conns"]
+            row = "cluster insert, %s row%s/call, %s conn%s" % (
+                b, "" if b == "1" else "s", c, "" if c == "1" else "s")
+            sec.add("durable", row, "calls", "calls/s", float(d["calls_s"]), rep)
+            sec.add("durable", row, "rows", "rows/s", float(d["rows_s"]), rep)
+            sec.add("durable", row, "p50", "ms", float(d["p50_ms"]), rep)
+            sec.add("durable", row, "p99", "ms", float(d["p99_ms"]), rep)
+
+
+def parse_cluster_rebuild(sec, phase, text, rep):
+    for line in text.splitlines():
+        if not line.startswith("RESULT "):
+            continue
+        d = kv(line)
+        if phase == "rebuild" and d.get("kind") == "rebuild":
+            sec.add("rebuild", "1-node rebuild", "time", "s", float(d["secs"]), rep)
+        elif d.get("kind") == "query":
+            q, secs = float(d["queries"]), float(d["secs"])
+            row = "foreground queries (%s)" % phase
+            sec.add("fg", row, "queries", "q/s", q / secs if secs > 0 else 0.0, rep)
+            if "p50_us" in d:
+                sec.add("fg", row, "p50", "us", float(d["p50_us"]), rep)
+            if "p99_us" in d:
+                sec.add("fg", row, "p99", "us", float(d["p99_us"]), rep)
+            if "max_us" in d:
+                sec.add("fg", row, "max", "us", float(d["max_us"]), rep)
+            if "errors" in d:
+                sec.add("fg", row, "errors", "errors", float(d["errors"]), rep)
+
+
+def parse_dropcache(sec, text, rep):
+    for line in text.splitlines():
+        m = re.match(r"^dropcache:\s+(\d+)\s+files,\s+(\d+)\s+bytes,\s+(\d+)\s+/\s+(\d+)\s+pages resident\s+\(" + NUM + r"%\)", line)
+        if m:
+            sec.add("dropcache", "page cache eviction (mincore)", "files", "files", float(m.group(1)), rep)
+            sec.add("dropcache", "page cache eviction (mincore)", "bytes", "MiB", float(m.group(2)) / 1048576.0, rep)
+            sec.add("dropcache", "page cache eviction (mincore)", "resident", "%", float(m.group(5)), rep)
 
 
 def parse_insert(sec, text, rep):
@@ -488,6 +578,57 @@ def collect(raw, status):
                 problems.append("tier run %d: no numbers found in raw/%s" % (rep, os.path.basename(path)))
         sec.reps = len(tier_files)
         secs.append(sec)
+
+    # Cluster benchmark sections (tools/bench-cluster.sh)
+    if runs("cluster-load") or runs("cluster-optimize"):
+        sec = Section("cluster_load", "Cluster load and optimize (tsdbc-bench)", "long")
+        for rep, path in runs("cluster-load").items():
+            parse_tcp(sec, "load", read(path) or "", rep)
+            sec.reps = max(sec.reps, rep)
+        for rep, path in runs("cluster-optimize").items():
+            parse_tcp(sec, "load", read(path) or "", rep)
+            sec.reps = max(sec.reps, rep)
+        if not sec.metrics:
+            problems.append("cluster_load: no numbers found in raw/cluster-load.*")
+        secs.append(sec)
+
+    simple("cluster_settle", "Cluster settle throughput, fence hold, and logical digest", "cluster-settle",
+           parse_cluster_settle)
+    simple("cluster_net", "Cluster network and storage bytes per row", "cluster-net", parse_cluster_net)
+    simple("cluster_dropcache", "Cold-cache eviction verification (tools/dropcache)", "cluster-dropcache",
+           parse_dropcache)
+
+    cquery_tables = (("warm", "Warm cache"), ("cold", "Cold cache"),
+                     ("down1", "1 position down"), ("downm", "m positions down"))
+    cq_sec = Section("cluster_queries", "Cluster query suite (tsdbc-bench)", "long")
+    cq_seen = False
+    for tag, _title in cquery_tables:
+        prefixes = sorted({re.sub(r"\.\d+\.txt$", "", n) for n in os.listdir(raw)
+                           if n.startswith("cluster-query-%s-c" % tag)})
+        for prefix in prefixes:
+            for rep, path in runs(prefix).items():
+                parse_tcp_query(cq_sec, read(path) or "", rep, table=tag)
+                cq_seen = True
+                cq_sec.reps = max(cq_sec.reps, rep)
+    if cq_seen:
+        if not cq_sec.metrics:
+            problems.append("cluster_queries: no numbers found in raw/cluster-query-*")
+        secs.append(cq_sec)
+
+    if runs("cluster-rebuild") or runs("cluster-rebuild-before"):
+        sec = Section("cluster_rebuild", "Cluster 1-node rebuild against foreground query load", "long")
+        for phase, prefix in (("rebuild", "cluster-rebuild"),
+                              ("before", "cluster-rebuild-before"),
+                              ("during", "cluster-rebuild-during"),
+                              ("after", "cluster-rebuild-after")):
+            for rep, path in runs(prefix).items():
+                parse_cluster_rebuild(sec, phase, read(path) or "", rep)
+                sec.reps = max(sec.reps, rep)
+        if not sec.metrics:
+            problems.append("cluster_rebuild: no numbers found in raw/cluster-rebuild*")
+        secs.append(sec)
+
+    simple("cluster_insert", "Durable cluster inserts (tsdbc-bench insert)", "cluster-insert", parse_cluster_insert)
     return secs, problems
 
 
@@ -532,9 +673,17 @@ def render_long(sec, rows, lines):
             tables.append(key[0])
     heading = {"load": "Load", "queries": "Queries", "random": "Random windows (2 s each)",
                "connections": "Connections", "durable": "Durable inserts",
-               "settle": "Settle per GiB", "reencode": "Re-encode per GiB",
-               "sweep": "Open orphan sweep", "digest": "Digest cost and throttling",
-               "cold": "Cold decode queries"}
+               "settle": "Settle per GiB" if sec.id == "tier" else "Settle",
+               "reencode": "Re-encode per GiB",
+               "sweep": "Open orphan sweep",
+               "digest": "Digest cost and throttling" if sec.id == "tier" else "Logical digest",
+               "cold": "Cold decode queries" if sec.id == "tier" else "Cold cache",
+               "warm": "Warm cache",
+               "down1": "1 position down", "downm": "m positions down",
+               "fence": "Settle fence length (leader log)",
+               "network": "Network and disk per row",
+               "rebuild": "Rebuild duration", "fg": "Foreground query load (before / during / after)",
+               "dropcache": "Page cache eviction"}
     for t in tables:
         sub = [(k, u, s) for k, u, s in rows if k[0] == t]
         if len(tables) > 1:
@@ -624,6 +773,21 @@ HEADLINES = [
     ("Tier re-encode 4+2", "tier", "reencode", r"^reencode 4\+2", "throughput", "MiB/s"),
     ("Tier cold decode, 1 series, prefetch off", "tier", "cold", r"^1 series, .*prefetch off", "wall", "ms"),
     ("Tier cold decode, 1 series, prefetch on", "tier", "cold", r"^1 series, .*prefetch on", "wall", "ms"),
+    ("Cluster load, 4 connections", "cluster_load", "load", r"^load through", "rate", "M rows/s"),
+    ("Cluster settle throughput", "cluster_settle", "settle", r"^settle throughput$", "rate", "MiB/s"),
+    ("Cluster settle fence p99", "cluster_settle", "fence", r"^settle fence hold$", "p99", "ms"),
+    ("Cluster digest cost", "cluster_settle", "digest", r"^logical digest$", "cost", "s/GiB"),
+    ("Cluster network bytes/row (peer links)", "cluster_net", "network", r"^peer link network", "bytes/row", "bytes/row"),
+    ("Cluster disk bytes/row (all nodes)", "cluster_net", "network", r"^storage on disk", "bytes/row", "bytes/row"),
+    ("Cluster warm raw query, 1 connection", "cluster_queries", "warm", r"^raw,.*1 connection$", "queries", "q/s"),
+    ("Cluster cold raw query, 1 connection", "cluster_queries", "cold", r"^raw,.*1 connection$", "queries", "q/s"),
+    ("Cluster 1-down raw query, 1 connection", "cluster_queries", "down1", r"^raw,.*1 connection$", "queries", "q/s"),
+    ("Cluster m-down raw query, 1 connection", "cluster_queries", "downm", r"^raw,.*1 connection$", "queries", "q/s"),
+    ("Cluster 1-node rebuild time", "cluster_rebuild", "rebuild", r"^1-node rebuild$", "time", "s"),
+    ("Cluster rebuild foreground p99 (before)", "cluster_rebuild", "fg", r"\(before\)$", "p99", "us"),
+    ("Cluster rebuild foreground p99 (during)", "cluster_rebuild", "fg", r"\(during\)$", "p99", "us"),
+    ("Cluster rebuild foreground p99 (after)", "cluster_rebuild", "fg", r"\(after\)$", "p99", "us"),
+    ("Cluster durable insert, 1000 rows/call", "cluster_insert", "durable", r"1000 rows/call", "rows", "rows/s"),
 ]
 
 
@@ -689,7 +853,8 @@ def main():
     md.append("")
     md.append("| | |")
     md.append("|---|---|")
-    for k, label in (("host", "host"), ("cpu", "CPU"), ("cpu_topology", "cores and threads"),
+    for k, label in (("cluster_mode", "cluster mode"), ("cluster_nodes", "cluster layout"),
+                     ("cluster_topology", "cluster topology"), ("host", "host"), ("cpu", "CPU"), ("cpu_topology", "cores and threads"),
                      ("cpu_flags", "CPU features"), ("virt", "virtualization"), ("memory", "memory"),
                      ("kernel", "kernel"), ("os", "OS"), ("governor", "CPU governor"),
                      ("scratch", "scratch directory"), ("scratch_fs", "scratch file system"),
