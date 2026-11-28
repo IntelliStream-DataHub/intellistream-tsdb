@@ -82,6 +82,28 @@ disk format and the wire protocol.
     `hold`, `stripeset`, `full`) across `--geometry 4+2|8+2|8+4|16+4|r3` and 4 selftest mutants (`noguard`, `wholeearly`,
     `fillnocheck`, `partialdelnow`).
 
+- **Re-encode and online redundancy conversion (`R10`, production in 0.11.0; `docs/cluster-preview.md`, `docs/tier.md`,
+  `docs/tasks/r10-reencode.md`).** Adds background E6 re-encoding on single-server tiers and cluster EC volumes, and
+  online redundancy conversion on replicated cluster volumes (`replicas=N <-> ec=K+M` and `ec <-> ec`) without moving
+  series to a new volume.
+  - **Metadata snapshot version bump (`server/meta.[ch]`).** Conversion state (`conv`, `conv_cancel_gen`,
+    `mixed_redundancy`, `stripe_pos[].retired_ver`, `VOLUME_LIVE_OBJS`, and `STRIPE_SET` live-object refusal) bumped
+    `META_SNAP_VERSION` from 8 to 9 (`"TME6"`, subsequently raised to `META_SNAP_VERSION = 12` / `"TME9"` by R13/R14/R9;
+    pre-1.0 clusters are initialised again, never upgraded).
+  - **New operator verbs (`tools/cluster-cli.c`, `tools/tsdb-cli.c`).** Adds
+    `tsdb cluster volume redundancy PEER VOLUME (ec=K+M | replicas=N | --cancel) --secret-file F` (progress in
+    `tsdb cluster status volume V [--json]`) driven on the Raft leader by `server/credund.c` through
+    `grow -> record -> reencode/unsettle -> drop -> shrink` (`CLUSTER_OP_VOLUME_REDUNDANCY = 26`, `MK_UNSETTLE = 14`,
+    `rebuild_mb_s`-paced `conv_main` worker, retired-position orphan cleanup before `STRIPE_DROP`, minimum-margin
+    reporting in `server/margins.c`, and E38 `cluster_versions_mixed()` pause hook). Single-server tiers configure
+    redundancy via `tsdb DIR tier set --redundancy K+M [--volume N]` (applied live to new settles and E6/`--shrink`
+    re-encodes via `tierctl`).
+  - **E6 background re-encode & fault injection (`src/ecpolicy.c`, `src/settle.c`, `src/merge.c`, `src/ecswap.c`,
+    `src/eccold.c`, `src/ecapply.c`, `tests/jepsen/cluster_r10.h`).** Combines keys with `> 4` combinable `.ec`
+    objects or `> 10%` tombstoned rows under frozen retention cutoffs and logical digest verification, treating
+    re-encodes as merges for the latest table (`lt_merge_marks`) and insert backpressure (`db_wait_merges`), with intent
+    v4/v5 crash recovery and Jepsen coverage (`jepsen --tier 6 --reencode`, `jepsen-cluster-r10 --convert`).
+
 - **Cluster disk flags, start checks, binding, and `HBS_DISKS` (`r13-start`).** Replaces `--chunk-dir`
   (`cluster.chunk.dir`) and `tsdb chunk-store init` with `--disk PATH[:CLASS]` (`storage.disks`, initialised with
   `tsdb disk init`), `--role compute|storage|both` (`cluster.role`), and `--allow-shared-device`

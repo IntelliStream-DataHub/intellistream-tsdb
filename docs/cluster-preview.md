@@ -580,6 +580,7 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster node destroyed PEER NODE --secret-file F` | Declare an `out` node permanently `destroyed` (final; refused while still heard; frees its peer address and identity; more than `M` destroyed stripe holders mark an EC volume `LOST`). |
 | `tsdb cluster volume add PEER NAME [--replicas N] --secret-file F` | Add a cluster volume called `NAME` on `N` servers (default: the cluster's `--replication`), in different racks where it can. Answers with its number. Refused when fewer than `N` members are up and may hold volumes. A name is never used twice. |
 | `tsdb cluster volume add PEER NAME --redundancy ec=K+M --secret-file F` | An erasure-coded volume (K 1 to 16, M 1 to 4): its settled parts are coded K+M across a stripe group of K+M members, each with a chunk store up (`tsdbd --disk PATH[:CLASS]`), which the leader picks once; positions are never renumbered. Its log is kept on M+1 servers and `min_isr` is M. Refused, naming how many members qualify, when fewer than K+M do. `--redundancy replicas=N` is `--replicas N`. `tsdb cluster status` shows `redundancy ec=K+M stripe A,B,... stripe_version V gc_suspended 0\|1`. |
+| `tsdb cluster volume redundancy PEER VOLUME (ec=K+M \| replicas=N \| --cancel) --secret-file F` | Convert an existing replicated volume online between `replicas=N` and `ec=K+M` (K 1..16, M 1..4), or between EC geometries, in five committed phases (`grow -> record -> reencode -> drop -> shrink`). Returns once committed; track progress with `tsdb cluster status volume VOLUME [--json] PEER --secret-file F`. `--cancel` stops a conversion before the `drop` phase (see [Changing volume redundancy online](#changing-volume-redundancy-online)). |
 | `tsdb cluster volume gc resume PEER VOLUME --secret-file F` | Turn the orphan collection of an erasure-coded volume (a name, else a number) back on. A `force-leader` (and a restore, once built) stops it (`gc_suspended 1`), because a chunk that a lost log tail still needs would look like an orphan; resume it once the volume is checked. |
 | `tsdb cluster status PEER --secret-file F` | What that server knows (see above). Views: `status volumes`, `status volume V`, `status disks`; `--json` on each. |
 | `tsdb cluster volume move PEER VOLUME --log --from A --to B --secret-file F` | Move volume `VOLUME`'s copy on node `A` to node `B` (up, allowed to hold volumes, no copy of it yet). It answers at once and runs in the background: `B` gets a new copy, fills it and joins the in-sync set; then, if `A` leads the volume, leadership moves first; then `A` leaves the in-sync set and its copy is removed, `B` taking its place in the list. The number of in-sync copies never goes below what it was before `B` joined, so a lagging copy makes the move wait. A new group leader carries a move on, but once `B` has joined it waits until every other copy is in sync (it no longer knows the smaller size from before the join), so with another copy down such a move waits for it to come back. One move per volume at a time. With `--cancel` instead, `B`'s copy is removed and the old set stays (a move already past its last step ends anyway). `status` shows it. |
@@ -636,6 +637,91 @@ and `--read-barrier` are stored only, and `--mode shared` and `--failover` (the 
 
 The design lists more commands (`restore` and others) that are not built yet; `tsdb cluster` prints what exists.
 
+### Changing volume redundancy online
+
+Any replicated volume can change redundancy while serving reads and writes, without moving series to a new volume:
+
+```sh
+# Convert a 3-replica volume to 4+2 erasure coding
+tsdb cluster volume redundancy PEER VOLUME ec=4+2 --secret-file F
+
+# Widen parity or data width (e.g. 4+2 -> 4+3 or 4+2 -> 8+4)
+tsdb cluster volume redundancy PEER VOLUME ec=4+3 --secret-file F
+
+# Convert an erasure-coded volume back to 3 replicas (unsettles all .ec parts)
+tsdb cluster volume redundancy PEER VOLUME replicas=3 --secret-file F
+
+# Cancel a conversion before the drop phase
+tsdb cluster volume redundancy PEER VOLUME --cancel --secret-file F
+
+# Track conversion phase, remaining old objects, and live margins
+tsdb cluster status volume VOLUME [--json] PEER --secret-file F
+```
+
+`VOLUME` may be a volume name or number. One conversion runs per volume at a time; a conversion is refused if a replica
+move, learner catch-up, stripe position fill, or leftover cleanup from a cancelled conversion is already in flight on
+the volume, if fewer live compute (`M+1` for `ec=K+M`, `N` for `replicas=N`) or storage (`K+M`) members qualify, or
+while a rolling upgrade has mixed versions in the cluster.
+
+**Phases and failover.** The command commits a durable conversion record and returns immediately. The Raft leader drives
+five ordered phases, committing each before the next, so Raft or volume leader failovers resume automatically from
+metadata:
+
+1. **`grow`**: if the target needs more log replicas (e.g. `ec=4+2` to `ec=8+4`, which grows from 3 to 5 log replicas),
+   adds learners one at a time until `nrep >= target_replicas` and `nisr >= target_replicas`.
+2. **`record`**: commits the target redundancy, updates `min_isr` (`min(M, nrep)` for EC; cluster `min_isr` or
+   preserved operator `min_isr` for `replicas`), and appends any new stripe positions without renumbering existing ones.
+   New settles immediately use the new geometry.
+3. **`reencode`**:
+   - `replicas -> ec`: no old `.ec` objects exist; the driver triggers a clean planned leadership transfer (when
+     `nisr >= 2`) so the volume leader attaches its EC tier and advances once `HBS_LIVE_OBJS` confirms attachment.
+   - `ec -> ec`: the volume leader re-encodes every settled partition key with objects below the new `stripe_version`
+     into the new geometry one key at a time, verifying each output's logical digest before retiring old objects to
+     `MK_GC`.
+   - `ec -> replicas`: the volume leader commits `MK_UNSETTLE` per settled key; every log replica decodes the objects
+     into local `.part` files and swaps them in via intent v5 before advancing `applied`, and old chunks are released
+     by `MK_GC` only after every log replica has applied `MK_UNSETTLE`.
+4. **`drop`**: retires trailing stripe positions once the volume leader's current-epoch `VOLUME_LIVE_OBJS` report proves
+   zero live objects remain below each position's `retired_ver` and all retired-position orphans are cleaned up.
+   `STRIPE_SET` refuses to drop any position while live objects or unknown counts remain.
+5. **`shrink`**: removes excess log replicas last (transferring leadership off first if needed) down to
+   `target_replicas`, then clears the conversion record.
+
+**Time per TB at `rebuild_mb_s`.** Both `ec -> ec` re-encodes and `ec -> replicas` unsettles run on the volume leader
+under the cluster's `rebuild_mb_s` pace cap (default `200` MB/s per server, adjustable live with
+`tsdb cluster settings set PEER rebuild_mb_s=N --secret-file F`):
+
+| `rebuild_mb_s` | Time per TB (1,000 GB) per volume leader | Time per TiB (1,024 GiB) |
+|---:|---:|---:|
+| `50` MB/s | ~5.6 hours | ~5.8 hours |
+| `100` MB/s | ~2.8 hours | ~2.9 hours |
+| `200` MB/s (default) | ~1.4 hours (~5,000 s) | ~1.5 hours (~5,369 s) |
+| `400` MB/s | ~0.7 hours | ~0.7 hours |
+
+In general, conversion takes `~1.4 hours * (200 / rebuild_mb_s)` per TB of settled data on one volume leader (or ~5 days
+for 1 PB spread across 11 servers at 200 MB/s per server). `replicas -> ec` finishes metadata conversion in seconds
+because existing partitions settle afterward under normal settle policy. `ec -> replicas` decodes each settled object
+onto every log replica, so each log replica needs enough free fast-disk capacity to hold the unsettled `.part` files
+(at `N` full copies instead of `1 + M/K`).
+
+**Fault tolerance during conversion.**
+
+- **`grow`**: unchanged at the original geometry's tolerance while learners catch up and join the ISR.
+- **`record` through `drop`**: settled fault tolerance is the **minimum of the old and new geometries** — `status` and
+  metrics report `min(orig_margin, target_margin)` across all live geometries. Raising parity (e.g. `4+2 -> 4+3` or
+  `4+2 -> 8+4`) keeps settled margin at `<= 2` until `reencode` finishes and `drop` completes; lowering parity (e.g.
+  `4+3 -> 4+2`) drops settled margin to `<= 2` as soon as new `4+2` objects are written. Old stripe holders that go
+  `OUT`/`DESTROYED` during `reencode` are still rebuilt onto replacements so tolerance never dips below the lower
+  geometry.
+- **`shrink`**: log replicas are dropped **only after `drop`**, so young-tier tolerance stays at `max(orig_m, target_m)`
+  (or `max(orig_replicas, target_replicas) - 1`) until every settled object has moved and every retired stripe position
+  is gone.
+- **`--cancel`**: accepted in `grow`, `record`, or `reencode`, and refused once `drop` starts. Cancelling during
+  `reencode` reverts the volume's geometry and `min_isr` to the original values; if any objects were already settled in
+  the aborted target geometry, the volume stays in a `mixed_redundancy` cleanup state (keeping settled margin capped at
+  the minimum of both geometries and refusing new conversions) until the background worker re-encodes or unsettles those
+  leftover objects and `VOLUME_LIVE_OBJS` proves zero remain.
+
 ## What's next
 
 The preview is the first step of a longer plan. The designs are written; the work is in this order:
@@ -645,12 +731,13 @@ The preview is the first step of a longer plan. The designs are written; the wor
   preview. The group's state machine (S1) and what a single server does while its storage
   is away (UNAVAILABLE, in N1) are already in 0.10.0, and users and grants kept in the group, with logins on every
   server ([Logins](#logins)), are in this preview; the proposer's rules for ownership and the time rules come with N7.
-- **Replicated mode (R1 to R4), erasure coding (R5 to R8), and failure handling/rebuilds/balancer (R9) are built**:
+- **Replicated mode (R1 to R4), erasure coding (R5 to R8), failure handling/rebuilds/balancer (R9), and online
+  re-encode / redundancy conversion (R10) are built**:
   each volume on servers with their own disks, with replication, the in-sync set, promotion, transfer, move, snapshot
   rebuild, erasure-coded settled parts, DOWN/OUT timers, holds, mass-OUT guard, degraded settles, FULL backpressure,
-  checked stripe rebuilds, return-during-rebuild, operator node verbs, and greedy balancing (alongside R10 conversion,
-  R12 scrub/repair, R13 device classes, R14 live settings/status/salvage, and R15 local tiers). Raft stays off the
-  insert path.
+  checked stripe rebuilds, return-during-rebuild, operator node verbs, greedy balancing, background re-encode, and
+  online `volume redundancy` conversion (alongside R12 scrub/repair, R13 device classes, R14 live
+  settings/status/salvage, and R15 local tiers). Raft stays off the insert path.
 - **Shared mode** (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume,
   fenced by the group (the design of [ha.md](ha.md)); this is what production on NFSv4 needs first.
 - Then direct-mode clients (S3) and production upgrade/backup/alert/soak gates (P1 to P6).

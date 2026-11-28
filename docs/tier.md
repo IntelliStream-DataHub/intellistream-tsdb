@@ -79,8 +79,20 @@ When `--redundancy` is not set explicitly, the default geometry follows the numb
 | 6 or more stores | `4+2` | Survives two lost stores |
 
 Each settled object records its own `(k', m, cell, length)` in its `.ec` index and chunk headers. Changing redundancy
-with `tsdb DIR tier set --redundancy K+M [--volume N]` applies immediately to new objects and triggers background
-re-encoding of older objects whose geometry differs.
+with `tsdb DIR tier set --redundancy K+M [--volume N]` appends a `SETTINGS` record to `TIERS` (validated against the
+configured non-shrinking stores; `1+0` requires every configured store to be `--single-copy`). On an active running
+writer, `tierctl` reloads `TIERS` every second so **new** settles and subsequent E6 or `--shrink` re-encodes use the
+new geometry immediately (the CLI prints that it takes effect on next open for stopped or inactive databases). Existing
+settled objects stay readable under their recorded per-object geometry and are re-encoded into the new geometry when
+selected by E6 (`> 4` combinable objects or `> 10%` tombstones) or `tier lost S --shrink` — there is no standalone
+single-server background geometry sweep yet.
+
+**Fault tolerance and pace when changing single-server redundancy.** While mixed geometries exist on a single-server
+tier, each older object retains the fault tolerance of its own recorded `m` (e.g. raising `2+1` to `4+2` after adding
+drives protects newly settled partitions against 2 lost stores while older `2+1` objects survive 1 lost store until
+re-encoded); `tier status` reports the minimum margin across global and per-volume configured redundancies. Re-encodes
+driven by `tier lost S --shrink` and replacement rebuilds are paced by `--rebuild-mb-s` (default `200` MB/s, i.e.
+**~1.4 hours per TB** / ~1.5 hours per TiB of settled data; scales as `~1.4 h * (200 / rebuild_mb_s)`).
 
 ### Timing, capacity, and pacing defaults
 
@@ -112,7 +124,8 @@ Fixed engine defaults and process-level settings:
 - **Store stall timeout**: `10s`. Each active store is probed every second with a 4 KiB `O_DIRECT` write, `fdatasync`,
   and read-back (`<store>/PROBE.tier`); a probe stuck for 10 seconds marks the store `stalled` (`DOWN`).
 - **Automatic re-encode**: combines a partition key's settled objects when it accumulates more than 4 combinable `.ec`
-  objects, more than 10% tombstoned rows, or objects in an older geometry.
+  objects or more than 10% tombstoned rows (bounded by `max_part_bytes` and `MAX_MERGE_PARTS`; uses the volume's current
+  redundancy setting for the combined output).
 
 ## Single-copy stores on ZFS or NFS
 
@@ -300,8 +313,8 @@ read-only tier automatically:
   `tsdb_tier_add`, `tsdb_tier_add_dir`, `tsdb_tier_lost`, `tsdb_tier_salvage`, `tsdb_tier_set_cache_bytes`;
   `tsdb_tier_set` and `tsdb_tier_status` are CLI-only in 0.11.0).
 - **No `tier remove`**: there is no command to unsettle a whole database and remove the tier in 0.11.0. To change
-  redundancy, use `tier set --redundancy` (background re-encode migrates existing objects); to remove a dead store
-  without replacing it, use `tier lost STORE --shrink`.
+  redundancy for new settles (and subsequent E6/`--shrink` re-encodes), use `tier set --redundancy`; to remove a dead
+  store without replacing it, use `tier lost STORE --shrink`.
 - **Shared-mode and cluster volumes**: cluster volumes (both replicated and `--mode shared`) refuse a local `TIERS`
   tier. Replicated cluster volumes use cluster erasure coding (`--redundancy ec=k+m` with `--disk`); shared-mode
   volumes have no EC tier in 0.11.0.

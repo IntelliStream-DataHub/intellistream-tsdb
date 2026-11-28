@@ -327,7 +327,21 @@ cgroup, so `nice` does not keep your work out of its way.
   ops STRIPE_SET, GC_SUSPEND, GC_RESUME (`test_cluster ecadd`; an EC add is admin op VOLUME_ADD_EC, so an older server
   refuses it); `cluster_copy_caught_up_at(copy)` (D9: the copy has applied the leader's commit index heard last and that
   heartbeat's lease still holds, read on the caller's clock; `test_cluster copycaught`, mutants `copynodeadline
-  copynofloor` in `make copy-mutants`); R13 (`r13-meta`): per-member registered disks (`META_DISKS_MAX = 64`:
+  copynofloor` in `make copy-mutants`); R10 (`r10-meta`, `r10-driver`; `server/meta.[ch]`, `server/credund.c`):
+  persisted per-volume conversion record `v->conv` (`phase` `META_CONV_NONE..META_CONV_SHRINK`, `target_redundancy`/
+  `target_k`/`target_m`/`target_replicas`, `new_stripe_version`, `orig_redundancy`/`orig_k`/`orig_m`/`orig_replicas`/
+  `orig_min_isr`), `conv_cancel_gen`, cancelled-`REENCODE` leftover tracker (`mixed_redundancy`/`mixed_k`/`mixed_m`/
+  `mixed_sv_lo`/`mixed_sv_hi`), `stripe_pos[].retired_ver`, and volume-leader live-object counts (`live_epoch`,
+  `live_sv_at`, `live_overflow`, `live_sv[META_LIVE_SV_MAX]`, reported via `HBS_LIVE_OBJS` and committed by
+  `META_OP_VOLUME_LIVE_OBJS`); ops `META_OP_VOLUME_REDUNDANCY`, `META_OP_VOLUME_CONV_STEP` (strictly
+  `GROW -> RECORD -> REENCODE -> DROP -> SHRINK -> NONE`), `META_OP_VOLUME_CONV_CANCEL` (before `DROP` only);
+  `META_OP_STRIPE_SET` with `node == 0` (`meta_op_stripe_drop`) is allowed only in `META_CONV_NONE` or `META_CONV_DROP`,
+  never drops active or `mixed_redundancy` positions, and refuses unless `stripe_drop_safe()` proves current-epoch,
+  non-overflow `live_sv[]` has 0 live objects at every `stripe_version < retired_ver` (D28; `tests/meta_mutants.sh`
+  mutants `stripelive`, `convskip`, `retireclear`, `livestale`, `reencskip`); Raft-leader conversion driver
+  `server/credund.c` (`credund_admin` for `CLUSTER_OP_VOLUME_REDUNDANCY = 26`, `credund_duty`, crash points
+  `conv-grow`/`conv-record`/`conv-drop`, E38 `cluster_versions_mixed()` pause hook, `test_cluster redund`,
+  `make redund-mutants`: `dropearly`, `shrinkfirst`); R13 (`r13-meta`): per-member registered disks (`META_DISKS_MAX = 64`:
   `store_id`, `nvme`/`ssd`/`hdd`, `log`/`chunk`, size, sync_us, `UP`/`DOWN`/`OUT`/`DESTROYED`), declared `role`
   (`both`/`compute`/`storage`) and computed `capability`, ops `STORE_ADD`/`STORE_CLASS`/`STORE_STATE`/`MEMBER_ROLE`,
   R12/R13/R9 settings (`META_SETTINGS_WORDS = 39`: `scrub_days`, `scrub_mb_s`, `scrub_out_count`, `log_on_hdd`,
@@ -1117,21 +1131,33 @@ cgroup, so `nice` does not keep your work out of its way.
   `p<K>_<A>_<B>_<L>.part` into `.ec` of the same name and block range (no gate, cut, marker or `ppos`); on a cluster
   EC volume (R8-1) the leader settles whole keys at a cut `Z` with `MK_COLD`, `PPOS`, `MK_DIGEST`, `MK_GC`, and durable
   `DIVERGED`. Every path that takes a part out of the list must respect that:
-  - **Never a merge input.** An `.ec` part and a `settling` one are barriers in merge selection, rewrites, `tsdb_optimize`
-    and the TTL rewrite (`part_merge_barrier`), never a source of `pw_copy_granule`; an `.ec` part is not counted in
-    `partition_parts` (a settling part still counts: it is a `.part` until the swap), and in `db_wait_merges` (backpressure) it is a wall, not a pair, so an insert never waits for a
-    settle in flight when no pair is left. A drop retires them (a settling part without waiting for the settle). On a
-    cluster EC leader (`db->ec_cluster`), `ttl_select_locked` (`src/merge.c`) also skips a key with a settling part
-    (mutant `ttlsettling`).
+  - **Never a merge input (except R10 re-encode).** An `.ec` part and a `settling` one are barriers in merge selection,
+    rewrites, `tsdb_optimize` and the TTL rewrite (`part_merge_barrier`), never a source of `pw_copy_granule`; an `.ec`
+    part is not counted in `partition_parts` (a settling part still counts: it is a `.part` until the swap), and in
+    `db_wait_merges` (backpressure) it is a wall, not a pair, so an insert never waits for a 1-to-1 settle in flight when
+    no pair is left. **R10 re-encode behaves as a merge for the latest table, drops, and backpressure:** `eng_reencode_ex`
+    (`src/settle.c`) decodes `.ec` and young `.part` sources through `merge_parts_reencode` (`src/merge.c`, never
+    `pw_copy_granule`; DOWN/CORRUPT `.ec` reads abort without marking damaged or bumping `merge_fail_seq`), sets
+    `p->reencoding`, counts `p->reencoding` in `db_wait_merges` (`src/db.c`: keeps inserts waiting while an active
+    re-encode lowers part count, waking `db->merged_cv` on swap or abort) and in `drop_settle_locked` (drops wait for
+    in-flight `p->reencoding` parts before `drop_intent_prepare` runs unlocked), and calls `lt_merge_marks` in
+    `ec_swap_reencode`'s `latest_rw` > `db->lock` write section (`src/ecswap.c`). A drop retires 1-to-1 settling parts
+    without waiting for the settle. On a cluster EC leader (`db->ec_cluster`), `ttl_select_locked` (`src/merge.c`) also
+    skips a key with a settling part (mutant `ttlsettling`).
   - **The swap checks its inputs under `db->lock`, in the hold of its renames** (`ec_swap_commit`): every source still
     listed, not dropped, not merging; else `TSDB_ERR_STOPPED`, nothing renamed, the temporaries unlinked and the objects
     handed to r7-gc. On a failed engine the answer is `TSDB_ERR_IO` and nothing is renamed or removed: the next open
     decides (only 0 means the `.ec` parts are listed; after IO a caller must not treat them as never listed). A drop takes no `publish_lock` (`drop_retire` takes `latest_rw` and
     `db->lock`), so a check made before those locks would list an `.ec` for a part the drop retired and bring its rows
     back (mutant `swapnodropcheck`). The swap is **intent v4** (`tsdb-intent 4 n`, n `L tmp final` lines, n `R part
-    settled_part` lines, a hash; R10 single-server re-encode `ec_swap_reencode` uses `tsdb-intent 4 1 <nin>` with `R
-    <p.ec> <retired_p.ec>` for `.ec` sources and `lt_merge_marks` in its write section), written and synced with its
-    directory before any rename. Recovery asks one question:
+    settled_part` lines, a hash); **R10 intent lines** are: (1) single-server and cluster leader re-encode
+    (`ec_swap_reencode`, `src/ecswap.c`) writes **intent v4** `tsdb-intent 4 1 <nin>` with 1 `L <tmp> <out>` line (`.ec`
+    or empty `.part`), `R <p.ec> retired_<p.ec>` for `.ec` inputs, `R <p.part> settled_<p.part>` for young `.part`
+    inputs, `lt_merge_marks` in its write section, and `L` directory-synced before retiring `.ec` sources; (2) cluster
+    replica `MK_COLD` re-encode apply (`src/ecapply.c`) writes **intent v5** (`N`, `Y`, `R <own.part> settled_<own.part>`,
+    and `R <own.ec> retired_<own.ec>`); (3) reverse unsettle (`ec_swap_unsettle_at`, `src/ecswap.c`, used by `MK_UNSETTLE`
+    and `volume diverged --clear`) writes **intent v5** (`L <settled|tmp> <P.part>`, `U <P.ec> retired_<P.ec>`). Every
+    intent is written and synced with its directory before any rename. Recovery asks one question:
     did the swap rename anything? Any `.ec` (under its name or `retired_`) or `settled_` name on disk means the check
     passed and the swap stands (a drop after it retires only the `.ec` parts), and a missing source then proves nothing;
     nothing renamed with every tmp and source present rolls forward, with one missing rolls back; damage (a sealed
@@ -1519,7 +1545,14 @@ cgroup, so `nice` does not keep your work out of its way.
   before `lw_enter`, never under the fence; no engine lock is held across chunk puts); a leader's unsettle
   (`src/ecunsettle.c` `eng_unsettle_key`) decodes unlocked and then takes `jr_serial` > `db->lock` > `buf_lock` (briefly
   to arm `unsettle_hold_pos`), then `jr_markers_append`/`jr_markers_wait` and `ec_swap_unsettle_at` (`publish_lock` >
-  `ppos_mu` / `latest_rw` > `manifest_lock` > `db->lock`); `PPOS` (`src/ppos.h`) takes
+  `ppos_mu` / `latest_rw` > `manifest_lock` > `db->lock`); R10 conversion driver (`server/credund.c`): `credund_admin`
+  and `credund_duty` run strictly on the cluster thread (single-threaded Raft/metadata loop, holding no mutexes of their
+  own; `cluster_versions_mixed()` takes leaf `g_vm_mu` briefly under `TSDB_TEST_HOOKS` and releases it before `access()`);
+  on the volume leader, `conv_main` / `chunkpeer_conv_cmd` (`server/chunkpeer_cluster.c`) takes `CONV.mu` as a leaf
+  mutex only to enqueue/dequeue `struct conv_req` or read `CONV.stop` (never held across `tsdb_cvol_ref`, engine calls,
+  chunk I/O, or `publish_live_objs`), and each key's `eng_reencode` / `eng_unsettle_key` follows the leader settle /
+  unsettle lock order above (`ret_lock` > `db->lock` for freeze; merge/encode/put/decode unlocked; `ecgc_live_by_sv` in
+  `publish_live_objs` takes `db->lock` > `ecgc_tier.mu` leaf and `g->mu` leaf); `PPOS` (`src/ppos.h`) takes
   `publish_lock` > `ppos_mu` (its append, `fdatasync` and creation `eng_sync_dir`) > `ppos` map mutex (a leaf, never
   held across I/O; `ppos_of` takes only it), and `ppos_mu` is never taken under `db->lock`, `latest_rw` or `buf_lock`
   (records go out before those are taken); `DIVERGED` (`src/ecdiverge.h`) takes its mutex > `dir_sync_lock` > `fail_lock`
