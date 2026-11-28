@@ -126,6 +126,7 @@
  */
 #define _GNU_SOURCE
 #include "tsdb_client.h"
+#include "chunk.h"
 #include "cluster.h"
 #include "crashpt.h"
 #include "cvol_check.h"
@@ -201,10 +202,14 @@ enum {
     N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16, N_FWDSTALL = 32,
     N_KILL2 = 64, N_SLOW = 128, N_LONGDOWN = 256, N_REBUILD = 512, N_CHURN = 1024,
     N_PARTIAL = 2048, N_DISKLOSS = 4096, N_ROT = 8192, /* --ec runs (cluster_ec.h) */
-    N_RDMA_QPERR = 16384 /* mid-stream RDMA QP error via TSDB_PLRDMA_TEST=qperr_file=... */
+    N_RDMA_QPERR = 16384, /* mid-stream RDMA QP error via TSDB_PLRDMA_TEST=qperr_file=... */
+    N_ROTPARITY = 32768, N_ROTCOLD = 65536, N_ROTYOUNG = 131072, N_ROTTHENM = 262144 /* R12 scrub/repair/heal */
 };
-#define NNEM 15
-#define N_EC (N_PARTIAL | N_DISKLOSS | N_ROT)
+#define NNEM 19
+#define N_R12_EC (N_ROTPARITY | N_ROTCOLD | N_ROTTHENM)
+#define N_R12 (N_R12_EC | N_ROTYOUNG)
+#define N_EC_ROT (N_ROT | N_R12_EC)
+#define N_EC (N_PARTIAL | N_DISKLOSS | N_EC_ROT)
 #define N_R4_KV (N_LONGDOWN | N_REBUILD | N_CHURN) /* these need kvr: workload kv, kv-via or classes */
 
 /* R4's nemeses and the tracks they need. `built`: that track is on main (flip it when it merges; the run is refused
@@ -755,9 +760,15 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         argv[na++] = "--merge-idle-s";
         argv[na++] = "1";
     }
-    if (want_ec_k || rdma_metrics) {
+    if (want_ec_k || rdma_metrics || (nemeses & N_ROTYOUNG)) {
         argv[na++] = "--metrics-port";
         argv[na++] = "auto";
+    }
+    if ((nemeses & N_ROTYOUNG) && !want_ec_k && !want_classes) {
+        argv[na++] = "--flush-interval-ms";
+        argv[na++] = "500";
+        argv[na++] = "--merge-idle-s";
+        argv[na++] = "1";
     }
     if (want_ec_k) { /* the stores exist once the cluster has member ids (ec_stores_make); settles are quick */
         argv[na++] = "--ec-settle-grace-s";
@@ -793,14 +804,14 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     char *envp[512];
     int ne = 0;
     const char *orig_plrdma_test = getenv("TSDB_PLRDMA_TEST");
-    for (char **e = environ; *e && ne < 500; e++)
+    for (char **e = environ; *e && ne < 495; e++)
         if (strncmp(*e, "TSDB_CLUSTER_TEST=", 18) && strncmp(*e, "TSDB_CRASH_AT=", 14) && strncmp(*e, "LD_PRELOAD=", 11) &&
             strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "OUTAGEFS_", 9) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20) &&
             strncmp(*e, "TSDBD_TEST_FWD_STALL=", 21) &&
             (!(nemeses & N_RDMA_QPERR) || strncmp(*e, "TSDB_PLRDMA_TEST=", 17)))
             envp[ne++] = *e;
     char e1[256], e2[2 * PATH_MAX + 64], e3[PATH_MAX + 64], e4[64], e5[PATH_MAX + 64], e6[PATH_MAX + 64], e7[PATH_MAX + 64],
-         e8[PATH_MAX + 256];
+         e8[PATH_MAX + 256], e9[PATH_MAX + 96];
     if (nemeses & N_RDMA_QPERR) {
         if (orig_plrdma_test && *orig_plrdma_test)
             snprintf(e8, sizeof e8, "TSDB_PLRDMA_TEST=%s,qperr_file=%s/rdma_qperr", orig_plrdma_test, n->dir);
@@ -814,8 +825,24 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     }
     if (!want_rep) /* the leader of a 1-replica cluster volume takes writes without the driver (kv-local) */
         envp[ne++] = "TSDB_CLUSTER_WRITES=1";
-    if (nemeses & N_CHURN) /* every applied record of kvr's set and ISR in <state>/voltrace (r4_move_trace_check) */
+    if ((nemeses & N_CHURN) && (nemeses & N_ROTYOUNG))
+        envp[ne++] = "TSDB_CLUSTER_TEST=vol_trace=1,heal_cooldown_ms=2000";
+    else if (nemeses & N_CHURN) /* every applied record of kvr's set and ISR in <state>/voltrace (r4_move_trace_check) */
         envp[ne++] = "TSDB_CLUSTER_TEST=vol_trace=1";
+    else if (nemeses & N_ROTYOUNG) /* R12 D8: short auto-reset cooldown so multiple rounds can rebuild */
+        envp[ne++] = "TSDB_CLUSTER_TEST=heal_cooldown_ms=2000";
+    if ((nemeses & N_R12_EC) && !getenv("TSDB_CHUNKSCRUB_TEST"))
+        envp[ne++] = "TSDB_CHUNKSCRUB_TEST=interval_ms=400";
+    if ((nemeses & N_ROTYOUNG) && !getenv("TSDB_SCRUB_TEST"))
+        envp[ne++] = "TSDB_SCRUB_TEST=interval_ms=400";
+    if (nemeses & N_ROTCOLD) {
+        if (!getenv("TSDB_REPAIR_TEST")) {
+            snprintf(e9, sizeof e9, "TSDB_REPAIR_TEST=pause_before_put=%s/repair.pause", rundir);
+            envp[ne++] = e9;
+        }
+        if (!getenv("TSDB_ECGC_TEST"))
+            envp[ne++] = "TSDB_ECGC_TEST=orphan_grace_ms=1000,poll_ms=200,lifetime_s=1";
+    }
     if (crash_at) {
         snprintf(e1, sizeof e1, "TSDB_CRASH_AT=%s", crash_at);
         envp[ne++] = e1;
@@ -4622,6 +4649,11 @@ static int cluster_form(void)
         S.repl_retain_s = (uint32_t)retain_eff;
         S.repl_retain_down_gb = 0; /* longdown / --retain-s tests snapshot catch-up past repl_retain_s (E29 off) */
     }
+    if (nemeses & N_R12) { /* R12 test pace via cluster init settings (D2, E25): pass finishes well within 60 s */
+        S.scrub_days = 1;
+        S.scrub_mb_s = 20;
+        S.scrub_out_count = 1000;
+    }
     /* Any S.* override added here must be mirrored in ju_init_cluster() (cluster_users.h), which runs
      * `tsdb cluster init --superuser` instead of CLUSTER_OP_INIT on odd-seed --auth runs. */
     uint8_t req[4 * (META_SETTINGS_WORDS + 1)]; /* 64 overflowed since the settings grew past 15 words (ASan) */
@@ -4833,7 +4865,7 @@ static void usage(void)
 {
     fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--seed N]\n"
                     "         [--nemesis kill,partition,pause,midcommit,power,fwdstall,kill2,slow,longdown,rebuild,churn,\n"
-                    "                    partial,diskloss,rot (the last three with --ec),rdma-qperr] [--ec K+M]\n"
+                    "                    partial,diskloss,rot,rotparity,rotcold,rotthenm (with --ec),rotyoung,rdma-qperr] [--ec K+M]\n"
                     "         [--workload meta,kv-local|kv|kv-via|classes|users] [--auth] [--retain-s S]\n"
                     "         [--peer-rdma auto|on|off] [--peer-rdma-pool-mb N] [--peer-rdma-device DEV[:PORT]]\n"
                     "         [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so] [--mutant NAME]\n"
@@ -4993,6 +5025,14 @@ int main(int argc, char **argv)
                     nemeses |= N_DISKLOSS;
                 else if (nem && !strcmp(t, "rot"))
                     nemeses |= N_ROT;
+                else if (nem && !strcmp(t, "rotparity"))
+                    nemeses |= N_ROTPARITY;
+                else if (nem && !strcmp(t, "rotcold"))
+                    nemeses |= N_ROTCOLD;
+                else if (nem && !strcmp(t, "rotyoung"))
+                    nemeses |= N_ROTYOUNG;
+                else if (nem && !strcmp(t, "rotthenm"))
+                    nemeses |= N_ROTTHENM;
                 else if (nem && !strcmp(t, "rdma-qperr"))
                     nemeses |= N_RDMA_QPERR;
                 else if (nem && !strcmp(t, "none"))
@@ -5047,16 +5087,24 @@ int main(int argc, char **argv)
                     want_ec_k + want_ec_m + 1);
             return 2;
         }
-        if ((nemeses & N_ROT) && !ec_settles) {
-            fprintf(stderr, "jepsen-cluster: the rot nemesis needs a tsdbd built with TSDB_EC: there is no chunk to flip a byte in\n");
+        if ((nemeses & N_EC_ROT) && !ec_settles) {
+            fprintf(stderr, "jepsen-cluster: the rot/rotparity/rotcold/rotthenm nemeses need a tsdbd built with TSDB_EC: there is no chunk to flip a byte in\n");
             return 2;
         }
-        if ((nemeses & N_ROT) && (nemeses & N_DISKLOSS)) {
-            fprintf(stderr, "jepsen-cluster: --nemesis rot and diskloss cannot be combined (each uses up to m fault positions)\n");
+        if ((nemeses & N_EC_ROT) && (nemeses & N_DISKLOSS)) {
+            fprintf(stderr, "jepsen-cluster: --nemesis rot/rotparity/rotcold/rotthenm and diskloss cannot be combined (each uses up to m fault positions)\n");
+            return 2;
+        }
+        if ((!!(nemeses & N_ROT) + !!(nemeses & N_ROTPARITY) + !!(nemeses & N_ROTCOLD) + !!(nemeses & N_ROTTHENM)) > 1) {
+            fprintf(stderr, "jepsen-cluster: --nemesis rot, rotparity, rotcold and rotthenm cannot be combined (each uses its own fault budget up to m positions)\n");
             return 2;
         }
     } else if (nemeses & N_EC) {
-        fprintf(stderr, "jepsen-cluster: the partial, diskloss and rot nemeses need --ec K+M\n");
+        fprintf(stderr, "jepsen-cluster: the partial, diskloss, rot, rotparity, rotcold and rotthenm nemeses need --ec K+M\n");
+        return 2;
+    }
+    if ((nemeses & N_ROTYOUNG) && !want_rep) {
+        fprintf(stderr, "jepsen-cluster: the rotyoung nemesis works on kvr: it needs the workload kv, kv-via or classes\n");
         return 2;
     }
     if (want_users && nn > 12) {
@@ -5261,6 +5309,10 @@ int main(int argc, char **argv)
         case N_DISKLOSS: faults[12]++; nem_diskloss(); break;
         case N_ROT: faults[13]++; nem_rot(); break;
         case N_RDMA_QPERR: faults[14]++; nem_rdma_qperr(); break;
+        case N_ROTPARITY: faults[15]++; nem_rotparity(); break;
+        case N_ROTCOLD: faults[16]++; nem_rotcold(); break;
+        case N_ROTYOUNG: faults[17]++; nem_rotyoung(); break;
+        case N_ROTTHENM: faults[18]++; nem_rotthenm(); break;
         }
         if (rdma_tracking()) {
             struct rdma_mstat rms;
@@ -5272,13 +5324,17 @@ int main(int argc, char **argv)
                 kind == N_MIDCOMMIT ? "midcommit" : kind == N_FWDSTALL ? "fwdstall" : kind == N_KILL2 ? "kill2" :
                 kind == N_SLOW ? "slow" : kind == N_LONGDOWN ? "longdown" : kind == N_REBUILD ? "rebuild" :
                 kind == N_CHURN ? "churn" : kind == N_PARTIAL ? "partial" : kind == N_DISKLOSS ? "diskloss" :
-                kind == N_ROT ? "rot" : kind == N_RDMA_QPERR ? "rdma-qperr" : "power", rounds);
+                kind == N_ROT ? "rot" : kind == N_RDMA_QPERR ? "rdma-qperr" : kind == N_ROTPARITY ? "rotparity" :
+                kind == N_ROTCOLD ? "rotcold" : kind == N_ROTYOUNG ? "rotyoung" : kind == N_ROTTHENM ? "rotthenm" :
+                "power", rounds);
         settle(kind == N_KILL ? "a kill" : kind == N_PARTITION ? "a partition" : kind == N_PAUSE ? "a pause" :
                kind == N_MIDCOMMIT ? "a crash point" : kind == N_FWDSTALL ? "a forward stall" : kind == N_KILL2 ? "two kills" :
                kind == N_SLOW ? "a slow disk" : kind == N_LONGDOWN ? "a long outage" : kind == N_REBUILD ? "a rebuild" :
                kind == N_CHURN ? "a transfer or move" : kind == N_PARTIAL ? "a partial partition" :
                kind == N_DISKLOSS ? "a disk loss" : kind == N_ROT ? "a rotted chunk" :
-               kind == N_RDMA_QPERR ? "an RDMA QP error" : "a power loss");
+               kind == N_RDMA_QPERR ? "an RDMA QP error" : kind == N_ROTPARITY ? "a rotted parity chunk" :
+               kind == N_ROTCOLD ? "a rotted cold chunk" : kind == N_ROTYOUNG ? "a rotted young part" :
+               kind == N_ROTTHENM ? "rot then m kills" : "a power loss");
         hold_ms(rnd_range(300, 1200));
     }
     if (term_cp >= 0 && !term_done) {
@@ -5379,6 +5435,8 @@ int main(int argc, char **argv)
     int rdiff = isr_short, isr = rep_full_mask();
     if (want_ec_k)
         r4_end_bad += ec_div_check(); /* its own FAIL line: not one of "the replicas differ" */
+    if (nemeses & N_R12)
+        r4_end_bad += r12_end_check();
     struct rdma_mstat rdma_end;
     memset(&rdma_end, 0, sizeof rdma_end);
     if (rdma_tracking())
@@ -5409,10 +5467,11 @@ int main(int argc, char **argv)
     for (int k = 0; k < NNEM; k++)
         total_faults += faults[k];
     printf("faults applied: kill %u, partition %u (cuts applied %d%s), pause %u, midcommit %u (crash points hit %u, %u of them while serving, "
-           "never fired %u), power %u (losses %u, idle %u), fwdstall %u (%u writes held, %u misses), rdma-qperr %u; restarts %u, rounds %u\n",
+           "never fired %u), power %u (losses %u, idle %u), fwdstall %u (%u writes held, %u misses), rdma-qperr %u, "
+           "rotparity %u, rotcold %u, rotyoung %u, rotthenm %u; restarts %u, rounds %u\n",
            faults[0], faults[1], partitions_applied, partitions_planted_noop ? ", PLANTED NO-OP" : "", faults[2],
            faults[3], cp_hits, cp_hits_serving, cp_unfired, faults[4], power_hits, power_idle, faults[5], fwd_stalls_held, fwd_stall_misses,
-           faults[14], restarts, rounds);
+           faults[14], faults[15], faults[16], faults[17], faults[18], restarts, rounds);
     if (nemeses & (N_KILL2 | N_SLOW | N_R4_KV))
         printf("r4: kill2 %u rounds (%u took two of kvr's replicas), slow %u, longdown %u (%u of them with a snapshot installed), "
                "rebuild %u (%u rebuilt, %u by a snapshot), churn %u (%u moves, %u transfers accepted of which %u landed, %u cancels, %u refused)\n",
@@ -5444,6 +5503,7 @@ int main(int argc, char **argv)
                indet_applied, nreads, (uint64_t)atomic_load(&kv_moved), (unsigned)atomic_load(&client_connects), (unsigned)atomic_load(&refused_foreign));
     (void)nwrites;
     ec_summary();
+    r12_summary();
     if (want_via)
         printf("kv-via: %" PRIu64 " writes and %" PRIu64 " reads answered through a member that did not lead kvr, %" PRIu64
                " read-your-writes reads, %d stall window(s) checked, %" PRIu64 " of %" PRIu64 " nemesis picks aimed at an entry "
@@ -5556,10 +5616,15 @@ int main(int argc, char **argv)
      * ones, and the floor, as everywhere, a third of the honest rate (never below one fault). A list without these two
      * keeps its 10 s. */
     int per_round = 10;
-    if (nemeses & (N_LONGDOWN | N_REBUILD)) {
+    if (nemeses & (N_LONGDOWN | N_REBUILD | N_R12)) {
         int sum = 0, n = 0;
         for (int k = 0; k < nk; k++) {
-            sum += kinds[k] == N_LONGDOWN ? (retain_eff > 0 ? retain_eff : 3) + 14 : kinds[k] == N_REBUILD ? 12 : 6;
+            sum += kinds[k] == N_LONGDOWN ? (retain_eff > 0 ? retain_eff : 3) + 14
+                 : kinds[k] == N_REBUILD  ? 12
+                 : kinds[k] == N_ROTTHENM ? 15
+                 : kinds[k] == N_ROTYOUNG ? 12
+                 : (kinds[k] & (N_ROTPARITY | N_ROTCOLD)) ? 8
+                                                          : 6;
             n++;
         }
         per_round = 3 * sum / n;
@@ -5622,7 +5687,9 @@ int main(int argc, char **argv)
                 "they were neither cut nor counted\n", (uint64_t)atomic_load(&unmapped_links));
         rc = 1;
     }
-    printf("jepsen-cluster: %s (seed %" PRIu64 ")\n", rc ? "FAILED" : "ok", seed);
+    if (!rc && r12_harness_err)
+        rc = 2;
+    printf("jepsen-cluster: %s (seed %" PRIu64 ")\n", rc == 2 ? "HARNESS ERROR" : rc ? "FAILED" : "ok", seed);
     if (!rc && !getenv("JEPSEN_KEEP"))
         rmtree(rundir);
     else if (rc)

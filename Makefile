@@ -2211,7 +2211,7 @@ jepsen-selftest-5:
 # (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
 # each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
 $(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/jepsen/cluster_ec.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
-    server/crashpt.h server/users.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
+    server/crashpt.h server/users.h src/chunk.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 # on a disk, never /tmp (a tmpfs: a failing run keeps the state of five nodes there, and a power run never syncs)
@@ -2233,7 +2233,11 @@ JEPSEN_VIA_NEMESES ?= fwdstall
 # JEPSEN_R4_NEMESES=none leaves them out. They add runs: IO x JEPSEN_R4_WORKLOADS (2) x the built nemeses, each
 # JEPSEN_SECONDS (20 runs and about 100 min at 300 s with all five built).
 # JEPSEN_R4_TRY=1 runs the unbuilt ones too. longdown runs with repl_retain_s 3 (--retain-s S for another age).
+# R12's replicated young-part rot nemesis (rotyoung): JEPSEN_R12_NEMESES defaults to rotyoung on JEPSEN_R12_WORKLOADS
+# (meta,kv), once per IO backend; JEPSEN_R12_NEMESES=none leaves it out.
 JEPSEN_R4_WORKLOADS ?= meta,kv meta,classes
+JEPSEN_R12_WORKLOADS ?= meta,kv
+JEPSEN_R12_NEMESES ?=
 jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so
 	for io in $(IO); do for wl in $(JEPSEN_CLUSTER_WORKLOADS); do for nem in $(JEPSEN_NEMESES); do \
 	    echo "== tsdbd --io $$io, workloads $$wl, nemesis $$nem"; \
@@ -2254,12 +2258,19 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)
 	        --nemesis $$nem --workload $$wl --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
 	        --outagefs $(B)/liboutagefs.so || exit 1; \
 	    done; done; done
+	r12="$(JEPSEN_R12_NEMESES)"; case "$$r12" in none) r12=;; "") r12="rotyoung";; esac; \
+	for io in $(IO); do for wl in $(JEPSEN_R12_WORKLOADS); do for nem in $$r12; do \
+	    echo "== tsdbd --io $$io, workloads $$wl, nemesis $$nem (R12)"; \
+	    TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
+	        --nemesis $$nem --workload $$wl --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
+	        || exit 1; \
+	    done; done; done
 	$(MAKE) --no-print-directory jepsen-cluster-ec
 
-# --ec (tests/jepsen/cluster_ec.h, row r8l-jc): kvr as an erasure-coded volume on JEPSEN_EC_NODES nodes with two chunk stores each.
+# --ec (tests/jepsen/cluster_ec.h, row r8l-jc, r12-jc): kvr as an erasure-coded volume on JEPSEN_EC_NODES nodes with two chunk stores each.
 # The nemeses default to kill partial diskloss, and, when this tsdbd settles ec volumes (built with TSDB_EC: only then
-# is there a chunk to rot and a crash point of the settle to reach) to partition pause rot midcommit power as well;
-# JEPSEN_EC= (empty) leaves the runs out. Per io and workload (JEPSEN_EC_WORKLOADS).
+# is there a chunk to rot and a crash point of the settle to reach) to partition pause rot midcommit power rotparity
+# rotcold rotthenm as well; JEPSEN_EC= (empty) leaves the runs out. Per io and workload (JEPSEN_EC_WORKLOADS).
 JEPSEN_EC ?= 4+2
 JEPSEN_EC_NODES ?= 7
 JEPSEN_EC_WORKLOADS ?= meta,kv
@@ -2267,7 +2278,7 @@ JEPSEN_EC_NEMESES ?=
 jepsen-cluster-ec: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
 	@if [ -z "$(JEPSEN_EC)" ]; then echo "jepsen-cluster-ec: off (JEPSEN_EC is empty)"; exit 0; fi; \
 	nems="$(JEPSEN_EC_NEMESES)"; if [ -z "$$nems" ]; then \
-	    if [ -n "$(EC_OBJ)" ]; then nems="kill partition partial pause diskloss rot midcommit power"; \
+	    if [ -n "$(EC_OBJ)" ]; then nems="kill partition partial pause diskloss rot midcommit power rotparity rotcold rotthenm"; \
 	    else nems="kill partial diskloss"; fi; fi; \
 	for io in $(IO); do for wl in $(JEPSEN_EC_WORKLOADS); do for nem in $$nems; do \
 	    echo "== tsdbd --io $$io, workloads $$wl, --ec $(JEPSEN_EC) on $(JEPSEN_EC_NODES) nodes, nemesis $$nem"; \
@@ -2414,7 +2425,16 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	                echo "jepsen-cluster-selftest: the server mutant $$m ($$var) went unnoticed in an ec run, or failed for another reason (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	        else echo "jepsen-cluster-selftest: the server mutant $$m skipped (tsdbd reads no $$var)"; fi; \
 	    done; \
-	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate skipped (NO_EC=1)"; fi; \
+	    out=$$(TSDB_CHUNKSCRUB_MUTANT=scrubskipcell $$j --nodes 7 --ec 4+2 --workload meta,kv --nemesis rotparity --seconds 40 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r12: .* chunk rot.* planted, but /metrics reports'; then \
+	        echo "jepsen-cluster-selftest: chunk scrub mutant scrubskipcell went unnoticed under rotparity (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    out=$$(TSDB_REPAIR_MUTANT=repairnolive $$j --nodes 7 --ec 4+2 --workload meta,kv --nemesis rotcold --seconds 40 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r12: .*chunk replace refused\|FAIL: r12: chunk repair resurrected'; then \
+	        echo "jepsen-cluster-selftest: chunk repair mutant repairnolive went unnoticed under rotcold (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate, scrubskipcell, repairnolive skipped (NO_EC=1)"; fi; \
+	out=$$(TSDB_SCRUB_MUTANT=youngskipgranule $$j --nodes 5 --workload meta,kv --nemesis rotyoung --seconds 40 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r12: rotyoung planted [1-9][0-9]* rot(s), rebuilt 0, /metrics reports young_damaged=0'; then \
+	        echo "jepsen-cluster-selftest: young scrub mutant youngskipgranule went unnoticed under rotyoung (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \

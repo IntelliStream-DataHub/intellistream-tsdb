@@ -1354,17 +1354,20 @@ static int ju_init_cluster(int i)
     int pp;
     node_snap(i, NULL, NULL, &pp);
     const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
-    char addr[48], tmo[24], hb[24], lease[24], ret[24], retd[24], out[4096];
+    char addr[48], tmo[24], hb[24], lease[24], ret[24], retd[24], sdays[24], smbs[24], sout[24], out[4096];
     snprintf(addr, sizeof addr, "127.0.0.1:%d", pp);
     snprintf(tmo, sizeof tmo, "%u", S.node_timeout_ms);
     snprintf(hb, sizeof hb, "%u", S.heartbeat_ms);
     snprintf(lease, sizeof lease, "%u", S.lease_s);
     snprintf(ret, sizeof ret, "%u", S.repl_retain_s);
     snprintf(retd, sizeof retd, "%u", S.repl_retain_down_gb);
+    snprintf(sdays, sizeof sdays, "%u", S.scrub_days);
+    snprintf(smbs, sizeof smbs, "%u", S.scrub_mb_s);
+    snprintf(sout, sizeof sout, "%u", S.scrub_out_count);
     char *argv[] = {(char *)cli, "cluster", "init", addr, "--secret-file", secret_path, "--superuser",
                     (char *)auth_user, "--password-file", auth_pw_path, "--mode", "replicated", "--node-timeout-ms",
                     tmo, "--heartbeat-ms", hb, "--lease-s", lease, "--repl-retain-s", ret, "--repl-retain-down-gb",
-                    retd, NULL};
+                    retd, "--scrub-days", sdays, "--scrub-mb-s", smbs, "--scrub-out-count", sout, NULL};
     int st = 0;
     int run_rc = ju_run_cli(argv, out, sizeof out, 30000, 0, &st, NULL);
     if (run_rc < 0)

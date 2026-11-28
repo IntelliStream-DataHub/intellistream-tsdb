@@ -76,12 +76,25 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # learner and no v<N>.snap, v<N>.old, v<N>.removed-* or snap_* on any node. make jepsen-cluster runs them
                           # after the others on kv and classes (JEPSEN_R4_WORKLOADS, JEPSEN_R4_NEMESES, `none` leaves them out): IO x 2 x
                           # the built ones more runs of JEPSEN_SECONDS: 20 runs, about 100 min at 300 s)
+                          # R12's young-part rot nemesis (`rotyoung`: flips a byte in the last granule of a young `.part` on one
+                          # follower, sets `TSDB_SCRUB_TEST=interval_ms=400` and `TSDB_CLUSTER_TEST=heal_cooldown_ms=2000`, and
+                          # checks `/metrics` `tsdb_young_scrub_damaged_total`, `tsdb_cluster_auto_resets_total{why="damaged"}`,
+                          # replica rebuild via `rid` change, and replica equality via `replicas_equal`/`rep_check`) runs in
+                          # `make jepsen-cluster` on `JEPSEN_R12_WORKLOADS` (`meta,kv`) with `JEPSEN_R12_NEMESES` (default `rotyoung`; `none` leaves it out).
                           # `jepsen-cluster-ec` (`JEPSEN_EC=4+2`, `JEPSEN_EC_NODES=7`; `JEPSEN_EC=` skips): runs `--ec K+M`
                           # (`tests/jepsen/cluster_ec.h`, `nodes >= 2` use `--io epoll` per D15), two chunk stores per node,
-                          # nemeses `kill partition partial pause diskloss rot midcommit power` (when `TSDB_EC` is built),
+                          # nemeses `kill partition partial pause diskloss rot midcommit power rotparity rotcold rotthenm`
+                          # (when `TSDB_EC` is built; `rotparity` flips a parity chunk's last cell, `rotcold` flips a cold `kvr.fill`
+                          # data chunk and ends with a D9 GC-vs-repair check using `TSDB_REPAIR_TEST=pause_before_put` and
+                          # `TSDB_ECGC_TEST=orphan_grace_ms=1000,poll_ms=200,lifetime_s=1`, `rotthenm` rots up to `m-1` members,
+                          # confirms every rotted chunk is replaced on disk, then kills `m` stripe members and reads every settled
+                          # series; R12 EC runs configure `scrub_days=1`, `scrub_mb_s=20`, `scrub_out_count=1000` plus
+                          # `TSDB_CHUNKSCRUB_TEST=interval_ms=400` and verify `/metrics` damage and repair totals),
                           # live per-replica verification across all ISR members via `VOLUME_TRANSFER`, `kvr.fill` batch
                           # check, and settled `.ec` part count; selftest checks `ec-diverged`, `ec-member-differs`,
-                          # `ec-notransfer`, `ec-nosettle`, and server mutants `ycold`, `ecabovey`, `cutnogate`;
+                          # `ec-notransfer`, `ec-nosettle`, and server mutants `ycold`, `ecabovey`, `cutnogate`,
+                          # `scrubskipcell` (`TSDB_CHUNKSCRUB_MUTANT`), `repairnolive` (`TSDB_REPAIR_MUTANT`), and
+                          # `youngskipgranule` (`TSDB_SCRUB_MUTANT`);
                           # `jepsen_cluster --ec 16+4 --nodes 22` tests 22-node geometry (2 io_uring + 20 epoll)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
