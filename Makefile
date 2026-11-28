@@ -453,7 +453,7 @@ test: $(TEST_BINS)
 # loops get TSAN_MUT_TIMEOUT unless MUTANT_TIMEOUT is set.
 TSAN_MUT_TIMEOUT ?= 5400
 MUT = tools/mutants.sh --tmp $(SCRATCH)$(if $(findstring -fsanitize=thread,$(CFLAGS)), --timeout $${MUTANT_TIMEOUT:-$(TSAN_MUT_TIMEOUT)})
-META_GROUPS := test-meta-1 test-meta-2 test-cluster-1 test-cluster-2 test-cluster-3 test-links
+META_GROUPS := test-meta-1 test-meta-2 test-cluster-1 test-cluster-2 test-cluster-3 test-cluster-4 test-links
 TEST_GROUPS ?= $(UNITS_GROUPS) test-units-b $(UNITS_B_GROUPS) $(META_GROUPS) test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-groups $(BT_TARGETS) test-units-b $(UNITS_GROUPS) $(UNITS_B_GROUPS) test-meta $(META_GROUPS) test-meta-mutants-1 test-meta-mutants-2 test-net
@@ -504,7 +504,7 @@ test-groups:
 	$(MAKE) -j1 $(TEST_GROUPS)
 BT_GROUPS_1 := test-units-h3 test-units-h4 test-units-h5 test-units-b test-units-c test-units-d
 BT_GROUPS_2 := test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-b6 test-units-b7
-BT_GROUPS_3 := test-cluster-3 test-cluster-2 test-cluster-1 test-links test-net test-units-i
+BT_GROUPS_3 := test-cluster-4 test-cluster-3 test-cluster-2 test-cluster-1 test-links test-net test-units-i
 BT_GROUPS_4 := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-units-b8 test-units-b9 test-meta-1 test-meta-2 test-meta-mutants-1 test-meta-mutants-2
 $(BT_TARGETS): test-groups-%:
 	$(MAKE) -j1 $(BT_GROUPS_$*)
@@ -676,11 +676,11 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs 
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
-    writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
-    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
+    writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast
+CLUSTER_SCEN_4 := outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
     nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio diskout \
     ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill posbalance adopt
-test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
+test-cluster-1 test-cluster-2 test-cluster-3 test-cluster-4: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
 	CRASHFS_SO=$(B)/libcrashfs.so OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
 test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margins $(B)/test_pout $(B)/test_pace $(B)/test_place $(B)/test_sfill $(B)/test_sreconcile $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb

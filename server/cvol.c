@@ -381,10 +381,13 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
     char root[PATH_MAX], vdir[4200];
     pthread_mutex_lock(&M.mu);
     snprintf(root, sizeof root, "%s", m->disk_root[0] ? m->disk_root : M.dir);
+#ifdef TSDB_TEST_HOOKS
     int do_slow = M.slow_open_ms > 0 && !m->opened_once;
     unsigned slow_ms = M.slow_open_ms;
+#endif
     pthread_mutex_unlock(&M.mu);
     snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, r->number);
+#ifdef TSDB_TEST_HOOKS
     if (do_slow) {
         say("volume %" PRIu32 " (%s): delaying first open by %u ms (TSDB_CLUSTER_TEST slow_open_ms)", r->number,
             r->name, slow_ms);
@@ -401,6 +404,7 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
             rem -= step;
         }
     }
+#endif
     int writer = r->leader == M.self && M.writes;
     /* replication (server/repld.c) opens it as a replica with REPL's floor; the record's leader promotes itself */
     int rc = chunkpeer_cluster_prepare(r->number, vdir); /* r8f: an ec volume's META asks for the peer cold ops */

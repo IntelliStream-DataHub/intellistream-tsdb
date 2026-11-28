@@ -55,7 +55,7 @@ for m in $muts; do
         want='lost: final holds|final holds .* completed before|: stale$|: torn$|acknowledged before a read saw|^  final: series|^  final latest'
         # jepsen says "does not come up" on one line and the server's log tail, which names the file, below it
         refused='does not come up|cannot open'
-        named='^tsdb: .*settle intent .*(damage|the open fails)'
+        named='^tsdb: .*(settle intent .*(damage|the open fails)|both exist and no intent names them \(a settle leaves one of the two\): the open fails)'
         ;;
     esac
     # the refusal's own line: one below jepsen's "does not come up", never any line of the run that names an intent

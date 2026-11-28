@@ -110,6 +110,7 @@ int place_out_log(struct place_out *out, const char *fmt, ...)
 
 int place_mutant_parse(const char *name)
 {
+#ifdef TSDB_TEST_HOOKS
     if (!name || !*name)
         return PLACE_MUT_NONE;
     if (!strcmp(name, "orderfifo"))
@@ -149,6 +150,9 @@ int place_mutant_parse(const char *name)
     if (!strcmp(name, "usechange"))
         return PLACE_MUT_USE_CHANGE;
     return -1;
+#else
+    return (!name || !*name) ? PLACE_MUT_NONE : -1;
+#endif
 }
 
 int place_mutant_env(void)

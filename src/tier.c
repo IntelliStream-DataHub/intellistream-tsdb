@@ -707,7 +707,7 @@ static tier **tier_reg;
 static size_t ntier_reg;
 
 #ifdef TSDB_EC
-static void tier_reg_add(tier *t, const char *dir)
+static void tier_set_dir(tier *t, const char *dir)
 {
     if (!t || !dir || !*dir)
         return;
@@ -715,9 +715,15 @@ static void tier_reg_add(tier *t, const char *dir)
     char *d = strdup(realpath(dir, canon) ? canon : dir);
     if (!d)
         return;
-    pthread_mutex_lock(&tier_reg_mu);
     free(t->dir);
     t->dir = d;
+}
+
+static void tier_reg_add(tier *t)
+{
+    if (!t || !t->dir)
+        return;
+    pthread_mutex_lock(&tier_reg_mu);
     bool present = false;
     for (size_t i = 0; i < ntier_reg; i++)
         if (tier_reg[i] == t) {
@@ -1015,12 +1021,13 @@ static int tier_open_impl(const char *dir, const tsdb_options *opt, bool salvage
                 return open_rc;
             }
         } else if (!ro) {
+            tier_set_dir(t, dir);
             if ((open_rc = ecgc_tier_open(t)) != 0 || (open_rc = ecsettle_tier_open(t)) != 0 ||
                 (open_rc = tier_health_open(t)) != 0 || (open_rc = tierctl_open(t)) != 0) {
                 tier_put(t);
                 return open_rc;
             }
-            tier_reg_add(t, dir);
+            tier_reg_add(t);
         }
         *out = t;
         return 0;
@@ -1098,11 +1105,12 @@ static int tier_open_impl(const char *dir, const tsdb_options *opt, bool salvage
     /* the cache reads through this backend, never one of its own (its stores' flocks would make that one BUSY) */
     eccache_set_backend(t, t->be);
     if (t->be) {
-        tier_reg_add(t, dir);
+        tier_set_dir(t, dir);
         if ((open_rc = tier_health_open(t)) != 0 || (open_rc = tierctl_open(t)) != 0) {
             tier_put(t);
             return open_rc;
         }
+        tier_reg_add(t);
     }
     *out = t;
     return 0;

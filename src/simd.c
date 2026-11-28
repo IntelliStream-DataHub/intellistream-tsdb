@@ -1272,7 +1272,7 @@ K_AVX2 void twa_avx2_exact(int type, const int64_t *ts, const void *v, size_t n,
     twa_tail(type, ts, v, s, n, sl, ll, o, L64);
 }
 
-__attribute__((target("avx2"), noinline, cold)) static void twa_avx2_exact_any(int type, const int64_t *ts,
+__attribute__((target("avx2"), noinline, cold)) static void twa_exact_any_avx2(int type, const int64_t *ts,
                                                                                const void *v, size_t n, twa_sums *o)
 {
     switch (type) {
@@ -1359,7 +1359,7 @@ K_AVX2 void twa_avx2_impl(int type, const int64_t *ts, const void *v, size_t n, 
         }
     }
     if (UNLIKELY(!_mm256_testz_si256(dtor, _mm256_set1_epi64x((long long)(~0ull << 52))))) {
-        twa_avx2_exact_any(type, ts, v, n, o);
+        twa_exact_any_avx2(type, ts, v, n, o);
         return;
     }
     double sl[L64], ll[L64], g[4];

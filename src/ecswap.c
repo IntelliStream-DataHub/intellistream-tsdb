@@ -219,11 +219,13 @@ static inline void sn_add(size_t *len, size_t cap, int r)
         *len += (size_t)r < cap - *len ? (size_t)r : cap - *len - 1;
 }
 
-static int intent_write(eng *db, const char *intent, part **in, part **ec, size_t n)
+static int intent_write(eng *db, const char *intent, part **in, part **ec, const char *const *pend, size_t n)
 {
     size_t cap = 64, len = 0; /* the lines' own lengths: no bound on a name's length is assumed */
-    for (size_t i = 0; i < n; i++)
-        cap += 16 + strlen(ec[i]->pending) + strlen(ec[i]->name) + 2 * strlen(in[i]->name);
+    for (size_t i = 0; i < n; i++) {
+        const char *pn = pend ? pend[i] : ec[i]->pending;
+        cap += 16 + strlen(pn) + strlen(ec[i]->name) + 2 * strlen(in[i]->name);
+    }
     int fail = atomic_load(&ecswap_test_fail); /* tests: one planted failure (ecswap.h) */
     if (fail == ECSWAP_FAIL_INTENT_NOMEM || fail == ECSWAP_FAIL_INTENT_IO)
         atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
@@ -231,8 +233,10 @@ static int intent_write(eng *db, const char *intent, part **in, part **ec, size_
     if (!buf)
         return TSDB_ERR_NOMEM;
     sn_add(&len, cap, snprintf(buf + len, cap - len, INTENT_V4_HEAD "%zu\n", n));
-    for (size_t i = 0; i < n; i++)
-        sn_add(&len, cap, snprintf(buf + len, cap - len, "L %s %s\n", ec[i]->pending, ec[i]->name));
+    for (size_t i = 0; i < n; i++) {
+        const char *pn = pend ? pend[i] : ec[i]->pending;
+        sn_add(&len, cap, snprintf(buf + len, cap - len, "L %s %s\n", pn, ec[i]->name));
+    }
     for (size_t i = 0; i < n; i++)
         sn_add(&len, cap, snprintf(buf + len, cap - len, "R %s settled_%s\n", in[i]->name, in[i]->name));
     sn_add(&len, cap, snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0)));
@@ -389,6 +393,15 @@ static void settled_of_ec(const char *ec_name, char *dst, size_t cap)
         dst[0] = '\0';
 }
 
+static void free_early_pend(char **arr, size_t n)
+{
+    if (!arr)
+        return;
+    for (size_t i = 0; i < n; i++)
+        free(arr[i]);
+    free(arr);
+}
+
 int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
 {
     sm_init();
@@ -449,7 +462,7 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
             return rc;
         }
     }
-    if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, n)) != 0) {
+    if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, NULL, n)) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
         free(at);
         if (logged)
@@ -471,6 +484,12 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     if (ec_swap_hook)
         ec_swap_hook(db);
 
+    char **early_pend = NULL;
+    if (early) {
+        early_pend = calloc(n, sizeof *early_pend);
+        for (size_t i = 0; early_pend && i < n; i++)
+            early_pend[i] = strdup(ec[i]->pending);
+    }
     lt_sec lsec;
     lt_begin(db, &lsec);
     pthread_mutex_lock(&db->lock);
@@ -506,10 +525,12 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     free(at);
 
     if (!ok && logged && eng_check(db) == 0) { /* a dropped, merging or unlisted source: the intent stays */
+        free_early_pend(early_pend, n);
         pthread_mutex_unlock(&db->publish_lock);
         return swap_refuse_logged(db, "a source was dropped, merged or unlisted before its renames");
     }
     if (!ok) {
+        free_early_pend(early_pend, n);
         rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
         if (!early)
             swap_discard(db, intent, ec, n);
@@ -517,12 +538,20 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
         return rc;
     }
     if (!renamed) { /* fail-stop: names may be half visible; the next open finishes or undoes the swap */
+        free_early_pend(early_pend, n);
         pthread_mutex_unlock(&db->publish_lock);
         return TSDB_ERR_IO;
     }
-    if (early && (rc = intent_write(db, intent, in, ec, n)) != 0) { /* the planted bug: the intent after the fact */
-        pthread_mutex_unlock(&db->publish_lock);
-        return rc;
+    if (early) { /* the planted bug: the intent after the fact */
+        bool have_all = early_pend != NULL;
+        for (size_t i = 0; have_all && i < n; i++)
+            have_all = early_pend[i] != NULL;
+        rc = have_all ? intent_write(db, intent, in, ec, (const char *const *)early_pend, n) : TSDB_ERR_NOMEM;
+        free_early_pend(early_pend, n);
+        if (rc != 0) {
+            pthread_mutex_unlock(&db->publish_lock);
+            return rc;
+        }
     }
     if ((rc = eng_sync_dir(db, "fsync of the directory after swapping settled parts")) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
@@ -579,9 +608,10 @@ static bool reencode_args_valid(part **in, size_t nin, part *out)
     return has_ec && out->min_block == min_b && out->max_block == max_b;
 }
 
-static int intent_write_reencode(eng *db, const char *intent, part **in, size_t nin, part *out)
+static int intent_write_reencode(eng *db, const char *intent, part **in, size_t nin, part *out, const char *pend)
 {
-    size_t cap = 96 + strlen(out->pending) + strlen(out->name), len = 0;
+    const char *pn = pend ? pend : out->pending;
+    size_t cap = 96 + strlen(pn) + strlen(out->name), len = 0;
     for (size_t i = 0; i < nin; i++)
         cap += 20 + 2 * strlen(in[i]->name);
     int fail = atomic_load(&ecswap_test_fail);
@@ -591,7 +621,7 @@ static int intent_write_reencode(eng *db, const char *intent, part **in, size_t 
     if (!buf)
         return TSDB_ERR_NOMEM;
     len += (size_t)snprintf(buf + len, cap - len, INTENT_V4_HEAD "1 %zu\n", nin);
-    len += (size_t)snprintf(buf + len, cap - len, "L %s %s\n", out->pending, out->name);
+    len += (size_t)snprintf(buf + len, cap - len, "L %s %s\n", pn, out->name);
     for (size_t i = 0; i < nin; i++) {
         const char *pfx = atomic_load(&in[i]->ec) ? "retired_" : "settled_";
         len += (size_t)snprintf(buf + len, cap - len, "R %s %s%s\n", in[i]->name, pfx, in[i]->name);
@@ -707,6 +737,7 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
      * lt_merge_marks: TTL drops run under db->lock, and drop_retire (whose intent preparation runs unlocked) waits in
      * drop_settle_locked for every p->reencoding in partitions <= ts while eng_reencode refuses partition_dropping, so
      * a drop intent and a re-encode intent never overlap on disk. */
+    char *early_pend = early ? strdup(out->pending) : NULL;
     lt_sec lsec;
     lt_begin(db, &lsec);
     pthread_mutex_lock(&db->lock);
@@ -728,7 +759,7 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
     bool renamed = false;
     bool wrote_intent = false;
     if (ok && !early) {
-        rc = intent_write_reencode(db, intent, in, nin, out);
+        rc = intent_write_reencode(db, intent, in, nin, out, NULL);
         if (rc == 0) {
             wrote_intent = true;
             if (ecswap_mutant != SWAP_MUT_NODIRSYNC &&
@@ -784,11 +815,13 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
     lt_end(db, &lsec);
 
     if (!ok && logged && eng_check(db) == 0) {
+        free(early_pend);
         pthread_mutex_unlock(&db->publish_lock);
         free(pin_parts);
         return swap_refuse_logged(db, "a source was dropped, merged or unlisted before its renames");
     }
     if (!ok) {
+        free(early_pend);
         rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
         swap_discard_reencode(db, out);
         pthread_mutex_unlock(&db->publish_lock);
@@ -796,6 +829,7 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         return rc;
     }
     if (rc != 0) {
+        free(early_pend);
         if (logged) {
             pthread_mutex_unlock(&db->publish_lock);
             free(pin_parts);
@@ -808,14 +842,19 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         return rc;
     }
     if (!renamed) {
+        free(early_pend);
         pthread_mutex_unlock(&db->publish_lock);
         free(pin_parts);
         return TSDB_ERR_IO;
     }
-    if (early && (rc = intent_write_reencode(db, intent, in, nin, out)) != 0) {
-        pthread_mutex_unlock(&db->publish_lock);
-        free(pin_parts);
-        return rc;
+    if (early) {
+        rc = early_pend ? intent_write_reencode(db, intent, in, nin, out, early_pend) : TSDB_ERR_NOMEM;
+        free(early_pend);
+        if (rc != 0) {
+            pthread_mutex_unlock(&db->publish_lock);
+            free(pin_parts);
+            return rc;
+        }
     }
     if ((rc = eng_sync_dir(db, "fsync of the directory after swapping re-encoded parts")) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
@@ -964,6 +1003,8 @@ int ec_swap_unsettle_at(eng *db, part **in, part **out, size_t n, uint64_t unset
     char intent[64];
     snprintf(intent, sizeof intent, "txn_%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
 
+    if (ec_swap_hook)
+        ec_swap_hook(db);
     pthread_mutex_lock(&db->publish_lock);
     int rc = eng_check(db) ? TSDB_ERR_IO : 0;
     if (rc) {
@@ -972,8 +1013,6 @@ int ec_swap_unsettle_at(eng *db, part **in, part **out, size_t n, uint64_t unset
         free(was_settled);
         return rc;
     }
-    if (ec_swap_hook)
-        ec_swap_hook(db);
 
     /* Serialize against concurrent drops (tsdb_drop_before and ttl_select_locked): waits for any settled drop touching
      * this key, then holds pub_active past the post-rename directory fsync so neither drop path can retire P.ec while

@@ -726,13 +726,16 @@ static void test_diff_and_two_way(void)
     CHECK(chunk_exists_on_disk(sdir, 1, extra_orphan.oid, 2), "c1: orphan chunk was deleted by reconcile");
 
     /* HBS_FILL progress report must carry version == current stripe_version (7) and clear when done. */
-    CHECK(env.saw_active_report, "c1: never observed active HBS_FILL progress report");
-    if (env.nseen_rep > 0) {
-        CHECK(env.seen_rep[0].volume == 1 && env.seen_rep[0].pos == 2 && env.seen_rep[0].stripe_version == 7 &&
-                  env.seen_rep[0].total == 1 && env.seen_rep[0].whole == 0,
+    pthread_mutex_lock(&env.mu);
+    bool saw_rep = env.saw_active_report;
+    uint32_t nseen = env.nseen_rep;
+    struct sfill_report rep0 = nseen > 0 ? env.seen_rep[0] : (struct sfill_report){0};
+    pthread_mutex_unlock(&env.mu);
+    CHECK(saw_rep, "c1: never observed active HBS_FILL progress report");
+    if (nseen > 0) {
+        CHECK(rep0.volume == 1 && rep0.pos == 2 && rep0.stripe_version == 7 && rep0.total == 1 && rep0.whole == 0,
               "c1: bad HBS_FILL report (vol=%" PRIu32 " pos=%" PRIu32 " ver=%" PRIu64 " total=%" PRIu64 " whole=%u)",
-              env.seen_rep[0].volume, env.seen_rep[0].pos, env.seen_rep[0].stripe_version, env.seen_rep[0].total,
-              env.seen_rep[0].whole);
+              rep0.volume, rep0.pos, rep0.stripe_version, rep0.total, rep0.whole);
     }
     struct sfill_report cur[4];
     CHECK(sreconcile_report(rec, cur, 4) == 0, "c1: reconcile report not cleared after completion");

@@ -72,7 +72,7 @@ typedef struct eccold_deg_wait {
     bool settled;          /* true after down_mask already waited wait_max_s and settled degraded */
     bool one_logged;       /* logged the wait for 1 position down */
     bool two_logged;       /* logged that >= 2 positions are down (never degraded) */
-    bool waiting;          /* last eccold_settle returned UNAVAILABLE only to wait: do not 1-hour backoff */
+    _Atomic bool waiting;  /* last eccold_settle returned UNAVAILABLE only to wait: do not 1-hour backoff */
 } eccold_deg_wait;
 eccold_deg_wait *ecsettle_deg_wait(eng *db);
 

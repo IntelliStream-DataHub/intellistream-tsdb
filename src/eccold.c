@@ -560,7 +560,7 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     eccold_mutant_init();
     eccold_deg_wait *dw = ecsettle_deg_wait(db);
     if (dw)
-        dw->waiting = false;
+        atomic_store_explicit(&dw->waiting, false, memory_order_relaxed);
     coldvol *cv = tier_cold(db);
     if (!cv)
         return TSDB_ERR_UNAVAILABLE;
@@ -629,7 +629,7 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
                                             "down for a degraded settle): waiting\n", db->dir, ndown, nstripe);
                             dw->two_logged = true;
                         }
-                        dw->waiting = true;
+                        atomic_store_explicit(&dw->waiting, true, memory_order_relaxed);
                     }
                 }
                 rc = TSDB_ERR_UNAVAILABLE;
@@ -658,7 +658,7 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
                             db->dir, ndown, nstripe, ndown == 1 ? "" : "s", (long long)max_s);
                     dw->one_logged = true;
                 }
-                dw->waiting = true;
+                atomic_store_explicit(&dw->waiting, true, memory_order_relaxed);
                 rc = TSDB_ERR_UNAVAILABLE;
                 goto out;
             }

@@ -15842,7 +15842,7 @@ static void scen_ecslow(void)
             /* Phase 3: Sustained delay (550 ms on every read to slow_node) -> enters read-avoid after 8 timeouts;
              * query p99 stays bounded (kills mutant noavoid). */
             ecslow_write_delay(dpath, slow_node, 550, 0);
-            uint64_t t_trig = now_ms();
+            uint64_t t_trig = now_ms(), t_entered = 0;
             int entered = 0;
             for (int iter = 0; iter < 6 && !entered && now_ms() - t_trig < 20000; iter++) {
                 int g = worder[iter % ECS_WINS];
@@ -15853,8 +15853,10 @@ static void scen_ecslow(void)
                         a.h != oracle[s][g].h)
                         die("ecslow: trigger avoid s=%d g=%d: %s", s, g, ers(rc));
                     metrics_get(mport[L], mbuf, sizeof mbuf);
-                    if (ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoid", slow_node) == 1)
+                    if (ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoid", slow_node) == 1) {
                         entered = 1;
+                        t_entered = now_ms();
+                    }
                 }
             }
             /* Timed query loop of 64 queries (4 windows x 16 series) to measure p99 latency. */
@@ -15889,7 +15891,34 @@ static void scen_ecslow(void)
                 die("ecslow: query p99 %" PRIu64 " ms exceeded 250 ms bound while slow node in read-avoid", p99_ms);
 
             /* Phase 4: E15 check — kill 2 other stripe members while slow_node is in read-avoid (m+1=3 away).
-             * Must return UNAVAILABLE, never CORRUPT (kills mutant hedgecorrupt). */
+             * Must return UNAVAILABLE, never CORRUPT (kills mutant hedgecorrupt).
+             * Under slow sanitizer runs (TSan), Phase 3's 64 queries can consume much of the 30 s avoid window:
+             * if > 12 s have elapsed since read-avoid began, let it expire and re-trigger a fresh 30 s window first. */
+            if (t_entered && now_ms() - t_entered > 12000) {
+                for (uint64_t t0 = now_ms(); now_ms() - t0 < 35000; usleep(250000)) {
+                    metrics_get(mport[L], mbuf, sizeof mbuf);
+                    if (ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoid", slow_node) == 0)
+                        break;
+                }
+                int re_entered = 0;
+                for (uint64_t t0 = now_ms(); !re_entered && now_ms() - t0 < 20000;) {
+                    for (int iter = 0; iter < ECS_WINS && !re_entered; iter++) {
+                        int g = worder[iter];
+                        int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                        for (int s = 0; s < ECS_SERIES && !re_entered; s++) {
+                            struct ecb_sum a;
+                            int rrc = ecslow_read_win(c, ide[s], ws, we, &a);
+                            if (rrc == TSDB_ERR_CORRUPT)
+                                die("ecslow: re-trigger avoid s=%d g=%d returned CORRUPT", s, g);
+                            metrics_get(mport[L], mbuf, sizeof mbuf);
+                            if (ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoid", slow_node) == 1)
+                                re_entered = 1;
+                        }
+                    }
+                }
+                if (!re_entered)
+                    die("ecslow: slow node %" PRIu32 " did not re-enter read-avoid before Phase 4", slow_node);
+            }
             int vict[2] = {-1, -1}, nv = 0;
             for (int kpass = 0; kpass < 2 && nv < 2; kpass++)
                 for (int i = 0; i < 6 && nv < 2; i++)

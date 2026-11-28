@@ -53,8 +53,8 @@ def plant(m, text):
 
 mut("M1", "C client ignores the validity bitmap of a values reply (nulls read as values)",
     "client/tsdb_client.c",
-    "tsdb_values col = {(tsdb_type)b[1], v, valid ? v + (size_t)n * aw : NULL};",
-    "tsdb_values col = {(tsdb_type)b[1], v, NULL};",
+    "tsdb_values col = {(tsdb_type)b[1], vp, valid ? vp + (size_t)n * aw : NULL};",
+    "tsdb_values col = {(tsdb_type)b[1], vp, NULL};",
     ["c"], "matrix")
 mut("M2", "Rust client: a local midnight near a clock change is one hour off (wrong time zone bound)",
     "client/rust/src/calendar.rs",
@@ -103,8 +103,8 @@ mut("M8", "tsdb import no longer reads an empty field as null",
     ["c"], "cli")
 mut("M9", "Java packed inserts canonicalise NaN (floatToIntBits): payloads and the null marker are lost",
     "client/java/src/main/java/ai/intellistream/tsdb/Pack.java",
-    "int x = Float.floatToRawIntBits(v[off + i]);",
-    "int x = Float.floatToIntBits(v[off + i]);",
+    "int x = Float.floatToRawIntBits(v[base + j]);",
+    "int x = Float.floatToIntBits(v[base + j]);",
     ["java"], "matrix")
 mut("M10", "crash recovery skips the WAL segment that follows a flushed part (acknowledged rows are lost)",
     "src/memtable.c",
@@ -170,11 +170,13 @@ mut("M19", "server skips the rights check of reads by id: a tenant reads any ser
 mut("M20", "server answers QUERY_LATEST for ids the user may not read (the denied mask is never set)",
     "server/tsdbd.c",
     "    if (!auth_all(&c->auth, R_READ)) {\n        own = malloc((size_t)n * sizeof *own);\n"
-    "        denied = calloc(((size_t)n + 7) / 8, 1);\n        if (!own || !denied)\n            rc = TSDB_ERR_NOMEM;\n"
-    "        for (uint32_t i = 0; rc == 0 && i < n; i++) {\n            bool no = auth_id(&c->auth, ids[i], R_READ) != 0;",
+    "        denied = malloc(((size_t)n + 7) / 8);\n        if (!own || !denied) {\n"
+    "            rc = TSDB_ERR_NOMEM;\n        } else {\n"
+    "            auth_ids_mask(&c->auth, ids, n, R_READ, own, denied);\n            ids = own;\n        }",
     "    if (!auth_all(&c->auth, R_READ)) {\n        own = malloc((size_t)n * sizeof *own);\n"
-    "        denied = calloc(((size_t)n + 7) / 8, 1);\n        if (!own || !denied)\n            rc = TSDB_ERR_NOMEM;\n"
-    "        for (uint32_t i = 0; rc == 0 && i < n; i++) {\n            bool no = false;",
+    "        denied = calloc(((size_t)n + 7) / 8, 1);\n        if (!own || !denied) {\n"
+    "            rc = TSDB_ERR_NOMEM;\n        } else {\n"
+    "            memcpy(own, ids, (size_t)n * sizeof *own);\n            ids = own;\n        }",
     ["c"], "matrix")
 mut("M21", "Java client drops the WITH_NULLS flag of latest (a null answers as the older value under it)",
     "client/java/src/main/java/ai/intellistream/tsdb/TsdbClient.java",

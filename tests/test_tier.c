@@ -39,6 +39,7 @@
 #include "tier.h"
 #include "tierfill.h"
 #include "tiers.h"
+#include "tierscrub.h"
 #include "tsdb.h"
 
 #include <dirent.h>
@@ -1147,9 +1148,11 @@ static int child_health(int argc, char **argv)
     if (!ctl || !*ctl)
         return 3;
 
-    /* Enable real orphan sweep for missed-delete verification. */
+    /* Enable real orphan sweep for missed-delete verification; pause background tier scrubber so attachnoheal is not
+     * masked by an automatic scrub repair right after attach marks the store UP without healing. */
     atomic_store(&ecgc_test_nosweep, false);
     atomic_store(&settle_poll_ms, 100);
+    tierscrub_set_test_pause(true);
     tier_health_test_opts(1500, 150, 3, 500);
 
     char dbdir[PATH_MAX + 64], st[3][PATH_MAX + 64];
@@ -2905,6 +2908,7 @@ static void t_follower(void)
         wo.flush_interval_ms = 50;
         wo.create_volumes = 0;
 
+        bool prev_gc_manual = atomic_exchange(&ecgc_test_manual, true);
         direct wd = {0}, fd = {0};
         CHECK(tier_open(db3, &wo, &wd.t) == 0 && wd.t != NULL);
         if (wd.t) {
@@ -3010,6 +3014,7 @@ static void t_follower(void)
         if (wd.t)
             tier_quiesce(wd.t);
         direct_close(&wd);
+        atomic_store(&ecgc_test_manual, prev_gc_manual);
 
         /* Reopen writer with 1 s lifetime: verify retired_p0.ec is cleaned up once the lifetime expires.
          * ("Still kept before deadline" was already asserted above under the 60 s lifetime, immune to load stalls.) */

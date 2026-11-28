@@ -68,6 +68,6 @@ bad=0
     "$bin" @D@ --mutant @M@ --seeds 6 --seconds 8 || bad=1
 if [ -n "${sim// /}" ]; then
     "$mut" --name meta-sim-only --tmp /var/tmp --timeout "${MUTANT_TIMEOUT:-3600}" --rc 1 --grep "$caught_re" \
-        --list "$sim" -- "$bin" @D@ --mutant @M@ --sim-only --seeds 6 --seconds 8 || bad=1
+        --list "$sim" -- "$bin" @D@ --mutant @M@ --sim-only --seeds 8 --seconds 12 || bad=1
 fi
 exit $bad

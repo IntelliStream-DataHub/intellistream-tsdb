@@ -135,6 +135,7 @@ jobs:
           - { name: cluster 1, target: test-cluster-1, timeout: 30 }
           - { name: cluster 2, target: test-cluster-2, timeout: 30 }
           - { name: cluster 3, target: test-cluster-3, timeout: 40 }
+          - { name: cluster 4, target: test-cluster-4, timeout: 40 }
           - { name: links, target: test-links, timeout: 30 }
           - { name: meta mutants 1, target: test-meta-mutants-1, timeout: 30 }
           - { name: meta mutants 2, target: test-meta-mutants-2, timeout: 30 }
@@ -215,6 +216,7 @@ jobs:
           - { name: cluster 1, target: test-cluster-1, timeout: 30 }
           - { name: cluster 2, target: test-cluster-2, timeout: 30 }
           - { name: cluster 3, target: test-cluster-3, timeout: 40 }
+          - { name: cluster 4, target: test-cluster-4, timeout: 40 }
           - { name: links, target: test-links, timeout: 30 }
           - { name: meta mutants 1, target: test-meta-mutants-1, timeout: 65 }
           - { name: meta mutants 2, target: test-meta-mutants-2, timeout: 65 }

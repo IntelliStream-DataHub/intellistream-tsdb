@@ -83,7 +83,10 @@ peer() { echo 127.0.0.1:$(pport $1); }     # the peer address of node N
 start_node() {                             # start_node N [witness]: start a server, remember its process id
     mkdir -p $D/n$1/state
     if [ "${2:-}" = witness ]; then role="--witness --advertise 127.0.0.1"
-    else mkdir -p $D/n$1/data; role="--dir $D/n$1/data --no-auth --port $(port $1)"; fi
+    else
+        [ -f $D/n$1/data/DISK ] || build/tsdb disk init $D/n$1/data:ssd
+        role="--dir $D/n$1/data --allow-shared-device --no-auth --port $(port $1)"
+    fi
     build/tsdbd $role --state-dir $D/n$1/state --peer-port $(pport $1) \
         --cluster --cluster-secret-file $D/secret --rack rack$1 &gt;&gt; $D/n$1/log 2&gt;&amp;1 &amp;
     echo $! &gt; $D/n$1/pid
@@ -212,9 +215,9 @@ added 127.0.0.1:17093</code></pre>
 cluster 875bd313f7abb7b8c0ca9b6b59e6c292 replication 3 min_isr 1 node_timeout_ms 3000 heartbeat_ms 500 voter_replace_s 600 voters_max 5 mode replicated failover lease read_barrier on lease_s 10 restore_gen 0
 replicated lease_ms 2000 drift_ppm 500 unanswered_ms 1000 commit_interval_ms 5 repl_retain_mb 4096 repl_retain_s 1800 idle_seal_ms 1000 rebuild_mb_s 200 rebuild_max 2 transfer_wait_ms 2000 leader_balance_s 0
 group voters 1,2,3 learners -
-member 1 up incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 344ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 242ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
+member 1 up incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 344ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 242ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
 volumes 0 users 0
 transfers started 0 done 0 timed_out 0 cancelled 0 fell_back 0 balance 0 drains_timed_out 0 resumed_blind 0 ready 0 cuts 0
 moves started 0 done 0 cancelled 0</code></pre>
@@ -227,7 +230,7 @@ pointed at the volume's leader with <code>TSDB_VOLUME=plant</code>:</p>
 volume-report node 1 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
 volume-report node 2 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
 volume-report node 3 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
-volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1 redundancy replicas=3
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
 replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 1
 replica volume 1 node 2 rid f37918561ea1bb09 open_gen 1
 replica volume 1 node 3 rid d7561d069104510c open_gen 1
@@ -245,13 +248,13 @@ Oslo day 2: 120 rows, average 47.47
 <pre><code data-lang="plain" data-block="6" data-src="docs/cluster-preview.md#What you should see">node 2 mode core role follower term 2 leader 3 commit 15 applied 15
 cluster ... (the settings, as before)
 group voters 1,2,3 learners -
-member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 4702ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
+member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 4702ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on down_reason timeout down_age 0s out_in 1800s role both cap both disks 1
 volume-report node 1 volume 1 role owner health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
-member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
+member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
 volume-report node 2 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
-member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 5ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
+member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 5ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
 volume-report node 3 volume 1 role none health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
-volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 2 set_version 1 preferred 1 redundancy replicas=3
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 2 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
 replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 1
 replica volume 1 node 2 rid f37918561ea1bb09 open_gen 1
 replica volume 1 node 3 rid d7561d069104510c open_gen 1
@@ -264,11 +267,11 @@ not tsdb.</p>
 <pre><code data-lang="plain" data-block="7" data-src="docs/cluster-preview.md#What you should see">node 1 mode core role follower term 2 leader 3 commit 17 applied 17
 cluster ... (the settings, as before)
 group voters 1,2,3 learners -
-member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 679ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
+member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
+member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 679ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 1
 volume-report node 2 volume 1 role promoting health ok epoch 2 domain - local_fault_s 0 fenced_age_ms 0
-member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
-volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 2,3 isr_version 3 set_version 1 preferred 1 redundancy replicas=3
+member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ? role both cap both disks 1
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 2,3 isr_version 3 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
 replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 1
 replica volume 1 node 2 rid f37918561ea1bb09 open_gen 1
 replica volume 1 node 3 rid d7561d069104510c open_gen 1
@@ -281,11 +284,11 @@ moves started 0 done 0 cancelled 0</code></pre>
 <pre><code data-lang="plain" data-block="8" data-src="docs/cluster-preview.md#What you should see">node 4 mode watch role - term 0 leader 0 commit 0 applied 18
 cluster ... (the settings, as before)
 group voters 1,2,3 learners -
-member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
-member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
-member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
+member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ? role both cap both disks 1
+member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ? role both cap both disks 1
+member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ? role both cap both disks 1
 member 4 up incarnation 1 addr 127.0.0.1:0 peer 127.0.0.1:17094 rack rack4 heard 0ms feed - voter_ok 1 volumes_ok 0 core_dropped 0 read_barrier ?
-volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 2,3 isr_version 3 set_version 1 preferred 1 redundancy replicas=3
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 2 epoch 2 min_isr 1 replicas 1,2,3 isr 2,3 isr_version 3 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
 replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 1
 replica volume 1 node 2 rid f37918561ea1bb09 open_gen 1
 replica volume 1 node 3 rid d7561d069104510c open_gen 1
@@ -299,15 +302,15 @@ replica to node 5 in the background, waits for it to join the in-sync set, and r
 and rebuilding it from a snapshot of the leader:</p>
 <pre><code data-lang="plain" data-block="9" data-src="docs/cluster-preview.md#What you should see">added 127.0.0.1:17095
 node 1 leads at epoch 3 (400 ms, READY at 1448)
-volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 5 set_version 1 preferred 1 redundancy replicas=3
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 5 set_version 1 preferred 1 redundancy replicas=3 rack loss survivable: yes
 move of volume 1 from node 2 to node 5: proposed (replica 70336e503a1df25e); it runs in the background: learner, join, shrink, remove
-volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,5,3 isr 1,3,5 isr_version 7 set_version 3 preferred 1 redundancy replicas=3
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,5,3 isr 1,3,5 isr_version 7 set_version 3 preferred 1 redundancy replicas=3 rack loss survivable: yes
 replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 2
 replica volume 1 node 5 rid 70336e503a1df25e open_gen 1
 replica volume 1 node 3 rid d7561d069104510c open_gen 1
 tsdbd: volumes: volume 1: /tmp/tsdb-cluster/n3/data/v1 is missing, while the metadata group recorded open generation 1 of replica d7561d069104510c here: not made again by itself (an unmounted disk looks the same); `tsdb cluster replica reset PEER 1 3` makes a fresh replica
 volume 1: reset of node 3 proposed (new instance 62f89e2e8f926b65); its old directory is set aside as v1.lost-&lt;old rid&gt; and a fresh one fills
-volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,5,3 isr 1,3,5 isr_version 9 set_version 4 preferred 1 redundancy replicas=3
+volume 1 name plant uuid ec299dbebada77d5705b89cd49705585 leader 1 epoch 3 min_isr 1 replicas 1,5,3 isr 1,3,5 isr_version 9 set_version 4 preferred 1 redundancy replicas=3 rack loss survivable: yes
 replica volume 1 node 1 rid e6e41ec318c17a90 open_gen 2
 replica volume 1 node 5 rid 70336e503a1df25e open_gen 1
 replica volume 1 node 3 rid 62f89e2e8f926b65 open_gen 2

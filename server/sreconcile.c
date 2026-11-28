@@ -572,7 +572,7 @@ static void stores_save_locked(const struct sreconcile *rec)
         free(buf);
         return;
     }
-    int fd = openat(dfd, SRECONCILE_STORE_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int fd = openat(dfd, SRECONCILE_STORE_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) {
         fprintf(stderr, "tsdbd: reconcile: cannot create %s.tmp: %s\n", path, strerror(errno));
         close(dfd);
@@ -1461,6 +1461,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
     uint64_t completed_replace = 0;
     uint64_t completed_replacing = 0;
     uint64_t l_done = 0, l_tot = 0, l_bytes = 0;
+    bool count_pass_ok = false;
     bool log_done = false;
     bool was_reporting = false;
 
@@ -1526,7 +1527,7 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
             l_done = j->done;
             l_tot = j->total;
             l_bytes = j->pass_bytes;
-            REC_STAT(rec, passes_ok);
+            count_pass_ok = true;
             log_done = (total_queued > 0 || already_present > 0 || gc_pending_cnt > 0 || orphans_cnt > 0 ||
                         replace_mask != 0);
             if (j->retrigger) {
@@ -1545,6 +1546,8 @@ static void run_reconcile_pass(struct sreconcile *rec, struct rec_job *j, uint64
         commit_replaced_stores(rec, completed_replace);
     if (completed_replacing != 0)
         settle_replacing_stores(rec, completed_replacing);
+    if (count_pass_ok)
+        REC_STAT(rec, passes_ok);
 
     if (log_done) {
         fprintf(stderr,

@@ -660,7 +660,7 @@ static size_t listed_p0(const char *dir)
  * nothing listed. The .ec is an empty stand-in, so the open fails after its intents, where this looks. */
 static void beside_swap(void)
 {
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < 3; c++) {
         char work[PATH_MAX], names[8][128], stem[128], buf[2048], ec[160];
         snprintf(work, sizeof work, "%s/swap%d", S, c);
         make_fixture(work);
@@ -673,7 +673,14 @@ static void beside_swap(void)
         len += (size_t)snprintf(buf + len, sizeof buf - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
         put_file(work, "tmp_77_77.ec", "", 0);
         put_file(work, "txn_1_99.intent", buf, len);
-        if (c == 1)
+        if (c == 2) {
+            /* Mid-settle state: R rename already moved .part -> settled_.part, L rename tmp -> .ec not yet durable. */
+            char src[PATH_MAX + 128], dst[PATH_MAX + 160];
+            snprintf(src, sizeof src, "%s/%s", work, names[0]);
+            snprintf(dst, sizeof dst, "%s/settled_%s", work, names[0]);
+            CHECK(rename(src, dst) == 0);
+        }
+        if (c >= 1)
             snprintf(names[0], 128, "%.120s", ec);
         write_intent(work, names, 3, false, false);
         tsdb_options o = opts(0);
@@ -684,7 +691,9 @@ static void beside_swap(void)
         char rec[200];
         snprintf(rec, sizeof rec, "retired_%s", ec);
         size_t left = listed_p0(work);
-        const char *what = c ? "the drop named the .ec, the swap's renames lost" : "the drop named the part";
+        const char *what = c == 0   ? "the drop named the part"
+                           : c == 1 ? "the drop named the .ec, the swap's renames lost"
+                                    : "the drop named the .ec, the swap's R rename durable and L pending";
         if (left)
             printf("  beside a settle's swap (%s): %zu names of partition 0 still listed: HALF DROP\n", what, left);
         CHECK(left == 0 && exists(work, rec) && count_prefix(work, "txn_", NULL, 0) == 0);

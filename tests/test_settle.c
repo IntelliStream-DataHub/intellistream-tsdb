@@ -212,7 +212,8 @@ static int count_fn(const char *path, const struct stat *st, int type, struct FT
 {
     (void)st;
     const char *b = path + f->base;
-    if (type == FTW_F && strcmp(b, "META") && strcmp(b, "EPOCH") && strcmp(b, "LOCK") && strncmp(b, "tmp_", 4))
+    if (type == FTW_F && strcmp(b, "META") && strcmp(b, "EPOCH") && strcmp(b, "LOCK") && strcmp(b, "SCRUB") &&
+        strcmp(b, "SCRUB.tmp") && strcmp(b, "DISK") && strncmp(b, "PROBE", 5) && strncmp(b, "tmp_", 4))
         chunk_files++;
     return 0;
 }

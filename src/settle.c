@@ -1479,7 +1479,7 @@ static bool settle_engine(eng *db)
     pthread_mutex_unlock(&db->lock);
     eccold_deg_wait *dw = ecsettle_deg_wait(db);
     if (dw)
-        dw->waiting = false;
+        atomic_store_explicit(&dw->waiting, false, memory_order_relaxed);
     int rc = n ? eng_settle(db, key, sel, n, NULL) : 0;
     for (size_t i = 0; i < n; i++)
         part_unref(sel[i]);
@@ -1497,7 +1497,7 @@ static bool settle_engine(eng *db)
     } else if (rc == CHUNK_ERR_FULL && settle_hit_store_cap(db)) {
         settle_mark_store_full(db);
     } else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND) {
-        if (!dw || !dw->waiting)
+        if (!dw || !atomic_load_explicit(&dw->waiting, memory_order_relaxed))
             ecpolicy_failed(db, key, now);
     }
     if (db->ec_cluster) {

@@ -55,7 +55,9 @@ class CalendarBoundsTest {
     static final Map<String, String> TZDB_CHANGES = Map.of(
             "Africa/Casablanca", "Morocco stays on +00:00 from 2026-09-20 (C: all fixed units align to +00:00)",
             "America/Vancouver", "British Columbia stays on -07:00 from November 2026 (as do Alberta and Manitoba)",
-            "Asia/Tehran", "Iran's DST began on 1979-05-26, not 1979-05-27");
+            "Asia/Tehran", "Iran's DST began on 1979-05-26, not 1979-05-27",
+            "America/Sao_Paulo", "tzdata 2026f historical 1965-1966 DST adjustment",
+            "America/Havana", "tzdata 2026f November 2026 - March 2027 DST adjustment");
 
     /** One line of the fixtures: a call of tsdb_calendar_bounds and what it returned. */
     record Case(String zone, Unit unit, int count, long start, long end, int rc, long[] bounds, String line) {
