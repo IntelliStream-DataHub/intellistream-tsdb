@@ -3,7 +3,7 @@
 # One command that benchmarks tsdb itself on this machine and writes a summary.
 #
 #   tools/bench-tsdb.sh [--quick|--standard|--full] [--reps N] [--dir SCRATCH] [--out RESULTS_DIR]
-#                       [--portable] [--cpu-compare] [--keep] [--io auto|uring|epoll] [--help]
+#                       [--portable] [--cpu-compare] [--tier] [--hdd PATH] [--keep] [--io auto|uring|epoll] [--help]
 #
 # Run it from a fresh clone on a machine that does nothing else. See --help for what each mode runs. The raw output
 # of every run goes to RESULTS_DIR/raw, the tables (mean, standard deviation, lowest and highest run) to
@@ -31,6 +31,8 @@ PORTABLE=0
 KEEP=0
 IO=
 CPUCMP=0
+TIER=0
+HDD=
 JOBS=${MAKE_JOBS:-$(nproc 2>/dev/null || echo 2)}
 
 usage() {
@@ -38,7 +40,7 @@ usage() {
 Benchmark tsdb on this machine and write a summary of how fast it is.
 
   tools/bench-tsdb.sh [--quick | --standard | --full] [--reps N] [--dir SCRATCH] [--out RESULTS_DIR]
-                      [--portable] [--cpu-compare] [--keep] [--io auto|uring|epoll]
+                      [--portable] [--cpu-compare] [--tier] [--hdd PATH] [--keep] [--io auto|uring|epoll]
 
 How big
   --quick       tiny sizes, 1 run: checks that the script works here (a few minutes). The numbers mean nothing.
@@ -61,6 +63,10 @@ Options
                 core is worth, how queries scale with threads, and where the short-run kernels hand over to the wide
                 ones on this CPU. Takes another half hour; this is the deeper per-CPU comparison, see
                 bench/cpu-compare/README.md.
+  --tier        also run tier-bench (local settled tier: settle per GiB, re-encode, orphan sweep, digest throttling,
+                and cold decode queries with/without prefetch). Without --hdd, cold decode runs under outagefs and
+                is labelled "shim, not hardware".
+  --hdd PATH    rotational hard drive path passed to tier-bench (implies --tier; refused if non-rotational per /sys).
   --keep        keep the scratch data at the end (default: remove it).
   --io BACKEND  the tsdbd event loop (default: the server's own choice).
 
@@ -82,6 +88,8 @@ What it runs, in this order, each test REPS times:
   6 large data set       --full only (and a tiny one in --quick): scale-bench loads and queries billions of rows
   7 CPU comparison       only with --cpu-compare: bench/cpu-compare/ht-sweep.sh and thresholds.sh (their output is
                          kept as it is, one run each)
+  8 local settled tier   only with --tier (or --hdd PATH): tier-bench (settle per GiB, re-encode, orphan sweep,
+                         digest throttling, and cold decode queries with and without prefetch)
 
 Before the first test it prints what is missing (a compiler, libzstd headers, ...), records the machine (CPU, memory,
 disk, governor, git commit) and warns if the machine is busy or the CPU governor is not "performance". Run nothing
@@ -101,6 +109,8 @@ while [ $# -gt 0 ]; do
     --portable) PORTABLE=1 ;;
     --keep) KEEP=1 ;;
     --cpu-compare) CPUCMP=1 ;;
+    --tier) TIER=1 ;;
+    --hdd) HDD=${2:-}; [ -n "$HDD" ] || { echo "bench-tsdb.sh: --hdd wants a path" >&2; exit 2; }; TIER=1; shift ;;
     --io) IO=${2:-}; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "bench-tsdb.sh: unknown option $1 (see --help)" >&2; exit 2 ;;
@@ -424,6 +434,13 @@ build() {
     for t in codec-bench type-bench decode-bench fold-bench tsdb-bench tsdbc-bench insert-bench scale-bench tsdbd; do
         [ -x "$B/$t" ] || die "the build did not make $B/$t"
     done
+    if [ $TIER = 1 ]; then
+        [ -x "$B/tier-bench" ] || die "the build did not make $B/tier-bench"
+        if [ -z "$HDD" ] && [ "$(uname -s)" = Linux ]; then
+            "${MAKE_ENV[@]}" make -j"$JOBS" B="$B" "$B/liboutagefs.so" >>"$RAW/build.log" 2>&1 ||
+                die "failed to build $B/liboutagefs.so (see $RAW/build.log)"
+        fi
+    fi
     # The flags as make expanded them (not as this script thinks they are).
     show() { "${MAKE_ENV[@]}" make -s B="$B" --eval='show-%: ; @echo $($*)' "show-$1" 2>/dev/null | head -n 1; }
     cflags=$(show CFLAGS)
@@ -650,6 +667,23 @@ t_cpu_compare() {
     done
 }
 
+t_tier() {
+    log "8 local settled tier (tier-bench)"
+    local targs=() r
+    [ "$MODE" = quick ] && targs+=(--quick)
+    if [ -n "$HDD" ]; then
+        targs+=(--hdd "$HDD")
+        meta size_tier "tier-bench (mode $MODE): settle per GiB (1+1, 2+1, 4+2, 1+0), re-encode per GiB, orphan sweep, digest throttling, and cold decode queries on real rotational hard drive ($HDD)."
+    else
+        [ -f "$B/liboutagefs.so" ] && targs+=(--outagefs "$B/liboutagefs.so")
+        meta size_tier "tier-bench (mode $MODE): settle per GiB (1+1, 2+1, 4+2, 1+0), re-encode per GiB, orphan sweep, digest throttling, and cold decode queries on outagefs (shim, not hardware)."
+    fi
+    for ((r = 1; r <= REPS; r++)); do
+        run tier "$r" "$B/tier-bench" --dir "$WORK/tier.$r" ${targs[@]+"${targs[@]}"}
+        rm -rf -- "$WORK/tier.$r"
+    done
+}
+
 # ------------------------------------------------------------------ main
 
 log "tsdb benchmark: mode $MODE, $REPS run(s) of each test, results in $RES"
@@ -672,6 +706,7 @@ t_server
 t_durable
 if [ "$SCALE_SERIES" != 0 ]; then t_scale; fi
 if [ $CPUCMP = 1 ]; then t_cpu_compare; fi
+if [ $TIER = 1 ]; then t_tier; fi
 secs=$(($(date +%s) - START))
 meta duration "$((secs / 60)) min $((secs % 60)) s (the tests, not the build)"
 

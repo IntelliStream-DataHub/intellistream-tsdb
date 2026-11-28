@@ -331,6 +331,53 @@ def parse_scale_query(sec, text, rep):
             sec.add("queries", row, "rate", "M rows/s", float(m.group(8)), rep)
 
 
+def kv_quoted(line):
+    out = {}
+    for m in re.finditer(r'(\w+)=(?:"([^"]*)"|(\S+))', line):
+        out[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return out
+
+
+def parse_tier(sec, text, rep):
+    for line in text.splitlines():
+        if line.startswith("tier-bench: skipped"):
+            sec.skipped_note = line.strip()
+            continue
+        if not line.startswith("TIER_RESULT "):
+            continue
+        d = kv_quoted(line)
+        t = d.get("section")
+        row = d.get("row")
+        if not t or not row:
+            continue
+        try:
+            if t in ("settle", "reencode"):
+                sec.add(t, row, "wall", "s/GiB", float(d["wall_s_gib"]), rep)
+                sec.add(t, row, "cpu", "s/GiB", float(d["cpu_s_gib"]), rep)
+                sec.add(t, row, "throughput", "MiB/s", float(d["mib_s"]), rep)
+                sec.add(t, row, "peak RSS", "MiB", float(d["rss_peak_mib"]), rep)
+                sec.add(t, row, "peak anon", "MiB", float(d["anon_peak_mib"]), rep)
+            elif t == "sweep":
+                sec.add(t, row, "wall", "ms", float(d["wall_ms"]), rep)
+                sec.add(t, row, "cpu", "ms", float(d["cpu_ms"]), rep)
+                sec.add(t, row, "rate", "objects/s", float(d["objs_s"]), rep)
+            elif t == "digest":
+                cap_k = "cap_mib_s" if "cap_mib_s" in d else "cap_mb_s"
+                sec.add(t, row, "cap", "MiB/s", float(d[cap_k]), rep)
+                sec.add(t, row, "actual", "MiB/s", float(d["actual_mib_s"]), rep)
+                sec.add(t, row, "wall", "s", float(d["wall_s"]), rep)
+                sec.add(t, row, "cpu", "s/GiB", float(d["cpu_s_gib"]), rep)
+            elif t == "cold":
+                sec.add(t, row, "wall", "ms", float(d["wall_ms"]), rep)
+                sec.add(t, row, "cpu", "ms", float(d["cpu_ms"]), rep)
+                sec.add(t, row, "reads", "reads", float(d["reads"]), rep)
+                sec.add(t, row, "pf used", "granules", float(d["pf_used"]), rep)
+                if d.get("storage"):
+                    sec.notes[(t, row)] = d["storage"]
+        except (KeyError, ValueError):
+            continue
+
+
 # ---------------------------------------------------------------- collecting
 
 def collect(raw, status):
@@ -428,6 +475,19 @@ def collect(raw, status):
         sec = Section("cpu_compare", "CPU comparison (bench/cpu-compare)", "text")
         sec.texts = [(n, read(os.path.join(raw, n)) or "") for n in texts]
         secs.append(sec)
+
+    tier_files = runs("tier")
+    if tier_files:
+        sec = Section("tier", "Local settled tier (tier-bench)", "long")
+        for rep, path in tier_files.items():
+            text = read(path) or ""
+            before = len(sec.metrics) and sum(len(v[1]) for v in sec.metrics.values())
+            parse_tier(sec, text, rep)
+            after = sum(len(v[1]) for v in sec.metrics.values())
+            if after == before and not getattr(sec, "skipped_note", None):
+                problems.append("tier run %d: no numbers found in raw/%s" % (rep, os.path.basename(path)))
+        sec.reps = len(tier_files)
+        secs.append(sec)
     return secs, problems
 
 
@@ -471,7 +531,10 @@ def render_long(sec, rows, lines):
         if key[0] not in tables:
             tables.append(key[0])
     heading = {"load": "Load", "queries": "Queries", "random": "Random windows (2 s each)",
-               "connections": "Connections", "durable": "Durable inserts"}
+               "connections": "Connections", "durable": "Durable inserts",
+               "settle": "Settle per GiB", "reencode": "Re-encode per GiB",
+               "sweep": "Open orphan sweep", "digest": "Digest cost and throttling",
+               "cold": "Cold decode queries"}
     for t in tables:
         sub = [(k, u, s) for k, u, s in rows if k[0] == t]
         if len(tables) > 1:
@@ -557,6 +620,10 @@ HEADLINES = [
     ("Durable insert, 1000 rows through WAL + memtable", "durable", "durable", r"^insert batch -> WAL.*, 1k rows",
      "rows", "rows/s"),
     ("Large data set: load", "scale", "load", r"^insert$", "rate", "M rows/s"),
+    ("Tier settle 4+2", "tier", "settle", r"^settle 4\+2$", "throughput", "MiB/s"),
+    ("Tier re-encode 4+2", "tier", "reencode", r"^reencode 4\+2", "throughput", "MiB/s"),
+    ("Tier cold decode, 1 series, prefetch off", "tier", "cold", r"^1 series, .*prefetch off", "wall", "ms"),
+    ("Tier cold decode, 1 series, prefetch on", "tier", "cold", r"^1 series, .*prefetch on", "wall", "ms"),
 ]
 
 
@@ -570,7 +637,9 @@ def headline(secs, lines):
         for key in sec.order:
             if key[0] == table and key[2] == col and re.search(rx, key[1]):
                 st = stats([sec.metrics[key][1][r] for r in sorted(sec.metrics[key][1])])
-                out.append("| %s | %s %s | %s | %d |" % (label, fmt(st["mean"]), unit,
+                note = sec.notes.get((table, key[1]))
+                lbl = "%s (%s)" % (label, note) if note else label
+                out.append("| %s | %s %s | %s | %d |" % (lbl, fmt(st["mean"]), unit,
                                                     "%.1f%%" % st["sd_pct"] if st["n"] > 1 else "-", st["n"]))
                 break
     if out:
@@ -683,7 +752,10 @@ def main():
             js["sections"].append({"id": sec.id, "title": sec.title, "text": {n: c for n, c in sec.texts}})
             continue
         if not rows:
-            md.append("No numbers (see Problems).")
+            if getattr(sec, "skipped_note", None):
+                md.append("%s." % sec.skipped_note)
+            else:
+                md.append("No numbers (see Problems).")
             md.append("")
         elif sec.kind == "matrix":
             render_matrix(sec, rows, md)
