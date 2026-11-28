@@ -162,6 +162,8 @@ enum { TIER_MUT_NONE = 0, TIER_MUT_PERENGINE, TIER_MUT_UNSURE, TIER_MUT_NOEC, TI
        TIER_MUT_FOLLOWFLOCK,  /* followflock: label for CHUNK_MUT_FOLLOW_FLOCK (follower takes exclusive store flock) */
        TIER_MUT_FOLLOWDEL     /* followdel: label for GC_MUT_FOLLOWDEL (writer deletes retired chunks immediately) */ };
 extern int tier_mutant;
+/* Parses TSDB_TIER_MUTANT once (TSDB_TEST_HOOKS only; 0 = ok/unset, -1 = unknown mutant name). */
+int tier_mutant_env_init(void);
 
 /* R15 (r15-health): per-store probes, runtime store DOWN, queued attach/heal worker, and tsdbd --health-domain hooks. */
 int tier_health_open(tier *t);

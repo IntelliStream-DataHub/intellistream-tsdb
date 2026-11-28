@@ -19,6 +19,8 @@
 #include "ecswap.h"
 #include "settle.h"
 #include "tierctl.h"
+#include "tierfill.h"
+#include "tiersalv.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -38,6 +40,43 @@ static inline int tier_mut(void)
 {
 #ifdef TSDB_TEST_HOOKS
     return tier_mutant;
+#else
+    return 0;
+#endif
+}
+
+#ifdef TSDB_TEST_HOOKS
+static pthread_once_t tier_mut_once = PTHREAD_ONCE_INIT;
+static int tier_mut_rc;
+
+static void tier_mut_init_once(void)
+{
+    const char *m = getenv("TSDB_TIER_MUTANT");
+    if (!m || !*m)
+        return;
+    if (strcmp(m, "downnoread") == 0) {
+        tier_mutant = TIER_MUT_DOWNNOREAD;
+        chunk_mutant = CHUNK_MUT_DOWNNOREAD;
+    } else if (strcmp(m, "fullnoflag") == 0) {
+        tierfill_mutant = TIERFILL_MUT_FULLNOFLAG;
+    } else if (strcmp(m, "lostnoreplace") == 0) {
+        tierctl_mutant = TIERCTL_MUT_LOSTNOREPLACE;
+    } else if (strcmp(m, "salvagelatest") == 0) {
+        tiersalv_mutant = TIERSALV_MUT_LATEST;
+    } else {
+        fprintf(stderr, "tsdb: TSDB_TIER_MUTANT=%s: no such mutant\n", m);
+        tier_mut_rc = -1;
+        return;
+    }
+    fprintf(stderr, "tsdb: TSDB_TIER_MUTANT=%s (tests only)\n", m);
+}
+#endif
+
+int tier_mutant_env_init(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    pthread_once(&tier_mut_once, tier_mut_init_once);
+    return tier_mut_rc;
 #else
     return 0;
 #endif
@@ -794,6 +833,8 @@ void tier_set_cluster(tier_cluster_fn fn, void *arg, uint64_t cache_mb)
 static int tier_open_impl(const char *dir, const tsdb_options *opt, bool salvage_mode, tier **out)
 {
     *out = NULL;
+    if (tier_mutant_env_init() != 0)
+        return TSDB_ERR_INVALID;
     tiers_view tv;
     tiers_view_init(&tv);
     bool has_db_id = false;

@@ -8019,6 +8019,8 @@ int main(int argc, char **argv)
     }
     if (margin_mutant)
         fprintf(stderr, "tsdbd: TSDBD_MARGIN_MUTANT=%s\n", getenv("TSDBD_MARGIN_MUTANT"));
+    if (tier_mutant_env_init() != 0)
+        return 2;
     test_query_status = getenv("TSDBD_TEST_QUERY_STATUS") ? atoi(getenv("TSDBD_TEST_QUERY_STATUS")) : 0;
     if (getenv("TSDB_ROUTE_MUTANT") && *getenv("TSDB_ROUTE_MUTANT")) { /* "" is unset (an exported empty name) */
         static const char *const names[] = {"",           "rightsbeforeroute", "movedoffcopy",

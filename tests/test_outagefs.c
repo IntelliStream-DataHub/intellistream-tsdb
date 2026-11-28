@@ -14,9 +14,11 @@
 #include <stdbool.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 
 static int failures;
@@ -139,6 +141,57 @@ static void run(void)
     t0 = now_ms();
     CHECK(pread(fd, buf, 5, 0) == 5);
     CHECK(now_ms() - t0 < 1000);
+
+    /* rate MB/s: caps both write and read throughput on dir_a without affecting dir_b */
+    {
+        char rp[512], rpb[512];
+        snprintf(rp, sizeof rp, "%s/rate.bin", dir_a);
+        snprintf(rpb, sizeof rpb, "%s/rate.bin", dir_b);
+        size_t sz = 256 * 1024; /* 0.25 MiB */
+        char *big = malloc(sz);
+        CHECK(big != NULL);
+        memset(big, 0x5a, sz);
+        CHECK(cmd("rate", dir_a, "0.5") == 0); /* 0.5 MiB/s -> 0.25 MiB takes >= ~450 ms each way */
+        CHECK(cmd("rate", dir_a, "-1") != 0);
+        int rfd = open(rp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        CHECK(rfd >= 0);
+        t0 = now_ms();
+        CHECK(pwrite(rfd, big, sz, 0) == (ssize_t)sz);
+        CHECK(now_ms() - t0 >= 400);
+        t0 = now_ms();
+        CHECK(pread(rfd, big, sz, 0) == (ssize_t)sz);
+        CHECK(now_ms() - t0 >= 400);
+        /* dir_b is uncapped */
+        int bf = open(rpb, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        CHECK(bf >= 0);
+        CHECK(pwrite(bf, big, sz, 0) == (ssize_t)sz);
+        close(bf);
+        CHECK(cmd("rate", dir_a, "0") == 0);
+        t0 = now_ms();
+        CHECK(pread(rfd, big, sz, 0) == (ssize_t)sz);
+        CHECK(now_ms() - t0 < 400);
+        close(rfd);
+        free(big);
+    }
+
+    /* fill PCT: overrides statvfs and fstatvfs on dir_a; dir_b and heal restore real statvfs */
+    {
+        struct statvfs sv;
+        CHECK(cmd("fill", dir_a, "92") == 0);
+        CHECK(cmd("fill", dir_a, "101") != 0);
+        CHECK(statvfs(dir_a, &sv) == 0 && sv.f_blocks > 0);
+        uint64_t pct = ((uint64_t)(sv.f_blocks - sv.f_bavail) * 100u) / (uint64_t)sv.f_blocks;
+        CHECK(pct == 92);
+        CHECK(fstatvfs(fd, &sv) == 0 && sv.f_blocks > 0);
+        pct = ((uint64_t)(sv.f_blocks - sv.f_bavail) * 100u) / (uint64_t)sv.f_blocks;
+        CHECK(pct == 92);
+        CHECK(cmd("fill", dir_a, "50") == 0);
+        CHECK(statvfs(dir_a, &sv) == 0 && sv.f_blocks > 0);
+        pct = ((uint64_t)(sv.f_blocks - sv.f_bavail) * 100u) / (uint64_t)sv.f_blocks;
+        CHECK(pct == 50);
+        CHECK(cmd("heal", dir_a, NULL) == 0);
+        CHECK(statvfs(dir_a, &sv) == 0);
+    }
 
     /* hang: the writer blocks, a sibling prefix goes on, heal lets it finish */
     hung_fd = fd;

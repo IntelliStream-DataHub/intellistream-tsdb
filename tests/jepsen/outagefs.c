@@ -16,7 +16,9 @@
  *               is not on the storage.
  *   enospc      calls that add data or names fail with ENOSPC; reads and fsync of what exists work (a full pool).
  *   slow MS     every call takes MS milliseconds more.
- *   heal        no fault.
+ *   rate MB/s   cap read and write throughput on the prefix to MB/s megabytes per second (0 disables).
+ *   fill PCT    override statvfs/fstatvfs on the prefix to report PCT% used (0..100; -1 disables).
+ *   heal        no fault (also clears slow, rate and fill).
  *   snap        copies the prefix's tree to a snapshot directory.
  *   rollback    puts the snapshot back in place: files that exist in it get its bytes (same inode, so open
  *               descriptors see them: tsdb's NFS client would see ESTALE for a file that went away, SIGBUS in a
@@ -53,11 +55,12 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #define MAX_FDS 65536
-#define MAX_ROOTS 16
+#define MAX_ROOTS 64
 
 enum fault { F_NONE, F_HANG, F_EIO, F_ESTALE, F_ETIMEDOUT, F_ENOSPC, F_EIODROP };
 
@@ -66,6 +69,10 @@ static struct {
     size_t len;
     enum fault fault;
     int slow_ms;
+    double rate_mb_s;     /* MB/s throughput cap for read/write (0 = unlimited) */
+    double rate_bps;      /* bytes/s (rate_mb_s * 1024 * 1024) */
+    int64_t rate_next_ns; /* monotonic ns when next byte slot is available */
+    int fill_pct;         /* statvfs/fstatvfs used % override (0..100, -1 = real) */
     char snap[PATH_MAX];
     unsigned long hung; /* threads inside a hang right now */
 } roots[MAX_ROOTS];
@@ -92,8 +99,12 @@ REAL(int, openat, (int, const char *, int, ...));
 REAL(int, creat, (const char *, mode_t));
 REAL(ssize_t, read, (int, void *, size_t));
 REAL(ssize_t, pread, (int, void *, size_t, off_t));
+REAL(ssize_t, readv, (int, const struct iovec *, int));
+REAL(ssize_t, preadv, (int, const struct iovec *, int, off_t));
 REAL(ssize_t, write, (int, const void *, size_t));
 REAL(ssize_t, pwrite, (int, const void *, size_t, off_t));
+REAL(ssize_t, writev, (int, const struct iovec *, int));
+REAL(ssize_t, pwritev, (int, const struct iovec *, int, off_t));
 REAL(int, fsync, (int));
 REAL(int, fdatasync, (int));
 REAL(int, syncfs, (int));
@@ -131,8 +142,12 @@ static void resolve(void)
     LOAD(creat);
     LOAD(read);
     LOAD(pread);
+    LOAD(readv);
+    LOAD(preadv);
     LOAD(write);
     LOAD(pwrite);
+    LOAD(writev);
+    LOAD(pwritev);
     LOAD(fsync);
     LOAD(fdatasync);
     LOAD(syncfs);
@@ -234,6 +249,74 @@ static int gate(int r, bool grows)
     if (slow > 0)
         usleep((useconds_t)slow * 1000);
     return rc;
+}
+
+/* Per-root read/write throughput cap (`rate MB/s`): reserves byte time under mu, sleeps outside mu in short slices
+ * so heal / `rate 0` or abandonment wakes promptly. */
+static void rate_gate(int r, size_t nbytes)
+{
+    if (!r || bypass || nbytes == 0)
+        return;
+    int i = r - 1;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    pthread_mutex_lock(&mu);
+    double bps = roots[i].rate_bps;
+    if (bps <= 0.0) {
+        pthread_mutex_unlock(&mu);
+        return;
+    }
+    double cost_d = (double)nbytes * 1e9 / bps;
+    int64_t cost_ns = cost_d > 6e10 ? 60000000000LL : cost_d < 1.0 ? 1 : (int64_t)cost_d;
+    int64_t base = roots[i].rate_next_ns;
+    if (base < now)
+        base = now;
+    int64_t done = base + cost_ns;
+    roots[i].rate_next_ns = done;
+    pthread_mutex_unlock(&mu);
+    int64_t wait_ns = done - now;
+    while (wait_ns > 0 && !abandoned) {
+        int64_t chunk = wait_ns > 50000000LL ? 50000000LL : wait_ns;
+        struct timespec sl = {.tv_sec = chunk / 1000000000LL, .tv_nsec = chunk % 1000000000LL};
+        nanosleep(&sl, NULL);
+        pthread_mutex_lock(&mu);
+        bool off = roots[i].rate_bps <= 0.0;
+        pthread_mutex_unlock(&mu);
+        if (off)
+            break;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        wait_ns = done - now;
+    }
+}
+
+/* Applies `fill PCT` override to a statvfs result when configured on root `r`. */
+static void apply_fill(int r, struct statvfs *sv)
+{
+    if (!r || bypass || !sv)
+        return;
+    pthread_mutex_lock(&mu);
+    int pct = roots[r - 1].fill_pct;
+    pthread_mutex_unlock(&mu);
+    if (pct < 0)
+        return;
+    if (pct > 100)
+        pct = 100;
+    if (sv->f_blocks == 0)
+        sv->f_blocks = 1000000;
+    if (sv->f_frsize == 0)
+        sv->f_frsize = 4096;
+    if (sv->f_bsize == 0)
+        sv->f_bsize = sv->f_frsize;
+    uint64_t total = (uint64_t)sv->f_blocks;
+    /* floor((total - avail) * 100 / total) == pct without uint64 overflow. */
+    uint64_t used = (total / 100u) * (uint64_t)pct + ((total % 100u) * (uint64_t)pct + 99u) / 100u;
+    if (used > total)
+        used = total;
+    fsblkcnt_t avail = (fsblkcnt_t)(total - used);
+    sv->f_bavail = avail;
+    sv->f_bfree = avail;
 }
 
 /* eiodrop: is the root's fault one that throws writes away? */
@@ -408,14 +491,22 @@ int flock(int fd, int op)
 ssize_t read(int fd, void *buf, size_t n)
 {
     resolve();
-    GATE(root_of_fd(fd), false);
-    return real_read(fd, buf, n);
+    int r = root_of_fd(fd);
+    GATE(r, false);
+    ssize_t got = real_read(fd, buf, n);
+    if (got > 0)
+        rate_gate(r, (size_t)got);
+    return got;
 }
 ssize_t pread(int fd, void *buf, size_t n, off_t off)
 {
     resolve();
-    GATE(root_of_fd(fd), false);
-    return real_pread(fd, buf, n, off);
+    int r = root_of_fd(fd);
+    GATE(r, false);
+    ssize_t got = real_pread(fd, buf, n, off);
+    if (got > 0)
+        rate_gate(r, (size_t)got);
+    return got;
 }
 ssize_t pread64(int fd, void *buf, size_t n, off_t off) { return pread(fd, buf, n, off); }
 /* glibc's fortified headers (Ubuntu builds at -O1 and up) turn read and pread into these when the buffer's size is
@@ -441,20 +532,91 @@ ssize_t __pread64_chk(int fd, void *buf, size_t n, off_t off, size_t buflen)
 ssize_t write(int fd, const void *buf, size_t n)
 {
     resolve();
-    GATE(root_of_fd(fd), true);
-    if (dropping(root_of_fd(fd)))
+    int r = root_of_fd(fd);
+    GATE(r, true);
+    if (dropping(r)) {
+        rate_gate(r, n);
         return (ssize_t)n;
-    return real_write(fd, buf, n);
+    }
+    ssize_t put = real_write(fd, buf, n);
+    if (put > 0)
+        rate_gate(r, (size_t)put);
+    return put;
 }
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
 {
     resolve();
-    GATE(root_of_fd(fd), true);
-    if (dropping(root_of_fd(fd)))
+    int r = root_of_fd(fd);
+    GATE(r, true);
+    if (dropping(r)) {
+        rate_gate(r, n);
         return (ssize_t)n;
-    return real_pwrite(fd, buf, n, off);
+    }
+    ssize_t put = real_pwrite(fd, buf, n, off);
+    if (put > 0)
+        rate_gate(r, (size_t)put);
+    return put;
 }
 ssize_t pwrite64(int fd, const void *buf, size_t n, off_t off) { return pwrite(fd, buf, n, off); }
+static size_t iov_total(const struct iovec *iov, int iovcnt)
+{
+    size_t tot = 0;
+    for (int i = 0; i < iovcnt; i++)
+        tot += iov[i].iov_len;
+    return tot;
+}
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    resolve();
+    int r = root_of_fd(fd);
+    GATE(r, false);
+    ssize_t got = real_readv(fd, iov, iovcnt);
+    if (got > 0)
+        rate_gate(r, (size_t)got);
+    return got;
+}
+ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t off)
+{
+    resolve();
+    int r = root_of_fd(fd);
+    GATE(r, false);
+    ssize_t got = real_preadv(fd, iov, iovcnt, off);
+    if (got > 0)
+        rate_gate(r, (size_t)got);
+    return got;
+}
+ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off_t off) { return preadv(fd, iov, iovcnt, off); }
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    resolve();
+    int r = root_of_fd(fd);
+    GATE(r, true);
+    if (dropping(r)) {
+        size_t tot = iov_total(iov, iovcnt);
+        rate_gate(r, tot);
+        return (ssize_t)tot;
+    }
+    ssize_t put = real_writev(fd, iov, iovcnt);
+    if (put > 0)
+        rate_gate(r, (size_t)put);
+    return put;
+}
+ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t off)
+{
+    resolve();
+    int r = root_of_fd(fd);
+    GATE(r, true);
+    if (dropping(r)) {
+        size_t tot = iov_total(iov, iovcnt);
+        rate_gate(r, tot);
+        return (ssize_t)tot;
+    }
+    ssize_t put = real_pwritev(fd, iov, iovcnt, off);
+    if (put > 0)
+        rate_gate(r, (size_t)put);
+    return put;
+}
+ssize_t pwritev64(int fd, const struct iovec *iov, int iovcnt, off_t off) { return pwritev(fd, iov, iovcnt, off); }
 /* fsync of data already written does not need space: it passes under enospc */
 int fsync(int fd)
 {
@@ -584,15 +746,23 @@ int fstatat64(int d, const char *p, struct stat64 *st, int flags)
 int statvfs(const char *p, struct statvfs *sv)
 {
     resolve();
-    GATE(root_of_path(p), false);
-    return real_statvfs(p, sv);
+    int r = root_of_path(p);
+    GATE(r, false);
+    int rc = real_statvfs(p, sv);
+    if (rc == 0)
+        apply_fill(r, sv);
+    return rc;
 }
 int statvfs64(const char *p, struct statvfs64 *sv) { return statvfs(p, (struct statvfs *)sv); }
 int fstatvfs(int fd, struct statvfs *sv)
 {
     resolve();
-    GATE(root_of_fd(fd), false);
-    return real_fstatvfs(fd, sv);
+    int r = root_of_fd(fd);
+    GATE(r, false);
+    int rc = real_fstatvfs(fd, sv);
+    if (rc == 0)
+        apply_fill(r, sv);
+    return rc;
 }
 int fstatvfs64(int fd, struct statvfs64 *sv) { return fstatvfs(fd, (struct statvfs *)sv); }
 
@@ -738,8 +908,8 @@ static void control_line(int c, char *line)
     if (!strcmp(cmd, "state")) {
         pthread_mutex_lock(&mu);
         for (int i = 0; i < nroots; i++)
-            reply(c, "%s %s slow=%d hung=%lu\n", roots[i].path, fault_name(roots[i].fault), roots[i].slow_ms,
-                  roots[i].hung);
+            reply(c, "%s %s slow=%d rate=%.2f fill=%d hung=%lu\n", roots[i].path, fault_name(roots[i].fault),
+                  roots[i].slow_ms, roots[i].rate_mb_s, roots[i].fill_pct, roots[i].hung);
         pthread_mutex_unlock(&mu);
         reply(c, "ok\n");
         return;
@@ -771,14 +941,49 @@ static void control_line(int c, char *line)
     if (is_fault) {
         pthread_mutex_lock(&mu);
         roots[i].fault = f;
-        if (f == F_NONE)
+        if (f == F_NONE) {
             roots[i].slow_ms = 0;
+            roots[i].rate_mb_s = 0.0;
+            roots[i].rate_bps = 0.0;
+            roots[i].rate_next_ns = 0;
+            roots[i].fill_pct = -1;
+        }
         pthread_cond_broadcast(&cv);
         pthread_mutex_unlock(&mu);
         reply(c, "ok\n");
     } else if (!strcmp(cmd, "slow") && arg) {
         pthread_mutex_lock(&mu);
         roots[i].slow_ms = atoi(arg);
+        pthread_mutex_unlock(&mu);
+        reply(c, "ok\n");
+    } else if (!strcmp(cmd, "rate") && arg) {
+        char *ep = NULL;
+        errno = 0;
+        double mb = strtod(arg, &ep);
+        if (errno || !ep || ep == arg || *ep != '\0' || !(mb >= 0.0) || mb > 1e6) {
+            reply(c, "err bad rate\n");
+            return;
+        }
+        pthread_mutex_lock(&mu);
+        roots[i].rate_mb_s = mb;
+        roots[i].rate_bps = mb > 0.0 ? mb * (1024.0 * 1024.0) : 0.0;
+        roots[i].rate_next_ns = 0;
+        pthread_mutex_unlock(&mu);
+        reply(c, "ok\n");
+    } else if (!strcmp(cmd, "fill") && arg) {
+        int pct = -1;
+        if (strcmp(arg, "off") != 0) {
+            char *ep = NULL;
+            errno = 0;
+            long v = strtol(arg, &ep, 10);
+            if (errno || !ep || ep == arg || *ep != '\0' || v < -1 || v > 100) {
+                reply(c, "err bad fill\n");
+                return;
+            }
+            pct = (int)v;
+        }
+        pthread_mutex_lock(&mu);
+        roots[i].fill_pct = pct;
         pthread_mutex_unlock(&mu);
         reply(c, "ok\n");
     } else if (!strcmp(cmd, "snap") || !strcmp(cmd, "rollback")) {
@@ -835,6 +1040,8 @@ __attribute__((constructor)) static void init(void)
     if (getenv("OUTAGEFS_HOLD_MAX_S"))
         hold_max_ms = atoi(getenv("OUTAGEFS_HOLD_MAX_S")) * 1000;
     snprintf(ctl_path, sizeof ctl_path, "%s", ctl);
+    for (int i = 0; i < MAX_ROOTS; i++)
+        roots[i].fill_pct = -1;
     char *copy = strdup(rs);
     for (char *p = strtok(copy, ":"); p && nroots < MAX_ROOTS; p = strtok(NULL, ":")) {
         if (!realpath(p, roots[nroots].path))

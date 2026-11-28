@@ -3,22 +3,29 @@
  * A Jepsen-style test of tsdbd: clients write and read through the network
  * while a nemesis crashes the server, and a checker verifies the history.
  *
- *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|settle-steps|none] [--seconds 20]
- *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]
- *          [--verify-checksums] [--auth] [--feed] [--tier N]
+ *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|settle-steps|store-eio|store-stuck|
+ *                               store-lost|salvage|fill|single-copy|none] [--seconds 20]
+ *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so]
+ *          [--workload kv|classes] [--verify-checksums] [--auth] [--feed] [--tier N]
  *
- * Tier (--tier N; R7, docs/design-cluster-data.md 10.2): the database has a directory tier, N store directories
- * (DIR/tier/s0 ...; k + m = N with m = N / 3, so 3 = 2+1 and 6 = 4+2), given to every tsdbd, the CLI and the final
- * in-process open as TSDB_TEST_TIER=k=..,m=..,dirs=..,grace_s=1,keep_s=5,eager=1 with TSDB_TEST_TIER_I_KNOW=1 (the
- * eager policy settles a key as soon as it is a second old: kv's keys are old from the start, and its writes keep
- * merges selectable, so no other policy would settle anything). With the tier the workloads send more deletes,
- * replaces and large inserts (also into old keys, which a settle has taken or is taking), and the run ends with a
- * settle check (tier_check): `.ec` parts, `settled_` and `retired_*.ec` files in DIR and the settle lines in the
- * server logs (JEPSEN_SETTLE_LINE, default "settled ") must reach a minimum (JEPSEN_MIN_SETTLES; 0 turns it off, for
- * a tsdbd without settles), so a run in which nothing settled fails: it tested nothing of the tier. The parts per
- * partition at the end are reported (settled parts count toward insert backpressure, finding 11). A kv or classes
- * run with the tier reads the database as it lies on disk: no follower (a follower refuses a tier volume, D7), and
- * classes' final "one part per partition" is only "no fewer rows than keys" (an `.ec` part is never merged).
+ * Tier (--tier N; R7/R15, docs/design-cluster-data.md 10.2, §15.9): the database lives in DIR/db with N store
+ * directories in DIR/tier/s0..s(N-1) configured via `tsdb DIR/db tier add` (`TIERS`), with timing overrides in
+ * TSDB_TEST_TIER=grace_s=1,keep_s=5,eager=1 (TSDB_TEST_TIER_I_KNOW=1). Set JEPSEN_TIER_LEGACY=1 for the legacy
+ * TSDB_TEST_TIER=k=..,m=..,dirs=.. path without TIERS. R15 tier nemeses (default 6 stores, 1 for single-copy, under
+ * outagefs): `store-eio` (EIO on one store: reads decode around it, server stays up, heals), `store-stuck` (hung I/O
+ * on one store: DOWN_STALLED, reads decode around it; kills `downnoread`), `store-lost` (wipe one store + live
+ * `tsdb tier lost STORE --replace`: verifies pre-wipe live chunks rebuilt; kills `lostnoreplace`), `salvage` (wipe
+ * m+1 stores, verify E15 TSDB_ERR_IO & stats before salvage, run `tsdb tier salvage`, verify young/surviving data and
+ * live latest-table invalidation; kills `salvagelatest`), `fill` (outagefs `fill 92` on fast root: UNAVAILABLE FULL
+ * refusals, reads go on, writes resume at 50%; kills `fullnoflag`), `single-copy` (1-store `--single-copy` 1+0 under
+ * outagefs `rate`/`slow` and SIGKILL restarts). With the tier the workloads send more deletes, replaces and large
+ * inserts (also into old keys, which a settle has taken or is taking), and the run ends with a settle check
+ * (tier_check): `.ec` parts, `settled_` and `retired_*.ec` files in dbdir and the settle lines in the server logs
+ * (JEPSEN_SETTLE_LINE, default "settled ") must reach a minimum (JEPSEN_MIN_SETTLES; 0 turns it off, for a tsdbd
+ * without settles), so a run in which nothing settled fails: it tested nothing of the tier. The parts per partition
+ * at the end are reported (settled parts count toward insert backpressure, finding 11). A kv or classes run with the
+ * tier reads the database as it lies on disk: no follower (a follower refuses a tier volume, D7), and classes' final
+ * "one part per partition" is only "no fewer rows than keys" (an `.ec` part is never merged).
  * The eio nemesis may hit a store file: a failed store stops that process's settles and nothing else (the server
  * goes on, reads go on), so a failure on a file under DIR/tier needs no fail-stop, and the minimum is 1.
  * settle-steps (needs --tier and --crashfs): every faulty tsdbd starts with TSDB_SETTLE_CRASH_AT=<step>[:n] (after-put,
@@ -197,6 +204,12 @@
 #include <unistd.h>
 
 #include "../../src/health_rules.h"
+#include "../../src/tiers.h"
+#ifdef TSDB_EC
+#include "../../src/eccache.h"
+#include "../../src/tier.h"
+#include "../../src/tierctl.h"
+#endif
 #include "../harness.h"
 #include "../outagefs_ctl.h"
 #include "outage_judge.h"
@@ -532,10 +545,77 @@ static int64_t ffail_longest;       /* ns, the longest run of failed follower re
 /* misdirect and rot: damage the database; each epoch (a forked child) runs on a fresh directory and ends early once
  * the damage is persistent (even a server without faults refuses the directory or fails the final read) */
 static bool md, rot;                /* --nemesis misdirect / rot */
-/* --tier N: a directory tier of N stores (see the header). settle_steps: --nemesis settle-steps. */
+/* --tier N: a directory tier of N stores (TIERS via `tsdb DIR tier add`, or legacy dirs= with JEPSEN_TIER_LEGACY=1).
+ * R15 nemeses: store-eio, store-stuck, store-lost, salvage, fill, single-copy. */
+static char dbdir[PATH_MAX];        /* DIR/db for TIERS mode (stores are siblings in DIR/tier), else DIR */
 static int tier_n;
+static bool tier_legacy;            /* JEPSEN_TIER_LEGACY=1: legacy TSDB_TEST_TIER dirs= path without TIERS */
 static bool settle_steps;
+static bool t_store_eio, t_store_stuck, t_store_lost, t_salvage, t_fill, t_single_copy, tier_nem;
 static char tier_root[PATH_MAX];    /* DIR/tier, as an absolute path: the stores are tier_root/s<i> */
+static char store_paths[16][PATH_MAX]; /* current canonical directory of each store slot 0..tier_n-1 */
+static int store_gen[16];           /* replacement counter per store slot */
+static bool store_replaced[16];     /* slot was replaced since the current server started (not in its OUTAGEFS_ROOTS) */
+static int tier_nem_problems;       /* safety violations detected by R15 tier nemeses (exit 1) */
+static int tier_liveness_issues;    /* timing/liveness misses in R15 tier nemeses (INCONCLUSIVE, exit 3) */
+static char tier_liveness_msg[256];
+static atomic_bool tier_harness_err; /* harness/setup/control failures in R15 tier nemeses (exit 2) */
+static char tier_harness_msg[256];
+static int tier_nem_rounds;         /* completed R15 tier fault rounds */
+static atomic_llong fill_full_refusals; /* UNAVAILABLE WHY_FULL refusals observed by clients under `fill` */
+static atomic_llong fill_writes_ok;     /* acknowledged writes under `fill` */
+static atomic_llong fill_last_ok_ns;    /* invoke time of latest acknowledged write under `fill` */
+static int salv_io_verified, salv_stats_verified, salv_parts_retired;
+static int lost_rebuilds_verified;
+#define MAX_SALV_EVENTS 32
+typedef struct salv_event {
+    int64_t lost_ns;              /* monotonic ns when 3 stores were marked LOST (settles paused from here) */
+    int64_t salv_ns;              /* monotonic ns when `tsdb tier salvage` retired the lost .ec parts */
+    int64_t done_ns;              /* monotonic ns when tsdbd restarted after replacing lost stores */
+    int64_t parts[64];            /* partition keys whose .ec parts were retired by this salvage */
+    int64_t lo[64];               /* inclusive timestamp start of each retired partition */
+    int64_t hi[64];               /* exclusive timestamp end of each retired partition */
+    int64_t settle_cutoff_ns[64]; /* monotonic ns cutoff from retired .ec settle_ms (never excuses younger writes) */
+    int nparts;
+} salv_event;
+static salv_event salv_ev[MAX_SALV_EVENTS];
+static int nsalv_ev;
+
+static void tier_liveness(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "  [tier liveness] %s\n", buf);
+    if (!tier_liveness_msg[0])
+        snprintf(tier_liveness_msg, sizeof tier_liveness_msg, "%s", buf);
+    tier_liveness_issues++;
+}
+
+static void tier_harness_fail(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "  [tier harness error] %s\n", buf);
+    if (!tier_harness_msg[0])
+        snprintf(tier_harness_msg, sizeof tier_harness_msg, "%s", buf);
+    atomic_store(&tier_harness_err, true);
+    atomic_store(&stop, true);
+}
+
+#ifdef TSDB_EC
+static int64_t wall_ms_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+#endif
 static const char *const settle_step_names[] = {"after-put", "after-ec-tmp", "after-intent", "between-renames",
                                                 "before-unlink"};
 #define NSTEPS 5
@@ -1189,6 +1269,14 @@ static void start_server_run(bool faulty)
                 setenv("LD_PRELOAD", outagefs_lib, 1);
                 setenv("OUTAGEFS_ROOTS", roots, 1);
                 setenv("OUTAGEFS_CTL", octl, 1);
+            } else if (tier_nem && faulty && outagefs_lib) { /* fast root + every store as its own outagefs root */
+                char roots[18 * PATH_MAX];
+                size_t at = (size_t)snprintf(roots, sizeof roots, "%s", dbdir);
+                for (int i = 0; i < tier_n && at + strlen(store_paths[i]) + 2 < sizeof roots; i++)
+                    at += (size_t)snprintf(roots + at, sizeof roots - at, ":%s", store_paths[i]);
+                setenv("LD_PRELOAD", outagefs_lib, 1);
+                setenv("OUTAGEFS_ROOTS", roots, 1);
+                setenv("OUTAGEFS_CTL", octl, 1);
             }
             if (faulty && crashfs && attempt == 0) {
                 char sd[32];
@@ -1232,6 +1320,8 @@ static void start_server_run(bool faulty)
              * probes of 400 to 1400 ms happen with no fault (the 10-seed runs, 6 of 20 failed at fast=400) */
             if (outage)
                 setenv("TSDBD_TEST_HEALTH", "down=2500,read=200,write=500,recover=1500,fast=2000,spawn=60000", 1);
+            if (tier_nem)
+                setenv("TSDB_TEST_TIER_HEALTH", "stall_ms=1000,every_ms=200,ok_need=2,fast_ms=500", 1);
             if (!getenv("JEPSEN_VERBOSE")) { /* kept for a server that does not come up */
                 bool keep = getenv("JEPSEN_KEEP") != NULL;
                 int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot || outage || keep || tier_n ? O_APPEND : O_TRUNC),
@@ -1249,8 +1339,9 @@ static void start_server_run(bool faulty)
                 if (lfd >= 0)
                     dup2(lfd, 2);
             }
-            const char *av[48] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
-                                  "--wal-max-batch-rows", WAL_MAX_BATCH_ROWS_STR, "--partition-ms", pms};
+            const char *av[48] = {"tsdbd", "--dir", dbdir, "--port", "0", "--port-file", pf, "--workers",
+                                  t_store_stuck ? "20" : "8", "--wal-max-batch-rows", WAL_MAX_BATCH_ROWS_STR,
+                                  "--partition-ms", pms};
             int ac = 13;
             av[ac++] = follow; /* a killed run leaves no server behind */
             if (!auth)
@@ -1292,6 +1383,7 @@ static void start_server_run(bool faulty)
         unlink(pf);
         atomic_store(&server_starting, false);
         if (p > 0) {
+            memset(store_replaced, 0, sizeof store_replaced);
             atomic_store(&port, p);
             up_ns = now_ns();
             if (server_faulty)
@@ -1617,7 +1709,7 @@ static void start_follower(void)
         int log = open(flogpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (log >= 0)
             dup2(log, 2);
-        const char *av[16] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--follow"};
+        const char *av[16] = {"tsdbd", "--dir", dbdir, "--port", "0", "--port-file", pf, "--workers", "2", "--follow"};
         int ac = 10;
         av[ac++] = follow;
         if (!auth)
@@ -1926,22 +2018,43 @@ static void *follower_reader(void *arg)
 
 /* ------------------------------------------------------------ clients */
 
-/* outage: what a write to series s came to. UNAVAILABLE is "not applied" (a definite failure, checked by 2); a
- * client that gets it does not spin. */
-static void outage_note(int s, int rc, int64_t invoke)
+/* outage & fill: what a write to series s came to. UNAVAILABLE is "not applied" (a definite failure, checked by 2); a
+ * client that gets it does not spin. Under `fill`, UNAVAILABLE carrying TSDB_WHY_FULL is counted in fill_full_refusals. */
+static void outage_note(tsdbc *c, int s, int rc, int64_t invoke)
 {
-    if (!outage)
+    if (outage) {
+        if (rc == 0) {
+            atomic_fetch_add(&vol_ok[s % 2], 1);
+            /* the invoke time, not the ack: a call that was stuck in the hang and returns the moment it heals is a write
+             * the old outage acknowledged, and says nothing of whether the volume takes new ones (it made the check
+             * below pass at once in half the runs). The latest invoke among the acknowledged writes. */
+            long long cur = atomic_load(&vol_last_ok[s % 2]);
+            while (cur < invoke && !atomic_compare_exchange_weak(&vol_last_ok[s % 2], &cur, invoke))
+                ;
+        } else if (rc == TSDB_ERR_UNAVAILABLE) {
+            usleep(2000);
+        }
         return;
-    if (rc == 0) {
-        atomic_fetch_add(&vol_ok[s % 2], 1);
-        /* the invoke time, not the ack: a call that was stuck in the hang and returns the moment it heals is a write
-         * the old outage acknowledged, and says nothing of whether the volume takes new ones (it made the check
-         * below pass at once in half the runs). The latest invoke among the acknowledged writes. */
-        long long cur = atomic_load(&vol_last_ok[s % 2]);
-        while (cur < invoke && !atomic_compare_exchange_weak(&vol_last_ok[s % 2], &cur, invoke))
-            ;
-    } else if (rc == TSDB_ERR_UNAVAILABLE)
-        usleep(2000);
+    }
+    if (t_fill) {
+        if (rc == 0) {
+            atomic_fetch_add(&fill_writes_ok, 1);
+            long long cur = atomic_load(&fill_last_ok_ns);
+            while (cur < invoke && !atomic_compare_exchange_weak(&fill_last_ok_ns, &cur, invoke))
+                ;
+        } else if (rc == TSDB_ERR_UNAVAILABLE) {
+            tsdbc_err_info ei;
+            if (c && tsdbc_last_error(c, &ei) == TSDB_ERR_UNAVAILABLE && ei.has_body) {
+                for (unsigned j = 0; j < ei.nunavail; j++) {
+                    if (ei.unavail[j].reason == TSDB_WHY_FULL) {
+                        atomic_fetch_add(&fill_full_refusals, 1);
+                        break;
+                    }
+                }
+            }
+            usleep(2000);
+        }
+    }
 }
 
 static tsdbc *connect_retry(void)
@@ -2224,7 +2337,7 @@ static void *client(void *arg)
                                           : REQ("delete of a key range", tsdbc_delete_range(c, ids[s], a, b));
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
-            outage_note(s, rc, w->invoke);
+            outage_note(c, s, rc, w->invoke);
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
@@ -2260,7 +2373,7 @@ static void *client(void *arg)
             int rc = REQ("insert of nulls", tsdbc_insert_series(c, ids[s], ts, v, n));
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
-            outage_note(s, rc, w->invoke);
+            outage_note(c, s, rc, w->invoke);
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
@@ -2356,7 +2469,7 @@ static void *client(void *arg)
             int rc = REQ("insert", tsdbc_insert_series(c, ids[s], ts, v, m));
             w->complete = now_ns();
             w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
-            outage_note(s, rc, w->invoke);
+            outage_note(c, s, rc, w->invoke);
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
@@ -2770,7 +2883,7 @@ static void rot_damage(uint64_t r)
         const char *kind = kinds[(r = mix(r)) % (sizeof kinds / sizeof *kinds)];
         if (kind[0] == '.' && !verify) /* granule payloads are checked only with verify_checksums (documented) */
             continue;
-        DIR *d = opendir(dir);
+        DIR *d = opendir(dbdir);
         unsigned seen = 0;
         struct dirent *e;
         while (d && (e = readdir(d)) != NULL) {
@@ -2778,7 +2891,7 @@ static void rot_damage(uint64_t r)
             bool match = kind[0] == '.' ? n > 5 && !strcmp(e->d_name + n - 5, ".part") && strncmp(e->d_name, "tmp_", 4)
                                         : !strncmp(e->d_name, kind, strlen(kind));
             if (match && (seen++, mix(r + seen) % seen == 0))
-                snprintf(pick, sizeof pick, "%s/%s", dir, e->d_name);
+                snprintf(pick, sizeof pick, "%.3800s/%s", dbdir, e->d_name);
         }
         if (d)
             closedir(d);
@@ -3183,6 +3296,1428 @@ static void outage_tick(uint64_t r)
     outage_await_recovery(v, now_ns(), what);
 }
 
+/* ---- R15 local tier nemeses (docs/design-cluster-data.md §15.9, E55):
+ *   store-eio    EIO on one store (reads decode around it, settles pause and resume after heal, server never stops)
+ *   store-stuck  hung I/O on one store (store goes DOWN_STALLED, reads decode around it without stalling; kills downnoread)
+ *   store-lost   wipe one store and `tsdb tier lost --replace` under live load (rebuilt store holds chunks; kills lostnoreplace)
+ *   salvage      wipe m+1 stores, verify E15 TSDB_ERR_IO + stats before salvage, `tsdb tier salvage`, replace & resume;
+ *                plus post-run live `tsdb_tier_salvage` latest-table oracle check (kills salvagelatest)
+ *   fill         drive fast root's statvfs fill to 92% (`UNAVAILABLE WHY_FULL` refusals, never lost writes; kills fullnoflag)
+ *   single-copy  one store (`--single-copy`, m = 0, 1+0) with rate/slow/kill faults */
+
+static const char *tsdb_cli_path(void) { return getenv("JEPSEN_TSDB") ? getenv("JEPSEN_TSDB") : "./build/tsdb"; }
+
+/* Runs `tsdb` CLI with LD_PRELOAD unset; copies combined stdout+stderr into out[0..outcap) if non-NULL. */
+static int tier_cli_run(char *const argv[], char *out, size_t outcap)
+{
+    int pfd[2] = {-1, -1};
+    if (out && outcap > 0) {
+        out[0] = 0;
+        if (pipe(pfd) != 0)
+            pfd[0] = pfd[1] = -1;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        unsetenv("LD_PRELOAD");
+        unsetenv("OUTAGEFS_CTL");
+        unsetenv("OUTAGEFS_ROOTS");
+        if (pfd[1] >= 0) {
+            dup2(pfd[1], 1);
+            dup2(pfd[1], 2);
+            close(pfd[0]);
+            close(pfd[1]);
+        }
+        execv(tsdb_cli_path(), argv);
+        _exit(127);
+    }
+    if (pfd[1] >= 0)
+        close(pfd[1]);
+    if (pfd[0] >= 0 && out && outcap > 0) {
+        size_t got = 0;
+        ssize_t n;
+        while (got + 1 < outcap && (n = read(pfd[0], out + got, outcap - 1 - got)) > 0)
+            got += (size_t)n;
+        out[got] = 0;
+        close(pfd[0]);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid)
+        return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static void rm_tree_dir(const char *p)
+{
+    DIR *d = opendir(p);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        char q[PATH_MAX];
+        int n = snprintf(q, sizeof q, "%s/%s", p, e->d_name);
+        if (n <= 0 || (size_t)n >= sizeof q)
+            continue;
+        struct stat st;
+        if (lstat(q, &st) == 0 && S_ISDIR(st.st_mode))
+            rm_tree_dir(q);
+        else
+            unlink(q);
+    }
+    closedir(d);
+    rmdir(p);
+}
+
+static int tier_outage_ctl(const char *cmd, const char *path, const char *arg)
+{
+    char line[PATH_MAX + 64], out[256];
+    snprintf(line, sizeof line, "%s %s%s%s", cmd, path, arg ? " " : "", arg ? arg : "");
+    if (getenv("JEPSEN_VERBOSE"))
+        fprintf(stderr, "jepsen: tier outagefs: %s\n", line);
+    int rc = outagefs_cmd(octl, line, out, sizeof out);
+    if (rc != 0)
+        fprintf(stderr, "  tier outagefs refused '%s': %s\n", line, out);
+    return rc;
+}
+
+static bool tier_status_get(const char *key, char *val, size_t n)
+{
+    tsdbc *c = NULL;
+    if (connect_own_ms(atomic_load(&port), atomic_load(&server_pid), &c, 3000) != 0)
+        return false;
+    tsdbc_set_timeout(c, 3000);
+    char *txt = NULL;
+    bool ok = false;
+    if (tsdbc_status(c, &txt) == 0 && txt) {
+        size_t kl = strlen(key);
+        for (char *p = txt; *p;) {
+            char *nl = strchr(p, '\n');
+            size_t ll = nl ? (size_t)(nl - p) : strlen(p);
+            if (ll > kl && strncmp(p, key, kl) == 0 && p[kl] == '=') {
+                size_t vl = ll - kl - 1;
+                if (vl >= n)
+                    vl = n - 1;
+                memcpy(val, p + kl + 1, vl);
+                val[vl] = 0;
+                ok = true;
+                break;
+            }
+            p = nl ? nl + 1 : p + ll;
+        }
+        free(txt);
+    }
+    tsdbc_close(c);
+    return ok;
+}
+
+static bool tier_wait_status(const char *key, const char *want, bool negate, int timeout_ms)
+{
+    int64_t end = now_ns() + (int64_t)timeout_ms * 1000000LL;
+    char val[128];
+    while (now_ns() < end && !atomic_load(&stop)) {
+        if (tier_status_get(key, val, sizeof val)) {
+            bool eq = strcmp(val, want) == 0;
+            if (negate ? !eq : eq)
+                return true;
+        }
+        usleep(50000);
+    }
+    return false;
+}
+
+static int count_ec_files(const char *d, int *settled_copies_out)
+{
+    int ec = 0, sc = 0;
+    DIR *dp = opendir(d);
+    struct dirent *e;
+    while (dp && (e = readdir(dp)) != NULL) {
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] == 'p' && l > 3 && strcmp(e->d_name + l - 3, ".ec") == 0)
+            ec++;
+        else if (strncmp(e->d_name, "settled_", 8) == 0)
+            sc++;
+    }
+    if (dp)
+        closedir(dp);
+    if (settled_copies_out)
+        *settled_copies_out = sc;
+    return ec;
+}
+
+static int list_ec_partitions(const char *d, int64_t *parts, int max)
+{
+    int np = 0;
+    DIR *dp = opendir(d);
+    struct dirent *e;
+    while (dp && (e = readdir(dp)) != NULL) {
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] != 'p' || l <= 3 || strcmp(e->d_name + l - 3, ".ec") != 0)
+            continue;
+        long long p = 0, lo = 0, hi = 0;
+        unsigned lvl = 0;
+        if (sscanf(e->d_name, "p%lld_%lld_%lld_%u", &p, &lo, &hi, &lvl) != 4)
+            continue;
+        bool dup = false;
+        for (int i = 0; i < np && !dup; i++)
+            dup = parts[i] == (int64_t)p;
+        if (!dup && np < max)
+            parts[np++] = (int64_t)p;
+    }
+    if (dp)
+        closedir(dp);
+    return np;
+}
+
+static void part_key_range(int64_t key, int64_t pms, int64_t *lo, int64_t *hi)
+{
+    static const int64_t mult[4] = {1, 7, 28, 364};
+    int c = (int)(((key % 4) + 4) % 4);
+    int64_t base = (key - c) / 4;
+    *lo = base * pms;
+    *hi = (base + mult[c]) * pms;
+}
+
+/* Reads the 16-byte OID from each live p*.ec file in `d` (trailer EC_TR_REC_OFF=16 -> record EC_REC_OID=8)
+ * into lowercase 32-hex strings. */
+static int read_ec_oids(const char *d, char oids[][33], int max)
+{
+    static const char hex[] = "0123456789abcdef";
+    int n = 0;
+    DIR *dp = opendir(d);
+    struct dirent *e;
+    while (dp && (e = readdir(dp)) != NULL && n < max) {
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] != 'p' || l <= 3 || strcmp(e->d_name + l - 3, ".ec") != 0)
+            continue;
+        char fp[PATH_MAX + 256];
+        int pn = snprintf(fp, sizeof fp, "%s/%s", d, e->d_name);
+        if (pn <= 0 || (size_t)pn >= sizeof fp)
+            continue;
+        int fd = open(fp, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size >= 128) {
+            uint8_t tr[64], ob[16];
+            if (pread(fd, tr, 64, st.st_size - 64) == 64) {
+                uint64_t rec_off = 0;
+                memcpy(&rec_off, tr + 16, 8);
+                if (rec_off + 24 <= (uint64_t)st.st_size && pread(fd, ob, 16, (off_t)(rec_off + 8)) == 16) {
+                    for (int i = 0; i < 16; i++) {
+                        oids[n][2 * i] = hex[ob[i] >> 4];
+                        oids[n][2 * i + 1] = hex[ob[i] & 0xf];
+                    }
+                    oids[n][32] = 0;
+                    n++;
+                }
+            }
+        }
+        close(fd);
+    }
+    if (dp)
+        closedir(dp);
+    return n;
+}
+
+static bool oid_in_list(const char *oid32, char list[][33], int n)
+{
+    for (int i = 0; i < n; i++)
+        if (memcmp(oid32, list[i], 32) == 0)
+            return true;
+    return false;
+}
+
+static int count_store_chunks_dir(const char *store_dir, bool pos0_only)
+{
+    char s0[PATH_MAX + 16];
+    snprintf(s0, sizeof s0, "%.4000s/s0", store_dir);
+    DIR *dp = opendir(s0);
+    if (!dp)
+        return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(dp)) != NULL) {
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] != 'o' || l <= 7 || strcmp(e->d_name + l - 6, ".chunk") != 0)
+            continue;
+        if (pos0_only) {
+            const char *dot = strchr(e->d_name, '.');
+            if (!dot || atoi(dot + 1) != 0)
+                continue;
+        }
+        n++;
+    }
+    closedir(dp);
+    return n;
+}
+
+/* Picks a store slot holding at least one live .ec object's pos-0 data chunk (or any live chunk if !pos0_only). */
+static int pick_tier_store(uint64_t r, bool pos0_only)
+{
+    char live[128][33];
+    int nlive = read_ec_oids(dbdir, live, 128);
+    int start = (int)((r + (uint64_t)tier_nem_rounds) % (uint64_t)tier_n);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int off = 0; off < tier_n; off++) {
+            int s = (start + off) % tier_n;
+            char s0[PATH_MAX + 16];
+            snprintf(s0, sizeof s0, "%.4000s/s0", store_paths[s]);
+            DIR *dp = opendir(s0);
+            if (!dp)
+                continue;
+            bool hit = false;
+            struct dirent *e;
+            while (!hit && (e = readdir(dp)) != NULL) {
+                size_t l = strlen(e->d_name);
+                if (e->d_name[0] != 'o' || l < 39 || strcmp(e->d_name + l - 6, ".chunk") != 0)
+                    continue;
+                const char *dot = strchr(e->d_name, '.');
+                if (!dot || dot - (e->d_name + 1) != 32)
+                    continue;
+                if (pos0_only && pass == 0 && atoi(dot + 1) != 0)
+                    continue;
+                if (nlive == 0 || oid_in_list(e->d_name + 1, live, nlive))
+                    hit = true;
+            }
+            closedir(dp);
+            if (hit)
+                return s;
+        }
+    }
+    return start;
+}
+
+static bool tier_wait_ec(int timeout_ms, bool want_no_settled_copies)
+{
+    int64_t end = now_ns() + (int64_t)timeout_ms * 1000000LL;
+    while (now_ns() < end && !atomic_load(&stop) && !atomic_load(&nem_stop) && !atomic_load(&nem_quiet)) {
+        int sc = 0;
+        int ec = count_ec_files(dbdir, &sc);
+        if (ec > 0 && (!want_no_settled_copies || sc == 0))
+            return true;
+        usleep(100000);
+    }
+    return false;
+}
+
+/* Queries all kv series. Sets *liveness_out = true when failure is a connect failure or client timeout (liveness)
+ * rather than an explicit server error reply. */
+static int tier_query_all_series(int timeout_ms, bool *liveness_out)
+{
+    if (liveness_out)
+        *liveness_out = false;
+    tsdbc *c = NULL;
+    if (connect_own_ms(atomic_load(&port), atomic_load(&server_pid), &c, timeout_ms) != 0) {
+        if (liveness_out)
+            *liveness_out = true;
+        return TSDB_ERR_IO;
+    }
+    tsdbc_set_timeout(c, timeout_ms);
+    int rc = 0;
+    for (int s = 0; s < nseries && rc == 0; s++) {
+        int64_t qt0 = now_ns();
+        tsdb_points p = {0};
+        rc = tsdbc_query_points(c, ids[s], key_ts(s, 0), key_end(s, nkeys[s]), &p);
+        free(p.ts);
+        free(p.values);
+        if (rc == TSDB_ERR_IO && liveness_out && now_ns() - qt0 >= (int64_t)timeout_ms * 850000LL)
+            *liveness_out = true;
+    }
+    tsdbc_close(c);
+    return rc;
+}
+
+/* store-eio: EIO on one store -> goes DOWN_IOERR, reads decode around it, server stays up, heals back to UP. */
+static void tier_store_eio_tick(uint64_t r)
+{
+    if (!tier_wait_ec(10000, false))
+        return;
+    int s = pick_tier_store(r, true);
+    int64_t t0 = now_ns();
+    atomic_fetch_add(&nem_inprog, 1);
+    if (tier_outage_ctl("eio", store_paths[s], NULL) != 0) {
+        tier_harness_fail("store-eio: outagefs eio failed on store %d (%s)", s, store_paths[s]);
+        atomic_fetch_sub(&nem_inprog, 1);
+        return;
+    }
+    /* Probe/read drives store s to DOWN_IOERR. */
+    char skey[64];
+    snprintf(skey, sizeof skey, "tier.store.%d.state", s);
+    bool went_down = tier_wait_status(skey, "DOWN_IOERR", false, 5000);
+    if (!server_running()) {
+        tier_nem_problems++;
+        fprintf(stderr, "  store-eio: server exited after EIO on store %d (%s): must stay up\n", s, store_paths[s]);
+    } else {
+        if (!went_down && !atomic_load(&stop)) {
+            char cur[64] = "?";
+            tier_status_get(skey, cur, sizeof cur);
+            tier_liveness("store-eio: store %d did not reach DOWN_IOERR within 5 s (state=%s)", s, cur);
+        }
+        /* Reads MUST decode around the EIO store and succeed. */
+        bool q_live = false;
+        int qrc = tier_query_all_series(5000, &q_live);
+        if (qrc != 0 && !atomic_load(&stop)) {
+            if (q_live) {
+                tier_liveness("store-eio: read timed out or lost connection while store %d was in EIO", s);
+            } else {
+                tier_nem_problems++;
+                fprintf(stderr, "  store-eio: query failed (%s) while store %d was in EIO: must decode around it\n",
+                        tsdbc_strerror(qrc), s);
+            }
+        }
+        nap(1500000, false);
+    }
+    tier_outage_ctl("heal", store_paths[s], NULL);
+    if (server_running() && !atomic_load(&stop)) {
+        if (!tier_wait_status(skey, "UP", false, 10000) && !atomic_load(&stop)) {
+            char cur[64] = "?";
+            tier_status_get(skey, cur, sizeof cur);
+            tier_liveness("store-eio: store %d did not recover to UP after heal (state=%s)", s, cur);
+        }
+    }
+    atomic_fetch_sub(&nem_inprog, 1);
+    nem_fault_span(t0, now_ns());
+    tier_nem_rounds++;
+    nap(1000000, false);
+}
+
+static char salv_cur_series[64];
+static int64_t salv_cur_tbase;
+static int64_t anchor_tbase;
+static bool stuck_cold_ready;
+
+static bool tier_wait_ec_for_ts(int64_t ts, int timeout_ms, bool want_no_settled_copies);
+
+/* Picks the store slot holding pos 0 (the first data chunk) of the .ec object for partition containing `ts`. */
+static int pick_pos0_store_for_ts(int64_t ts, uint64_t r)
+{
+    int64_t pms_val = classes ? (int64_t)CL_PARTITION_MS : PARTITION_MS;
+    int64_t want_p = -1;
+    int64_t parts[64];
+    int np = list_ec_partitions(dbdir, parts, 64);
+    for (int i = 0; i < np; i++) {
+        int64_t lo = 0, hi = 0;
+        part_key_range(parts[i], pms_val, &lo, &hi);
+        if (ts >= lo && ts < hi) {
+            want_p = parts[i];
+            break;
+        }
+    }
+    if (want_p >= 0) {
+        char pfx[64];
+        snprintf(pfx, sizeof pfx, "p%lld_", (long long)want_p);
+        DIR *dp = opendir(dbdir);
+        struct dirent *e;
+        static const char hex[] = "0123456789abcdef";
+        char oid[33] = "";
+        while (dp && (e = readdir(dp)) != NULL) {
+            size_t l = strlen(e->d_name);
+            if (strncmp(e->d_name, pfx, strlen(pfx)) != 0 || l <= 3 || strcmp(e->d_name + l - 3, ".ec") != 0)
+                continue;
+            char fp[PATH_MAX + 256];
+            if (snprintf(fp, sizeof fp, "%.4000s/%s", dbdir, e->d_name) > 0) {
+                int fd = open(fp, O_RDONLY | O_CLOEXEC);
+                struct stat st;
+                if (fd >= 0) {
+                    if (fstat(fd, &st) == 0 && st.st_size >= 128) {
+                        uint8_t tr[64], ob[16];
+                        if (pread(fd, tr, 64, st.st_size - 64) == 64) {
+                            uint64_t rec_off = 0;
+                            memcpy(&rec_off, tr + 16, 8);
+                            if (rec_off + 24 <= (uint64_t)st.st_size && pread(fd, ob, 16, (off_t)(rec_off + 8)) == 16) {
+                                for (int i = 0; i < 16; i++) {
+                                    oid[2 * i] = hex[ob[i] >> 4];
+                                    oid[2 * i + 1] = hex[ob[i] & 0xf];
+                                }
+                                oid[32] = 0;
+                            }
+                        }
+                    }
+                    close(fd);
+                }
+            }
+            if (oid[0])
+                break;
+        }
+        if (dp)
+            closedir(dp);
+        if (oid[0]) {
+            char fname[64];
+            snprintf(fname, sizeof fname, "o%s.0.chunk", oid);
+            for (int s = 0; s < tier_n; s++) {
+                char cp[PATH_MAX + 96];
+                snprintf(cp, sizeof cp, "%.4000s/s0/%s", store_paths[s], fname);
+                if (access(cp, F_OK) == 0)
+                    return s;
+            }
+        }
+    }
+    return pick_tier_store(r, true);
+}
+
+/* store-stuck: hung I/O on one store -> store goes DOWN_STALLED, reads decode around it without stalling, heals UP.
+ * Kills `downnoread` (reads of an unread cold series whose data chunk lives on the hung store block and miss timeout). */
+static void tier_store_stuck_tick(uint64_t r)
+{
+    if (stuck_cold_ready && anchor_tbase != 0) {
+        if (!tier_wait_ec_for_ts(anchor_tbase, 12000, false))
+            return;
+    } else if (!tier_wait_ec(10000, false)) {
+        return;
+    }
+    int s = (stuck_cold_ready && anchor_tbase != 0 && tier_nem_rounds < 8)
+                ? pick_pos0_store_for_ts(anchor_tbase, r)
+                : pick_tier_store(r, true);
+    int64_t t0 = now_ns();
+    atomic_fetch_add(&nem_inprog, 1);
+    if (tier_outage_ctl("hang", store_paths[s], NULL) != 0) {
+        tier_harness_fail("store-stuck: outagefs hang failed on store %d (%s)", s, store_paths[s]);
+        atomic_fetch_sub(&nem_inprog, 1);
+        return;
+    }
+    char skey[64];
+    snprintf(skey, sizeof skey, "tier.store.%d.state", s);
+    bool stalled = tier_wait_status(skey, "DOWN_STALLED", false, 6000);
+    if (!stalled && !atomic_load(&stop)) {
+        char cur[64] = "?";
+        tier_status_get(skey, cur, sizeof cur);
+        tier_liveness("store-stuck: store %d did not reach DOWN_STALLED within 6 s (state=%s)", s, cur);
+    }
+    if (stalled && !atomic_load(&stop)) {
+        /* Query an unread cold series whose granule lives in pos 0 on the hung store (guaranteed eccache miss!)
+         * plus all kv series: MUST decode around store s promptly without stalling on its hung fd. */
+        int qrc = 0;
+        if (stuck_cold_ready && anchor_tbase != 0 && tier_nem_rounds < 8) {
+            int64_t pms_val = classes ? (int64_t)CL_PARTITION_MS : PARTITION_MS;
+            char cname[64];
+            snprintf(cname, sizeof cname, "jepsen.cold.%d", tier_nem_rounds);
+            tsdbc *c = NULL;
+            if (connect_own_ms(atomic_load(&port), atomic_load(&server_pid), &c, 3000) == 0 && c) {
+                tsdbc_set_timeout(c, 3000);
+                tsdb_sid csid = 0;
+                if (tsdbc_series(c, cname, 0, &csid) == 0) {
+                    tsdb_points p = {0};
+                    qrc = tsdbc_query_points(c, csid, anchor_tbase, anchor_tbase + pms_val, &p);
+                    free(p.ts);
+                    free(p.values);
+                }
+                tsdbc_close(c);
+            } else {
+                qrc = TSDB_ERR_IO;
+            }
+        }
+        if (qrc == 0)
+            qrc = tier_query_all_series(3000, NULL);
+        if (qrc != 0 && !atomic_load(&stop)) {
+            tier_nem_problems++;
+            fprintf(stderr,
+                    "  store-stuck: read stalled or failed (%s) while store %d (%s) was DOWN_STALLED: did not "
+                    "decode around it (downnoread?)\n",
+                    tsdbc_strerror(qrc), s, store_paths[s]);
+        }
+    }
+    tier_outage_ctl("heal", store_paths[s], NULL);
+    if (server_running() && !atomic_load(&stop)) {
+        if (!tier_wait_status(skey, "UP", false, 10000) && !atomic_load(&stop)) {
+            char cur[64] = "?";
+            tier_status_get(skey, cur, sizeof cur);
+            tier_liveness("store-stuck: store %d did not recover to UP after heal (state=%s)", s, cur);
+        }
+    }
+    atomic_fetch_sub(&nem_inprog, 1);
+    nem_fault_span(t0, now_ns());
+    tier_nem_rounds++;
+    nap(1000000, false);
+}
+
+/* Writes a cold, never-overwritten level-1 .part (~320 KiB -> k'=4, m=2 across all 6 stores) while tsdbd is stopped.
+ * Runs in a short-lived forked child so unsetenv("TSDB_TEST_TIER*") never mutates environ while client threads run.
+ * If n_multi > 1, writes n_multi series named "<prefix>.0" .. "<prefix>.<n_multi-1>" into the same partition so
+ * each store-stuck round can query a never-before-read series in data position 0 (guaranteed eccache miss). */
+static int tier_write_cold_part_multi(const char *sname, int64_t t_base, int n_multi)
+{
+    int64_t pms_val = classes ? (int64_t)CL_PARTITION_MS : PARTITION_MS;
+    pid_t pid = fork();
+    if (pid < 0)
+        return TSDB_ERR_IO;
+    if (pid == 0) {
+        unsetenv("TSDB_TEST_TIER");
+        unsetenv("TSDB_TEST_TIER_I_KNOW");
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.partition_ms = pms_val;
+        o.merge_threads = 0;
+        tsdb *db = NULL;
+        int rc = tsdb_open(dbdir, &o, &db);
+        if (rc == 0 && db) {
+            int ns = n_multi > 1 ? n_multi : 1;
+            if (ns > 64)
+                ns = 64;
+            /* Single flush >= 320 KiB incompressible float32 -> ONE .part > 256 KiB -> ONE 4+2 .ec spanning all 6 stores. */
+            size_t total = pms_val >= 1000000 ? 80000 : 1000;
+            size_t per_s = total / (size_t)ns;
+            if (per_s < 10)
+                per_s = 10;
+            int64_t step = pms_val >= 1000000 ? 10 : 1;
+            int64_t *ts = malloc(per_s * sizeof *ts);
+            float *vs = malloc(per_s * sizeof *vs);
+            if (!ts || !vs) {
+                rc = TSDB_ERR_NOMEM;
+            } else {
+                tsdb_sid sids[64];
+                for (int k = 0; k < ns && rc == 0; k++) {
+                    char nm[96];
+                    if (n_multi > 1)
+                        snprintf(nm, sizeof nm, "%s.%d", sname, k);
+                    else
+                        snprintf(nm, sizeof nm, "%s", sname);
+                    rc = tsdb_series(db, nm, &sids[k]);
+                }
+                for (int k = 0; k < ns && rc == 0; k++) {
+                    for (size_t i = 0; i < per_s; i++) {
+                        ts[i] = t_base + (int64_t)i * step;
+                        uint64_t h = mix((uint64_t)i + (uint64_t)k * 100003ull + (uint64_t)t_base + seed);
+                        vs[i] = 1.0f + (float)(h & 0x7fffffu) * 1e-4f;
+                    }
+                    rc = tsdb_insert_series(db, sids[k], ts, vs, per_s);
+                }
+                if (rc == 0)
+                    rc = tsdb_flush(db);
+                if (rc == 0)
+                    rc = tsdb_optimize(db);
+            }
+            free(ts);
+            free(vs);
+            tsdb_close(db);
+        }
+        _exit(rc == 0 ? 0 : 1);
+    }
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+        ;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : TSDB_ERR_IO;
+}
+
+static int tier_write_cold_part(const char *sname, int64_t t_base)
+{
+    return tier_write_cold_part_multi(sname, t_base, 1);
+}
+
+/* Scans server log for `chunk backend: store <idx> (<path>) is UP: <N> chunks rebuilt`; returns max N found, or -1. */
+static long long slog_store_rebuilt_chunks(const char *store_path)
+{
+    FILE *f = fopen(slogpath, "r");
+    if (!f)
+        return -1;
+    char needle[PATH_MAX + 32];
+    snprintf(needle, sizeof needle, "(%.4000s) is UP: ", store_path);
+    long long best = -1;
+    char line[4096];
+    while (fgets(line, sizeof line, f)) {
+        char *p = strstr(line, needle);
+        if (!p)
+            continue;
+        p += strlen(needle);
+        char *ep = NULL;
+        long long n = strtoll(p, &ep, 10);
+        if (ep != p && strstr(ep, " chunks rebuilt"))
+            if (n > best)
+                best = n;
+    }
+    fclose(f);
+    return best;
+}
+
+static bool part_has_settled_copy(const char *d, int64_t part)
+{
+    char pfx[64];
+    snprintf(pfx, sizeof pfx, "settled_p%lld_", (long long)part);
+    size_t pl = strlen(pfx);
+    DIR *dp = opendir(d);
+    if (!dp)
+        return false;
+    bool hit = false;
+    struct dirent *e;
+    while (!hit && (e = readdir(dp)) != NULL)
+        hit = strncmp(e->d_name, pfx, pl) == 0;
+    closedir(dp);
+    return hit;
+}
+
+static bool tier_wait_ec_for_ts(int64_t ts, int timeout_ms, bool want_salvage_ready)
+{
+    int64_t pms_val = classes ? (int64_t)CL_PARTITION_MS : PARTITION_MS;
+    int64_t end = now_ns() + (int64_t)timeout_ms * 1000000LL;
+    while (now_ns() < end && !atomic_load(&stop) && !atomic_load(&nem_stop) && !atomic_load(&nem_quiet)) {
+        int64_t parts[64];
+        int np = list_ec_partitions(dbdir, parts, 64);
+        for (int i = 0; i < np; i++) {
+            int64_t lo = 0, hi = 0;
+            part_key_range(parts[i], pms_val, &lo, &hi);
+            if (ts >= lo && ts < hi) {
+                if (!want_salvage_ready || !part_has_settled_copy(dbdir, parts[i]))
+                    return true;
+                break;
+            }
+        }
+        usleep(100000);
+    }
+    return false;
+}
+
+/* store-lost: wipe one store and run `tsdb DIR tier lost STORE --replace PATH` under live ingest/query load.
+ * Verifies every pre-wipe live .ec chunk that belonged to the store was actually rebuilt onto the replacement store
+ * (and serves reads with 2 other stores in EIO). Kills `lostnoreplace`. */
+static void tier_store_lost_tick(uint64_t r)
+{
+    if (anchor_tbase != 0) {
+        if (!tier_wait_ec_for_ts(anchor_tbase, 12000, false))
+            return;
+    } else if (!tier_wait_ec(10000, false)) {
+        return;
+    }
+    int s = pick_tier_store(r, false);
+    /* Snapshot exact chunk filenames on store s belonging to currently live .ec objects BEFORE wiping. */
+    char live_before[128][33];
+    int nlive_before = read_ec_oids(dbdir, live_before, 128);
+    char orig_chunks[128][64];
+    int norig = 0;
+    {
+        char s0[PATH_MAX + 16];
+        snprintf(s0, sizeof s0, "%.4000s/s0", store_paths[s]);
+        DIR *dp = opendir(s0);
+        struct dirent *e;
+        while (dp && (e = readdir(dp)) != NULL && norig < 128) {
+            size_t l = strlen(e->d_name);
+            if (e->d_name[0] != 'o' || l < 39 || l >= sizeof orig_chunks[0] || strcmp(e->d_name + l - 6, ".chunk") != 0)
+                continue;
+            if (nlive_before == 0 || oid_in_list(e->d_name + 1, live_before, nlive_before))
+                snprintf(orig_chunks[norig++], sizeof orig_chunks[0], "%s", e->d_name);
+        }
+        if (dp)
+            closedir(dp);
+    }
+    if (norig == 0) {
+        usleep(300000);
+        return;
+    }
+    int64_t t0 = now_ns();
+    atomic_fetch_add(&nem_inprog, 1);
+    rm_tree_dir(store_paths[s]);
+
+    char newp[PATH_MAX], newarg[PATH_MAX + 16], sname[16], out[2048];
+    snprintf(newp, sizeof newp, "%.4000s/s%d_r%d", tier_root, s, ++store_gen[s]);
+    snprintf(newarg, sizeof newarg, "%.4000s:hdd", newp);
+    snprintf(sname, sizeof sname, "s%d", s);
+    char *av[] = {"tsdb", dbdir, "tier", "lost", sname, "--replace", newarg, "--allow-shared-device", NULL};
+    int rc = tier_cli_run(av, out, sizeof out);
+    if (rc != 0) {
+        tier_harness_fail("store-lost: `tsdb tier lost %s --replace %s` failed (rc %d): %.120s", sname, newarg, rc, out);
+        atomic_fetch_sub(&nem_inprog, 1);
+        return;
+    }
+    char canon[PATH_MAX];
+    snprintf(store_paths[s], sizeof store_paths[s], "%.4090s", realpath(newp, canon) ? canon : newp);
+    store_replaced[s] = true;
+
+    /* Wait for live tsdbd's tier worker to finish rebuilding (REBUILDING gone AND state == UP). */
+    char rb[PATH_MAX + 32], skey[64];
+    snprintf(rb, sizeof rb, "%.4000s/REBUILDING", store_paths[s]);
+    snprintf(skey, sizeof skey, "tier.store.%d.state", s);
+    int64_t dl = now_ns() + 30000000000LL;
+    bool done = false;
+    while (now_ns() < dl && !atomic_load(&stop)) {
+        char stv[64] = "";
+        if (access(rb, F_OK) != 0 && tier_status_get(skey, stv, sizeof stv) && strcmp(stv, "UP") == 0) {
+            done = true;
+            break;
+        }
+        usleep(100000);
+    }
+    if (!done && !atomic_load(&stop)) {
+        tier_liveness("store-lost: live tsdbd did not finish rebuilding store %d (%s) within 30 s", s, store_paths[s]);
+    } else if (done) {
+        /* Every pre-wipe chunk whose OID is STILL listed in a live .ec file MUST exist on the replacement store! */
+        char live_after[128][33];
+        int nlive_after = read_ec_oids(dbdir, live_after, 128);
+        int checked = 0, missing = 0;
+        char first_miss[64] = "";
+        for (int k = 0; k < norig; k++) {
+            if (!oid_in_list(orig_chunks[k] + 1, live_after, nlive_after))
+                continue; /* retired/re-encoded during rebuild */
+            checked++;
+            char cp[PATH_MAX + 96];
+            snprintf(cp, sizeof cp, "%.4000s/s0/%.63s", store_paths[s], orig_chunks[k]);
+            if (access(cp, F_OK) != 0) {
+                /* Re-check .ec liveness on a miss: an object may have retired and been GC'd since live_after was read. */
+                char live_recheck[128][33];
+                int nlive_recheck = read_ec_oids(dbdir, live_recheck, 128);
+                if (!oid_in_list(orig_chunks[k] + 1, live_recheck, nlive_recheck)) {
+                    checked--;
+                    continue;
+                }
+                if (!first_miss[0])
+                    snprintf(first_miss, sizeof first_miss, "%.63s", orig_chunks[k]);
+                missing++;
+            }
+        }
+        if (missing > 0) {
+            tier_nem_problems++;
+            fprintf(stderr,
+                    "  store-lost: replacement store %d (%s) promoted UP missing %d of %d live pre-wipe chunks "
+                    "(e.g. %s; lostnoreplace?)\n",
+                    s, store_paths[s], missing, checked, first_miss);
+        } else if (!getenv("JEPSEN_VERBOSE") && checked > 0 && slog_store_rebuilt_chunks(store_paths[s]) <= 0) {
+            /* Even if background tierscrub patched missing chunks after promotion, the replacement rebuild itself
+             * MUST have rebuilt >= 1 chunk before promoting the store UP! */
+            tier_nem_problems++;
+            fprintf(stderr,
+                    "  store-lost: replacement store %d (%s) promoted UP with 0 chunks rebuilt by replacement "
+                    "(had %d live pre-wipe chunks; lostnoreplace?)\n",
+                    s, store_paths[s], checked);
+        } else if (checked > 0) {
+            lost_rebuilds_verified++;
+        } else if (count_store_chunks_dir(store_paths[s], false) == 0 && count_ec_files(dbdir, NULL) > 0) {
+            tier_nem_problems++;
+            fprintf(stderr,
+                    "  store-lost: replacement store %d (%s) promoted UP with 0 chunks rebuilt (had %d before wipe; "
+                    "lostnoreplace?)\n",
+                    s, store_paths[s], norig);
+        } else {
+            lost_rebuilds_verified++;
+        }
+        /* If outagefs is loaded, briefly take 2 OTHER unreplaced stores into EIO so reads MUST rely on rebuilt s. */
+        if (outagefs_lib && tier_n >= 6 && !atomic_load(&stop)) {
+            int o1 = -1, o2 = -1;
+            for (int k = 1; k < tier_n; k++) {
+                int cand = (s + k) % tier_n;
+                if (!store_replaced[cand]) {
+                    if (o1 < 0)
+                        o1 = cand;
+                    else if (o2 < 0) {
+                        o2 = cand;
+                        break;
+                    }
+                }
+            }
+            if (o1 >= 0 && o2 >= 0) {
+                tier_outage_ctl("eio", store_paths[o1], NULL);
+                tier_outage_ctl("eio", store_paths[o2], NULL);
+                char k1[64], k2[64];
+                snprintf(k1, sizeof k1, "tier.store.%d.state", o1);
+                snprintf(k2, sizeof k2, "tier.store.%d.state", o2);
+                tier_wait_status(k1, "DOWN_IOERR", false, 4000);
+                tier_wait_status(k2, "DOWN_IOERR", false, 4000);
+                bool q_live = false;
+                int qrc = tier_query_all_series(5000, &q_live);
+                if (qrc != 0 && !atomic_load(&stop)) {
+                    if (q_live) {
+                        tier_liveness("store-lost: read timed out or lost connection with stores (%d,%d) in EIO after "
+                                      "rebuilding store %d", o1, o2, s);
+                    } else {
+                        tier_nem_problems++;
+                        fprintf(stderr,
+                                "  store-lost: query failed (%s) with 2 other stores (%d,%d) in EIO after rebuilding "
+                                "store %d (lostnoreplace?)\n",
+                                tsdbc_strerror(qrc), o1, o2, s);
+                    }
+                }
+                tier_outage_ctl("heal", store_paths[o1], NULL);
+                tier_outage_ctl("heal", store_paths[o2], NULL);
+                tier_wait_status(k1, "UP", false, 8000);
+                tier_wait_status(k2, "UP", false, 8000);
+            }
+        }
+    }
+    atomic_fetch_sub(&nem_inprog, 1);
+    nem_fault_span(t0, now_ns());
+    tier_nem_rounds++;
+    nap(1500000, false);
+}
+
+#ifdef TSDB_EC
+/* Scans store_paths[0..tier_n-1]/s0 for a LIVE .ec OID present on >= need stores, returning `need` distinct store indices. */
+static bool pick_stores_for_oid(int *slots, int need)
+{
+    char live[128][33];
+    int nlive = read_ec_oids(dbdir, live, 128);
+    if (nlive == 0)
+        return false;
+    for (int oi = 0; oi < nlive; oi++) {
+        int cnt = 0;
+        for (int j = 0; j < tier_n && cnt < need; j++) {
+            char j0[PATH_MAX + 16];
+            snprintf(j0, sizeof j0, "%.4000s/s0", store_paths[j]);
+            DIR *dj = opendir(j0);
+            if (!dj)
+                continue;
+            struct dirent *ej;
+            bool hit = false;
+            while (!hit && (ej = readdir(dj)) != NULL)
+                hit = ej->d_name[0] == 'o' && strncmp(ej->d_name + 1, live[oi], 32) == 0;
+            closedir(dj);
+            if (hit)
+                slots[cnt++] = j;
+        }
+        if (cnt >= need)
+            return true;
+    }
+    return false;
+}
+
+static int salvage_mark_stores_lost(const int *slots, int nslots)
+{
+    int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return -1;
+    int vfd = openat(dfd, "VOLUMES", O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (vfd < 0) {
+        close(dfd);
+        return -1;
+    }
+    struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    int lrc;
+    while ((lrc = fcntl(vfd, F_OFD_SETLKW, &fl)) != 0 && errno == EINTR)
+        ;
+    if (lrc != 0) {
+        close(vfd);
+        close(dfd);
+        return -1;
+    }
+    tiers_view tv;
+    tiers_view_init(&tv);
+    int rc = tiers_load(dfd, true, true, &tv);
+    for (int i = 0; rc == 0 && i < nslots; i++) {
+        int idx = slots[i];
+        if (idx < 0 || (size_t)idx >= tv.nstores) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        if (tv.stores[idx].state == TIERS_STATE_LOST)
+            continue;
+        const uint8_t *id = tv.stores[idx].state == TIERS_STATE_REPLACED_BY ? tv.stores[idx].replaced_by
+                                                                            : tv.stores[idx].id;
+        rc = tiers_append_state(dfd, true, id, TIERS_STATE_LOST, 0, false, NULL, NULL);
+    }
+    tiers_view_free(&tv);
+    close(vfd);
+    close(dfd);
+    return rc;
+}
+/* Picks `need` (m+1 = 3 for 6 stores) distinct store indices that knock out > m chunks of at least one live .ec
+ * object (including the cold 4+2 salvage partition when present) while avoiding triples that would lose a higher-block
+ * .ec part above a surviving lower-block part in the same partition (which ec_swap_salvage refuses to retire alone). */
+static bool pick_salvage_stores(int *slots, int need, uint64_t r)
+{
+    if (tier_n == 6 && need == 3) {
+        typedef struct {
+            int64_t part;
+            long long min_block;
+            unsigned store_mask;
+            bool is_ec;
+        } pitem;
+        pitem items[256];
+        int ni = 0;
+        static const char hex[] = "0123456789abcdef";
+        DIR *dp = opendir(dbdir);
+        struct dirent *e;
+        while (dp && (e = readdir(dp)) != NULL && ni < 256) {
+            size_t l = strlen(e->d_name);
+            bool is_ec = e->d_name[0] == 'p' && l > 3 && strcmp(e->d_name + l - 3, ".ec") == 0;
+            bool is_pt = e->d_name[0] == 'p' && l > 5 && strcmp(e->d_name + l - 5, ".part") == 0;
+            if (!is_ec && !is_pt)
+                continue;
+            long long p = 0, lo = 0, hi = 0;
+            unsigned lvl = 0;
+            if (sscanf(e->d_name, "p%lld_%lld_%lld_%u", &p, &lo, &hi, &lvl) != 4)
+                continue;
+            unsigned mask = 0;
+            if (is_ec) {
+                char fp[PATH_MAX + 256], oid[33] = "";
+                if (snprintf(fp, sizeof fp, "%.4000s/%s", dbdir, e->d_name) > 0) {
+                    int fd = open(fp, O_RDONLY | O_CLOEXEC);
+                    struct stat st;
+                    if (fd >= 0) {
+                        if (fstat(fd, &st) == 0 && st.st_size >= 128) {
+                            uint8_t tr[64], ob[16];
+                            if (pread(fd, tr, 64, st.st_size - 64) == 64) {
+                                uint64_t rec_off = 0;
+                                memcpy(&rec_off, tr + 16, 8);
+                                if (rec_off + 24 <= (uint64_t)st.st_size &&
+                                    pread(fd, ob, 16, (off_t)(rec_off + 8)) == 16) {
+                                    for (int i = 0; i < 16; i++) {
+                                        oid[2 * i] = hex[ob[i] >> 4];
+                                        oid[2 * i + 1] = hex[ob[i] & 0xf];
+                                    }
+                                    oid[32] = 0;
+                                }
+                            }
+                        }
+                        close(fd);
+                    }
+                }
+                if (oid[0]) {
+                    for (int j = 0; j < tier_n; j++) {
+                        char j0[PATH_MAX + 16];
+                        snprintf(j0, sizeof j0, "%.4000s/s0", store_paths[j]);
+                        DIR *dj = opendir(j0);
+                        struct dirent *ej;
+                        bool hit = false;
+                        while (dj && !hit && (ej = readdir(dj)) != NULL)
+                            hit = ej->d_name[0] == 'o' && strncmp(ej->d_name + 1, oid, 32) == 0;
+                        if (dj)
+                            closedir(dj);
+                        if (hit)
+                            mask |= 1u << j;
+                    }
+                }
+            }
+            items[ni++] = (pitem){.part = (int64_t)p, .min_block = lo, .store_mask = mask, .is_ec = is_ec};
+        }
+        if (dp)
+            closedir(dp);
+
+        unsigned triples[20];
+        int nt = 0;
+        for (int a = 0; a < 6; a++)
+            for (int b = a + 1; b < 6; b++)
+                for (int c = b + 1; c < 6; c++)
+                    triples[nt++] = (1u << a) | (1u << b) | (1u << c);
+
+        int start = (int)((r + (uint64_t)tier_nem_rounds) % 20u);
+        unsigned best_t = 0;
+        int best_score = -1;
+        for (int ti = 0; ti < nt; ti++) {
+            unsigned T = triples[(start + ti) % nt];
+            int lost_ec = 0;
+            bool shadow = false;
+            for (int i = 0; i < ni && !shadow; i++) {
+                if (!items[i].is_ec || (items[i].store_mask & T) != T)
+                    continue;
+                lost_ec++;
+                /* Would retiring items[i] leave a surviving lower-block part in the same partition? */
+                for (int k = 0; k < ni; k++) {
+                    if (items[k].part == items[i].part && items[k].min_block < items[i].min_block) {
+                        if (!items[k].is_ec || (items[k].store_mask & T) != T) {
+                            shadow = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!shadow && lost_ec > best_score) {
+                best_score = lost_ec;
+                best_t = T;
+            }
+        }
+        if (best_score > 0) {
+            int cnt = 0;
+            for (int j = 0; j < 6; j++)
+                if (best_t & (1u << j))
+                    slots[cnt++] = j;
+            return cnt == 3;
+        }
+        return false; /* skip this tick rather than falling back to a shadowing triple */
+    }
+    return pick_stores_for_oid(slots, need);
+}
+#endif
+
+/* salvage: wipe m+1 (3) stores holding a settled object, declare them LOST, verify E15 TSDB_ERR_IO on reads and
+ * statistics answering before salvage, stop tsdbd, run `tsdb DIR tier salvage`, replace lost stores, restart tsdbd. */
+static void tier_salvage_tick(uint64_t r)
+{
+#ifndef TSDB_EC
+    (void)r;
+    return;
+#else
+    if (nsalv_ev >= MAX_SALV_EVENTS)
+        return;
+    /* Wait until the cold 4+2 salvage partition has settled into .ec AND its keep_s=1 settled_ copy has aged out. */
+    if (salv_cur_series[0]) {
+        if (!tier_wait_ec_for_ts(salv_cur_tbase, 14000, true))
+            return;
+    } else if (!tier_wait_ec(14000, true)) {
+        return;
+    }
+    int need = (tier_n >= 6 ? 2 : 1) + 1; /* m + 1 = 3 for 6 stores */
+    int slots[8];
+    if (!pick_salvage_stores(slots, need, r)) {
+        usleep(300000);
+        return;
+    }
+
+    int64_t t0 = now_ns();
+    atomic_fetch_add(&nem_inprog, 1);
+
+    /* Wipe the m+1 stores and mark them LOST in TIERS. */
+    for (int i = 0; i < need; i++)
+        rm_tree_dir(store_paths[slots[i]]);
+    if (salvage_mark_stores_lost(slots, need) != 0) {
+        tier_harness_fail("salvage: failed to mark %d stores LOST in TIERS", need);
+        atomic_fetch_sub(&nem_inprog, 1);
+        return;
+    }
+    int64_t t_lost = now_ns();
+
+    /* Wait for live tsdbd's tierctl (1 s poll) to mark all m+1 stores non-UP/LOST. */
+    for (int i = 0; i < need; i++) {
+        char skey[64];
+        snprintf(skey, sizeof skey, "tier.store.%d.state", slots[i]);
+        tier_wait_status(skey, "UP", true, 5000);
+    }
+
+    /* Before salvage: retry up to 5 s while tierctl's 1 s poll picks up TIERS_STATE_LOST (until then reads return
+     * TSDB_ERR_UNAVAILABLE because the wiped stores look DOWN_IOERR). Once LOST, reads of lost .ec partitions MUST
+     * return TSDB_ERR_IO (E15) while statistics still answer from the local .ec index! */
+    int64_t pms_val = classes ? (int64_t)CL_PARTITION_MS : PARTITION_MS;
+    int64_t pre_parts[64];
+    int npre = list_ec_partitions(dbdir, pre_parts, 64);
+    bool got_io = false, got_stats = false, probe_conn_ok = false, probe_timed_out = false;
+    {
+        tsdbc *c = NULL;
+        if (connect_own_ms(atomic_load(&port), atomic_load(&server_pid), &c, 3000) == 0 && c) {
+            probe_conn_ok = true;
+            tsdbc_set_timeout(c, 5000);
+            int64_t probe_dl = now_ns() + 5000000000LL;
+            tsdb_sid ssid = 0;
+            bool have_cold = salv_cur_series[0] && tsdbc_series(c, salv_cur_series, 0, &ssid) == 0;
+            while (!got_io && now_ns() < probe_dl && !atomic_load(&stop)) {
+                if (have_cold) {
+                    int64_t qt0 = now_ns();
+                    tsdb_points p = {0};
+                    int qrc = tsdbc_query_points(c, ssid, salv_cur_tbase, salv_cur_tbase + pms_val, &p);
+                    free(p.ts);
+                    free(p.values);
+                    if (qrc == TSDB_ERR_IO && now_ns() - qt0 >= 4250000000LL) {
+                        probe_timed_out = true;
+                        break;
+                    }
+                    if (qrc == TSDB_ERR_IO) {
+                        got_io = true;
+                        salv_io_verified++;
+                        tsdb_bucket *bk = NULL;
+                        size_t nbk = 0;
+                        if (tsdbc_query_agg(c, ssid, salv_cur_tbase, salv_cur_tbase + pms_val, pms_val, &bk, &nbk) ==
+                            0) {
+                            got_stats = true;
+                            salv_stats_verified++;
+                        }
+                        free(bk);
+                        break;
+                    }
+                }
+                for (int pi = 0; pi < npre && !got_io; pi++) {
+                    int64_t a = 0, b = 0;
+                    part_key_range(pre_parts[pi], pms_val, &a, &b);
+                    for (int s = 0; s < nseries && !got_io; s++) {
+                        int64_t qt0 = now_ns();
+                        tsdb_points p = {0};
+                        int qrc = tsdbc_query_points(c, ids[s], a, b, &p);
+                        free(p.ts);
+                        free(p.values);
+                        if (qrc == TSDB_ERR_IO && now_ns() - qt0 >= 4250000000LL) {
+                            probe_timed_out = true;
+                            break;
+                        }
+                        if (qrc == TSDB_ERR_IO) {
+                            got_io = true;
+                            salv_io_verified++;
+                            /* Verify statistics query STILL answers on the lost partition! */
+                            tsdb_bucket *bk = NULL;
+                            size_t nbk = 0;
+                            if (tsdbc_query_agg(c, ids[s], a, b, b - a, &bk, &nbk) == 0) {
+                                got_stats = true;
+                                salv_stats_verified++;
+                            }
+                            free(bk);
+                        }
+                    }
+                }
+                if (probe_timed_out)
+                    break;
+                if (!got_io)
+                    usleep(150000);
+            }
+            tsdbc_close(c);
+        }
+    }
+    if (!got_io && !atomic_load(&stop)) {
+        if (!probe_conn_ok || probe_timed_out) {
+            tier_liveness("salvage: pre-salvage E15 probe %s before reading lost partition",
+                          !probe_conn_ok ? "could not connect" : "timed out");
+        } else {
+            tier_nem_problems++;
+            fprintf(stderr, "  salvage: expected TSDB_ERR_IO on lost partition before salvage, got none (%d .ec parts)\n",
+                    npre);
+        }
+    } else if (got_io && !got_stats && !atomic_load(&stop)) {
+        tier_nem_problems++;
+        fprintf(stderr, "  salvage: statistics query failed on lost partition before salvage\n");
+    }
+
+    /* Let clients write young rows while 3 stores are LOST (settles paused -> must survive salvage intact!). */
+    nap(500000, false);
+
+    /* Stop tsdbd cleanly and run offline `tsdb DIR tier salvage` + replace the m+1 lost stores. */
+    atomic_store(&watch_excused, true);
+    stop_server(SIGTERM);
+    int64_t t_salv = now_ns();
+
+    /* Snapshot every live .ec file (name, partition, settle_ms from EC_REC_SETTLE_MS=88) before salvage so
+     * salvaged_away only excuses rows settled into a retired .ec part, NEVER young rows written after settle. */
+    typedef struct {
+        char name[96];
+        int64_t part;
+        int64_t settle_ms;
+    } pre_ec;
+    pre_ec pec[256];
+    int npec = 0;
+    int ec_before = 0;
+    {
+        DIR *dp = opendir(dbdir);
+        struct dirent *e;
+        while (dp && (e = readdir(dp)) != NULL) {
+            size_t l = strlen(e->d_name);
+            if (e->d_name[0] != 'p' || l <= 3 || strcmp(e->d_name + l - 3, ".ec") != 0)
+                continue;
+            ec_before++;
+            long long p = 0, lo = 0, hi = 0;
+            unsigned lvl = 0;
+            if (sscanf(e->d_name, "p%lld_%lld_%lld_%u", &p, &lo, &hi, &lvl) != 4 || npec >= 256)
+                continue;
+            int64_t sms = 0;
+            char fp[PATH_MAX + 256];
+            if (snprintf(fp, sizeof fp, "%.4000s/%s", dbdir, e->d_name) > 0) {
+                int fd = open(fp, O_RDONLY | O_CLOEXEC);
+                struct stat st;
+                if (fd >= 0) {
+                    if (fstat(fd, &st) == 0 && st.st_size >= 160) {
+                        uint8_t tr[64];
+                        if (pread(fd, tr, 64, st.st_size - 64) == 64) {
+                            uint64_t rec_off = 0;
+                            memcpy(&rec_off, tr + 16, 8);
+                            if (rec_off + 96 <= (uint64_t)st.st_size &&
+                                pread(fd, &sms, 8, (off_t)(rec_off + 88)) != 8) /* EC_REC_SETTLE_MS = 88 */
+                                sms = 0;
+                        }
+                    }
+                    close(fd);
+                }
+            }
+            snprintf(pec[npec].name, sizeof pec[npec].name, "%s", e->d_name);
+            pec[npec].part = (int64_t)p;
+            pec[npec].settle_ms = sms;
+            npec++;
+        }
+        if (dp)
+            closedir(dp);
+    }
+    int64_t wall_to_mono_ns = now_ns() - wall_ms_now() * 1000000LL;
+
+    char out[4096];
+    char *sav[] = {"tsdb", dbdir, "tier", "salvage", NULL};
+    int src = tier_cli_run(sav, out, sizeof out);
+    if (src != 0) {
+        tier_nem_problems++;
+        fprintf(stderr, "  salvage: `tsdb %s tier salvage` failed (rc %d): %s\n", dbdir, src, out);
+    }
+    int ec_after = count_ec_files(dbdir, NULL);
+    int retired_now = ec_before > ec_after ? ec_before - ec_after : 0;
+    salv_parts_retired += retired_now;
+
+    salv_event *ev = &salv_ev[nsalv_ev];
+    memset(ev, 0, sizeof *ev);
+    ev->lost_ns = t_lost;
+    ev->salv_ns = t_salv;
+    for (int i = 0; i < npec; i++) {
+        char fp[PATH_MAX + 128];
+        snprintf(fp, sizeof fp, "%.4000s/%.95s", dbdir, pec[i].name);
+        if (access(fp, F_OK) == 0)
+            continue; /* survived salvage */
+        /* Convert retired .ec's wall-clock settle_ms to monotonic ns (50 ms quantization slack, clamped to <= t_lost). */
+        int64_t cut_ns = pec[i].settle_ms > 0 ? pec[i].settle_ms * 1000000LL + wall_to_mono_ns + 50000000LL : t_lost;
+        if (cut_ns > t_lost)
+            cut_ns = t_lost;
+        int idx = -1;
+        for (int k = 0; k < ev->nparts; k++)
+            if (ev->parts[k] == pec[i].part) {
+                idx = k;
+                break;
+            }
+        if (idx < 0 && ev->nparts < 64) {
+            idx = ev->nparts++;
+            ev->parts[idx] = pec[i].part;
+            part_key_range(pec[i].part, pms_val, &ev->lo[idx], &ev->hi[idx]);
+            ev->settle_cutoff_ns[idx] = cut_ns;
+        } else if (idx >= 0 && cut_ns > ev->settle_cutoff_ns[idx]) {
+            ev->settle_cutoff_ns[idx] = cut_ns;
+        }
+    }
+    if (retired_now == 0) {
+        tier_nem_problems++;
+        fprintf(stderr, "  salvage: `tsdb tier salvage` retired 0 .ec parts (output: %s)\n", out);
+    }
+
+    /* Replace the m+1 lost stores so tsdbd can reopen with full redundancy and resume settles. */
+    for (int i = 0; i < need; i++) {
+        int slot = slots[i];
+        char newp[PATH_MAX], newarg[PATH_MAX + 16], sname[16], lout[1024];
+        snprintf(newp, sizeof newp, "%.4000s/s%d_r%d", tier_root, slot, ++store_gen[slot]);
+        snprintf(newarg, sizeof newarg, "%.4000s:hdd", newp);
+        snprintf(sname, sizeof sname, "s%d", slot);
+        char *lav[] = {"tsdb", dbdir, "tier", "lost", sname, "--replace", newarg, "--allow-shared-device", NULL};
+        int lrc = tier_cli_run(lav, lout, sizeof lout);
+        if (lrc != 0) {
+            tier_harness_fail("salvage: `tsdb tier lost %s --replace %s` failed (rc %d): %.120s", sname, newarg, lrc,
+                              lout);
+        } else {
+            char canon[PATH_MAX];
+            snprintf(store_paths[slot], sizeof store_paths[slot], "%.4090s", realpath(newp, canon) ? canon : newp);
+        }
+    }
+    memset(store_replaced, 0, sizeof store_replaced);
+    /* Prepare a fresh unread 4+2 cold partition for the next salvage round while tsdbd is stopped. */
+    snprintf(salv_cur_series, sizeof salv_cur_series, "jepsen.salv.%d", tier_nem_rounds + 1);
+    salv_cur_tbase = (T0 / pms_val - 6 - tier_nem_rounds) * pms_val;
+    if (tier_write_cold_part(salv_cur_series, salv_cur_tbase) != 0)
+        tier_harness_fail("salvage: failed to prepare next cold partition %s", salv_cur_series);
+    start_server(true);
+    restarts++;
+    ev->done_ns = now_ns();
+    nsalv_ev++;
+    atomic_store(&watch_excused, false);
+    atomic_fetch_sub(&nem_inprog, 1);
+    nem_fault_span(t0, now_ns());
+    tier_nem_rounds++;
+    nap(3000000, false);
+#endif
+}
+
+/* fill: drive fast root's statvfs fill hook to 92% (>= young_high_pct 90%). Inserts must fail with UNAVAILABLE
+ * TSDB_WHY_FULL (definite refusals, never lost writes), reads keep working, and writes resume once lowered to 50%.
+ * Kills `fullnoflag`. */
+static void tier_fill_tick(uint64_t r)
+{
+    (void)r;
+    /* Let at least one settle run before the first fill cycle so tier_check sees settles > 0. */
+    if (tier_nem_rounds == 0)
+        tier_wait_ec(8000, false);
+    if (atomic_load(&stop) || atomic_load(&nem_stop) || atomic_load(&nem_quiet))
+        return;
+
+    /* Create/resolve the probe series BEFORE setting fill to 92% so series creation cannot fail under FULL. */
+    static tsdb_sid fill_probe_sid;
+    if (fill_probe_sid == 0) {
+        tsdbc *c = NULL;
+        if (connect_own_ms(atomic_load(&port), atomic_load(&server_pid), &c, 3000) == 0 && c) {
+            tsdbc_set_timeout(c, 5000);
+            (void)tsdbc_series(c, "jepsen.fillprobe", 1, &fill_probe_sid);
+            tsdbc_close(c);
+        }
+    }
+
+    int64_t t0 = now_ns();
+    atomic_fetch_add(&nem_inprog, 1);
+    if (tier_outage_ctl("fill", dbdir, "92") != 0) {
+        tier_harness_fail("fill: outagefs fill 92 failed on %s", dbdir);
+        atomic_fetch_sub(&nem_inprog, 1);
+        return;
+    }
+
+    /* Wait up to 3 s for tierfill's 1 s sampler to latch FULL. */
+    bool latched = tier_wait_status("vol.0.full", "1", false, 3000);
+    long long ref0 = atomic_load(&fill_full_refusals);
+    nap(2000000, false);
+
+    /* Direct insert probe while at 92% fill: MUST be refused with TSDB_ERR_UNAVAILABLE + TSDB_WHY_FULL! */
+    bool probe_full = false;
+    {
+        tsdbc *c = NULL;
+        if (connect_own_ms(atomic_load(&port), atomic_load(&server_pid), &c, 3000) == 0 && c) {
+            tsdbc_set_timeout(c, 5000);
+            tsdb_sid fsid = fill_probe_sid ? fill_probe_sid : ids[0];
+            int64_t fts = T0 + 1000;
+            float fv = 1.0f;
+            int irc = tsdbc_insert_series(c, fsid, &fts, &fv, 1);
+            if (irc == TSDB_ERR_UNAVAILABLE) {
+                tsdbc_err_info ei;
+                if (tsdbc_last_error(c, &ei) == TSDB_ERR_UNAVAILABLE && ei.has_body) {
+                    for (unsigned j = 0; j < ei.nunavail; j++)
+                        if (ei.unavail[j].reason == TSDB_WHY_FULL)
+                            probe_full = true;
+                }
+            }
+            /* Reads must still succeed while the volume is FULL. */
+            tsdb_points p = {0};
+            int qrc = tsdbc_query_points(c, ids[0], key_ts(0, 0), key_end(0, 200), &p);
+            free(p.ts);
+            free(p.values);
+            if (qrc != 0 && !atomic_load(&stop)) {
+                tier_nem_problems++;
+                fprintf(stderr, "  fill: read failed (%s) while fast root was at 92%% fill\n", tsdbc_strerror(qrc));
+            }
+            tsdbc_close(c);
+        }
+    }
+    long long ref_delta = atomic_load(&fill_full_refusals) - ref0;
+    if (!atomic_load(&stop) && (!probe_full || (!latched && ref_delta == 0))) {
+        tier_nem_problems++;
+        fprintf(stderr,
+                "  fill: volume at 92%% fill (>= young_high_pct 90%%) did not refuse inserts with UNAVAILABLE FULL "
+                "(vol.0.full=%d, probe_full=%d, client WHY_FULL refusals=%lld; fullnoflag?)\n",
+                latched ? 1 : 0, probe_full ? 1 : 0, ref_delta);
+    }
+
+    /* Lower fill to 50% (< 88% hysteresis clear) and verify writes resume cleanly. */
+    if (tier_outage_ctl("fill", dbdir, "50") != 0)
+        tier_harness_fail("fill: outagefs fill 50 failed on %s", dbdir);
+    int64_t t_lower = now_ns();
+    if (!atomic_load(&stop)) {
+        bool resumed = false;
+        int64_t dl = now_ns() + 15000000000LL;
+        while (now_ns() < dl && !atomic_load(&stop)) {
+            if (atomic_load(&fill_last_ok_ns) > t_lower) {
+                resumed = true;
+                break;
+            }
+            usleep(50000);
+        }
+        if (!resumed && !atomic_load(&stop))
+            tier_liveness("fill: writes did not resume within 15 s after lowering fill to 50%%");
+    }
+    atomic_fetch_sub(&nem_inprog, 1);
+    nem_fault_span(t0, now_ns());
+    tier_nem_rounds++;
+    nap(2000000, false);
+}
+
+/* single-copy: 1-store (--single-copy, m=0) tier under rate/slow throttling (when outagefs is loaded) and SIGKILL restarts. */
+static void tier_single_copy_tick(uint64_t r)
+{
+    (void)r;
+    if (tier_nem_rounds == 0)
+        tier_wait_ec(8000, false);
+    if (atomic_load(&stop) || atomic_load(&nem_stop) || atomic_load(&nem_quiet))
+        return;
+    if (outagefs_lib && (tier_nem_rounds % 2 == 0)) {
+        int64_t t0 = now_ns();
+        atomic_fetch_add(&nem_inprog, 1);
+        tier_outage_ctl("rate", store_paths[0], "20");
+        tier_outage_ctl("slow", store_paths[0], "5");
+        nap(2000000, false);
+        tier_outage_ctl("heal", store_paths[0], NULL);
+        atomic_fetch_sub(&nem_inprog, 1);
+        nem_fault_span(t0, now_ns());
+    } else {
+        kill_and_restart(SIGKILL, outagefs_lib != NULL);
+        restarts++;
+    }
+    tier_nem_rounds++;
+    nap(1500000, false);
+}
+
 static void *nemesis_thread(void *arg)
 {
     (void)arg;
@@ -3500,6 +5035,18 @@ static void *nemesis_thread(void *arg)
             }
         } else if (outage) {
             outage_tick(r);
+        } else if (t_store_eio) {
+            tier_store_eio_tick(r);
+        } else if (t_store_stuck) {
+            tier_store_stuck_tick(r);
+        } else if (t_store_lost) {
+            tier_store_lost_tick(r);
+        } else if (t_salvage) {
+            tier_salvage_tick(r);
+        } else if (t_fill) {
+            tier_fill_tick(r);
+        } else if (t_single_copy) {
+            tier_single_copy_tick(r);
         } else if (md || rot) { /* a restart (SIGKILL or SIGTERM), over damage the shim or rot put on disk */
             pid_t pid = atomic_load(&server_pid);
             int st = 0, sig = (r >> 20) % 2 ? SIGKILL : SIGTERM;
@@ -3610,6 +5157,8 @@ static double nem_rate(void)
 {
     if (outage)
         return 0.11;
+    if (tier_nem) /* multi-second store faults, rebuilds, salvages, fill cycles: sustained cadence across the run */
+        return t_salvage ? 0.05 : 0.12;
     if (settle_steps) /* a server settles when it settles: tier_check judges the steps reached, the floor is one cut */
         return 0;
     if (!strcmp(nemesis, "kill"))
@@ -3687,7 +5236,7 @@ static int nemesis_check(void)
     }
     /* the faults must be spread over the run, not a burst at its start: one in each third (an outage fault is a step of many
      * seconds, a flapping domain's heal waits for a minute: there only the number counts) */
-    if (seconds >= 10 && !outage && !(nem_faults < want) && ((judged[0] && !covered[0]) || (judged[1] && !covered[1]) || (judged[2] && !covered[2]))) {
+    if (seconds >= 10 && !outage && !t_salvage && !(nem_faults < want) && ((judged[0] && !covered[0]) || (judged[1] && !covered[1]) || (judged[2] && !covered[2]))) {
         INCONCLUSIVE("fault-spread", "the nemesis' faults (%d/%d/%d in the three thirds of the run) were not spread over it: it was idle for a part of it\n",
                      third[0], third[1], third[2]);
         bad++;
@@ -3696,7 +5245,7 @@ static int nemesis_check(void)
      * stretch it leaves is a long one: the server listening and nothing issued or in progress (an outage fault is a step of
      * many seconds: there only the number counts) */
     double gap_max_s = nem_gap_max_s();
-    if (seconds >= 10 && !outage && (double)watch_gap_worst_ns / 1e9 > gap_max_s) {
+    if (seconds >= 10 && !outage && !tier_nem && (double)watch_gap_worst_ns / 1e9 > gap_max_s) {
         INCONCLUSIVE("gap", "a server was listening for %.1f s with no fault issued or in progress (at most %.1f s expected; %.1f s of it at "
                      "the end of the run): the nemesis was idle\n", (double)watch_gap_worst_ns / 1e9, gap_max_s, (double)watch_tail_ns / 1e9);
         bad++;
@@ -3744,7 +5293,7 @@ static void feed_check(const char *when, bool crashed)
 {
     char why[512];
     feed_checks++;
-    if (feedcheck_dir(dir, crashed, why, sizeof why) != 0)
+    if (feedcheck_dir(dbdir, crashed, why, sizeof why) != 0)
         VIOLATION("feed, %s: %s\n", when, why);
     else if (!crashed && why[0])
         printf("feed, %s: %s\n", when, why);
@@ -3759,14 +5308,14 @@ static int feed_cli(bool enable)
         unsetenv("LD_PRELOAD");
         /* short retention and a small size bound: the cleaner runs, and its floor is under every fault too */
         if (enable)
-            execl(cli, "tsdb", dir, "feed", "enable", "--retention", "5s", "--max-bytes", "3M", (char *)NULL);
+            execl(cli, "tsdb", dbdir, "feed", "enable", "--retention", "5s", "--max-bytes", "3M", (char *)NULL);
         else
-            execl(cli, "tsdb", dir, "feed", "info", (char *)NULL);
+            execl(cli, "tsdb", dbdir, "feed", "info", (char *)NULL);
         _exit(127);
     }
     int st;
     if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-        fprintf(stderr, "jepsen: %s %s feed %s failed\n", cli, dir, enable ? "enable" : "info");
+        fprintf(stderr, "jepsen: %s %s feed %s failed\n", cli, dbdir, enable ? "enable" : "info");
         return 1;
     }
     return 0;
@@ -4023,6 +5572,34 @@ static void load_cuts(power_cut **out, size_t *nout)
     *nout = n;
 }
 
+/* True if write starting at `w_invoke` to key `k` of series `s` may have been settled into a .ec part retired by a
+ * `salvage` event at or before `at_ns` (INT64_MAX for final state). Bounded by each retired .ec part's settle_ms
+ * (EC_REC_SETTLE_MS, mapped to monotonic settle_cutoff_ns): writes invoked at/before settle_ms in that partition are
+ * excused (note: a row still in the memtable at settle_ms shares that window), while all writes invoked after settle_ms
+ * — including young rows written between settle and wipe and all writes while stores are LOST — must survive salvage. */
+static bool salvaged_away(int s, uint32_t k, int64_t w_invoke, int64_t at_ns)
+{
+    if (!nsalv_ev)
+        return false;
+    int64_t ts = key_ts(s, k);
+    for (int e = 0; e < nsalv_ev; e++) {
+        if (at_ns >= salv_ev[e].salv_ns) {
+            for (int p = 0; p < salv_ev[e].nparts; p++)
+                if (ts >= salv_ev[e].lo[p] && ts < salv_ev[e].hi[p] && w_invoke <= salv_ev[e].settle_cutoff_ns[p])
+                    return true;
+        }
+    }
+    return false;
+}
+
+static bool salvage_window_overlaps(int64_t invoke, int64_t complete)
+{
+    for (int e = 0; e < nsalv_ev; e++)
+        if (complete >= salv_ev[e].lost_ns && invoke <= salv_ev[e].done_ns)
+            return true;
+    return false;
+}
+
 static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
 {
     uint32_t nl = atomic_load(&nlats);
@@ -4043,6 +5620,8 @@ static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
                   (long long)(l->end == INT64_MAX ? -1 : l->end), (long long)l->invoke, (long long)l->complete, lm_); \
     } while (0)
         if (l->rstatus != 0) {
+            if (t_salvage && l->rstatus == TSDB_ERR_IO && salvage_window_overlaps(l->invoke, l->complete))
+                goto next; /* expected E15 TSDB_ERR_IO while m+1 stores were LOST before salvage */
             LVIOL("status %d for a series that exists and that the user may read\n", l->rstatus);
             goto next;
         }
@@ -4117,14 +5696,26 @@ static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
         for (int64_t k = (int64_t)top - 1; k > ak; k--) {
             size_t slot = koff[s] + (size_t)k, n = wc[slot + 1] - wc[slot];
             const uint32_t *cov = wl + wc[slot];
-            for (size_t j = 0; j < n; j++) {
+            /* cov is sorted ascending by invoke; latest_removes and salvaged_away are monotone in w->invoke, so walking
+             * backwards from the newest write with invoke < l->invoke checks the strictest bound first and breaks early. */
+            size_t lo = 0, hi = n;
+            while (lo < hi) {
+                size_t mid = (lo + hi) / 2;
+                if (writes[cov[mid]].invoke < l->invoke)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            for (size_t j = lo; j-- > 0;) {
                 const wop *w = &writes[cov[j]];
                 int row = row_of(w, (uint32_t)k, true);
                 if (w->st != ST_OK || w->complete >= l->invoke || row == 0 || (row == 2 && !l->with_nulls) ||
                     (may_lose && may_lose[cov[j]] && l->complete >= cut_at[cov[j]]))
                     continue;
                 if (latest_removes(s, (uint32_t)k, w->invoke, l->complete, !l->with_nulls))
-                    continue;
+                    break;
+                if (salvaged_away(s, (uint32_t)k, w->invoke, l->complete))
+                    break;
                 LVIOL("%s at key %lld (write %u, acknowledged before the request), newer than the answer (%s%s key "
                       "%lld): stale or missing\n", row == 1 ? "a value" : "a null", (long long)k, cov[j],
                       l->kind == TSDB_LATEST_NONE ? "none" : l->kind == TSDB_LATEST_NULL ? "null at" : "value at",
@@ -4404,7 +5995,9 @@ static int check(const uint32_t *final)
             continue;
         for (uint32_t i = 0; i < writes[w].nkeys; i++) {
             uint32_t k = writes[w].keys[i], f = final[koff[writes[w].series] + k];
-            if (f ? older_seen(f, w) : !absent_ok(writes[w].series, k, writes[w].invoke, INT64_MAX)) {
+            if (f ? older_seen(f, w)
+                  : !absent_ok(writes[w].series, k, writes[w].invoke, INT64_MAX) &&
+                        !salvaged_away(writes[w].series, k, writes[w].invoke, INT64_MAX)) {
                 if (lost++ < 10)
                     VIOLATION("write %u (%s, %u keys) to series %d key %u lost: final holds %u (%u keys)%s\n", w,
                               writes[w].st == ST_OK ? "acknowledged" : "seen or partly kept", writes[w].nkeys,
@@ -4489,7 +6082,9 @@ static int check(const uint32_t *final)
                 uint32_t other = q->seen[k2 - q->lo];
                 if (other >= nw)
                     continue; /* a value no write wrote: reported by check 1 */
-                if (other ? other != w && older(other, w) : !absent_ok(q->series, k2, writes[w].invoke, q->complete)) {
+                if (other ? other != w && older(other, w)
+                          : !absent_ok(q->series, k2, writes[w].invoke, q->complete) &&
+                                !salvaged_away(q->series, k2, writes[w].invoke, q->complete)) {
                     VIOLATION("read %u [%lld..%lld] saw write %u (%u keys, %lld..%lld) but %u (%u keys, %lld..%lld) at "
                               "its key %u: torn\n",
                               i, (long long)q->invoke, (long long)q->complete, w, writes[w].nkeys,
@@ -4661,7 +6256,8 @@ static int check(const uint32_t *final)
                 continue;
             uint32_t seen = q->seen[k - q->lo];
             if (seen ? seen < nw && writes[seen].complete < req_inv
-                     : !absent_ok(q->series, k, req_inv, q->complete)) {
+                     : !absent_ok(q->series, k, req_inv, q->complete) &&
+                           !salvaged_away(q->series, k, req_inv, q->complete)) {
                 char cut_info[64] = "";
                 if (wal_sync_ms > 0 && req_w && ncuts > 0) {
                     for (size_t c = 0; c < ncuts; c++)
@@ -4975,7 +6571,7 @@ static int check_classes(const uint32_t *final)
     int before = violations;
     /* CLASSES: 24-byte records [check][series][from][class][0]; from = INT64_MIN is a fresh series' decision */
     char path[PATH_MAX];
-    snprintf(path, sizeof path, "%s/CLASSES", dir);
+    snprintf(path, sizeof path, "%.4080s/CLASSES", dbdir);
     unsigned switches = 0, fresh = 0;
     FILE *f = fopen(path, "rb");
     unsigned char rec[24];
@@ -4993,7 +6589,7 @@ static int check_classes(const uint32_t *final)
     tsdb_options_init(&o);
     o.merge_threads = 0;
     tsdb *db;
-    int rc = tsdb_open(dir, &o, &db);
+    int rc = tsdb_open(dbdir, &o, &db);
     if (rc) {
         VIOLATION("classes: cannot open the database in-process: %s\n", tsdb_strerror(rc));
         return violations - before;
@@ -5143,18 +6739,252 @@ static void tier_scan(const char *d, const char *log, const char *pat, struct ti
     }
 }
 
+#ifdef TSDB_EC
+typedef struct salv_race_ctx {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool armed;
+    bool hit;
+    bool release;
+} salv_race_ctx;
+
+static void salv_race_hook(void *arg, int at)
+{
+    if (at != LH_WARM_BEFORE_STORE)
+        return;
+    salv_race_ctx *c = arg;
+    pthread_mutex_lock(&c->mu);
+    if (c->armed && !c->hit) {
+        c->hit = true;
+        pthread_cond_broadcast(&c->cv);
+        while (!c->release)
+            pthread_cond_wait(&c->cv, &c->mu);
+    }
+    pthread_mutex_unlock(&c->mu);
+}
+#endif
+
+/* Post-run live latest-table salvage check (`--nemesis salvage`): opens the clean database in-process with the latest
+ * table enabled, writes and settles a top-timestamp partition on ids[0] & ids[1], pauses the warmer at
+ * LH_WARM_BEFORE_STORE right after it computes the pre-salvage row from the .ec part, wipes & marks all stores LOST,
+ * verifies E15 TSDB_ERR_IO on unread ids[1], runs live tsdb_tier_salvage(), releases the warmer, and checks tsdb_latest
+ * against full-scan tsdb_query_points. Deterministically catches the exact original `salvagelatest` (skipped lgen bump). */
+static void salvage_live_latest_check(void)
+{
+#ifdef TSDB_EC
+    if (!t_salvage)
+        return;
+    setenv("TSDB_TEST_TIER", "grace_s=0,keep_s=0,eager=1", 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.partition_ms = PARTITION_MS;
+    o.latest_cache = 16u << 20; /* 16 MiB: enough for page 0 of ltab (1 MiB per 65,536-series page) */
+    tsdb *db = NULL;
+    int rc = tsdb_open(dbdir, &o, &db);
+    if (rc != 0 || !db) {
+        tier_harness_fail("salvage live-latest: tsdb_open(%s) failed (%s)", dbdir, tsdb_strerror(rc));
+        return;
+    }
+    /* Write two flushes of ids[0] and ids[1] into a brand-new top partition strictly newer than every kv key, optimize
+     * so it merges to level 1, and wait for eager settle to move it into an .ec part. */
+    int64_t t_young = T0 + 19LL * PARTITION_MS + 1000;
+    int64_t t_top = T0 + 20LL * PARTITION_MS;
+    int64_t p_top = -1;
+    int64_t ts1 = t_top + 1000, ts2 = t_top + 2000;
+    float vy = 888888.0f, v1 = 999991.0f, v2 = 999992.0f;
+    if (tsdb_insert_series(db, ids[0], &ts1, &v1, 1) != 0 || tsdb_insert_series(db, ids[1], &ts1, &v1, 1) != 0 ||
+        tsdb_flush(db) != 0 || tsdb_insert_series(db, ids[0], &ts2, &v2, 1) != 0 ||
+        tsdb_insert_series(db, ids[1], &ts2, &v2, 1) != 0 || tsdb_flush(db) != 0 || tsdb_optimize(db) != 0) {
+        tier_harness_fail("salvage live-latest: setup write/flush/optimize failed");
+        tsdb_close(db);
+        return;
+    }
+    bool settled = false;
+    for (int w = 0; w < 100 && !settled; w++) {
+        int64_t parts[64];
+        int np = list_ec_partitions(dbdir, parts, 64);
+        for (int i = 0; i < np; i++) {
+            int64_t lo = 0, hi = 0;
+            part_key_range(parts[i], PARTITION_MS, &lo, &hi);
+            if (ts2 >= lo && ts2 < hi) {
+                p_top = parts[i];
+                settled = true;
+                break;
+            }
+        }
+        if (!settled)
+            usleep(100000);
+    }
+    if (!settled) {
+        tier_liveness("salvage live-latest: top partition for ts %lld did not settle into .ec within 10 s",
+                      (long long)ts2);
+        tsdb_close(db);
+        return;
+    }
+    /* Write a surviving level-0 young .part on ids[0] at t_young (below p_top, strictly above all kv partitions):
+     * eager settle never settles level-0 parts, so post-salvage tsdb_latest(ids[0]) finds t_young directly without
+     * scanning older kv partitions (letting us salvage p_top alone cleanly via tsdb_tier_salvage(db, p_top, 0, 0)). */
+    if (tsdb_insert_series(db, ids[0], &t_young, &vy, 1) != 0 || tsdb_flush(db) != 0) {
+        tier_harness_fail("salvage live-latest: setup young-part write failed");
+        tsdb_close(db);
+        return;
+    }
+    /* Remove any settled_ copy of p_top so salvage retires the .ec part instead of restoring from settled_. */
+    {
+        char spfx[80];
+        snprintf(spfx, sizeof spfx, "settled_p%lld_", (long long)p_top);
+        DIR *dp = opendir(dbdir);
+        struct dirent *e;
+        while (dp && (e = readdir(dp)) != NULL) {
+            if (!strncmp(e->d_name, spfx, strlen(spfx))) {
+                char fp[PATH_MAX + 256];
+                snprintf(fp, sizeof fp, "%.4000s/%s", dbdir, e->d_name);
+                unlink(fp);
+            }
+        }
+        if (dp)
+            closedir(dp);
+    }
+    /* Drain any earlier warmer work so LH_WARM_BEFORE_STORE catches our targeted ids[0] warm below. */
+    for (int ms = 0; ms < 5000; ms += 10) {
+        tsdb_latest_stats lst;
+        if (tsdb_get_latest_stats(db, 0, &lst) == 0 && lst.enabled && lst.unknown == 0)
+            break;
+        usleep(10000);
+    }
+    /* Arm warmer pause at LH_WARM_BEFORE_STORE, then write a NULL at ts2 on ids[0] so lt_fold marks ids[0] LE_UNKNOWN
+     * and hints the warmer: it reads ts1 from p_top's .ec part and pauses right before storing into ltab! */
+    salv_race_ctx rctx = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .armed = true};
+    tsdb_test_latest_hook(db, salv_race_hook, &rctx);
+    float dummy = 0.0f;
+    uint8_t valid0 = 0;
+    tsdb_values ncol = {.type = TSDB_FLOAT32, .values = &dummy, .valid = &valid0};
+    if (tsdb_insert_values(db, &ids[0], &ts2, &ncol, 1) != 0 || tsdb_flush(db) != 0) {
+        tsdb_test_latest_hook(db, NULL, NULL);
+        tier_harness_fail("salvage live-latest: null write to trigger warmer failed");
+        tsdb_close(db);
+        return;
+    }
+    struct timespec wt;
+    clock_gettime(CLOCK_REALTIME, &wt);
+    wt.tv_sec += 10;
+    pthread_mutex_lock(&rctx.mu);
+    while (!rctx.hit) {
+        if (pthread_cond_timedwait(&rctx.cv, &rctx.mu, &wt) == ETIMEDOUT)
+            break;
+    }
+    bool hook_hit = rctx.hit;
+    pthread_mutex_unlock(&rctx.mu);
+    if (!hook_hit) {
+        tier_liveness("salvage live-latest: warmer did not reach LH_WARM_BEFORE_STORE within 10 s");
+        tsdb_test_latest_hook(db, NULL, NULL);
+        tsdb_close(db);
+        return;
+    }
+    /* Mark ALL stores LOST (guaranteed > m positions lost for every .ec part regardless of k') and wake tierctl. */
+    int all_slots[16];
+    for (int i = 0; i < tier_n; i++) {
+        all_slots[i] = i;
+        rm_tree_dir(store_paths[i]);
+    }
+    if (salvage_mark_stores_lost(all_slots, tier_n) != 0) {
+        pthread_mutex_lock(&rctx.mu);
+        rctx.release = true;
+        pthread_cond_broadcast(&rctx.cv);
+        pthread_mutex_unlock(&rctx.mu);
+        tsdb_test_latest_hook(db, NULL, NULL);
+        tier_harness_fail("salvage live-latest: failed to mark stores LOST");
+        tsdb_close(db);
+        return;
+    }
+    tier *t = tier_find_by_dir(dbdir);
+    if (t) {
+        tierctl_wake(t);
+        (void)tierctl_wait_idle(t, 10000);
+        eccache_reopen_all(t);
+        tier_put(t);
+    }
+    /* Verify read of unread ids[1] in p_top fails with TSDB_ERR_IO (E15). */
+    bool io_seen = false;
+    for (int w = 0; w < 50 && !io_seen; w++) {
+        tsdb_points p = {0};
+        int qrc = tsdb_query_points(db, ids[1], t_top, t_top + PARTITION_MS, &p);
+        tsdb_points_free(&p);
+        if (qrc == TSDB_ERR_IO)
+            io_seen = true;
+        else
+            usleep(100000);
+    }
+    if (!io_seen) {
+        pthread_mutex_lock(&rctx.mu);
+        rctx.release = true;
+        pthread_cond_broadcast(&rctx.cv);
+        pthread_mutex_unlock(&rctx.mu);
+        tsdb_test_latest_hook(db, NULL, NULL);
+        VIOLATION("salvage live-latest: read of lost top partition did not return TSDB_ERR_IO\n");
+        tsdb_close(db);
+        return;
+    }
+    /* Run live tsdb_tier_salvage on p_top ONLY (isolated from any older kv partition layout) while warmer holds ts1! */
+    rc = tsdb_tier_salvage(db, p_top, 0, 0);
+    /* Release the paused warmer and wait for it to finish its store attempt (must be rejected by lgen bump). */
+    pthread_mutex_lock(&rctx.mu);
+    rctx.release = true;
+    pthread_cond_broadcast(&rctx.cv);
+    pthread_mutex_unlock(&rctx.mu);
+    tsdb_test_latest_hook(db, NULL, NULL);
+    for (int ms = 0; ms < 5000; ms += 10) {
+        tsdb_latest_stats lst;
+        if (tsdb_get_latest_stats(db, 0, &lst) == 0 && lst.enabled && lst.unknown == 0)
+            break;
+        usleep(10000);
+    }
+    if (rc != 0) {
+        VIOLATION("salvage live-latest: tsdb_tier_salvage(partition %lld) failed (%s)\n", (long long)p_top,
+                  tsdb_strerror(rc));
+        tsdb_close(db);
+        return;
+    }
+    /* Compare tsdb_latest (NULL opts -> ltab fast path) against full-scan [t_young, INT64_MAX): must return t_young! */
+    tsdb_latest_result lr1 = {0};
+    rc = tsdb_latest(db, &ids[0], 1, NULL, &lr1);
+    if (rc != 0 || lr1.status != 0) {
+        VIOLATION("salvage live-latest: post-salvage tsdb_latest failed (rc=%d status=%d)\n", rc, lr1.status);
+    } else if (lr1.kind == TSDB_LATEST_VALUE && lr1.ts >= t_top) {
+        VIOLATION("salvage live-latest: tsdb_latest returned salvaged row at ts %lld (salvagelatest?)\n",
+                  (long long)lr1.ts);
+    } else {
+        tsdb_points p = {0};
+        int qrc = tsdb_query_points(db, ids[0], t_young, INT64_MAX, &p);
+        if (qrc == 0) {
+            int64_t want_ts = INT64_MIN;
+            for (size_t i = 0; i < p.n; i++)
+                if (!isnan(p.values[i]) && p.ts[i] > want_ts)
+                    want_ts = p.ts[i];
+            if (want_ts != t_young || lr1.kind != TSDB_LATEST_VALUE || lr1.ts != want_ts) {
+                VIOLATION("salvage live-latest: expected latest ts %lld, got kind=%d ts=%lld (salvagelatest?)\n",
+                          (long long)want_ts, lr1.kind, (long long)lr1.ts);
+            }
+            tsdb_points_free(&p);
+        }
+    }
+    tsdb_close(db);
+#endif
+}
+
 /* At the end of a run with the tier: report, and fail a run in which nothing settled. */
 static int tier_check(void)
 {
     int before = violations;
     const char *pat = getenv("JEPSEN_SETTLE_LINE") ? getenv("JEPSEN_SETTLE_LINE") : "settled ";
     struct tier_counts c;
-    tier_scan(dir, slogpath, pat, &c);
+    tier_scan(dbdir, slogpath, pat, &c);
     /* the minimum: a few settles in any run of a minute (the eager policy settles 30 a minute at most, and a key
      * needs its merge round first); the eio nemesis fails a store now and then, and a failed store stops the settles of
      * that process until the next start, so there one is enough. */
     unsigned want = seconds >= 100 ? 5 : seconds >= 40 ? 3 : 1;
-    if (!strcmp(nemesis, "eio"))
+    if (!strcmp(nemesis, "eio") || tier_nem)
         want = 1;
     if (getenv("JEPSEN_MIN_SETTLES"))
         want = (unsigned)atoi(getenv("JEPSEN_MIN_SETTLES"));
@@ -5192,11 +7022,25 @@ static int tier_check(void)
         printf("tier: no part files at the end\n");
     }
     unsigned files = c.ec + c.settled + c.retired_ec;
-    if (want > 0 && files == 0)
+    if (want > 0 && files == 0 && !t_salvage)
         VIOLATION("tier: no .ec, settled_ or retired_*.ec file at the end: nothing settled (or all of it was removed)\n");
     if (c.lines < want)
         VIOLATION("tier: %u settle lines (\"%s\") in the server logs, at least %u wanted in %.0f s: nothing, or too "
                   "little, settled\n", c.lines, pat, want, seconds);
+    if (tier_nem) {
+        printf("tier-nemesis %s: %d fault rounds, %d problems", nemesis, tier_nem_rounds, tier_nem_problems);
+        if (t_fill)
+            printf(", %lld UNAVAILABLE WHY_FULL refusals", (long long)atomic_load(&fill_full_refusals));
+        if (t_store_lost)
+            printf(", %d rebuilds verified", lost_rebuilds_verified);
+        if (t_salvage)
+            printf(", %d E15 IO / %d stats verified, %d .ec parts retired across %d salvage(s)", salv_io_verified,
+                   salv_stats_verified, salv_parts_retired, nsalv_ev);
+        printf("\n");
+        if (seconds >= 10 && tier_nem_rounds == 0)
+            INCONCLUSIVE("tier-nemesis-coverage", "tier nemesis %s completed 0 fault rounds in %.0f s\n", nemesis,
+                         seconds);
+    }
     if (tier_n && !strcmp(nemesis, "eio")) {
         printf("tier: %d EIOs landed on a file of a store\n", store_eios);
         unsigned min_eios = getenv("JEPSEN_MIN_STORE_EIOS") ? (unsigned)atoi(getenv("JEPSEN_MIN_STORE_EIOS")) : 1;
@@ -5235,12 +7079,12 @@ static int users_cli(const char *a1, const char *a2, const char *a3, const char 
     pid_t pid = fork();
     if (pid == 0) {
         unsetenv("LD_PRELOAD");
-        execl(cli, "tsdb", dir, "user", a1, a2, a3, a4, a5, (char *)NULL);
+        execl(cli, "tsdb", dbdir, "user", a1, a2, a3, a4, a5, (char *)NULL);
         _exit(127);
     }
     int st;
     if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-        fprintf(stderr, "jepsen: %s %s user %s %s ... failed\n", cli, dir, a1, a2);
+        fprintf(stderr, "jepsen: %s %s user %s %s ... failed\n", cli, dbdir, a1, a2);
         return 1;
     }
     return 0;
@@ -5261,7 +7105,7 @@ static int make_users(void)
             return 1;
         }
     }
-    if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+    if (mkdir(dbdir, 0755) != 0 && errno != EEXIST)
         return 1;
     return users_cli("add", "root", "--superuser", "--password-file", root_pw) ||
            users_cli("add", KV_USER, "--password-file", kv_pw, NULL) ||
@@ -5285,7 +7129,7 @@ static int make_volumes(void)
         snprintf(vol_dir[i], sizeof vol_dir[i], "%s", rp);
     }
     uint32_t vi;
-    int rc = tsdb_open(dir, &o, &db);
+    int rc = tsdb_open(dbdir, &o, &db);
     if (rc == 0) {
         rc = tsdb_volume_add(db, vol_dir[0], &vi) || tsdb_volume_add(db, vol_dir[1], &vi);
         for (int s = 0; !rc && s < nseries; s++) {
@@ -5502,44 +7346,142 @@ static int epochs(void)
     return 0;
 }
 
-/* --tier N: N store directories inside DIR (under the shim of a power run too: crashfs's root is DIR), and the two
- * variables for every process of the run: the servers, the CLI and the in-process opens of this one. DIR is made now
- * (tsdbd takes an existing one). m = N / 3 stores may be lost (3 = 2+1, 6 = 4+2). The settle policy is the eager one
- * with a short grace and keep time (see the header). */
+/* --tier N: sets up N store directories. By default (R15), builds TIERS in DIR/db using `tsdb DIR/db tier add` with
+ * stores in DIR/tier/s0..s(N-1) (siblings of DIR/db so path-overlap checks pass while CRASHFS_ROOT=DIR covers both)
+ * and passes timing keys only via TSDB_TEST_TIER. With JEPSEN_TIER_LEGACY=1, keeps the legacy dirs= path without TIERS. */
 static int tier_setup(void)
 {
-    int m = tier_n / 3, k = tier_n - m;
-    if ((mkdir(dir, 0755) != 0 && errno != EEXIST) || !realpath(dir, tier_root)) {
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
         fprintf(stderr, "jepsen: cannot make %s: %s\n", dir, strerror(errno));
         return 1;
     }
-    char dirs[16 * PATH_MAX], d[PATH_MAX + 64];
-    size_t at = 0;
-    if (strlen(tier_root) + 8 >= sizeof tier_root) {
+    char root_rp[PATH_MAX];
+    if (!realpath(dir, root_rp)) {
+        fprintf(stderr, "jepsen: cannot resolve %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    if (strlen(root_rp) + 16 >= sizeof tier_root) {
         fprintf(stderr, "jepsen: the path of %s is too long\n", dir);
         return 1;
     }
-    strcat(tier_root, "/tier");
+    snprintf(tier_root, sizeof tier_root, "%s/tier", root_rp);
     if (mkdir(tier_root, 0755) != 0 && errno != EEXIST) {
         fprintf(stderr, "jepsen: cannot make %s: %s\n", tier_root, strerror(errno));
         return 1;
     }
-    for (int i = 0; i < tier_n; i++) {
-        snprintf(d, sizeof d, "%s/s%d", tier_root, i);
-        if ((mkdir(d, 0755) != 0 && errno != EEXIST) || at + strlen(d) + 2 >= sizeof dirs) {
-            fprintf(stderr, "jepsen: cannot make store %s: %s\n", d, strerror(errno));
+    if (tier_legacy) {
+        int m = tier_n / 3, k = tier_n - m;
+        char dirs[16 * PATH_MAX], d[PATH_MAX + 64];
+        size_t at = 0;
+        for (int i = 0; i < tier_n; i++) {
+            snprintf(d, sizeof d, "%.4000s/s%d", tier_root, i);
+            if ((mkdir(d, 0755) != 0 && errno != EEXIST) || at + strlen(d) + 2 >= sizeof dirs) {
+                fprintf(stderr, "jepsen: cannot make store %s: %s\n", d, strerror(errno));
+                return 1;
+            }
+            snprintf(store_paths[i], sizeof store_paths[i], "%.4090s", d);
+            at += (size_t)snprintf(dirs + at, sizeof dirs - at, "%s%s", i ? ":" : "", d);
+        }
+        char *spec = malloc(sizeof dirs + 256);
+        const char *extra = getenv("JEPSEN_TIER_EXTRA");
+        snprintf(spec, sizeof dirs + 256, "k=%d,m=%d,dirs=%s,grace_s=1,keep_s=5,eager=1%s%s", k, m, dirs,
+                 extra && *extra ? "," : "", extra && *extra ? extra : "");
+        setenv("TSDB_TEST_TIER", spec, 1);
+        setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+        printf("tier (legacy): %d stores, k=%d m=%d, TSDB_TEST_TIER=%s\n", tier_n, k, m, spec);
+        free(spec);
+        return 0;
+    }
+
+    /* R15 TIERS path: db lives in DIR/db, stores in DIR/tier/s0..s(N-1), configured via `tsdb DIR/db tier add`. */
+    snprintf(dbdir, sizeof dbdir, "%s/db", root_rp);
+    if (mkdir(dbdir, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "jepsen: cannot make %s: %s\n", dbdir, strerror(errno));
+        return 1;
+    }
+    /* Initialize root META with the run's partition_ms before `tsdb tier add` (no TSDB_TEST_TIER set yet). */
+    unsetenv("TSDB_TEST_TIER");
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+    {
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.partition_ms = classes ? (int64_t)CL_PARTITION_MS : PARTITION_MS;
+        tsdb *db = NULL;
+        int rc = tsdb_open(dbdir, &o, &db);
+        if (rc != 0 || !db) {
+            fprintf(stderr, "jepsen: cannot initialize %s (%s)\n", dbdir, tsdb_strerror(rc));
             return 1;
         }
-        at += (size_t)snprintf(dirs + at, sizeof dirs - at, "%s%s", i ? ":" : "", d);
+        tsdb_close(db);
     }
-    char *spec = malloc(sizeof dirs + 256);
-    const char *extra = getenv("JEPSEN_TIER_EXTRA"); /* more settings of the grammar, e.g. coarse_s=60 */
-    snprintf(spec, sizeof dirs + 256, "k=%d,m=%d,dirs=%s,grace_s=1,keep_s=5,eager=1%s%s", k, m, dirs,
-             extra && *extra ? "," : "", extra && *extra ? extra : "");
+    for (int i = 0; i < tier_n; i++) {
+        char d[PATH_MAX + 64], arg[PATH_MAX + 80], out[1024];
+        snprintf(d, sizeof d, "%.4000s/s%d", tier_root, i);
+        snprintf(arg, sizeof arg, "%.4000s:hdd", d);
+        char *av[8];
+        int ac = 0;
+        av[ac++] = "tsdb";
+        av[ac++] = dbdir;
+        av[ac++] = "tier";
+        av[ac++] = "add";
+        av[ac++] = arg;
+        av[ac++] = "--allow-shared-device";
+        if (t_single_copy)
+            av[ac++] = "--single-copy";
+        av[ac] = NULL;
+        int rc = tier_cli_run(av, out, sizeof out);
+        if (rc != 0) {
+            fprintf(stderr, "jepsen: `tsdb %s tier add %s` failed (rc %d): %s\n", dbdir, arg, rc, out);
+            return 1;
+        }
+        char canon[PATH_MAX];
+        snprintf(store_paths[i], sizeof store_paths[i], "%.4090s", realpath(d, canon) ? canon : d);
+    }
+    if (t_single_copy) {
+        char out[1024];
+        char *av[] = {"tsdb", dbdir, "tier", "set", "--redundancy", "1+0", NULL};
+        int rc = tier_cli_run(av, out, sizeof out);
+        if (rc != 0) {
+            fprintf(stderr, "jepsen: `tsdb %s tier set --redundancy 1+0` failed (rc %d): %s\n", dbdir, rc, out);
+            return 1;
+        }
+    }
+    int64_t pms_val = classes ? (int64_t)CL_PARTITION_MS : PARTITION_MS;
+    if (t_store_lost) {
+        anchor_tbase = (T0 / pms_val - 4) * pms_val;
+        int arc = tier_write_cold_part("jepsen.anchor", anchor_tbase);
+        if (arc != 0) {
+            fprintf(stderr, "jepsen: cannot write cold anchor part (%s)\n", tsdb_strerror(arc));
+            return 1;
+        }
+    }
+    if (t_store_stuck) {
+        anchor_tbase = (T0 / pms_val - 4) * pms_val;
+        int arc = tier_write_cold_part_multi("jepsen.cold", anchor_tbase, 32);
+        if (arc != 0) {
+            fprintf(stderr, "jepsen: cannot write cold stuck-probe part (%s)\n", tsdb_strerror(arc));
+            return 1;
+        }
+        stuck_cold_ready = true;
+    }
+    if (t_salvage) {
+        snprintf(salv_cur_series, sizeof salv_cur_series, "jepsen.salv.0");
+        salv_cur_tbase = (T0 / pms_val - 5) * pms_val;
+        int src = tier_write_cold_part(salv_cur_series, salv_cur_tbase);
+        if (src != 0) {
+            fprintf(stderr, "jepsen: cannot write cold salvage part (%s)\n", tsdb_strerror(src));
+            return 1;
+        }
+    }
+    char spec[512];
+    const char *extra = getenv("JEPSEN_TIER_EXTRA");
+    int keep = t_salvage ? 1 : 5;
+    snprintf(spec, sizeof spec, "grace_s=1,keep_s=%d,eager=1%s%s", keep, extra && *extra ? "," : "",
+             extra && *extra ? extra : "");
     setenv("TSDB_TEST_TIER", spec, 1);
     setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
-    printf("tier: %d stores, k=%d m=%d, TSDB_TEST_TIER=%s\n", tier_n, k, m, spec);
-    free(spec);
+    printf("tier (TIERS): %d store(s)%s in %s, TSDB_TEST_TIER=%s\n", tier_n, t_single_copy ? " (single-copy 1+0)" : "",
+           tier_root, spec);
     return 0;
 }
 
@@ -5618,18 +7560,33 @@ int main(int argc, char **argv)
     rot = !strcmp(nemesis, "rot");
     outage = !strcmp(nemesis, "outage");
     settle_steps = !strcmp(nemesis, "settle-steps");
-    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || md || outage || settle_steps;
-    if (!dir || (shim && !outage && !crashfs) || (outage && (!outagefs_lib || classes || auth)) ||
-        ((md || rot) && classes) || tier_n < 0 || (tier_n && (tier_n < 3 || outage || md || rot || verify)) ||
-        (settle_steps && !tier_n) || wal_sync_ms < 0 ||
-        (wal_sync_ms > 0 && (classes || (strcmp(nemesis, "power") && strcmp(nemesis, "none"))))) {
-        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|settle-steps|none]\n"
+    t_store_eio = !strcmp(nemesis, "store-eio");
+    t_store_stuck = !strcmp(nemesis, "store-stuck");
+    t_store_lost = !strcmp(nemesis, "store-lost");
+    t_salvage = !strcmp(nemesis, "salvage");
+    t_fill = !strcmp(nemesis, "fill");
+    t_single_copy = !strcmp(nemesis, "single-copy");
+    tier_nem = t_store_eio || t_store_stuck || t_store_lost || t_salvage || t_fill || t_single_copy;
+    tier_legacy = getenv("JEPSEN_TIER_LEGACY") && atoi(getenv("JEPSEN_TIER_LEGACY")) > 0;
+    if (tier_nem && tier_n == 0)
+        tier_n = t_single_copy ? 1 : 6;
+    bool need_outagefs = outage || t_store_eio || t_store_stuck || t_fill;
+    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || md || outage || settle_steps ||
+                (tier_nem && outagefs_lib != NULL);
+    bool bad_tier_n = tier_n < 0 || tier_n > 16 ||
+                      (tier_n && ((t_single_copy ? tier_n != 1 : tier_n < 3) || outage || md || rot || verify)) ||
+                      (tier_nem && (tier_legacy || classes));
+    if (!dir || (shim && !outage && !tier_nem && !crashfs) || (need_outagefs && !outagefs_lib) ||
+        (outage && (classes || auth)) || ((md || rot) && classes) || bad_tier_n || (settle_steps && !tier_n) ||
+        wal_sync_ms < 0 || (wal_sync_ms > 0 && (classes || (strcmp(nemesis, "power") && strcmp(nemesis, "none"))))) {
+        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|settle-steps|\n"
+                        "                                   store-eio|store-stuck|store-lost|salvage|fill|single-copy|none]\n"
                         "              [--seconds S] [--clients N] [--seed N] [--crashfs build/libcrashfs.so]\n"
                         "              [--workload kv|classes] [--verify-checksums]   (misdirect and rot: workload kv)\n"
                         "              [--wal-sync-ms MS]   (periodic WAL sync: workload kv under power or none)\n"
-                        "              [--auth] [--feed] [--tier N]   (N stores, at least 3; not with outage, misdirect, rot or\n"
-                        "              --verify-checksums; settle-steps needs it)\n"
-                        "              [--outagefs build/liboutagefs.so]   (outage: workload kv, no login)\n");
+                        "              [--auth] [--feed] [--tier N]   (N stores, >= 3 or 1 for single-copy; not with outage,\n"
+                        "              misdirect, rot or --verify-checksums; settle-steps needs it)\n"
+                        "              [--outagefs build/liboutagefs.so]   (required for outage, store-eio, store-stuck, fill)\n");
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
@@ -5669,6 +7626,7 @@ int main(int argc, char **argv)
                 dir, strerror(errno));
         return 2;
     }
+    snprintf(dbdir, sizeof dbdir, "%s", dir);
     char cmd[6 * PATH_MAX + 256];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (outage) { /* the volumes and the shim's socket beside the directory */
@@ -5677,6 +7635,9 @@ int main(int argc, char **argv)
         snprintf(octl, sizeof octl, "%s.outagefs", dir);
         snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s' '%s' '%s' '%s.snap0' '%s.snap1'", dir, vol_dir[0], vol_dir[1],
                  octl, octl, octl);
+    } else if (tier_nem && outagefs_lib) {
+        snprintf(octl, sizeof octl, "%s.outagefs", dir);
+        snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", dir, octl);
     }
     if (system(cmd) != 0)
         return 2;
@@ -5719,7 +7680,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "jepsen: --feed goes with the kv workload under kill, power, pause and eio\n");
         return 2;
     }
-    if (feed && ((mkdir(dir, 0755) != 0 && errno != EEXIST) || feed_cli(true)))
+    if (feed && ((mkdir(dbdir, 0755) != 0 && errno != EEXIST) || feed_cli(true)))
         return 2;
 
     start_server(false); /* the series exist before any fault */
@@ -5835,7 +7796,20 @@ int main(int argc, char **argv)
             md_death(st, 0, pid);
         server_gone();
     }
-    stop_server(!strcmp(nemesis, "eio") || wal_sync_ms > 0 ? SIGTERM : SIGKILL); /* eio: the shim rolls back at a normal exit; wal_sync_ms > 0: clean stop flushes unsynced buffer */
+    stop_server(!strcmp(nemesis, "eio") || wal_sync_ms > 0 || (tier_nem && !t_single_copy) ? SIGTERM : SIGKILL); /* eio: the shim rolls back at a normal exit; wal_sync_ms > 0: clean stop flushes unsynced buffer */
+    if (atomic_load(&tier_harness_err)) {
+        /* A tier nemesis harness step (outagefs ctl / TIERS write / CLI replace) failed before the final state:
+         * exit 2 without judging a database that the harness itself left half-modified. */
+        pthread_mutex_unlock(&server_lock);
+        if (samp_on) {
+            atomic_store(&samp_stop, true);
+            join_bounded(samp_th, "the disk sampler", 30);
+        }
+        fprintf(stderr, "jepsen: harness error: %s\n",
+                tier_harness_msg[0] ? tier_harness_msg : "tier nemesis setup/control failed");
+        (void)system(cmd);
+        return 2;
+    }
     uint32_t *final = calloc(koff[nseries], sizeof *final), *again = calloc(koff[nseries], sizeof *again);
     if (!damaged) /* misdirect, rot: a database refused while the clients ran has no final state */
         start_server(false);
@@ -5919,6 +7893,17 @@ int main(int argc, char **argv)
         v += check_classes(final);
     if (tier_n)
         v += tier_check();
+    if (t_salvage && !damaged) {
+        int before_sl = violations;
+        salvage_live_latest_check();
+        v += violations - before_sl;
+    }
+    if (tier_nem) {
+        v += tier_nem_problems;
+        if (tier_liveness_issues > 0)
+            INCONCLUSIVE("tier-liveness", "%d tier liveness miss(es) (first: %s)\n", tier_liveness_issues,
+                         tier_liveness_msg);
+    }
     if (!strcmp(nemesis, "eio")) {
         printf("eio: %d fail-stops\n", failstops);
         v += eio_problems;
@@ -5986,6 +7971,10 @@ int main(int argc, char **argv)
     }
     if (env_kills) { /* the machine killed the server (see end_report): nothing here says anything about tsdb */
         fprintf(stderr, "jepsen: harness error: a server was killed, or fail-stopped on a full disk, by something that was not the harness\n");
+        return 2;
+    }
+    if (atomic_load(&tier_harness_err)) {
+        fprintf(stderr, "jepsen: harness error: %s\n", tier_harness_msg[0] ? tier_harness_msg : "tier nemesis setup/control failed");
         return 2;
     }
     if (inconclusive)

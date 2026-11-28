@@ -26,11 +26,15 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # kv also with login on (jepsen --auth) under kill and power, on each backend;
                           # JEPSEN_SECONDS=300 makes every run that long (the weekly CI run)
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
-                          # (JEPSEN_TIER, "3 6" by default: a directory tier of 2+1 and of 4+2 stores, `jepsen --tier N`, under the
-                          # eager policy: kill, power, eio and settle-steps (TSDB_SETTLE_CRASH_AT: a power cut at each named step of a
-                          # settle) on kv and classes, both backends, JEPSEN_TIER_SEEDS 1 2; a run in which nothing settled fails;
-                          # JEPSEN_TIER= turns them off; tests/jepsen/mutant-settle.sh plants a settle that ranks its .ec below the
-                          # rows it replaced and a swap that renames early: jepsen-selftest runs it, both must be caught)
+                          # (JEPSEN_TIER, "3 6" by default: a directory tier of 2+1 and of 4+2 stores, `jepsen --tier N`, built via
+                          # `tsdb DIR/db tier add` with stores in DIR/tier/s0..s(N-1) and timings via TSDB_TEST_TIER (grace_s/keep_s/eager;
+                          # JEPSEN_TIER_LEGACY=1 keeps the legacy dirs= path without TIERS): kill, power, eio and settle-steps
+                          # (TSDB_SETTLE_CRASH_AT: a power cut at each named step of a settle) on kv and classes, both backends,
+                          # JEPSEN_TIER_SEEDS 1 2; plus JEPSEN_TIER_R15 (`store-eio`, `store-stuck`, `store-lost`, `salvage`, `fill`,
+                          # `single-copy`) under outagefs (`rate MB/s` and `fill PCT` controls added to tests/jepsen/outagefs.c);
+                          # a run in which nothing settled fails; JEPSEN_TIER= turns them off; tests/jepsen/mutant-settle.sh plants
+                          # ecrankdown and swapearly, and tests/jepsen/mutant-tier.sh plants downnoread, fullnoflag, lostnoreplace and
+                          # salvagelatest via TSDB_TIER_MUTANT: jepsen-selftest runs both and every mutant must be caught)
                           # (kv also writes nulls and checks every QUERY_LATEST answer, and the final ones; tests/jepsen/mutant-latest.sh
                           # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
                           # jepsen exits 0 valid, 1 VIOLATION (a wrong answer of tsdb: never repeated), 2 harness failure, 3 INCONCLUSIVE
