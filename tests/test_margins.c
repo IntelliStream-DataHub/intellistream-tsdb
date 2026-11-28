@@ -152,6 +152,56 @@ int main(int argc, char **argv)
     CHECK(m.settled == 1 && m.present == 7, "6+2 with node 8 down: settled %d present %u", m.settled, m.present);
     members_up();
 
+    /* R10 (D29): mixed-geometry settled margins during conversion take the minimum across all active geometries. */
+    /* (a) 4+2 -> 4+3 in REENCODE: 7 healthy stripe positions -> min(4+3 margin 3, 4+2 margin 2) == 2. */
+    struct cluster_copy_vol c43 = {.number = 10, .redundancy = META_RED_EC, .ec_k = 4, .ec_m = 3, .nstripe = 7,
+                                   .nrep = 4, .nisr = 4, .stripe_version = 2};
+    for (uint32_t i = 0; i < 7; i++)
+        c43.stripe[i] = i + 1;
+    c43.conv.phase = META_CONV_REENCODE;
+    c43.conv.orig_redundancy = META_RED_EC;
+    c43.conv.orig_k = 4;
+    c43.conv.orig_m = 2;
+    margins_of(&cp, &c43, NULL, 0, false, mut, &m);
+    CHECK(m.settled == 2 && m.tier == MARGIN_TIER_OK, "4+2->4+3 REENCODE healthy: settled %d tier %s", m.settled,
+          margin_tier_name(m.tier));
+    /* Node 1 down (in both 4+2 and 4+3): min(2, 1) == 1. */
+    members[0].state = META_DOWN;
+    margins_of(&cp, &c43, NULL, 0, false, mut, &m);
+    CHECK(m.settled == 1 && m.tier == MARGIN_TIER_OK, "4+2->4+3 REENCODE node 1 down: settled %d tier %s", m.settled,
+          margin_tier_name(m.tier));
+    /* Nodes 1, 2, 3 down: 4+3 still has 4/7 (margin 0), but old 4+2 has only 3/6 -> settled -1, UNAVAILABLE! */
+    members[1].state = members[2].state = META_DOWN;
+    margins_of(&cp, &c43, NULL, 0, false, mut, &m);
+    CHECK(m.settled == -1 && m.tier == MARGIN_TIER_UNAVAILABLE, "4+2->4+3 REENCODE 3 down: settled %d tier %s",
+          m.settled, margin_tier_name(m.tier));
+    members_up();
+    /* (b) 4+2 -> replicas=3 in REENCODE (unsettling): redundancy is REPLICAS, but orig 4+2 still active -> margin 2. */
+    struct cluster_copy_vol c2r = {.number = 11, .redundancy = META_RED_REPLICAS, .nstripe = 6, .nrep = 3, .nisr = 3,
+                                   .stripe_version = 2};
+    for (uint32_t i = 0; i < 6; i++)
+        c2r.stripe[i] = i + 1;
+    c2r.conv.phase = META_CONV_REENCODE;
+    c2r.conv.orig_redundancy = META_RED_EC;
+    c2r.conv.orig_k = 4;
+    c2r.conv.orig_m = 2;
+    margins_of(&cp, &c2r, NULL, 0, false, mut, &m);
+    CHECK(m.settled == 2 && m.tier == MARGIN_TIER_OK, "4+2->replicas REENCODE healthy: settled %d tier %s", m.settled,
+          margin_tier_name(m.tier));
+    members[0].state = META_DOWN;
+    margins_of(&cp, &c2r, NULL, 0, false, mut, &m);
+    CHECK(m.settled == 1 && m.tier == MARGIN_TIER_OK, "4+2->replicas REENCODE 1 down: settled %d tier %s", m.settled,
+          margin_tier_name(m.tier));
+    members_up();
+    /* (c) Cancelled REENCODE leaves mixed_redundancy EC 4+2 alongside 4+3: settled margin stays min(3, 2) == 2. */
+    c43.conv.phase = META_CONV_NONE;
+    c43.mixed_redundancy = META_RED_EC;
+    c43.mixed_k = 4;
+    c43.mixed_m = 2;
+    margins_of(&cp, &c43, NULL, 0, false, mut, &m);
+    CHECK(m.settled == 2 && m.tier == MARGIN_TIER_OK, "cancelled REENCODE mixed 4+2/4+3: settled %d tier %s", m.settled,
+          margin_tier_name(m.tier));
+
     CHECK(strcmp(margin_tier_name(MARGIN_TIER_LOST), "lost") == 0 && strcmp(margin_tier_name(99), "?") == 0,
           "tier names");
     CHECK(margin_mutant_parse(NULL) == 0 && margin_mutant_parse("") == 0 && margin_mutant_parse("nosuch") == -1,

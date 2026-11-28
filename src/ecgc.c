@@ -209,6 +209,7 @@ typedef struct gc_rec {
     bool need_digest;      /* true: cluster MK_GC waits until leader re-encode digest matches & commits (r10-crepl) */
     int64_t partition;
     uint64_t min_block, max_block;
+    uint64_t stripe_version; /* R10: stripe_version of this retired object (0: unknown/default 1) */
     uint64_t need_applied; /* >0: cluster MK_GC waits until db->lead_applied_floor >= need_applied (R10 unsettle/crepl) */
     int64_t deadline;      /* monotonic ms: when cluster MK_GC may collect this retired object */
     gc_ticket *tk;
@@ -900,6 +901,7 @@ int ecgc_load_retired(eng *db, const char *name, bool read_only)
     unsigned npos = (unsigned)ep->rec.k + ep->rec.m;
     int64_t part_key = p->partition;
     uint64_t min_blk = p->min_block, max_blk = p->max_block;
+    uint64_t sver = ep->rec.stripe_version;
     part_unref(p); /* drops the temporary hold taken by part_open_ec */
     int64_t deadline = eng_mono_ms() + gc_life_ms(db);
     gc_rec *r = rec_add(e, name, oid, npos, true, deadline);
@@ -909,6 +911,7 @@ int ecgc_load_retired(eng *db, const char *name, bool read_only)
     r->partition = part_key;
     r->min_block = min_blk;
     r->max_block = max_blk;
+    r->stripe_version = sver;
     return 0;
 }
 
@@ -932,6 +935,7 @@ static void retire_locked_ex(eng *db, part *p, uint64_t need_applied, bool need_
     r->partition = p->partition;
     r->min_block = p->min_block;
     r->max_block = p->max_block;
+    r->stripe_version = object ? ep->rec.stripe_version : 0;
     r->need_applied = need_applied;
     r->need_digest = need_digest;
     /* Holds are taken in part_open_ec; holdatretire plants the old r7-gc F5 bug of taking them only here. */
@@ -1500,4 +1504,211 @@ int ecgc_open_sweep(eng *db)
     int rc = sweep_list(t, db->tier_vol, tier_vuuid(db), named, n);
     free(named);
     return rc;
+}
+
+typedef struct live_oid_ent {
+    uint8_t oid[16];
+    uint64_t sv;
+} live_oid_ent;
+
+static int live_oid_cmp(const void *a, const void *b)
+{
+    const live_oid_ent *x = a, *y = b;
+    int c = memcmp(x->oid, y->oid, 16);
+    if (c != 0)
+        return c;
+    return x->sv < y->sv ? -1 : x->sv > y->sv ? 1 : 0;
+}
+
+static int live_sv_cmp(const void *a, const void *b)
+{
+    const ecgc_live_sv *x = a, *y = b;
+    return x->stripe_version < y->stripe_version ? -1 : x->stripe_version > y->stripe_version ? 1 : 0;
+}
+
+static bool oid_in_known(const live_oid_ent *known, size_t nknown, const uint8_t oid[16])
+{
+    size_t lo = 0, hi = nknown;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = memcmp(known[mid].oid, oid, 16);
+        if (c == 0)
+            return true;
+        if (c < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return false;
+}
+
+int ecgc_live_by_sv(eng *db, ecgc_live_sv *out, uint32_t cap, uint32_t *nout, uint8_t *overflow)
+{
+    if (nout)
+        *nout = 0;
+    if (overflow)
+        *overflow = 0;
+    if (!db || !nout || !overflow)
+        return TSDB_ERR_INVALID;
+    if (!db->tier || !db->ecstate)
+        return 0;
+
+    /* 1. Snapshot listed .ec parts and ALL retired .ec records (still awaiting obsolete_part_lifetime_s / MK_GC)
+     *    under db->lock, plus any held oids in the tier's hold table (lock order: db->lock > g->mu).
+     *    If ecgcmk_apply(RETIRED/ORPHAN) is mid-flight between ge->r removal and GCMK insert, report overflow +
+     *    TSDB_ERR_UNAVAILABLE so callers retry instead of observing a transient gap. */
+    pthread_mutex_lock(&db->lock);
+    if (ecgcmk_applying_count(db) > 0) {
+        pthread_mutex_unlock(&db->lock);
+        *overflow = 1;
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    struct ecgc_eng *ge = eng_gc(db);
+    struct ecgc_tier *gt = db->tier->gc;
+    size_t nheld_cap = 0;
+    if (gt) {
+        pthread_mutex_lock(&gt->mu);
+        nheld_cap = gt->noholds;
+        pthread_mutex_unlock(&gt->mu);
+    }
+    size_t max_n = db->nparts + (ge ? ge->n : 0) + nheld_cap;
+    live_oid_ent *ents = max_n ? malloc(max_n * sizeof *ents) : NULL;
+    if (max_n && !ents) {
+        pthread_mutex_unlock(&db->lock);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < db->nparts; i++) {
+        part *p = db->parts[i];
+        if (!p || p->dropped)
+            continue;
+        struct ecpart *ep = atomic_load_explicit(&p->ec, memory_order_acquire);
+        if (!ep || ep->test_mark)
+            continue;
+        memcpy(ents[n].oid, ep->rec.oid, 16);
+        ents[n].sv = ep->rec.stripe_version ? ep->rec.stripe_version : 1;
+        n++;
+    }
+    if (ge) {
+        for (size_t i = 0; i < ge->n; i++) {
+            const gc_rec *r = &ge->r[i];
+            if (!r->object)
+                continue;
+            /* Count EVERY retired object until MK_GC removes it from ge->r (and moves it to GCMK): dropping stripe
+             * positions before MK_GC_DONE would leak chunks on dropped positions or wedge ecgcmk at nstripe == 0. */
+            memcpy(ents[n].oid, r->oid, 16);
+            ents[n].sv = r->stripe_version ? r->stripe_version : 1;
+            n++;
+        }
+    }
+    size_t nknown = n;
+    if (nknown > 1)
+        qsort(ents, nknown, sizeof *ents, live_oid_cmp);
+
+    if (gt) {
+        pthread_mutex_lock(&gt->mu);
+        for (size_t i = 0; i < gt->ocap; i++) {
+            if (gt->otab[i].count == 0 || gt->otab[i].volume != db->tier_vol)
+                continue;
+            if (oid_in_known(ents, nknown, gt->otab[i].oid))
+                continue;
+            if (n == max_n) {
+                size_t nc = max_n ? max_n * 2 : 16;
+                live_oid_ent *ne = realloc(ents, nc * sizeof *ne);
+                if (!ne) {
+                    pthread_mutex_unlock(&gt->mu);
+                    pthread_mutex_unlock(&db->lock);
+                    free(ents);
+                    return TSDB_ERR_NOMEM;
+                }
+                ents = ne;
+                max_n = nc;
+            }
+            memcpy(ents[n].oid, gt->otab[i].oid, 16);
+            ents[n].sv = 1; /* conservative lowest sv so DROP waits until the hold is released */
+            n++;
+        }
+        pthread_mutex_unlock(&gt->mu);
+    }
+    pthread_mutex_unlock(&db->lock);
+
+    /* 2. Also include every GCMK-pending oid (MK_GC committed, awaiting CHUNK_DEL across all positions + MK_GC_DONE).
+     *    ecgcmk_pending_list takes its own lock, so call it after releasing db->lock. */
+    if (db->gcmk) {
+        uint8_t (*pend)[16] = NULL;
+        size_t npend = 0;
+        int prc = ecgcmk_pending_list(db, &pend, &npend);
+        if (prc != 0) {
+            free(ents);
+            return prc;
+        }
+        if (npend > 0) {
+            if (n + npend > max_n) {
+                size_t nc = n + npend;
+                live_oid_ent *ne = realloc(ents, nc * sizeof *ne);
+                if (!ne) {
+                    free(pend);
+                    free(ents);
+                    return TSDB_ERR_NOMEM;
+                }
+                ents = ne;
+                max_n = nc;
+            }
+            for (size_t i = 0; i < npend; i++) {
+                if (oid_in_known(ents, nknown, pend[i]))
+                    continue;
+                memcpy(ents[n].oid, pend[i], 16);
+                ents[n].sv = 1; /* conservative lowest sv so DROP never precedes MK_GC_DONE */
+                n++;
+            }
+        }
+        free(pend);
+    }
+    if (ecgcmk_applying_count(db) > 0) {
+        free(ents);
+        *overflow = 1;
+        return TSDB_ERR_UNAVAILABLE;
+    }
+
+    if (n == 0) {
+        free(ents);
+        return 0;
+    }
+    if (n > 1)
+        qsort(ents, n, sizeof *ents, live_oid_cmp);
+
+    ecgc_live_sv *agg = malloc(n * sizeof *agg);
+    if (!agg) {
+        free(ents);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t nagg = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (i > 0 && memcmp(ents[i].oid, ents[i - 1].oid, 16) == 0)
+            continue; /* deduplicate same oid */
+        uint64_t sv = ents[i].sv;
+        size_t j = 0;
+        while (j < nagg && agg[j].stripe_version != sv)
+            j++;
+        if (j == nagg) {
+            agg[nagg].stripe_version = sv;
+            agg[nagg].count = 1;
+            nagg++;
+        } else {
+            agg[j].count++;
+        }
+    }
+    free(ents);
+
+    if (nagg > 1)
+        qsort(agg, nagg, sizeof *agg, live_sv_cmp);
+    if (nagg > cap) {
+        *overflow = 1;
+        nagg = cap;
+    }
+    if (nagg > 0 && out)
+        memcpy(out, agg, nagg * sizeof *out);
+    *nout = (uint32_t)nagg;
+    free(agg);
+    return 0;
 }

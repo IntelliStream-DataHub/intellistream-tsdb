@@ -90,6 +90,15 @@ void ecgc_oid_lock(struct tier *t, uint32_t volume, const uint8_t oid[16]);
 void ecgc_oid_unlock(struct tier *t, uint32_t volume, const uint8_t oid[16]);
 bool ecgc_oid_is_live(eng *db, const uint8_t oid[16]);
 
+/* R10 (r10-driver, D26, D28): count distinct live EC objects per stripe_version (listed .ec parts plus retired .ec
+ * parts still awaiting leader digest or replica apply floor), ascending by stripe_version. Sets *overflow = 1 if more
+ * than `cap` distinct nonzero stripe_versions exist. Caller holds no engine locks. */
+typedef struct ecgc_live_sv {
+    uint64_t stripe_version;
+    uint64_t count;
+} ecgc_live_sv;
+int ecgc_live_by_sv(eng *db, ecgc_live_sv *out, uint32_t cap, uint32_t *nout, uint8_t *overflow);
+
 /* tests */
 typedef struct ecgc_counters {
     uint64_t queued;    /* objects queued */

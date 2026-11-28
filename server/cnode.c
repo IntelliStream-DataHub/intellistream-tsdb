@@ -62,7 +62,7 @@ static void node_positions(const struct meta_state *sm, uint32_t node, uint32_t 
             if (v->rep[k].replaces == node)
                 ni++;
         }
-        if (v->redundancy == META_RED_EC) {
+        if (v->nstripe > 0) {
             for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
                 if (v->stripe[p] == node)
                     ns++;
@@ -327,7 +327,7 @@ void cnode_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, siz
         const struct meta_volume *v = &sm->volumes[i];
         int old_log = meta_replica(v, old_node) != NULL;
         int old_stripe = 0;
-        if (v->redundancy == META_RED_EC) {
+        if (v->nstripe > 0) {
             for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++)
                 if (v->stripe[p] == old_node)
                     old_stripe = 1;
@@ -338,7 +338,7 @@ void cnode_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, siz
             need_stores = 1;
         int new_log = meta_replica(v, new_node) != NULL;
         int new_stripe = 0;
-        if (v->redundancy == META_RED_EC) {
+        if (v->nstripe > 0) {
             for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++)
                 if (v->stripe[p] == new_node)
                     new_stripe = 1;
@@ -428,10 +428,21 @@ void cnode_move_pos_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, si
               v->name);
         return;
     }
+    if (v->conv.phase != META_CONV_NONE) {
+        reply(conn, reqid, META_ERR_STATE,
+              "volume move --pos: volume %" PRIu32 " (%s) has a redundancy conversion in progress (phase %s)", vol,
+              v->name, meta_conv_phase_name(v->conv.phase));
+        return;
+    }
     if (pos >= v->nstripe) {
         reply(conn, reqid, META_ERR_INVALID,
               "volume move --pos: position %" PRIu32 " out of range for volume %" PRIu32 " (0 to %" PRIu32 ")", pos, vol,
               v->nstripe ? v->nstripe - 1 : 0);
+        return;
+    }
+    if (v->stripe_pos[pos].retired_ver != 0) {
+        reply(conn, reqid, META_ERR_STATE,
+              "volume move --pos: volume %" PRIu32 " pos %" PRIu32 " is retired (waiting for drop)", vol, pos);
         return;
     }
     if (v->stripe_pos[pos].state == META_STRIPE_FILLING) {

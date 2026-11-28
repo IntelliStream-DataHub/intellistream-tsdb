@@ -52,7 +52,10 @@
     X(CP_RETURN_SET, "return-set")                     /* Raft leader proposed STRIPE_SET returning a pos (R9) */    \
     X(CP_RELEASE_GC, "release-gc")                     /* MK_GC release committed/applied for partial fill (R9) */   \
     X(CP_UNSETTLE_MID_APPLY, "unsettle-mid-apply")     /* replica decoded MK_UNSETTLE, before durable swap (R10) */  \
-    X(CP_UNSETTLE_AFTER_MARKER, "unsettle-after-marker") /* leader committed MK_UNSETTLE, before its own swap (R10) */
+    X(CP_UNSETTLE_AFTER_MARKER, "unsettle-after-marker") /* leader committed MK_UNSETTLE, before its own swap (R10) */ \
+    X(CP_CONV_GROW, "conv-grow")                       /* Raft leader in conversion GROW phase (credund.c, R10) */   \
+    X(CP_CONV_RECORD, "conv-record")                   /* Raft leader in conversion RECORD phase (credund.c, R10) */ \
+    X(CP_CONV_DROP, "conv-drop")                       /* Raft leader in conversion DROP phase (credund.c, R10) */
 
 enum crash_point_id {
 #define X(id, name) id,

@@ -71,7 +71,7 @@ peer_of() {
 for hargs in "" "help" "help status" "help status volumes" "help status volume" "help status disks" \
              "help init" "help node" "help node add" "help node hold" "help node out" "help node drain" \
              "help node replace" "help node destroyed" "help disk" "help disk out" "help disk replace" "help disk class" \
-             "help volume" "help volume add" "help volume move" \
+             "help volume" "help volume add" "help volume move" "help volume redundancy" \
              "help volume transfer" "help volume force-leader" "help volume gc resume" "help replica reset" \
              "help settings" "help settings show" "help settings set" "help balance" \
              "help secret" "help user"; do
@@ -96,7 +96,7 @@ done
 # Wrong verb / missing args must exit 2 with empty stdout.
 for bad in "bogus" "help bogus" "help status volumes extra" "status" "status --json" "status volumes" \
            "status volume" "status volume 1" "status disks" "node nope" "disk nope" "disk out" "disk replace" \
-           "disk class" "volume nope" "replica nope" \
+           "disk class" "volume nope" "volume redundancy" "replica nope" \
            "settings" "settings nope" "settings show" "settings set" "settings set 127.0.0.1:1" "balance"; do
     # shellcheck disable=SC2086
     out=$("$T" cluster $bad 2>"$scratch/err"); rc=$?
@@ -578,5 +578,30 @@ out=$("$T" cluster settings set "$p2" balance=off --secret-file "$sec") || fail 
 case $out in *"balance on->off"*) ;; *) fail "unexpected balance=off output: $out" ;; esac
 out=$("$T" cluster settings set "$p2" balance=on --secret-file "$sec") || fail "settings set balance=on failed"
 case $out in *"balance off->on"*) ;; *) fail "unexpected balance=on output: $out" ;; esac
+
+# ---- 8. R10 volume redundancy CLI (`volume redundancy`, `--cancel`, STATUS JSON) ----
+
+"$T" cluster volume redundancy "$p1" repv bogus --secret-file "$sec" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ] || fail "volume redundancy bogus: exit $rc, want 2"
+"$T" cluster volume redundancy "$p1" repv ec=2+1 --cancel --secret-file "$sec" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ] || fail "volume redundancy target+--cancel: exit $rc, want 2"
+out=$("$T" cluster volume redundancy "$p2" repv --cancel --secret-file "$sec" 2>&1); rc=$?
+[ "$rc" -eq 1 ] || fail "volume redundancy --cancel when idle: exit $rc, want 1"
+case $out in *"no conversion"*) ;; *) fail "unexpected volume redundancy --cancel error: $out" ;; esac
+out=$("$T" cluster volume redundancy "$p2" repv ec=2+1 --secret-file "$sec") || fail "volume redundancy repv->ec=2+1 failed"
+case $out in *"redundancy conversion to ec=2+1 started"*) ;; *) fail "unexpected volume redundancy start output: $out" ;; esac
+conv_ok=0
+for _ in $(seq 200); do
+    if "$T" cluster status volume repv --json "$p1" --secret-file "$sec" 2>/dev/null | python3 -I -c '
+import json, sys
+v = json.load(sys.stdin)["volume"]
+sys.exit(0 if v["redundancy"] == "ec=2+1" and v["conversion"] is None and len(v["stripe"]) == 3 else 1)
+' 2>/dev/null; then
+        conv_ok=1
+        break
+    fi
+    sleep 0.1
+done
+[ "$conv_ok" -eq 1 ] || fail "volume redundancy repv->ec=2+1 did not complete"
 
 echo "test_cluster_cli: ok"

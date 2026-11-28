@@ -671,7 +671,7 @@ CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail re
     fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
     snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
     reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
-CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs r9stubs opening failgasp faultreason addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode redund r4stubs r9stubs opening failgasp faultreason addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
     volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
@@ -1117,7 +1117,7 @@ $(B)/meta.o: server/meta.c server/meta.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # tsdbd's cluster thread (and the CLI's side of the admin ops); CLUSTER_OBJ goes into tsdbd, every binary that
 # includes tsdbd.c, and the CLI
-$(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/creport.h server/disks.h server/crashpt.h server/place.h server/pace.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
+$(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/credund.h server/creport.h server/disks.h server/crashpt.h server/place.h server/pace.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # R14 (r14-report): cluster heartbeat-section and metrics registries (creport.o: no engine/repld deps; creport_drv.o: repld lag bridge)
 $(B)/creport.o: server/creport.c server/creport.h | $(B)
@@ -1197,7 +1197,9 @@ $(B)/pace.o: server/pace.c server/pace.h src/compat.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/cnode.o: server/cnode.c $(R4_CL_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
-R9_OBJ := $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/sfill.o $(B)/chunkrepair.o $(B)/sreconcile.o $(B)/pace.o $(B)/cnode.o
+$(B)/credund.o: server/credund.c server/credund.h $(R4_CL_HDR) server/crashpt.h server/place.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+R9_OBJ := $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/sfill.o $(B)/chunkrepair.o $(B)/sreconcile.o $(B)/pace.o $(B)/cnode.o $(B)/credund.o
 CLUSTER_OBJ := $(B)/creport.o $(B)/disks.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/ctransfer.o $(B)/cmove.o $(B)/cset.o $(B)/cheal.o $(R9_OBJ) $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
 # R9 placement simulator (tests/sim_place.c, tests/sim_place.sh, docs/design-cluster-data.md §10.2; track r9-simplace)
 $(B)/sim_place: tests/sim_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
@@ -1447,6 +1449,12 @@ reencode-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ reencode
 	$(MUT) --name reencode-gc --list "gcbeforedigest" -- env TSDB_ECGC_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ reencode
+# r10-driver: redundancy conversion driver planted bugs (server/credund.c TSDB_CLUSTER_MUTANT), each must fail test_cluster redund
+.PHONY: redund-mutants
+redund-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	@$(if $(EC_OBJ),true,echo "redund-mutants: this build has no erasure codec (NO_EC=1): redund skips, nothing to plant"; false)
+	$(MUT) --name redund --list "dropearly shrinkfirst" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ redund
 # the planned leader transfer's mutants (server/rtransfer.c, server/ctransfer.c; tests/transfer_mutants.sh)
 transfer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/transfer_mutants.sh $(SCRATCH)

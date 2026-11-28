@@ -63,10 +63,11 @@ struct chunkpeer_view {
     uint8_t gc_suspended; /* R8 (E14): orphan collection suspended until GC_RESUME */
     uint32_t stripe[CHUNK_POS_MAX]; /* position -> member */
     /* R9 (r9-whole, D10, D12): per-position fill state and previous holder for filling reads and MK_GC releases. */
-    uint8_t stripe_filling[CHUNK_POS_MAX];  /* 1 while position is META_STRIPE_FILLING, else 0 */
-    uint32_t stripe_prev[CHUNK_POS_MAX];    /* previous holder A (0: none) */
-    uint8_t stripe_prev_up[CHUNK_POS_MAX];  /* 1 when prev is UP/DRAINING in the copy */
-    uint64_t stripe_set_ver[CHUNK_POS_MAX]; /* stripe_version V at which pos was set (barrier) */
+    uint8_t stripe_filling[CHUNK_POS_MAX];     /* 1 while position is META_STRIPE_FILLING, else 0 */
+    uint32_t stripe_prev[CHUNK_POS_MAX];       /* previous holder A (0: none) */
+    uint8_t stripe_prev_up[CHUNK_POS_MAX];     /* 1 when prev is UP/DRAINING in the copy */
+    uint64_t stripe_set_ver[CHUNK_POS_MAX];    /* stripe_version V at which pos was set (barrier) */
+    uint64_t stripe_retired_ver[CHUNK_POS_MAX]; /* R10: >0 when pos is retired at this stripe_version */
 };
 /* 0 with *v, TSDB_ERR_NOTFOUND when there is no copy or it does not hold `volume` as an ec volume. Any thread. */
 typedef int (*chunkpeer_view_fn)(void *arg, uint32_t volume, struct chunkpeer_view *v);
@@ -143,6 +144,9 @@ uint32_t sfill_cluster_progress(struct sfill_progress *out, uint32_t cap);
 /* cvol.c, before a cluster volume's engine opens (writer or replica): an ec volume in the copy gets requires=tier,ec in
  * its META (synced), so that it attaches the peer cold ops; 0 for any other volume, else the line and an error. */
 int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir);
+/* R10 (r10-driver): handles CL_VOLCMD_CONV_WORK on the volume leader (re-encode old stripe_version or unsettle). */
+struct cluster_volcmd;
+void chunkpeer_conv_cmd(const struct cluster_volcmd *cmd);
 
 /* Per-storage-server read hedging and read-avoid counters (E31; /metrics and unit tests). */
 #define CHUNKPEER_PEERS_MAX 256

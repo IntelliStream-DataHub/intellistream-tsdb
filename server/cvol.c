@@ -114,6 +114,8 @@ struct mvol {
     char disk_root[PATH_MAX]; /* R13 (D14): disk root directory holding v<N> */
     uint8_t store_id[16];     /* R13 (D14): disk store_id holding v<N> (reported in HBS_VOLUMES) */
     int refused_disk_down;    /* R13 (r13-fault): 1 when MV_REFUSED solely because its disk was non-UP */
+    uint64_t ec_reopen_ns;    /* R10: last monotonic ns of follower EC-attach reopen (rate-limits retries) */
+    uint32_t ec_reopen_tries; /* R10: consecutive EC-attach reopen attempts without ec_cluster (caps retry loops) */
     /* E51: 1-hour sliding window of WAL bytes written by this replica. */
     uint64_t wal_last_bytes;
     uint64_t wal_first_s;
@@ -560,8 +562,65 @@ static void *mgr_main(void *arg)
                 st = forget(r->number, st);
             if (st == MV_NONE || st == MV_REPREP)
                 prepare(r);
-            else if (st == MV_OPEN && !M.writes)
+            else if (st == MV_OPEN && !M.writes) {
                 repld_update(r);
+#ifdef TSDB_EC
+                /* R10 (r10-driver): when a replicas volume converts to EC, attach the EC tier cleanly.
+                 * Followers (and a 1-replica leader) reopen right away so chunkpeer_cluster_prepare writes
+                 * requires=tier,ec and repld_open attaches the tier; multi-replica leaders attach during the
+                 * planned transfer driven by credund.c (promote_fn / demote_fn), avoiding indeterminate writes.
+                 * Gated on TSDB_EC and bounded by ec_reopen_tries with exponential backoff so a failed attach
+                 * cannot spin open_gen forever. */
+                if (r->redundancy == META_RED_EC && r->nstripe > 0 && r->nstripe <= CHUNK_POS_MAX &&
+                    (r->leader != M.self || r->nrep <= 1)) {
+                    struct timespec ts_now;
+                    clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                    uint64_t now_ns = (uint64_t)ts_now.tv_sec * 1000000000ull + (uint64_t)ts_now.tv_nsec;
+                    int try_reopen = 0;
+                    pthread_mutex_lock(&M.mu);
+                    struct mvol *cm = mv_get(r->number);
+                    if (cm && cm->ec_reopen_tries < 5) {
+                        uint64_t wait_ns = cm->ec_reopen_tries ? (1000000000ull << (cm->ec_reopen_tries - 1)) : 0;
+                        if (!cm->ec_reopen_ns || now_ns - cm->ec_reopen_ns >= wait_ns)
+                            try_reopen = 1;
+                    }
+                    pthread_mutex_unlock(&M.mu);
+                    struct eng *db = try_reopen ? tsdb_cvol_ref(M.t, r->number) : NULL;
+                    int has_ec = db && db->ec_cluster;
+                    int need_ec = db && !db->ec_cluster;
+                    tsdb_cvol_unref(&db);
+                    if (has_ec) {
+                        pthread_mutex_lock(&M.mu);
+                        struct mvol *rm = mv_get(r->number);
+                        if (rm)
+                            rm->ec_reopen_tries = 0;
+                        pthread_mutex_unlock(&M.mu);
+                    } else if (need_ec) {
+                        say("volume %" PRIu32 " (%s): reopening to attach EC tier (redundancy ec=%u+%u)", r->number,
+                            r->name, r->ec_k, r->ec_m);
+                        pthread_mutex_lock(&M.mu);
+                        struct mvol *rm = mv_get(r->number);
+                        if (rm) {
+                            rm->state = MV_INSTALL;
+                            rm->ec_reopen_ns = now_ns;
+                            rm->ec_reopen_tries++;
+                        }
+                        pthread_mutex_unlock(&M.mu);
+                        repld_close(r->number);
+                        pthread_mutex_lock(&M.mu);
+                        rm = mv_get(r->number);
+                        if (rm) {
+                            rm->state = MV_REPREP;
+                            rm->fault_reason = CL_FAULT_NONE;
+                        }
+                        M.dirty = 1;
+                        pthread_cond_signal(&M.cv);
+                        pthread_mutex_unlock(&M.mu);
+                        cluster_beat_soon();
+                    }
+                }
+#endif
+            }
             pthread_mutex_lock(&M.mu);
             m = mv_get(r->number);
             int ready = 0, older = 0;

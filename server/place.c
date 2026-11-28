@@ -628,7 +628,7 @@ static void build_pair_matrices(const struct meta_state *sm, uint32_t *log_pairs
                     log_pairs[(size_t)idx[b] * nm + (size_t)idx[a]]++;
                 }
         }
-        if (stripe_pairs && v->redundancy == META_RED_EC) {
+        if (stripe_pairs && v->nstripe > 0) {
             int32_t idx[META_STRIPE_MAX];
             uint32_t cnt = 0;
             for (uint32_t k = 0; k < v->nstripe && k < META_STRIPE_MAX; k++) {
@@ -994,28 +994,57 @@ int place_rack_survivable(const struct meta_state *sm, const struct meta_volume 
     if (max_rep_rack >= nfull || (nfull - max_rep_rack) < floor_rep)
         return 0;
 
-    /* For EC volumes, also check stripe group: every holder must carry a rack, and at most m positions may sit on
-     * any single rack (E9: losing any one rack leaves at least k chunks). */
+    /* For EC volumes (and converting volumes with active EC geometries), check every active geometry's stripe group:
+     * every holder must carry a rack, and at most m positions may sit on any single rack (E9). */
+    struct {
+        uint32_t npos;
+        uint8_t m;
+    } geoms[3];
+    int ngeoms = 0;
     if (v->redundancy == META_RED_EC) {
-        if (v->nstripe == 0 || v->nstripe > META_STRIPE_MAX || v->nstripe != (uint32_t)v->ec_k + v->ec_m)
+        uint32_t need = (uint32_t)v->ec_k + (uint32_t)v->ec_m;
+        if (v->nstripe == 0 || v->nstripe > META_STRIPE_MAX || v->nstripe < need || need == 0)
             return 0;
+        geoms[ngeoms].npos = need;
+        geoms[ngeoms].m = v->ec_m;
+        ngeoms++;
+    }
+    if ((v->conv.phase == META_CONV_REENCODE || v->conv.phase == META_CONV_DROP) &&
+        v->conv.orig_redundancy == META_RED_EC) {
+        uint32_t need = (uint32_t)v->conv.orig_k + (uint32_t)v->conv.orig_m;
+        if (need > 0 && v->nstripe >= need && v->nstripe <= META_STRIPE_MAX) {
+            geoms[ngeoms].npos = need;
+            geoms[ngeoms].m = v->conv.orig_m;
+            ngeoms++;
+        }
+    }
+    if (v->mixed_redundancy == META_RED_EC) {
+        uint32_t need = (uint32_t)v->mixed_k + (uint32_t)v->mixed_m;
+        if (need > 0 && v->nstripe >= need && v->nstripe <= META_STRIPE_MAX) {
+            geoms[ngeoms].npos = need;
+            geoms[ngeoms].m = v->mixed_m;
+            ngeoms++;
+        }
+    }
+    for (int gi = 0; gi < ngeoms; gi++) {
+        uint32_t np = geoms[gi].npos;
         uint32_t sp_idx[META_STRIPE_MAX];
-        for (uint32_t i = 0; i < v->nstripe; i++) {
+        for (uint32_t i = 0; i < np; i++) {
             int32_t mi = member_idx(sm, v->stripe[i]);
             if (mi < 0 || !sm->members[mi].rack[0])
                 return 0;
             sp_idx[i] = (uint32_t)mi;
         }
         uint32_t max_stripe_rack = 0;
-        for (uint32_t i = 0; i < v->nstripe; i++) {
+        for (uint32_t i = 0; i < np; i++) {
             uint32_t cnt = 0;
-            for (uint32_t j = 0; j < v->nstripe; j++)
+            for (uint32_t j = 0; j < np; j++)
                 if (!strcmp(sm->members[sp_idx[i]].rack, sm->members[sp_idx[j]].rack))
                     cnt++;
             if (cnt > max_stripe_rack)
                 max_stripe_rack = cnt;
         }
-        if (max_stripe_rack > v->ec_m)
+        if (max_stripe_rack > geoms[gi].m)
             return 0;
     }
     return 1;
@@ -1687,7 +1716,7 @@ void place_plan(const struct place_in *in, struct place_out *out)
     if (in->fills && in->nfills > 0) {
         for (uint32_t vi = 0; vi < nv; vi++) {
             const struct meta_volume *v = &sm->volumes[vi];
-            if (v->redundancy != META_RED_EC)
+            if (v->nstripe == 0)
                 continue;
             int smarg = vol_sm[vi];
             for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
@@ -1754,7 +1783,7 @@ void place_plan(const struct place_in *in, struct place_out *out)
                 }
             }
         }
-        if (v->redundancy == META_RED_EC) {
+        if (v->nstripe > 0) {
             for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
                 int32_t mi = member_idx(sm, v->stripe[p]);
                 if (mi < 0)
@@ -1778,8 +1807,8 @@ void place_plan(const struct place_in *in, struct place_out *out)
         int ym = vol_ym[vi], smarg = vol_sm[vi];
         uint64_t vbytes = vol_bytes_of(in, v->number);
 
-        /* Log replica re-placement: at most one move per volume (never start while a learner/move is in flight). */
-        if (!vol_has_move(v) && v->nrep < META_REPLICAS_MAX) {
+        /* Log replica re-placement: at most one move per volume (never start while a learner/move or conversion runs). */
+        if (!vol_has_move(v) && v->conv.phase == META_CONV_NONE && v->nrep < META_REPLICAS_MAX) {
             int best_prio = 99; /* 1: OUT/DESTROYED, 2: fault, 3: replace intent, 4: DRAINING */
             uint32_t best_k = 0, best_forced = 0;
             for (uint32_t k = 0; k < v->nrep; k++) {
@@ -1834,9 +1863,12 @@ void place_plan(const struct place_in *in, struct place_out *out)
             }
         }
 
-        /* Stripe position re-placement for EC volumes. */
-        if (v->redundancy == META_RED_EC) {
+        /* Stripe position re-placement for any volume holding stripes (including ec -> replicas during REENCODE and
+         * mixed-geometry leftovers, so OUT/DESTROYED holders are still rebuilt while old objects remain readable).
+         * Skip during RECORD/DROP; on retired positions, heal OUT/DESTROYED/explicit-replace only (skip drain/evict). */
+        if (v->nstripe > 0 && v->conv.phase != META_CONV_RECORD && v->conv.phase != META_CONV_DROP) {
             for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+                int retired = v->stripe_pos[p].retired_ver != 0;
                 uint32_t a = v->stripe[p];
                 int32_t ai = member_idx(sm, a);
                 const struct meta_member *mb = ai >= 0 ? &sm->members[ai] : NULL;
@@ -1852,9 +1884,9 @@ void place_plan(const struct place_in *in, struct place_out *out)
                     }
                 } else if (!mb || mb->state == META_OUT || mb->state == META_DESTROYED) {
                     need = 1;
-                } else if (member_needs_stripe_evict(in, mb, evict_mark_ppm)) {
+                } else if (!retired && member_needs_stripe_evict(in, mb, evict_mark_ppm)) {
                     need = 1;
-                } else if (mb->state == META_DRAINING) {
+                } else if (!retired && mb->state == META_DRAINING) {
                     need = 1;
                     is_drain = 1;
                 }

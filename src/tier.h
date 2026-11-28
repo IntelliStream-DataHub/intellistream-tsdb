@@ -218,7 +218,7 @@ typedef struct tier_settings {
 } tier_settings;
 static inline void tier_settings_set_km(tier_settings *s, int k, int m)
 {
-    uint32_t packed = ((uint32_t)(uint16_t)k << 16) | (uint32_t)(uint16_t)m;
+    uint32_t packed = 0x80000000u | (((uint32_t)(uint16_t)k & 0x7fffu) << 16) | (uint32_t)(uint16_t)m;
     atomic_store_explicit(&s->km_packed, packed, memory_order_release);
     atomic_store_explicit(&s->k, k, memory_order_relaxed);
     atomic_store_explicit(&s->m, m, memory_order_relaxed);
@@ -227,7 +227,7 @@ static inline void tier_settings_get_km(const tier_settings *s, int *k_out, int 
 {
     uint32_t packed = atomic_load_explicit(&((tier_settings *)s)->km_packed, memory_order_acquire);
     if (packed != 0) {
-        *k_out = (int)(packed >> 16);
+        *k_out = (int)((packed >> 16) & 0x7fffu);
         *m_out = (int)(packed & 0xffffu);
     } else {
         *k_out = atomic_load_explicit(&((tier_settings *)s)->k, memory_order_relaxed);

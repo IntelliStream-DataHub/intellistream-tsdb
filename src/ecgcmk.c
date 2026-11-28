@@ -132,7 +132,17 @@ struct ecgcmk {
     int64_t last_sweep_ms;
     atomic_bool fenced; /* a CHUNK_DEL returned CHUNK_ERR_FENCED (or INDETERMINATE): stop GC */
     atomic_bool stop;
+    atomic_uint applying; /* >0 while ecgcmk_apply(RETIRED/ORPHAN) is moving oids from ge->r into GCMK */
 };
+
+#ifdef TSDB_TEST_HOOKS
+void (*_Atomic ecgcmk_test_apply_mid_hook)(struct eng *db);
+#endif
+
+unsigned ecgcmk_applying_count(const struct eng *db)
+{
+    return (db && db->gcmk) ? atomic_load_explicit(&db->gcmk->applying, memory_order_seq_cst) : 0;
+}
 
 /* ------------------------------------------------------------ GCMK record codec */
 
@@ -814,26 +824,39 @@ int ecgcmk_apply(eng *db, uint64_t pos, const mk *m)
         return TSDB_ERR_INVALID;
 
     /* 1. Retire any still-listed .ec parts of these oids (a replica whose TTL is behind) and collect all retired_
-     *    names to unlink after GCMK is durable. */
+     *    names to unlink after GCMK is durable. Raise g->applying under db->lock BEFORE removing from ge->r so
+     *    ecgc_live_by_sv can never observe an oid missing from both ge->r and GCMK. */
     char (*unlinks)[256] = NULL;
     size_t nunlinks = 0;
     bool retired_listed = false;
     lt_sec lsec;
     lt_begin(db, &lsec);
     pthread_mutex_lock(&db->lock);
+    atomic_fetch_add_explicit(&g->applying, 1, memory_order_seq_cst);
     int rc = ecgc_collect_oids_locked(db, gc->oids, gc->noids, &unlinks, &nunlinks, &retired_listed);
     pthread_mutex_unlock(&db->lock);
     lt_end(db, &lsec);
-    if (rc)
+    if (rc) {
+        atomic_fetch_sub_explicit(&g->applying, 1, memory_order_seq_cst);
         return rc;
+    }
     if (retired_listed)
         fprintf(stderr, "tsdb: %s: MK_GC at position %" PRIu64 " retired still-listed .ec part(s)\n", db->dir, pos);
+
+#ifdef TSDB_TEST_HOOKS
+    {
+        void (*hook)(struct eng *) = atomic_load_explicit(&ecgcmk_test_apply_mid_hook, memory_order_acquire);
+        if (hook)
+            hook(db);
+    }
+#endif
 
     /* 2. Record oids in the durable pending-delete file GCMK before unlinking retired_ names. */
     pthread_mutex_lock(&g->fmu);
     uint8_t (*add)[16] = malloc((size_t)gc->noids * 16);
     if (!add) {
         pthread_mutex_unlock(&g->fmu);
+        atomic_fetch_sub_explicit(&g->applying, 1, memory_order_seq_cst);
         free(unlinks);
         return TSDB_ERR_NOMEM;
     }
@@ -867,6 +890,7 @@ int ecgcmk_apply(eng *db, uint64_t pos, const mk *m)
         }
         pthread_mutex_unlock(&g->mu);
     }
+    atomic_fetch_sub_explicit(&g->applying, 1, memory_order_seq_cst);
     free(add);
     pthread_mutex_unlock(&g->fmu);
 
@@ -1516,6 +1540,17 @@ static void rel_mark_clean(struct ecgcmk *g, uint32_t pos, uint32_t node, uint64
     pthread_mutex_unlock(&g->mu);
 }
 
+bool ecgcmk_release_is_clean(const struct eng *db, uint32_t pos, uint32_t node, uint64_t ver)
+{
+    if (!db || !db->gcmk)
+        return false;
+    struct ecgcmk *g = db->gcmk;
+    pthread_mutex_lock(&g->mu);
+    bool clean = rel_is_clean(g, pos, node, ver);
+    pthread_mutex_unlock(&g->mu);
+    return clean;
+}
+
 static int live_obj_oid_cmp(const void *a, const void *b)
 {
     const cold_live_obj *x = a, *y = b;
@@ -1642,9 +1677,29 @@ static void collect_releases(eng *db, coldvol *cv)
     for (unsigned i = 0; i < ntodo; i++) {
         if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
             break;
+        if (todo[i].retired) {
+            /* R10 retired position: release only once no settle/reencode put or commit is in flight and 0 live,
+             * retired, held, or GCMK-pending objects remain below retired_ver (preventing deletion of any needed
+             * chunk or marking clean while an in-flight older-geometry put could still commit a chunk onto pos). */
+            if (eccold_active_sv(db) != 0 || eccold_put_active(db))
+                continue;
+            ecgc_live_sv lsv[16];
+            uint32_t nlsv = 0;
+            uint8_t lovf = 0;
+            int lrc = ecgc_live_by_sv(db, lsv, 16, &nlsv, &lovf);
+            if (lrc != 0 || lovf != 0 || eccold_active_sv(db) != 0 || eccold_put_active(db))
+                continue;
+            bool has_old = false;
+            for (uint32_t j = 0; j < nlsv; j++)
+                if (lsv[j].stripe_version < todo[i].version && lsv[j].count > 0)
+                    has_old = true;
+            if (has_old)
+                continue;
+        }
         int vrc = cv->ops->release_verify(cv->ctx, todo[i].pos, todo[i].node, todo[i].version, objs, nobjs);
         if (vrc == 0) {
-            rel_mark_clean(g, todo[i].pos, todo[i].node, todo[i].version);
+            if (!todo[i].retired || (!eccold_put_active(db) && eccold_active_sv(db) == 0))
+                rel_mark_clean(g, todo[i].pos, todo[i].node, todo[i].version);
         } else if (vrc > 0) {
             if (append_and_apply_mkgc_release(db, MK_GC_RELEASE, db->tier_vol, todo[i].pos, todo[i].node,
                                               todo[i].version) == 0)

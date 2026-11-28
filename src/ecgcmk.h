@@ -48,9 +48,16 @@ bool ecgcmk_pending_has(const struct eng *db, const uint8_t oid[16]);
 int ecgcmk_pending_list(const struct eng *db, uint8_t (**oids_out)[16], size_t *n_out);
 size_t ecgcmk_pending_releases(const struct eng *db);
 bool ecgcmk_pending_release_has(const struct eng *db, uint32_t pos, uint32_t node, uint64_t ver);
+bool ecgcmk_release_is_clean(const struct eng *db, uint32_t pos, uint32_t node, uint64_t ver);
 bool ecgcmk_is_fenced(const struct eng *db);
+/* Non-zero while ecgcmk_apply(RETIRED/ORPHAN) has removed oids from ge->r and has not yet added them to GCMK. */
+unsigned ecgcmk_applying_count(const struct eng *db);
 
 /* R9 (r9-whole): crash-point hook fired after MK_GC_RELEASE is durably applied to GCMK (server sets CP_RELEASE_GC). */
 extern void (*_Atomic ecgcmk_release_crash_hook)(void);
+#ifdef TSDB_TEST_HOOKS
+/* R10 (test_ecgc): hook fired between ge->r removal and GCMK ent_add_locked inside ecgcmk_apply. */
+extern void (*_Atomic ecgcmk_test_apply_mid_hook)(struct eng *db);
+#endif
 
 #endif

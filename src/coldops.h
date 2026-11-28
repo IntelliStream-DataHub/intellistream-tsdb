@@ -38,11 +38,12 @@ enum {
     COLD_DEL_MKGC = 3,  /* a committed MK_GC marker (R8 cluster volume, r8k-gc) */
 };
 
-/* Candidate former stripe holder eligible for MK_GC_RELEASE (R9 D12). */
+/* Candidate former stripe holder (R9 D12) or retired stripe position (R10) eligible for MK_GC_RELEASE. */
 typedef struct cold_release {
     uint32_t pos;
     uint32_t node;
     uint64_t version;
+    uint8_t retired; /* R10: 1 when releasing a retired stripe position (pos >= active, retired_ver > 0) */
 } cold_release;
 
 /* Live object descriptor passed by ecgcmk_work to release_verify (R9 D12). */

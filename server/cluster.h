@@ -97,11 +97,15 @@ enum cluster_admin_op {
     CLUSTER_OP_DISK_OUT = 23,
     CLUSTER_OP_DISK_REPLACE = 24,
     CLUSTER_OP_DISK_CLASS = 25,
+    /* R10 (E2, §6.4, D26; server/credund.c): volume redundancy change on the Raft leader. Reply: text.
+     * Body (16 bytes): u32 volume, u8 redundancy, u8 ec_k, u8 ec_m, u8 pad(0), u32 replicas, u32 flags. */
+    CLUSTER_OP_VOLUME_REDUNDANCY = 26,
 };
 enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
 enum { CLUSTER_HOLD_RELEASE = 1 };                      /* CLUSTER_OP_NODE_HOLD's flags */
 enum { CLUSTER_DRAIN_CANCEL = 1 };                      /* CLUSTER_OP_NODE_DRAIN's flags */
 enum { CLUSTER_BALANCE_APPLY = 1 };                     /* CLUSTER_OP_BALANCE's flags */
+enum { CLUSTER_REDUND_CANCEL = 1 };                     /* CLUSTER_OP_VOLUME_REDUNDANCY's flags */
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
 enum cluster_err {
@@ -280,7 +284,10 @@ void cluster_set_fence_handler(cluster_fence_fn fn, void *arg);
  * (the connection's member, or this server for its own) is all a receiver knows of the sender, and a deposed Raft
  * leader's TRANSFER or CANCEL at the volume's current epoch looks like the new one's. The receiving track (r4-transfer,
  * r4-move) must check `from` against the Raft leader it knows, or carry the term or a transfer id in `arg`. */
-enum { CL_VOLCMD_TRANSFER = 1, CL_VOLCMD_DROP_MEMBER = 2, CL_VOLCMD_CANCEL = 3 };
+enum { CL_VOLCMD_TRANSFER = 1, CL_VOLCMD_DROP_MEMBER = 2, CL_VOLCMD_CANCEL = 3, CL_VOLCMD_CONV_WORK = 4 };
+/* R10 (E38): returns 1 while cluster members run mixed versions during a rolling upgrade (pauses conversions before
+ * the next key; returns 0 until P1 rolling-upgrade version tracking lands, or when test hook overrides). */
+int cluster_versions_mixed(void);
 struct cluster_volcmd {
     uint8_t kind;
     uint32_t volume;
@@ -342,6 +349,10 @@ struct cluster_vol_rec {
     uint32_t scrub_days, scrub_mb_s, scrub_out_count; /* R12/R13 scrub settings (meta.h, D2) */
     uint32_t young_warn_pct, young_move_pct, disk_stall_s; /* R13 fast-disk marks and probe stall (meta.h, D13) */
     uint8_t log_on_hdd; /* R13 E50: 1 grants HDD-only members compute cap (placer still prefers fast members) */
+    /* R10 (r10-driver): volume redundancy and stripe metadata for tier attach / conversion handling */
+    uint8_t redundancy, ec_k, ec_m;
+    uint32_t nstripe;
+    uint64_t stripe_version;
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
  * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)
@@ -711,6 +722,11 @@ size_t cluster_disk_op_encode(uint32_t node, const uint8_t store_id[16], uint8_t
 int cluster_disk_op_decode(const uint8_t *p, size_t n, uint32_t *node, uint8_t store_id[16]);
 size_t cluster_disk_class_encode(uint32_t node, const uint8_t store_id[16], uint8_t disk_class, uint8_t *out);
 int cluster_disk_class_decode(const uint8_t *p, size_t n, uint32_t *node, uint8_t store_id[16], uint8_t *disk_class);
+/* R10 (r10-driver; E2, §6.4, D26): VOLUME_REDUNDANCY body (16 bytes). */
+size_t cluster_volume_redundancy_encode(uint32_t volume, const struct meta_redundancy_target *target, uint32_t flags,
+                                        uint8_t *out);
+int cluster_volume_redundancy_decode(const uint8_t *p, size_t n, uint32_t *volume,
+                                     struct meta_redundancy_target *target, uint32_t *flags);
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

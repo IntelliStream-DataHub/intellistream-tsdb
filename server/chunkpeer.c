@@ -156,6 +156,17 @@ static int view_of(pctx *p, struct chunkpeer_view *v)
     return 0;
 }
 
+/* Like view_of, but also accepts nstripe == 0 (formerly-EC volume converted to replicas=3) for pending releases. */
+static int view_any_of(pctx *p, struct chunkpeer_view *v)
+{
+    int rc = p->cp->view(p->cp->view_arg, p->volume, v);
+    if (rc)
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_UNAVAILABLE : rc;
+    if (v->nstripe > CHUNK_POS_MAX)
+        return TSDB_ERR_UNAVAILABLE;
+    return 0;
+}
+
 static void see_fence(pctx *p, uint64_t e)
 {
     uint64_t cur = atomic_load(&p->seen);
@@ -2231,6 +2242,13 @@ static int ask_all(pctx *p, uint64_t e, bool stop_on_fail, unsigned *held, unsig
 static int p_see_epoch(void *ctx, uint64_t e)
 {
     pctx *p = ctx;
+    struct chunkpeer_view v;
+    if (p->cp->view(p->cp->view_arg, p->volume, &v) == 0 && v.nstripe == 0) {
+        /* R10: formerly-EC volume converted to replicas=3 (nstripe == 0): nothing to fence, no puts/deletes.
+         * Leaving asked_ms untouched (0) lets writable() re-fence immediately if the volume converts back to EC. */
+        atomic_store(&p->unfenced, true);
+        return 0;
+    }
     unsigned held, n;
     int bad_i;
     ask bad;
@@ -2447,14 +2465,37 @@ static int list_node_pos_oids(pctx *p, uint32_t node, unsigned pos, bool ok_only
 
 enum { REL_VIEW_RETRY = -1, REL_VIEW_SUPERSEDED = 0, REL_VIEW_OK = 1 };
 
-/* Checks whether `v` authorizes deleting former holder `node`'s chunks of `pos` from release version `ver`.
- * Requires a caught-up copy, `pos` whole at `set_ver >= ver`, `node` not holding `pos`, and `node` not
- * listed as `prev` of any filling position. Only `stripe[pos] == node` supersedes the release (so a later
- * move B->C at V2 > V still lets A's pending release at V clean A's stale chunks once C is whole). */
+static unsigned view_active_nstripe(const struct chunkpeer_view *v)
+{
+    return (v->k > 0 && v->m > 0) ? v->k + v->m : 0;
+}
+
+/* Checks whether `v` authorizes deleting `node`'s chunks of `pos` from release version `ver`.
+ * Covers three cases:
+ *  A. Dropped position (pos >= v->nstripe, stripe_version >= ver): position already removed by META_OP_STRIPE_DROP.
+ *  B. R10 retired position (pos >= active, retired_ver > 0 && <= ver, stripe[pos] == node, not filling).
+ *  C. R9 former holder (pos < v->nstripe, stripe[pos] != node, pos WHOLE at set_ver >= ver).
+ * Only holding an active (non-retired) position (`stripe[pos] == node` outside Case B) supersedes a pending release. */
 static int release_view_status(const struct chunkpeer_view *v, unsigned pos, uint32_t node, uint64_t ver)
 {
-    if (!v->caught_up || pos >= v->nstripe || v->stripe_version < ver)
+    if (!v->caught_up || v->stripe_version < ver)
         return REL_VIEW_RETRY;
+    if (pos >= v->nstripe) {
+        for (unsigned p = 0; p < v->nstripe; p++)
+            if (v->stripe_filling[p] && v->stripe_prev[p] == node)
+                return REL_VIEW_RETRY;
+        return REL_VIEW_OK;
+    }
+    unsigned active = view_active_nstripe(v);
+    if (pos >= active && v->stripe_retired_ver[pos] > 0 && v->stripe_retired_ver[pos] <= ver &&
+        v->stripe[pos] == node) {
+        if (v->stripe_filling[pos])
+            return REL_VIEW_RETRY;
+        for (unsigned p = 0; p < v->nstripe; p++)
+            if (v->stripe_filling[p] && v->stripe_prev[p] == node)
+                return REL_VIEW_RETRY;
+        return REL_VIEW_OK;
+    }
     if (v->stripe[pos] == node)
         return REL_VIEW_SUPERSEDED;
     uint64_t sver = v->stripe_set_ver[pos] ? v->stripe_set_ver[pos] : v->stripe_version;
@@ -2484,7 +2525,23 @@ static unsigned p_release_candidates(void *ctx, cold_release *out, unsigned cap)
             continue;
         if (release_view_status(&v, i, prev, ver) != REL_VIEW_OK)
             continue;
-        out[n++] = (cold_release){.pos = i, .node = prev, .version = ver};
+        out[n++] = (cold_release){.pos = i, .node = prev, .version = ver, .retired = 0};
+    }
+    /* R10: retired stripe positions (pos >= active, retired_ver > 0) are released before META_OP_STRIPE_DROP so
+     * aborted-settle orphan chunks on dropped positions are never leaked across geometry narrowing or ec->replicas. */
+    unsigned active = view_active_nstripe(&v);
+    for (unsigned i = active; i < v.nstripe && n < cap; i++) {
+        if (v.stripe_filling[i] || v.stripe_retired_ver[i] == 0)
+            continue;
+        uint32_t node = v.stripe[i];
+        if (node == 0)
+            continue;
+        if (p->cp->node_state && p->cp->node_state(p->cp->view_arg, node) == CP_NODE_DESTROYED)
+            continue;
+        uint64_t ver = v.stripe_retired_ver[i];
+        if (release_view_status(&v, i, node, ver) != REL_VIEW_OK)
+            continue;
+        out[n++] = (cold_release){.pos = i, .node = node, .version = ver, .retired = 1};
     }
     return n;
 }
@@ -2498,6 +2555,36 @@ static int p_release_verify(void *ctx, unsigned pos, uint32_t node, uint64_t ver
         return -1;
     if (release_view_status(&v, pos, node, ver) != REL_VIEW_OK)
         return -1;
+
+    /* R10 retired position release (stripe[pos] == node, pos >= active, retired_ver <= ver): verify no live object
+     * still uses pos, then check whether node holds any chunks of (volume, pos). For an offline non-DESTROYED node,
+     * return 1 so MK_GC_RELEASE is durably queued in GCMK and executed once the node returns (even after DROP). */
+    unsigned active = view_active_nstripe(&v);
+    if (pos >= active && v.stripe_retired_ver[pos] > 0 && v.stripe_retired_ver[pos] <= ver &&
+        v.stripe[pos] == node) {
+        for (size_t i = 0; i < nobjs; i++) {
+            if (objs[i].stripe_version < ver || pos < objs[i].npos)
+                return -1;
+        }
+        if (p->cp->node_state) {
+            int nst = p->cp->node_state(p->cp->view_arg, node);
+            if (nst == CP_NODE_DESTROYED)
+                return 0;
+            if (nst == CP_NODE_DOWN)
+                return 1; /* queue durable MK_GC_RELEASE in GCMK for when node returns */
+        }
+        uint8_t (*old_oids)[16] = NULL;
+        size_t nold = 0;
+        if (list_node_pos_oids(p, node, pos, false, &old_oids, &nold) != 0)
+            return -1;
+        free(old_oids);
+        if (view_of(p, &v) != 0 || release_view_status(&v, pos, node, ver) != REL_VIEW_OK)
+            return -1;
+        return nold > 0 ? 1 : 0;
+    }
+    if (pos >= v.nstripe)
+        return -1; /* dropped between release_candidates and release_verify */
+
     uint32_t cur_holder = v.stripe[pos];
 
     /* 1. Check whether `node` actually holds any chunk of `(volume, pos)` to release. */
@@ -2544,17 +2631,15 @@ static int p_release_pos(void *ctx, unsigned pos, uint32_t node, uint64_t ver, u
     pctx *p = ctx;
     if (mk_pos == 0 || epoch == 0 || node == 0 || ver == 0)
         return TSDB_ERR_INVALID;
-    if (!p_writable(p))
-        return TSDB_ERR_UNAVAILABLE;
     struct chunkpeer_view v;
-    int rc = view_of(p, &v);
+    int rc = view_any_of(p, &v);
     if (rc)
         return rc;
-    if (pos >= v.nstripe)
-        return TSDB_ERR_INVALID;
+    if (view_active_nstripe(&v) > 0 && !p_writable(p))
+        return TSDB_ERR_UNAVAILABLE;
     int vst = release_view_status(&v, pos, node, ver);
     if (vst == REL_VIEW_SUPERSEDED)
-        return 0; /* node holds pos again: retire stale release without deleting */
+        return 0; /* node holds active pos again: retire stale release without deleting */
     if (vst != REL_VIEW_OK)
         return TSDB_ERR_UNAVAILABLE;
     if (p->cp->node_state) {
@@ -2574,7 +2659,7 @@ static int p_release_pos(void *ctx, unsigned pos, uint32_t node, uint64_t ver, u
     size_t deleted = 0;
     for (size_t i = 0; i < noids; i++) {
         /* Re-check the metadata copy before every delete so a concurrent STRIPE_SET(pos -> node) stops the loop. */
-        if (view_of(p, &v) != 0) {
+        if (view_any_of(p, &v) != 0) {
             free(oids);
             return TSDB_ERR_UNAVAILABLE;
         }
@@ -2604,7 +2689,7 @@ static int p_release_pos(void *ctx, unsigned pos, uint32_t node, uint64_t ver, u
         if (res == TSDB_ERR_LOCKED) {
             /* Target's own rel_guard refused because it holds/fills pos or stripe version moved past ver. */
             free(oids);
-            if (view_of(p, &v) == 0 && release_view_status(&v, pos, node, ver) == REL_VIEW_SUPERSEDED)
+            if (view_any_of(p, &v) == 0 && release_view_status(&v, pos, node, ver) == REL_VIEW_SUPERSEDED)
                 return 0;
             return TSDB_ERR_UNAVAILABLE;
         }

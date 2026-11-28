@@ -2194,6 +2194,7 @@ struct eng {
     struct ppos *ppos;
     struct eccold *cold;
     atomic_uint_fast64_t cold_active_sv; /* R9 (r9-whole, D10): stripe_version of an eccold_settle in commit phase */
+    atomic_uint_fast32_t cold_put_active; /* R10: non-zero while an eccold_settle/reencode put may still write chunks */
     struct ecdiverge *diverge;
     struct ecgcmk *gcmk;
     pthread_mutex_t feed_lock;

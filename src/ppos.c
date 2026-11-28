@@ -6,6 +6,7 @@
  */
 #include "internal.h"
 #include "ppos.h"
+#include "replfile.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -18,6 +19,7 @@
 
 #define PPOS_FILE "PPOS"
 #define PPOS_TMP "PPOS.tmp"
+#define PPOS_INIT_FILE "PPOS.init"
 #define PPOS_REC 32
 
 int ppos_mutant;
@@ -567,6 +569,51 @@ int ppos_open(struct eng *db)
     p->fd = -1;
     pthread_mutex_init(&p->mu, NULL);
     pthread_mutex_init(&p->mapmu, NULL);
+    /* R10 (r10-driver): first open after attaching EC to a replicas volume that already has .part files.
+     * chunkpeer_cluster_prepare writes PPOS.init before adding META_REQ_EC; seed every pre-existing part with the
+     * replicated-log upper bound max(REPL.floor, max parts fno_hi) — never FNO, which can skip by FNO_BELT (2^40)
+     * on a torn slot or outrun a deposed leader's cut tail — then atomically remove PPOS.init. */
+    bool has_init = faccessat(db->dirfd, PPOS_INIT_FILE, F_OK, 0) == 0;
+    bool has_ppos = faccessat(db->dirfd, PPOS_FILE, F_OK, 0) == 0;
+    if (has_init && !has_ppos) {
+        uint64_t seed = 0;
+        for (size_t i = 0; i < db->nparts; i++)
+            if (db->parts[i]->fno_hi > seed)
+                seed = db->parts[i]->fno_hi;
+        struct replfile *rf = NULL;
+        struct replfile_state rst;
+        bool rtorn = false;
+        int rrc = replfile_load(db->dirfd, &rf, &rst, &rtorn);
+        if (rrc == 0) {
+            if (rst.floor > seed)
+                seed = rst.floor;
+            replfile_state_free(&rst);
+            replfile_close(rf);
+        } else if (rrc != TSDB_ERR_NOTFOUND) {
+            fprintf(stderr, "tsdb: %s: PPOS seed: replfile_load failed (%s); falling back to part fno_hi\n", db->dir,
+                    tsdb_strerror(rrc));
+        }
+        if (seed == 0)
+            seed = 1;
+        int rc = map_reserve(p, db->nparts);
+        for (size_t i = 0; rc == 0 && i < db->nparts; i++)
+            map_put(p, name_hash(db->parts[i]->name), seed, PPOS_F_GIVEN);
+        if (rc == 0 && !ro) {
+            rc = compact(db, p);
+            if (rc == 0) {
+                if (unlinkat(db->dirfd, PPOS_INIT_FILE, 0) != 0 && errno != ENOENT)
+                    rc = TSDB_ERR_IO;
+                else
+                    rc = eng_sync_dir(db, "fsync of the directory after removing PPOS.init");
+            }
+        }
+        if (rc) {
+            ppos_free(p);
+            return rc;
+        }
+        db->ppos = p;
+        return 0;
+    }
     uint8_t *buf;
     size_t len;
     int rc = ppos_read_file(db, &buf, &len);
@@ -629,6 +676,12 @@ int ppos_open(struct eng *db)
         free(q.keys);
         free(q.vals);
         free(q.fls);
+    }
+    if (rc == 0 && has_init && !ro) {
+        if (unlinkat(db->dirfd, PPOS_INIT_FILE, 0) != 0 && errno != ENOENT)
+            rc = TSDB_ERR_IO;
+        else
+            rc = eng_sync_dir(db, "fsync of the directory after removing PPOS.init");
     }
     if (rc) {
         ppos_free(p);

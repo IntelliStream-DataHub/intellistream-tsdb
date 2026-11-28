@@ -145,5 +145,8 @@ static inline void cl_sid_hex(const uint8_t id[16], char out[33])
 }
 /* once-per-second Raft leader duty: DRAINING -> OUT when empty, and node replace completion (r9-ops) */
 void cnode_duty(uint64_t now);
+/* server/credund.c (R10, r10-driver; D26-D29): CLUSTER_OP_VOLUME_REDUNDANCY and Raft-leader conversion driver */
+void credund_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+void credund_duty(uint64_t now);
 
 #endif

@@ -17749,6 +17749,922 @@ static void scen_reencode(void)
 }
 
 #ifdef TSDB_EC
+static uint16_t ecd_le16(const uint8_t *p);
+static uint32_t ecd_le32(const uint8_t *p);
+static uint64_t ecd_le64(const uint8_t *p);
+
+/* Verify every live .ec part on srv uses geometry (1..max_k)+want_m within valid_mask (shortened RS allowed for small
+ * writer parts), and returns the total number of live .ec parts (checking >= min_full full-width parts). */
+static int redund_check_ec_geom(int srv, uint32_t num, uint16_t max_k, uint16_t want_m, uint32_t valid_mask,
+                                int min_full)
+{
+    char d[PATH_MAX + 80], dirp[PATH_MAX + 120];
+    server_dir(srv, d, sizeof d);
+    snprintf(dirp, sizeof dirp, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(dirp);
+    if (!dd)
+        die("opendir %s: %s", dirp, strerror(errno));
+    int count = 0, full = 0;
+    for (struct dirent *de; (de = readdir(dd));) {
+        size_t l = strlen(de->d_name);
+        if (l <= 3 || strcmp(de->d_name + l - 3, ".ec") != 0 || strncmp(de->d_name, "retired_", 8) == 0)
+            continue;
+        char fp[PATH_MAX + 256];
+        snprintf(fp, sizeof fp, "%s/%s", dirp, de->d_name);
+        int fd = open(fp, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            die("open %s: %s", fp, strerror(errno));
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size < 64 + 216)
+            die("%s: short .ec file (%lld)", fp, (long long)st.st_size);
+        uint8_t tr[64], rhdr[64];
+        if (pread(fd, tr, 64, st.st_size - 64) != 64 || memcmp(tr, "TSDB-EC\n", 8) != 0)
+            die("%s: bad .ec trailer", fp);
+        uint64_t roff = ecd_le64(tr + 16), rlen = ecd_le64(tr + 24);
+        if (rlen < 216 || roff + rlen + 64 != (uint64_t)st.st_size)
+            die("%s: bad record offset/len", fp);
+        if (pread(fd, rhdr, 64, (off_t)roff) != 64)
+            die("%s: short record read", fp);
+        close(fd);
+        uint16_t k = ecd_le16(rhdr + 52), m = ecd_le16(rhdr + 54);
+        uint32_t pos = ecd_le32(rhdr + 60);
+        if (k < 1 || k > max_k || m != want_m)
+            die("%s: geometry %u+%u, want (1..%u)+%u", fp, k, m, max_k, want_m);
+        if (pos != 0 && ((pos & ~valid_mask) != 0 || (uint16_t)__builtin_popcount(pos) != k + m))
+            die("%s: record positions 0x%x invalid for (1..%u)+%u (mask 0x%x)", fp, pos, max_k, want_m, valid_mask);
+        if (k == max_k)
+            full++;
+        count++;
+    }
+    closedir(dd);
+    if (full < min_full)
+        die("redund: expected >= %d full %u+%u .ec parts, got %d (total %d)", min_full, max_k, want_m, full, count);
+    return count;
+}
+
+/* Plant a valid aborted-settle orphan chunk directly into srv's chunk store for (vol, pos) under epoch 1 so
+ * retired-position release must clean it before META_OP_STRIPE_DROP even with the default 1 h orphan_grace_ms. */
+static void redund_plant_orphan(int srv, uint32_t vol, const uint8_t vuuid[16], uint16_t k, uint16_t m, uint16_t pos)
+{
+    chunk_hdr h;
+    memset(&h, 0, sizeof h);
+    memcpy(h.vuuid, vuuid, 16);
+    if (chunk_random(h.oid, 16) != 0)
+        die("redund: chunk_random failed");
+    h.epoch = 1;
+    if (chunk_geom_derive(&h.g, k, m, (uint64_t)k * 65536ull) != 0)
+        die("redund: chunk_geom_derive(%u+%u) failed", k, m);
+    h.pos = pos;
+    h.chunk_len = chunk_pos_len(&h.g, pos);
+    uint64_t nc = chunk_pos_cells(&h.g, pos);
+    uint8_t *cells = calloc(1, h.chunk_len ? h.chunk_len : 1);
+    uint64_t *sums = calloc(nc ? nc : 1, sizeof *sums);
+    if (!cells || !sums)
+        die("redund: oom planting orphan");
+    size_t img_n = 0;
+    uint8_t *img = chunk_image_build(&h, cells, sums, &img_n);
+    free(cells);
+    free(sums);
+    if (!img)
+        die("redund: chunk_image_build failed");
+    char dir[PATH_MAX + 80], tmp[PATH_MAX + 160], fin[PATH_MAX + 160], hex[33];
+    chunk_oid_hex(h.oid, hex);
+    snprintf(dir, sizeof dir, "%s/ecs%d/chunks/s%" PRIu32, base, srv, vol);
+    mkdir(dir, 0755);
+    snprintf(tmp, sizeof tmp, "%s/orphan_%s.%u.tmp", dir, hex, pos);
+    snprintf(fin, sizeof fin, "%s/o%s.%u.chunk", dir, hex, pos);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0 || write(fd, img, img_n) != (ssize_t)img_n || fsync(fd) != 0 || close(fd) != 0 ||
+        rename(tmp, fin) != 0)
+        die("redund: write orphan chunk %s failed: %s", fin, strerror(errno));
+    free(img);
+}
+
+static int redund_node_chunks(int srv, uint32_t num)
+{
+    char p[PATH_MAX + 80];
+    snprintf(p, sizeof p, "%s/ecs%d/chunks/s%" PRIu32, base, srv, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        n += e->d_name[0] == 'o' && l > 6 && !strcmp(e->d_name + l - 6, ".chunk");
+    }
+    closedir(dd);
+    return n;
+}
+
+static int vol_redundancy(int via, uint32_t vol, const struct meta_redundancy_target *tgt, uint32_t flags, char *why,
+                          size_t wn)
+{
+    uint8_t body[16], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_redundancy_encode(vol, tgt, flags, body);
+    char target[META_ADDR_MAX + 1], err[256];
+    peer_of(via, target, sizeof target);
+    int rc = CLUSTER_ERR_RETRY;
+    for (int hop = 0; hop < 2; hop++) {
+        reply = NULL;
+        rl = 0;
+        if (cluster_admin(target, secret, secret_len, CLUSTER_OP_VOLUME_REDUNDANCY, body, bl, 5000, &rc, &reply, &rl,
+                          err, sizeof err) != 0) {
+            if (why && wn)
+                snprintf(why, wn, "%s", err);
+            return CLUSTER_ERR_RETRY;
+        }
+        if (rc == CLUSTER_ERR_NOTLEADER && hop == 0 && rl > 0 && rl < sizeof target) {
+            memcpy(target, reply, rl);
+            target[rl] = '\0';
+            free(reply);
+            continue;
+        }
+        break;
+    }
+    if (why && wn)
+        snprintf(why, wn, "%.*s", (int)(rl < wn - 1 ? rl : wn - 1), reply ? (const char *)reply : "");
+    free(reply);
+    return rc;
+}
+
+static int redund_try_view(int i, struct view *v)
+{
+    if (pids[i] <= 0 || stopped[i] || pports[i] <= 0)
+        return -1;
+    size_t len = 0;
+    int rc = 0;
+    char target[META_ADDR_MAX + 1], err[256];
+    peer_of(i, target, sizeof target);
+    memset(v, 0, sizeof *v);
+    meta_init(&v->m);
+    if (cluster_admin(target, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, 2000, &rc, &v->raw, &len, err,
+                      sizeof err) != 0 ||
+        rc != 0) {
+        view_free(v);
+        return -1;
+    }
+    if (cluster_status_parse(v->raw, len, &v->st) != 0) {
+        view_free(v);
+        return -1;
+    }
+    if (v->st.image_len && meta_snapshot_decode(&v->m, v->st.image, v->st.image_len) != META_OK) {
+        view_free(v);
+        return -1;
+    }
+    if (v->m.config_len && !raft_config_decode(v->m.config, v->m.config_len, &v->cfg)) {
+        view_free(v);
+        return -1;
+    }
+    return 0;
+}
+
+static int redund_vol_rec(int nsrv, const char *name, struct meta_volume *out)
+{
+    for (int i = 0; i < nsrv; i++) {
+        struct view v;
+        if (redund_try_view(i, &v) != 0)
+            continue;
+        int found = 0;
+        for (uint32_t k = 0; k < v.m.nvolumes; k++) {
+            if (!strcmp(v.m.volumes[k].name, name)) {
+                *out = v.m.volumes[k];
+                out->hist = NULL;
+                out->nhist = 0;
+                found = 1;
+                break;
+            }
+        }
+        view_free(&v);
+        if (found)
+            return 1;
+    }
+    return 0;
+}
+
+static tsdbc *redund_try_client(int i)
+{
+    if (i < 0 || pids[i] <= 0 || stopped[i] || cports[i] <= 0)
+        return NULL;
+    tsdbc *c = NULL;
+    return tsdbc_connect("127.0.0.1", cports[i], &c) == 0 ? c : NULL;
+}
+
+static int redund_find_up_srv(int n)
+{
+    for (int i = 0; i < n; i++)
+        if (pids[i] > 0 && !stopped[i])
+            return i;
+    return 0;
+}
+
+static int redund_raft_leader(int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (pids[i] <= 0 || stopped[i])
+            continue;
+        struct view v;
+        if (redund_try_view(i, &v) != 0)
+            continue;
+        uint32_t lid = v.st.leader;
+        view_free(&v);
+        int s = lid ? server_of(lid) : -1;
+        if (s >= 0 && pids[s] > 0 && !stopped[s])
+            return s;
+    }
+    return -1;
+}
+
+static void redund_arm_crash(int n, const char *vol_name, const char *cp_name, const char *trig_path,
+                             char penv_buf[7][4 * PATH_MAX + 512], char xa[7][PATH_MAX + 256])
+{
+    /* Restart each voter one by one with TSDB_CRASH_AT=<cp_name>:1@<trig_path>, preserving Raft quorum and volume ISR. */
+    struct view v0;
+    int via = redund_find_up_srv(n);
+    view(via, &v0);
+    raft_config cfg = {0};
+    int have_cfg = v0.m.config_len && raft_config_decode(v0.m.config, v0.m.config_len, &cfg);
+    view_free(&v0);
+    if (!have_cfg)
+        die("redund: cannot decode raft config to arm %s", cp_name ? cp_name : "none");
+    for (unsigned k = 0; k < cfg.n; k++) {
+        if (cfg.m[k].learner)
+            continue;
+        int s = server_of(cfg.m[k].id);
+        if (s < 0)
+            continue;
+        if (cp_name)
+            snprintf(penv_buf[s], 4 * PATH_MAX + 512,
+                     "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=2 TSDB_CLUSTER_TEST=versions_mixed_file=1 "
+                     "TSDB_CRASH_AT=%s:1@%s",
+                     cp_name, trig_path);
+        else
+            snprintf(penv_buf[s], 4 * PATH_MAX + 512,
+                     "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=2 TSDB_CLUSTER_TEST=versions_mixed_file=1");
+        penv[s] = penv_buf[s];
+        restart_xargs(s, xa[s]);
+        /* Wait until restarted voter is UP and (if a replica of vol_name) back in ISR before moving to next voter. */
+        int probe = (s == 0) ? 1 : 0;
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            struct view v;
+            int ok = 0;
+            if (redund_try_view(probe, &v) == 0) {
+                const struct meta_member *mb = meta_member(&v.m, ids[s]);
+                const struct meta_volume *mv = NULL;
+                for (uint32_t j = 0; j < v.m.nvolumes; j++)
+                    if (!strcmp(v.m.volumes[j].name, vol_name))
+                        mv = &v.m.volumes[j];
+                if (mb && mb->state == META_UP && (mb->flags & META_MF_VOLUMES_OK) && mv && mv->nisr == mv->nrep)
+                    ok = 1;
+                view_free(&v);
+            }
+            if (ok)
+                break;
+            if (now_ms() - t0 > 30000)
+                die("redund: server %d did not rejoin cleanly after arming %s", s, cp_name ? cp_name : "none");
+        }
+    }
+}
+
+/* Wait for any of the n servers to exit with status 99 on `cp_name`, unlink trigger, and restart it without crashpt. */
+static int redund_await_crash(int n, const char *cp_name, const char *trig_path, char penv_buf[7][4 * PATH_MAX + 512],
+                              char xa[7][PATH_MAX + 256])
+{
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        for (int i = 0; i < n; i++) {
+            if (pids[i] <= 0)
+                continue;
+            int st = 0;
+            if (waitpid(pids[i], &st, WNOHANG) == pids[i]) {
+                pids[i] = 0;
+                unlink(trig_path);
+                if (!WIFEXITED(st) || WEXITSTATUS(st) != 99 || !log_has(i, cp_name))
+                    die("redund: server %d exited unexpectedly (status=%d, expected crash point %s)", i,
+                        WIFEXITED(st) ? WEXITSTATUS(st) : -1, cp_name);
+                snprintf(penv_buf[i], 4 * PATH_MAX + 512,
+                         "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=2 TSDB_CLUSTER_TEST=versions_mixed_file=1");
+                penv[i] = penv_buf[i];
+                xargs[i] = xa[i];
+                start(i);
+                return i;
+            }
+        }
+        if (now_ms() - t0 > 45000)
+            die("redund: no Raft leader hit crash point %s within 45 s", cp_name);
+    }
+}
+
+struct redund_writer {
+    int id;
+    int nsrv;
+    const char *vol_name;
+    const char *twin_name;
+    tsdb_sid ide[2];
+    tsdb_sid idt[2];
+    int64_t base_ms;
+    _Atomic int *stop;
+    _Atomic int *batches;
+    pthread_mutex_t *oracle_mu;
+    int err;
+};
+
+static int redund_pick_leader(int nsrv, const char *vname)
+{
+    struct meta_volume mv;
+    if (redund_vol_rec(nsrv, vname, &mv) && mv.leader) {
+        int s = server_of(mv.leader);
+        if (s >= 0 && pids[s] > 0 && !stopped[s])
+            return s;
+    }
+    return -1;
+}
+
+static int redund_count_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ts;
+    (void)v;
+    *(size_t *)ctx += n;
+    return 0;
+}
+
+static int redund_row_exists(int nsrv, const char *vname, tsdb_sid sid, int64_t ts0, int64_t ts1)
+{
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 30000; usleep(100000)) {
+        int s = redund_pick_leader(nsrv, vname);
+        if (s < 0)
+            continue;
+        tsdbc *c = redund_try_client(s);
+        if (!c)
+            continue;
+        size_t rn = 0;
+        int rc = tsdbc_query_raw(c, sid, ts0, ts1, redund_count_cb, &rn);
+        tsdbc_close(c);
+        if (rc == 0)
+            return rn > 0 ? 1 : 0;
+    }
+    return -1;
+}
+
+static void *redund_writer_fn(void *arg)
+{
+    struct redund_writer *w = arg;
+    tsdbc *c = NULL;
+    int cur_srv = -1;
+    int seq = 0;
+    while (!atomic_load(w->stop) && seq < 500) {
+        int64_t ts[8];
+        float val[8];
+        int k = seq & 1;
+        for (int r = 0; r < 8; r++) {
+            ts[r] = w->base_ms + ((int64_t)w->id * 20000LL + (int64_t)seq * 16LL + (int64_t)r) * 1000LL;
+            val[r] = 2000.0f + (float)w->id * 100.0f + (float)seq + 0.125f * (float)r;
+        }
+        int landed = 0;
+        for (uint64_t t0 = now_ms(); !landed;) {
+            if (!c) {
+                cur_srv = redund_pick_leader(w->nsrv, w->vol_name);
+                if (cur_srv >= 0)
+                    c = redund_try_client(cur_srv);
+            }
+            int rc = c ? tsdbc_insert_series(c, w->ide[k], ts, val, 8) : TSDB_ERR_UNAVAILABLE;
+            if (rc == 0) {
+                landed = 1;
+                break;
+            }
+            if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED) {
+                if (c) {
+                    tsdbc_close(c);
+                    c = NULL;
+                }
+                if (now_ms() - t0 > 45000) {
+                    w->err = rc;
+                    break;
+                }
+                usleep(50000);
+                continue;
+            }
+            /* Connection dropped (e.g. Raft leader crash on the same node): check if the batch committed before retrying. */
+            if (c) {
+                tsdbc_close(c);
+                c = NULL;
+            }
+            int ex = redund_row_exists(w->nsrv, w->vol_name, w->ide[k], ts[0], ts[7] + 1);
+            if (ex == 1) {
+                landed = 1;
+                break;
+            }
+            if (ex < 0 || now_ms() - t0 > 45000) {
+                w->err = rc ? rc : TSDB_ERR_IO;
+                break;
+            }
+            usleep(50000);
+        }
+        if (w->err)
+            break;
+        if (landed) {
+            pthread_mutex_lock(w->oracle_mu);
+            int orc = TSDB_ERR_UNAVAILABLE;
+            for (uint64_t t0 = now_ms(); now_ms() - t0 < 45000; usleep(50000)) {
+                int tsrv = redund_pick_leader(w->nsrv, w->twin_name);
+                if (tsrv < 0)
+                    continue;
+                tsdbc *ct = redund_try_client(tsrv);
+                if (!ct)
+                    continue;
+                orc = tsdbc_insert_series(ct, w->idt[k], ts, val, 8);
+                tsdbc_close(ct);
+                if (orc == 0)
+                    break;
+            }
+            pthread_mutex_unlock(w->oracle_mu);
+            if (orc != 0) {
+                w->err = orc;
+                break;
+            }
+            seq++;
+            atomic_fetch_add(w->batches, 1);
+        }
+        usleep(40000);
+    }
+    if (c)
+        tsdbc_close(c);
+    return NULL;
+}
+#endif
+
+/* redund (R10 r10-driver, §6.4, E2, E38, D26-D29): 7-node cluster with 4 concurrent writers.
+ * Exercises replicas=3 -> ec=4+2 (conv-record Raft leader kill), 4+2 -> 4+3 (conv-grow Raft leader kill,
+ * mixed-geometry settled margin <= 2 while converting, CLI verb & STATUS progress), E38 mixed-version pause &
+ * --cancel, 4+3 -> 4+2 (conv-drop Raft leader kill, stripe drop + log shrink), and 4+2 -> replicas=3 (MK_UNSETTLE
+ * + full stripe drop). Verifies zero lost writes and bit-for-bit oracle equality across all log replicas.
+ * Planted mutants (make redund-mutants): dropearly, shrinkfirst. */
+static void scen_redund(void)
+{
+    scenario("redund");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    const int NS = 7;
+    const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
+    static char rec_trig[PATH_MAX + 256], grow_trig[PATH_MAX + 256], drop_trig[PATH_MAX + 256];
+    static char penv_buf[7][4 * PATH_MAX + 512];
+    static char xa[7][PATH_MAX + 256];
+    snprintf(rec_trig, sizeof rec_trig, "%s/redund_crash_record", base);
+    snprintf(grow_trig, sizeof grow_trig, "%s/redund_crash_grow", base);
+    snprintf(drop_trig, sizeof drop_trig, "%s/redund_crash_drop", base);
+    unlink(rec_trig);
+    unlink(grow_trig);
+    unlink(drop_trig);
+
+    for (int i = 0; i < NS; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i],
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-settle-keep-s 1",
+                 sd);
+        snprintf(penv_buf[i], sizeof penv_buf[i],
+                 "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=2 TSDB_CLUSTER_TEST=versions_mixed_file=1 "
+                 "TSDB_CRASH_AT=conv-record:1@%s",
+                 rec_trig);
+        penv[i] = penv_buf[i];
+        xargs[i] = xa[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < NS; i++)
+        node_add(0, i);
+    unsigned want_v = 5, want_n = 7;
+    await_view(0, p_voters, &want_v, "five voters of seven members");
+    await_view(0, p_n_placeable, &want_n, "seven members UP with volumes open");
+    for (int i = 0; i < NS; i++) {
+        for (uint64_t t0 = now_ms(); !log_has(i, "chunk server up"); usleep(100000))
+            if (now_ms() - t0 > 30000)
+                die("redund: server %d chunk server did not come up", i);
+    }
+
+    uint32_t num = 0, tnum = 0;
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "cv", 3, &num)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("redund: vol_add cv: %s", cluster_strerror(rc));
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "tv", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("redund: vol_add tv: %s", cluster_strerror(rc));
+
+    struct meta_volume mv, tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "cv", &mv) || !mv.leader || mv.nisr < 3; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("redund: cv did not reach ISR=3");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "tv", &tv) || !tv.leader || tv.nisr < 3; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("redund: tv did not reach ISR=3");
+
+    int Lc = server_of(mv.leader), Lt = server_of(tv.leader);
+    tsdbc *cc = client(Lc), *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    const int64_t day0 = 1704067200000LL;
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "rd.s%d", s);
+        ide[s] = ecb_series(cc, nm, "cv");
+        idt[s] = ecb_series(ct, nm, "tv");
+    }
+    /* Seed two distinct partitions (35 days apart) so conversion to EC immediately settles >= 2 .ec objects. */
+    reenc_write_round(cc, ct, ide, idt, day0, 0);
+    reenc_write_round(cc, ct, ide, idt, day0 + 35 * 86400000LL, 1);
+    tsdbc_close(cc);
+    tsdbc_close(ct);
+
+    /* Start 4 concurrent writers inserting continuously into cv and mirroring acknowledged batches to oracle tv. */
+    _Atomic int stop_w = 0, w_batches = 0;
+    pthread_mutex_t oracle_mu = PTHREAD_MUTEX_INITIALIZER;
+    struct redund_writer ws[4];
+    pthread_t wt[4];
+    for (int w = 0; w < 4; w++) {
+        ws[w] = (struct redund_writer){
+            .id = w,
+            .nsrv = NS,
+            .vol_name = "cv",
+            .twin_name = "tv",
+            .ide = {ide[w], ide[w + 4]},
+            .idt = {idt[w], idt[w + 4]},
+            .base_ms = day0 + 70 * 86400000LL,
+            .stop = &stop_w,
+            .batches = &w_batches,
+            .oracle_mu = &oracle_mu,
+            .err = 0,
+        };
+        if (pthread_create(&wt[w], NULL, redund_writer_fn, &ws[w]) != 0)
+            die("redund: pthread_create writer %d failed", w);
+    }
+    for (uint64_t t0 = now_ms(); atomic_load(&w_batches) < 8; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("redund: 4 writers produced only %d batches", atomic_load(&w_batches));
+
+    /* E38 check: refuse starting conversion while cluster_versions_mixed() is true. */
+    {
+        int rl = redund_raft_leader(NS);
+        if (rl < 0)
+            die("redund: no Raft leader found for E38 check");
+        char vm[PATH_MAX + 128];
+        snprintf(vm, sizeof vm, "%s/n%d/state/versionsmixed", base, rl);
+        touch_file(vm);
+        struct meta_redundancy_target tgt = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 2, .replicas = 3};
+        char why[256];
+        rc = vol_redundancy(rl, num, &tgt, 0, why, sizeof why);
+        unlink(vm);
+        if (rc != META_ERR_STATE || !strstr(why, "mixed"))
+            die("redund: expected E38 mixed-version refusal, got rc=%d (%s)", rc, why);
+    }
+
+    /* ---- Conversion 1: replicas=3 -> ec=4+2 (kills Raft leader at conv-record) ---- */
+    touch_file(rec_trig);
+    {
+        struct meta_redundancy_target tgt = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 2, .replicas = 3};
+        char why[256];
+        for (uint64_t t0 = now_ms(); (rc = vol_redundancy(redund_find_up_srv(NS), num, &tgt, 0, why, sizeof why)) != 0;
+             usleep(100000))
+            if ((rc != CLUSTER_ERR_NOTLEADER && rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_RETRY) ||
+                now_ms() - t0 > 30000)
+                die("redund: replicas=3 -> ec=4+2 start failed: %s (%s)", cluster_strerror(rc), why);
+    }
+    int crashed_rec = redund_await_crash(NS, "conv-record", rec_trig, penv_buf, xa);
+    printf("  conv 1 (replicas=3 -> ec=4+2): Raft leader %d hit conv-record, restarted; new leader resuming\n",
+           crashed_rec);
+
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        if (redund_vol_rec(NS, "cv", &mv) && mv.conv.phase == META_CONV_NONE &&
+            mv.redundancy == META_RED_EC && mv.ec_k == 4 && mv.ec_m == 2 && mv.nstripe == 6 && mv.nrep == 3 &&
+            mv.nisr == 3)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("redund: replicas=3 -> ec=4+2 did not complete (phase=%u red=%u %u+%u nstripe=%u nrep=%u nisr=%u)",
+                mv.conv.phase, mv.redundancy, mv.ec_k, mv.ec_m, mv.nstripe, mv.nrep, mv.nisr);
+    }
+    /* Wait for at least 2 settled .ec objects on all 3 log replicas before converting 4+2 -> 4+3. */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        redund_vol_rec(NS, "cv", &mv);
+        int ok = mv.nrep == 3;
+        for (uint32_t k = 0; k < mv.nrep; k++)
+            if (ecb_ec_parts(server_of(mv.rep[k].node), num) < 2)
+                ok = 0;
+        if (ok)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("redund: cv did not settle >= 2 .ec objects after replicas=3 -> ec=4+2");
+    }
+    printf("  conv 1 ok: replicas=3 -> ec=4+2 settled %d .ec parts across 3 log replicas (%d chunks)\n",
+           ecb_ec_parts(server_of(mv.leader), num), ecb_chunks(num));
+
+    /* ---- Conversion 2: 4+2 -> 4+3 (kills Raft leader at conv-grow, checks settled margin <= 2 & CLI verb) ---- */
+    redund_arm_crash(NS, "cv", "conv-grow", grow_trig, penv_buf, xa);
+    touch_file(grow_trig);
+    {
+        char cmd[PATH_MAX + 512], out[1024];
+        int via = redund_find_up_srv(NS);
+        snprintf(cmd, sizeof cmd, "%s cluster volume redundancy 127.0.0.1:%d cv ec=4+3 --secret-file %s 2>&1", cli,
+                 pports[via], secret_path);
+        FILE *fp = popen(cmd, "r");
+        if (!fp)
+            die("redund: popen cli failed");
+        size_t nr = fread(out, 1, sizeof out - 1, fp);
+        out[nr] = '\0';
+        int pst = pclose(fp);
+        if (pst != 0 || !strstr(out, "redundancy conversion to ec=4+3 started"))
+            die("redund: cli volume redundancy ec=4+3 failed (rc=%d): %s", pst, out);
+    }
+    int crashed_grow = redund_await_crash(NS, "conv-grow", grow_trig, penv_buf, xa);
+    printf("  conv 2 (4+2 -> 4+3): Raft leader %d hit conv-grow, restarted; new leader resuming\n", crashed_grow);
+
+    int saw_margin_capped = 0, saw_status_conv = 0;
+    for (uint64_t t0 = now_ms();; usleep(150000)) {
+        int via = redund_find_up_srv(NS);
+        if (!redund_vol_rec(NS, "cv", &mv))
+            continue;
+        if (mv.conv.phase == META_CONV_REENCODE || mv.conv.phase == META_CONV_DROP) {
+            char sm_buf[32] = "", ks[64];
+            snprintf(ks, sizeof ks, "vol.%u.settled_margin", (unsigned)num);
+            if (status_key(via, ks, sm_buf, sizeof sm_buf)) {
+                int sm = atoi(sm_buf);
+                if (sm > 2)
+                    die("redund: settled margin during 4+2 -> 4+3 REENCODE/DROP was %d, must be <= 2", sm);
+                saw_margin_capped = 1;
+            }
+            if (!saw_status_conv) {
+                char cmd[PATH_MAX + 512], out[4096];
+                snprintf(cmd, sizeof cmd, "%s cluster status volume cv --json 127.0.0.1:%d --secret-file %s 2>&1", cli,
+                         pports[via], secret_path);
+                FILE *fp = popen(cmd, "r");
+                if (fp) {
+                    size_t nr = fread(out, 1, sizeof out - 1, fp);
+                    out[nr] = '\0';
+                    if (pclose(fp) == 0 && strstr(out, "\"conversion\":") && strstr(out, "\"phase\":"))
+                        saw_status_conv = 1;
+                }
+            }
+        }
+        if (mv.conv.phase == META_CONV_NONE && mv.redundancy == META_RED_EC && mv.ec_k == 4 && mv.ec_m == 3 &&
+            mv.nstripe == 7 && mv.nrep == 4 && mv.nisr == 4)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("redund: 4+2 -> 4+3 did not complete (phase=%u red=%u %u+%u nstripe=%u nrep=%u nisr=%u)",
+                mv.conv.phase, mv.redundancy, mv.ec_k, mv.ec_m, mv.nstripe, mv.nrep, mv.nisr);
+    }
+    /* Wait for retired .ec cleanup and verify every live .ec part on leader has 4+3 geometry (positions 0x7f). */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        redund_vol_rec(NS, "cv", &mv);
+        int L = server_of(mv.leader);
+        if (L >= 0 && ecb_ec_parts(L, num) >= 2 && ecb_retired_ec(L, num) == 0)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("redund: 4+2 -> 4+3 post-reencode cleanup did not finish");
+    }
+    {
+        int L = server_of(mv.leader);
+        int nec = redund_check_ec_geom(L, num, 4, 3, 0x7fu, 2);
+        printf("  conv 2 ok: 4+2 -> 4+3 complete (%d .ec parts 4+3, nrep=4, nstripe=7, margin_capped=%d status_json=%d)\n",
+               nec, saw_margin_capped, saw_status_conv);
+    }
+
+    /* Cancel-during-REENCODE test: start 4+3 -> 4+2, wait for META_CONV_REENCODE (non-zero lifetime_s holds REENCODE
+     * open), then --cancel so meta sets mixed_redundancy=EC and credund_duty must clear it back to clean 4+3. */
+    {
+        struct meta_redundancy_target tgt = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 2, .replicas = 3};
+        char why[256];
+        for (uint64_t t0 = now_ms(); (rc = vol_redundancy(redund_find_up_srv(NS), num, &tgt, 0, why, sizeof why)) != 0;
+             usleep(100000))
+            if ((rc != CLUSTER_ERR_NOTLEADER && rc != CLUSTER_ERR_RETRY) || now_ms() - t0 > 30000)
+                die("redund: cancel-test start failed: %s (%s)", cluster_strerror(rc), why);
+        for (uint64_t t0 = now_ms();; usleep(50000)) {
+            if (redund_vol_rec(NS, "cv", &mv) && mv.conv.phase == META_CONV_REENCODE)
+                break;
+            if (now_ms() - t0 > 15000)
+                die("redund: cancel-test did not enter REENCODE (phase=%s)", meta_conv_phase_name(mv.conv.phase));
+        }
+        struct meta_redundancy_target ztgt = {0};
+        rc = vol_redundancy(redund_find_up_srv(NS), num, &ztgt, CLUSTER_REDUND_CANCEL, why, sizeof why);
+        if (rc != 0)
+            die("redund: --cancel during REENCODE failed: %s (%s)", cluster_strerror(rc), why);
+        for (uint64_t t0 = now_ms();; usleep(150000)) {
+            if (redund_vol_rec(NS, "cv", &mv) && mv.conv.phase == META_CONV_NONE &&
+                mv.mixed_redundancy == META_RED_REPLICAS && mv.conv_cancel_gen >= 1 && mv.redundancy == META_RED_EC &&
+                mv.ec_k == 4 && mv.ec_m == 3 && mv.nrep == 4 && mv.nstripe == 7)
+                break;
+            if (now_ms() - t0 > 60000)
+                die("redund: --cancel in REENCODE did not clear mixed_redundancy back to 4+3 "
+                    "(phase=%s mixed=%u cancel_gen=%" PRIu64 " red=%u %u+%u)",
+                    meta_conv_phase_name(mv.conv.phase), mv.mixed_redundancy, mv.conv_cancel_gen, mv.redundancy,
+                    mv.ec_k, mv.ec_m);
+        }
+        printf("  cancel ok: cancelled in REENCODE and cleared mixed_redundancy back to 4+3 (conv_cancel_gen=%" PRIu64
+               ")\n",
+               mv.conv_cancel_gen);
+    }
+
+    /* Record the 7th stripe position's node before 4+3 -> 4+2 and plant an aborted-settle orphan chunk on pos 6
+     * (default 1 h orphan_grace_ms) to verify retired-position MK_GC_RELEASE cleans it before DROP. */
+    uint32_t dropped_node = mv.nstripe >= 7 ? mv.stripe[6] : 0;
+    if (dropped_node && server_of(dropped_node) >= 0)
+        redund_plant_orphan(server_of(dropped_node), num, mv.uuid, 4, 3, 6);
+
+    /* ---- Conversion 3: 4+3 -> 4+2 (kills Raft leader at conv-drop, catches dropearly & shrinkfirst!) ---- */
+    redund_arm_crash(NS, "cv", "conv-drop", drop_trig, penv_buf, xa);
+    touch_file(drop_trig);
+    {
+        struct meta_redundancy_target tgt = {.redundancy = META_RED_EC, .ec_k = 4, .ec_m = 2, .replicas = 3};
+        char why[256];
+        for (uint64_t t0 = now_ms(); (rc = vol_redundancy(redund_find_up_srv(NS), num, &tgt, 0, why, sizeof why)) != 0;
+             usleep(100000))
+            if ((rc != CLUSTER_ERR_NOTLEADER && rc != CLUSTER_ERR_RETRY) || now_ms() - t0 > 30000)
+                die("redund: 4+3 -> 4+2 start failed: %s (%s)", cluster_strerror(rc), why);
+    }
+    int crashed_drop = -1;
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (crashed_drop < 0) {
+            for (int i = 0; i < NS; i++) {
+                if (pids[i] <= 0)
+                    continue;
+                int st = 0;
+                if (waitpid(pids[i], &st, WNOHANG) == pids[i]) {
+                    pids[i] = 0;
+                    unlink(drop_trig);
+                    if (!WIFEXITED(st) || WEXITSTATUS(st) != 99 || !log_has(i, "conv-drop"))
+                        die("redund: server %d exited unexpectedly waiting for conv-drop (status=%d)", i,
+                            WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+                    snprintf(penv_buf[i], sizeof penv_buf[i],
+                             "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=2 TSDB_CLUSTER_TEST=versions_mixed_file=1");
+                    penv[i] = penv_buf[i];
+                    xargs[i] = xa[i];
+                    start(i);
+                    crashed_drop = i;
+                    printf("  conv 3 (4+3 -> 4+2): Raft leader %d hit conv-drop, restarted; new leader resuming\n",
+                           crashed_drop);
+                    break;
+                }
+            }
+        }
+        if (!redund_vol_rec(NS, "cv", &mv))
+            continue;
+        /* Strict phase-ordering assertions (catch shrinkfirst and dropearly immediately!). */
+        if (mv.conv.phase != META_CONV_NONE && mv.conv.phase < META_CONV_SHRINK && mv.nrep < 4)
+            die("redund: log replicas shrunk before SHRINK (phase=%s nrep=%u nisr=%u; shrinkfirst?)",
+                meta_conv_phase_name(mv.conv.phase), mv.nrep, mv.nisr);
+        if (mv.conv.phase == META_CONV_REENCODE && mv.nstripe < 7)
+            die("redund: stripe positions dropped during REENCODE (nstripe=%u; dropearly?)", mv.nstripe);
+        if (mv.conv.phase == META_CONV_NONE && mv.redundancy == META_RED_EC && mv.ec_k == 4 && mv.ec_m == 2 &&
+            mv.nstripe == 6 && mv.nrep == 3 && mv.nisr == 3)
+            break;
+        if (now_ms() - t0 > 45000)
+            die("redund: 4+3 -> 4+2 did not complete (phase=%s red=%u %u+%u nstripe=%u nrep=%u nisr=%u; mutant?)",
+                meta_conv_phase_name(mv.conv.phase), mv.redundancy, mv.ec_k, mv.ec_m, mv.nstripe, mv.nrep, mv.nisr);
+    }
+    if (crashed_drop < 0)
+        die("redund: conv-drop crash point was never hit during 4+3 -> 4+2");
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        redund_vol_rec(NS, "cv", &mv);
+        int L = server_of(mv.leader);
+        if (L >= 0 && ecb_ec_parts(L, num) >= 2 && ecb_retired_ec(L, num) == 0)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("redund: 4+3 -> 4+2 post-reencode cleanup did not finish");
+    }
+    {
+        int L = server_of(mv.leader);
+        int nec = redund_check_ec_geom(L, num, 4, 2, 0x3fu, 2);
+        int dropped_srv = dropped_node ? server_of(dropped_node) : -1;
+        int leaked = dropped_srv >= 0 ? redund_node_chunks(dropped_srv, num) : 0;
+        if (leaked != 0)
+            die("redund: 4+3 -> 4+2 leaked %d chunks on dropped pos 6 node %" PRIu32 " (server %d)", leaked,
+                dropped_node, dropped_srv);
+        printf("  conv 3 ok: 4+3 -> 4+2 complete (%d .ec parts 4+2, nrep=3, nstripe=6, 0 leaked chunks on dropped node %"
+               PRIu32 ")\n",
+               nec, dropped_node);
+    }
+
+    /* Clear crash points on remaining voters before conversion 4, and plant aborted-settle orphan chunks on
+     * positions 0 and 1 (default 1 h orphan_grace_ms) to verify 4+2 -> replicas=3 cleans all retired positions. */
+    redund_arm_crash(NS, "cv", NULL, "", penv_buf, xa);
+    if (redund_vol_rec(NS, "cv", &mv) && mv.nstripe >= 2) {
+        if (server_of(mv.stripe[0]) >= 0)
+            redund_plant_orphan(server_of(mv.stripe[0]), num, mv.uuid, 4, 2, 0);
+        if (server_of(mv.stripe[1]) >= 0)
+            redund_plant_orphan(server_of(mv.stripe[1]), num, mv.uuid, 4, 2, 1);
+    }
+
+    /* ---- Conversion 4: 4+2 -> replicas=3 (MK_UNSETTLE + full stripe drop) ---- */
+    {
+        struct meta_redundancy_target tgt = {.redundancy = META_RED_REPLICAS, .replicas = 3};
+        char why[256];
+        for (uint64_t t0 = now_ms(); (rc = vol_redundancy(redund_find_up_srv(NS), num, &tgt, 0, why, sizeof why)) != 0;
+             usleep(100000))
+            if ((rc != CLUSTER_ERR_NOTLEADER && rc != CLUSTER_ERR_RETRY) || now_ms() - t0 > 30000)
+                die("redund: 4+2 -> replicas=3 start failed: %s (%s)", cluster_strerror(rc), why);
+    }
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        if (redund_vol_rec(NS, "cv", &mv) && mv.conv.phase == META_CONV_NONE &&
+            mv.redundancy == META_RED_REPLICAS && mv.nstripe == 0 && mv.nrep == 3 && mv.nisr == 3)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("redund: 4+2 -> replicas=3 did not complete (phase=%s red=%u nstripe=%u nrep=%u nisr=%u)",
+                meta_conv_phase_name(mv.conv.phase), mv.redundancy, mv.nstripe, mv.nrep, mv.nisr);
+    }
+    /* Verify 0 .ec parts, 0 retired .ec, and 0 chunks remaining across ALL 7 chunk stores. */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        redund_vol_rec(NS, "cv", &mv);
+        int ok = mv.nrep == 3 && ecb_chunks_n(num, NS) == 0;
+        for (uint32_t k = 0; k < mv.nrep; k++) {
+            int s = server_of(mv.rep[k].node);
+            if (s < 0 || ecb_ec_parts(s, num) != 0 || ecb_retired_ec(s, num) != 0)
+                ok = 0;
+        }
+        if (ok)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("redund: 4+2 -> replicas=3 left .ec parts or chunks behind (chunks=%d)", ecb_chunks_n(num, NS));
+    }
+    /* Verify clean restart of a formerly-EC replica after ec -> replicas=3 (retains requires=tier,ec with nstripe=0). */
+    {
+        int rsrv = server_of(mv.rep[mv.nrep - 1].node);
+        restart_xargs(rsrv, xa[rsrv]);
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            if (redund_vol_rec(NS, "cv", &mv) && mv.nisr == 3 && meta_volume_in_isr(&mv, ids[rsrv]))
+                break;
+            if (now_ms() - t0 > 30000)
+                die("redund: replica server %d did not reopen cleanly after ec -> replicas=3", rsrv);
+        }
+    }
+    printf("  conv 4 ok: 4+2 -> replicas=3 complete (0 .ec parts, 0 chunks across 7 stores, restart ok, nrep=3, nstripe=0)\n");
+
+    /* Stop writers and verify zero lost writes + bit-for-bit oracle equality on EVERY log replica. */
+    atomic_store(&stop_w, 1);
+    for (int w = 0; w < 4; w++) {
+        pthread_join(wt[w], NULL);
+        if (ws[w].err != 0)
+            die("redund: writer %d failed: %s", w, ers(ws[w].err));
+    }
+    int total_batches = atomic_load(&w_batches);
+    if (total_batches < 20)
+        die("redund: 4 writers only completed %d batches across 4 conversions", total_batches);
+    for (int i = 0; i < NS; i++)
+        if (log_has(i, "DIVERGED"))
+            die("redund: server %d logged DIVERGED", i);
+
+    int t_srv = redund_pick_leader(NS, "tv");
+    if (t_srv < 0)
+        die("redund: no leader for oracle tv");
+    ct = client(t_srv);
+    struct ecb_sum oracle[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        if ((rc = ecb_read(ct, idt[s], &oracle[s])) != 0 || oracle[s].n == 0)
+            die("redund: oracle read s=%d: %s", s, ers(rc));
+    }
+    tsdbc_close(ct);
+
+    vol_rec(redund_find_up_srv(NS), "cv", &mv);
+    int order[3], no = 0;
+    int L0 = server_of(mv.leader);
+    order[no++] = L0;
+    for (uint32_t k = 0; k < mv.nrep && no < 3; k++) {
+        int s = server_of(mv.rep[k].node);
+        if (s >= 0 && s != L0)
+            order[no++] = s;
+    }
+    for (int step = 0; step < no; step++) {
+        int tgt = order[step];
+        if (step > 0) {
+            char why[256];
+            for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[tgt], why, sizeof why)) != 0; usleep(200000))
+                if (now_ms() - t0 > 30000)
+                    die("redund: final transfer to %d: %s (%s)", tgt, cluster_strerror(rc), why);
+            for (uint64_t t0 = now_ms();; usleep(100000)) {
+                struct meta_volume mv2;
+                if (vol_rec(tgt, "cv", &mv2) && mv2.leader == ids[tgt])
+                    break;
+                if (now_ms() - t0 > 30000)
+                    die("redund: replica %d did not become leader", tgt);
+            }
+        }
+        cc = client(tgt);
+        for (int s = 0; s < ECB_SERIES; s++) {
+            struct ecb_sum got;
+            for (uint64_t t0 = now_ms(); (rc = ecb_read(cc, ide[s], &got)) != 0; usleep(100000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("redund: final read on %d s=%d: %s", tgt, s, ers(rc));
+            if (got.n != oracle[s].n || got.h != oracle[s].h)
+                die("redund: final replica %d s=%d mismatch (n=%" PRIu64 " want %" PRIu64 ", h=%016" PRIx64
+                    " want %016" PRIx64 ")",
+                    tgt, s, got.n, oracle[s].n, got.h, oracle[s].h);
+        }
+        tsdbc_close(cc);
+    }
+    printf("  redund ok: all 4 conversions passed under %d concurrent batches, bit-for-bit oracle verified on all %d replicas\n",
+           total_batches, no);
+#endif
+}
+
+#ifdef TSDB_EC
 static int ecd_chunks_of(int srv, uint32_t num)
 {
     char p[PATH_MAX + 80];
@@ -36546,7 +37462,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"snapmove", scen_snapmove}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"unsettle", scen_unsettle}, {"reencode", scen_reencode}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"opening", scen_opening}, {"failgasp", scen_failgasp}, {"faultreason", scen_faultreason}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"unsettle", scen_unsettle}, {"reencode", scen_reencode}, {"redund", scen_redund}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"opening", scen_opening}, {"failgasp", scen_failgasp}, {"faultreason", scen_faultreason}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast},

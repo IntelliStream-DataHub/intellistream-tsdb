@@ -111,6 +111,7 @@
 #include <unistd.h>
 
 #include "repld.h"
+#include "chunkpeer.h"
 #include "disks.h"
 #include "tsdb_protocol.h"
 #include "crashpt.h"
@@ -1947,6 +1948,9 @@ static void plant_diverge(struct rvol *rv)
 static int promote_fn(void *ctx, struct eng **old, struct eng **neu)
 {
     struct rvol *rv = ctx;
+    int prc = chunkpeer_cluster_prepare(rv->number, rv->dir);
+    if (prc != 0)
+        say("volume %" PRIu32 ": promote EC prepare failed (%s)", rv->number, tsdb_strerror(prc));
     int rc = replica_promote(old, rv->epoch_pos, neu);
     if (rc == 0 && (rc = eng_leader_attach(*neu, &rv->ops)) != 0) {
         eng_close(*neu);
@@ -2740,6 +2744,10 @@ static void handle(struct rvol *rv, struct item *it)
             rset_cmd(rv, &c, it->node);
         else if (c.kind == CL_VOLCMD_TRANSFER || c.kind == CL_VOLCMD_CANCEL)
             rtr_cmd(rv, &c, it->node);
+        else if (c.kind == CL_VOLCMD_CONV_WORK)
+            /* No sender check needed: conv_req_still_valid verifies (volume, epoch, phase, target_sv) against the
+             * local replicated metadata copy before any work executes. */
+            chunkpeer_conv_cmd(&c);
         return;
     }
     int from = node_index(rv, it->node);
@@ -3048,10 +3056,19 @@ static void replica_caps_next(struct rvol *rv)
 
 static void demote_between(void) { crash_point(CP_DEPOSE_BEFORE_REOPEN); }
 
+struct demote_ctx {
+    uint64_t floor;
+    uint32_t number;
+    const char *dir;
+};
+
 static int demote_fn(void *ctx, struct eng **old, struct eng **neu)
 {
-    const uint64_t *floor = ctx;
-    return replica_demote(old, *floor, demote_between, neu);
+    const struct demote_ctx *dc = ctx;
+    int prc = chunkpeer_cluster_prepare(dc->number, dc->dir);
+    if (prc != 0)
+        say("volume %" PRIu32 ": demote EC prepare failed (%s)", dc->number, tsdb_strerror(prc));
+    return replica_demote(old, dc->floor, demote_between, neu);
 }
 
 /* The core stepped down (a FENCE or REFUSE with a higher epoch, a REPLY REPL_MOVED; design-cluster.md 6.3) while this
@@ -3091,7 +3108,8 @@ static void demote(struct rvol *rv)
     repl_free(old);
     uint64_t t0 = now_ms();
     replica_caps_next(rv);
-    int rc = tsdb_cvol_replace(G.t, rv->number, demote_fn, &floor, CVOL_REPLICA);
+    struct demote_ctx dctx = {.floor = floor, .number = rv->number, .dir = rv->dir};
+    int rc = tsdb_cvol_replace(G.t, rv->number, demote_fn, &dctx, CVOL_REPLICA);
     struct repl *core = NULL;
     uint64_t log_end = 0;
     if (rc == 0)

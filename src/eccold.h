@@ -53,6 +53,10 @@ bool eccold_swap_cur(struct eng *db, uint64_t *pos, int64_t *key, uint64_t *z);
  * ec_swap_commit (0 when none). Paired with cp_objlist_srv's stripe_version >= max_version check via seq_cst so no
  * settle at version < V can commit unseen by OBJLIST(max_version = V). */
 uint64_t eccold_active_sv(const struct eng *db);
+/* R10: true while an eccold_settle or eccold_reencode put is in flight (between before ecsettle_put and cleanup).
+ * Paired with collect_releases / publish_live_objs so a retired stripe position is not marked clean while an
+ * in-flight put under an older geometry could still commit a chunk onto it. */
+bool eccold_put_active(const struct eng *db);
 
 #define ECCOLD_FORCE_S_DEFAULT 3600   /* tier_settings.force_s 0 */
 #define ECCOLD_WAIT_MAX_S_DEFAULT 600 /* tier_settings.wait_max_s 0 */

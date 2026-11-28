@@ -235,6 +235,11 @@ uint64_t eccold_active_sv(const struct eng *db)
     return db ? atomic_load_explicit(&db->cold_active_sv, memory_order_seq_cst) : 0;
 }
 
+bool eccold_put_active(const struct eng *db)
+{
+    return db && atomic_load_explicit(&db->cold_put_active, memory_order_seq_cst) != 0;
+}
+
 static int64_t mono_ms(void)
 {
     struct timespec ts;
@@ -292,7 +297,7 @@ static int stripe_wait(eng *db, const coldvol *cv, uint64_t epoch, uint64_t sv, 
     for (;;) {
         if (eng_check(db))
             return TSDB_ERR_IO;
-        if (ecsettle_stopping(db) || !eccold_leader(db))
+        if (ecsettle_stopping(db) || !eccold_leader(db) || coldvol_epoch(cv) != epoch || stripe_of(cv) != sv)
             return TSDB_ERR_STOPPED;
         if (stripe_written_ok(cv, epoch, sv, written_mask))
             return 0;
@@ -594,6 +599,7 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     cut.stripe_version = sv;
     int64_t t_gate = 0;
     bool degraded = false;
+    bool put_counted = false;
     uint32_t posmask = 0;
     uint32_t written_union = 0;
     if (cv->ops->stripe_up_mask) {
@@ -687,6 +693,8 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
         goto out;
     }
     /* 1: the objects, no engine lock held */
+    atomic_fetch_add_explicit(&db->cold_put_active, 1, memory_order_seq_cst);
+    put_counted = true;
     for (; nput < np; nput++) {
         uint64_t e = 0;
         uint32_t wmask = 0;
@@ -859,6 +867,8 @@ out:
     free(y);
     for (size_t i = 0; i < nput; i++) /* put, never indexed: nothing names them */
         ecsettle_gc_object(db, &recs[i]);
+    if (put_counted)
+        atomic_fetch_sub_explicit(&db->cold_put_active, 1, memory_order_seq_cst);
     for (size_t i = 0; i < np; i++)
         ec_record_free(&recs[i]);
     free(recs);
@@ -955,7 +965,7 @@ int eccold_reencode(eng *db, int64_t key, part **pin, size_t np)
     part *merged = NULL, *out = NULL;
     ec_record rec;
     memset(&rec, 0, sizeof rec);
-    bool have_rec = false, put_unindexed = false;
+    bool have_rec = false, put_unindexed = false, put_counted = false;
     part **y = NULL, **part_srcs = NULL;
     size_t ny = 0, npart_srcs = 0, nret = 0;
     uint8_t (*ret_oids)[16] = NULL;
@@ -987,6 +997,8 @@ int eccold_reencode(eng *db, int64_t key, part **pin, size_t np)
 
     /* 2. Put the combined object onto the stripe group outside every engine lock (full stripe group, no degraded). */
     if (merged->ng > 0) {
+        atomic_fetch_add_explicit(&db->cold_put_active, 1, memory_order_seq_cst);
+        put_counted = true;
         rc = ecsettle_put(db, merged, &rec, &epoch);
         if (rc != 0)
             goto out;
@@ -1274,6 +1286,8 @@ out:
         part_unref(out);
     if (put_unindexed)
         ecsettle_gc_object(db, &rec);
+    if (put_counted)
+        atomic_fetch_sub_explicit(&db->cold_put_active, 1, memory_order_seq_cst);
     if (have_rec)
         ec_record_free(&rec);
     cut.rc = rc;

@@ -56,6 +56,7 @@ static const char cl_help[] =
     "       tsdb cluster volume transfer PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster volume move PEER VOLUME --log --from NODE --to NODE [--cancel] --secret-file F\n"
     "       tsdb cluster volume move PEER VOLUME --pos P --to NODE --secret-file F\n"
+    "       tsdb cluster volume redundancy PEER VOLUME (ec=K+M | replicas=N | --cancel) --secret-file F\n"
     "       tsdb cluster replica reset PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster status PEER [--json] --secret-file F\n"
     "       tsdb cluster status volumes [--json] PEER --secret-file F\n"
@@ -118,6 +119,9 @@ static const char cl_help[] =
     "                      move that has not removed A yet).\n"
     "  volume move PEER VOLUME --pos P --to B  moves stripe position P of erasure-coded volume VOLUME to node B\n"
     "                      (B is marked filling with the previous holder kept until whole).\n"
+    "  volume redundancy PEER VOLUME (ec=K+M | replicas=N | --cancel)  converts VOLUME online between replicated\n"
+    "                      and erasure-coded geometries (grow -> record -> reencode/unsettle -> drop -> shrink).\n"
+    "                      Returns immediately; track progress with `tsdb cluster status volume VOLUME`.\n"
     "  replica reset PEER VOLUME NODE  gives the copy on NODE (neither the leader nor in sync) a new identity: its\n"
     "                      directory is set aside as v<N>.lost-<rid> and it is rebuilt from a snapshot.\n"
     "  status PEER         what that server knows: its role, the leader, quorum, settings, every member (up or\n"
@@ -280,6 +284,16 @@ static const char help_volume_move[] =
     "  Move a log replica (--log --from A --to B [--cancel]) or an EC stripe position (--pos P --to B).\n"
     "  Exit codes: 0 ok, 1 refused/failed, 2 usage.\n";
 
+static const char help_volume_redundancy[] =
+    "usage: tsdb cluster volume redundancy PEER VOLUME (ec=K+M | replicas=N) --secret-file F\n"
+    "       tsdb cluster volume redundancy PEER VOLUME --cancel --secret-file F\n"
+    "\n"
+    "  Start or cancel an online redundancy conversion of VOLUME (name or number) between replicated and EC\n"
+    "  geometries (K 1..16, M 1..4). Returns immediately once committed; the Raft leader drives the conversion\n"
+    "  through grow, record, reencode (or unsettle), drop, and shrink. Track progress via `status volume VOLUME`.\n"
+    "  --cancel stops a conversion before the drop phase (refused once old positions are being dropped).\n"
+    "  Exit codes: 0 ok, 1 refused/failed, 2 usage.\n";
+
 static const char help_replica_reset[] =
     "usage: tsdb cluster replica reset PEER VOLUME NODE --secret-file F\n"
     "\n"
@@ -323,7 +337,7 @@ static const char help_status[] =
     "      volume:    number, name, uuid, kind, leader, preferred, epoch, min_isr, isr, isr_version,\n"
     "                 set_version, redundancy, ec_k, ec_m, gc_suspended, mixed_class, rack_survivable,\n"
     "                 young_margin, settled_margin, settled_state, health, warnings, replicas, stripe,\n"
-    "                 reports, rebuild, settle_backlog, young_scrub_age_s\n"
+    "                 reports, rebuild, settle_backlog, young_scrub_age_s, conversion\n"
     "    status disks --json:\n"
     "      top-level: view, reported, chunk_fill_mark_pct, classes, disks, warnings\n"
     "      classes[]: class, disks, disks_up, disks_down, disks_out, disks_destroyed, size_bytes,\n"
@@ -654,6 +668,9 @@ struct cl_vol_view {
     uint64_t young_scrub_age_s;
     uint32_t nwarnings;
     const char *warnings[8];
+    int conv_active;
+    int conv_old_known;
+    uint64_t conv_old_objs;
 };
 
 static void add_warn(struct cl_vol_view *vv, const char *w)
@@ -683,29 +700,61 @@ static void compute_vol_view(const struct cluster_status *st, const struct meta_
     if (any_rack && v->kind != META_VOL_SHARED && !out->rack_survivable)
         add_warn(out, "rack_not_survivable");
 
-    uint32_t destroyed = 0;
     int stripe_degraded = 0;
-    if (v->redundancy == META_RED_EC && v->nstripe > 0) {
+    int has_ec_geom = 0;
+    uint32_t g_k[3], g_m[3];
+    int ng = 0;
+    if (v->nstripe > 0) {
+        if (v->redundancy == META_RED_EC && v->ec_k > 0 && v->ec_m > 0) {
+            g_k[ng] = v->ec_k;
+            g_m[ng++] = v->ec_m;
+        }
+        if ((v->conv.phase == META_CONV_REENCODE || v->conv.phase == META_CONV_DROP) &&
+            v->conv.orig_redundancy == META_RED_EC && v->conv.orig_k > 0 && v->conv.orig_m > 0) {
+            g_k[ng] = v->conv.orig_k;
+            g_m[ng++] = v->conv.orig_m;
+        }
+        if (v->mixed_redundancy == META_RED_EC && v->mixed_k > 0 && v->mixed_m > 0) {
+            g_k[ng] = v->mixed_k;
+            g_m[ng++] = v->mixed_m;
+        }
+        has_ec_geom = (ng > 0);
+    }
+    if (has_ec_geom) {
         int sm = 0;
         meta_vol_margins(m, v, NULL, NULL, &sm);
         out->settled_margin = sm;
         out->settled_na = 0;
+        int is_lost = 0;
+        int min_m = INT_MAX;
+        for (int gi = 0; gi < ng; gi++) {
+            uint32_t gw = g_k[gi] + g_m[gi];
+            if (gw > v->nstripe)
+                gw = v->nstripe;
+            uint32_t gdest = 0;
+            for (uint32_t p = 0; p < gw && p < META_STRIPE_MAX; p++) {
+                const struct meta_member *mb = meta_member(m, v->stripe[p]);
+                if (mb && mb->state == META_DESTROYED)
+                    gdest++;
+            }
+            if (gdest > g_m[gi])
+                is_lost = 1;
+            if ((int)g_m[gi] < min_m)
+                min_m = (int)g_m[gi];
+        }
         for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
-            const struct meta_member *mb = meta_member(m, v->stripe[p]);
-            if (mb && mb->state == META_DESTROYED)
-                destroyed++;
             if (v->stripe_pos[p].state == META_STRIPE_FILLING) {
                 out->nfills_active++;
                 stripe_degraded = 1;
             }
         }
-        if (destroyed > v->ec_m)
+        if (is_lost)
             out->settled_state = "lost";
         else if (out->settled_margin < 0)
             out->settled_state = "unavailable";
         else
             out->settled_state = "ok";
-        if (out->settled_margin < (int)v->ec_m)
+        if (min_m != INT_MAX && out->settled_margin < min_m)
             stripe_degraded = 1;
         out->mixed_class = place_stripe_mixed_class(m, v);
         if (out->mixed_class)
@@ -715,6 +764,36 @@ static void compute_vol_view(const struct cluster_status *st, const struct meta_
     } else {
         out->settled_na = 1;
         out->settled_state = "none";
+    }
+
+    if (v->conv.phase != META_CONV_NONE) {
+        out->conv_active = 1;
+        if ((v->conv.phase == META_CONV_REENCODE || v->conv.phase == META_CONV_DROP) &&
+            v->conv.new_stripe_version > 0) {
+            const struct cluster_heard *lh = v->leader ? find_heard(st, v->leader) : NULL;
+            for (uint32_t j = 0; lh && j < lh->nlive_objs; j++) {
+                const struct cluster_live_objs_report *lo = &lh->live_objs[j];
+                if (lo->volume != v->number || lo->epoch != v->epoch ||
+                    lo->stripe_version < v->conv.new_stripe_version || lo->overflow)
+                    continue;
+                uint64_t rem = 0;
+                for (uint32_t k = 0; k < lo->nsv && k < META_LIVE_SV_MAX; k++)
+                    if (lo->sv[k].stripe_version < v->conv.new_stripe_version)
+                        rem = status_add_sat(rem, lo->sv[k].count);
+                out->conv_old_objs = rem;
+                out->conv_old_known = 1;
+                break;
+            }
+            if (!out->conv_old_known && v->live_epoch == v->epoch &&
+                v->live_sv_at >= v->conv.new_stripe_version && !v->live_overflow) {
+                uint64_t rem = 0;
+                for (uint32_t k = 0; k < v->nlive_sv && k < META_LIVE_SV_MAX; k++)
+                    if (v->live_sv[k].stripe_version < v->conv.new_stripe_version)
+                        rem = status_add_sat(rem, v->live_sv[k].count);
+                out->conv_old_objs = rem;
+                out->conv_old_known = 1;
+            }
+        }
     }
 
     int any_damaged = 0, any_fault = 0;
@@ -1298,7 +1377,7 @@ static void print_volume_json(const struct cluster_status *st, const struct meta
     printf("],\n");
 
     printf("%s  \"stripe\": [", indent);
-    if (v->redundancy == META_RED_EC) {
+    if (v->nstripe > 0) {
         for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
             printf("%s{\"pos\": %" PRIu32 ", \"node\": %" PRIu32 ", \"state\": \"%s\", \"prev\": %" PRIu32
                    ", \"set_ver\": %" PRIu64 "}",
@@ -1372,7 +1451,28 @@ static void print_volume_json(const struct cluster_status *st, const struct meta
 
     printf("%s  \"settle_backlog\": {\"keys_waiting\": %" PRIu32 ", \"oldest_wait_s\": %" PRIu64 "},\n", indent,
            vv.settle_keys_waiting, vv.settle_oldest_wait_s);
-    printf("%s  \"young_scrub_age_s\": %" PRIu64 "\n", indent, vv.young_scrub_age_s);
+    printf("%s  \"young_scrub_age_s\": %" PRIu64 ",\n", indent, vv.young_scrub_age_s);
+    if (v->conv.phase != META_CONV_NONE) {
+        char ctgt[32], corig[32];
+        if (v->conv.target_redundancy == META_RED_EC)
+            snprintf(ctgt, sizeof ctgt, "ec=%u+%u", v->conv.target_k, v->conv.target_m);
+        else
+            snprintf(ctgt, sizeof ctgt, "replicas=%" PRIu32, v->conv.target_replicas);
+        if (v->conv.orig_redundancy == META_RED_EC)
+            snprintf(corig, sizeof corig, "ec=%u+%u", v->conv.orig_k, v->conv.orig_m);
+        else
+            snprintf(corig, sizeof corig, "replicas=%" PRIu32, v->conv.orig_replicas);
+        printf("%s  \"conversion\": {\"phase\": \"%s\", \"target\": \"%s\", \"orig\": \"%s\", \"target_replicas\": %" PRIu32
+               ", \"new_stripe_version\": %" PRIu64 ", \"old_objects_remaining\": ",
+               indent, meta_conv_phase_name(v->conv.phase), ctgt, corig, v->conv.target_replicas,
+               v->conv.new_stripe_version);
+        if (vv.conv_old_known)
+            printf("%" PRIu64 "}\n", vv.conv_old_objs);
+        else
+            fputs("null}\n", stdout);
+    } else {
+        printf("%s  \"conversion\": null\n", indent);
+    }
     printf("%s}", indent);
 }
 
@@ -1547,8 +1647,33 @@ static void print_status_summary_text(const struct cluster_status *st)
                 printf(" mixed_class 1");
         } else {
             printf(" redundancy replicas=%" PRIu32, v->nrep);
+            if (v->nstripe > 0) {
+                printf(" stripe");
+                for (uint32_t k = 0; k < v->nstripe && k < META_STRIPE_MAX; k++)
+                    printf("%s%" PRIu32, k ? "," : " ", v->stripe[k]);
+                printf(" stripe_version %" PRIu64, v->stripe_version);
+            }
         }
         printf(" rack loss survivable: %s\n", vv.rack_survivable ? "yes" : "no");
+        if (v->conv.phase != META_CONV_NONE) {
+            char ctgt[32], corig[32];
+            if (v->conv.target_redundancy == META_RED_EC)
+                snprintf(ctgt, sizeof ctgt, "ec=%u+%u", v->conv.target_k, v->conv.target_m);
+            else
+                snprintf(ctgt, sizeof ctgt, "replicas=%" PRIu32, v->conv.target_replicas);
+            if (v->conv.orig_redundancy == META_RED_EC)
+                snprintf(corig, sizeof corig, "ec=%u+%u", v->conv.orig_k, v->conv.orig_m);
+            else
+                snprintf(corig, sizeof corig, "replicas=%" PRIu32, v->conv.orig_replicas);
+            printf("conversion volume %" PRIu32 " phase %s target %s orig %s target_replicas %" PRIu32
+                   " new_stripe_version %" PRIu64 " old_objects ",
+                   v->number, meta_conv_phase_name(v->conv.phase), ctgt, corig, v->conv.target_replicas,
+                   v->conv.new_stripe_version);
+            if (vv.conv_old_known)
+                printf("%" PRIu64 "\n", vv.conv_old_objs);
+            else
+                puts("-");
+        }
         if (v->redundancy == META_RED_EC && vv.mixed_class)
             printf("health warn=mixed_stripe_class volume=%" PRIu32 " name=%s\n", v->number, v->name);
         for (uint32_t k = 0; k < v->nrep; k++) {
@@ -1976,13 +2101,32 @@ static int print_status_volume(const struct cluster_status *st, const char *vol_
         printf("%d", vv.settled_margin);
     printf(" settled_state %s rack_survivable %s\n", vv.settled_state, vv.rack_survivable ? "yes" : "no");
 
-    if (v->redundancy == META_RED_EC) {
+    if (v->nstripe > 0) {
         printf("stripe");
         for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++)
             printf("%s%" PRIu32 "%s", p ? "," : " ", v->stripe[p],
                    v->stripe_pos[p].state == META_STRIPE_FILLING ? "(filling)" : "");
         printf("%s stripe_version %" PRIu64 " gc_suspended %u mixed_class %d\n", v->nstripe ? "" : " -",
                v->stripe_version, v->gc_suspended, vv.mixed_class);
+    }
+
+    if (v->conv.phase != META_CONV_NONE) {
+        char ctgt[32], corig[32];
+        if (v->conv.target_redundancy == META_RED_EC)
+            snprintf(ctgt, sizeof ctgt, "ec=%u+%u", v->conv.target_k, v->conv.target_m);
+        else
+            snprintf(ctgt, sizeof ctgt, "replicas=%" PRIu32, v->conv.target_replicas);
+        if (v->conv.orig_redundancy == META_RED_EC)
+            snprintf(corig, sizeof corig, "ec=%u+%u", v->conv.orig_k, v->conv.orig_m);
+        else
+            snprintf(corig, sizeof corig, "replicas=%" PRIu32, v->conv.orig_replicas);
+        printf("conversion phase %s target %s orig %s target_replicas %" PRIu32 " new_stripe_version %" PRIu64
+               " old_objects ",
+               meta_conv_phase_name(v->conv.phase), ctgt, corig, v->conv.target_replicas, v->conv.new_stripe_version);
+        if (vv.conv_old_known)
+            printf("%" PRIu64 "\n", vv.conv_old_objs);
+        else
+            puts("-");
     }
 
     for (uint32_t k = 0; k < v->nrep; k++) {
@@ -2263,9 +2407,10 @@ struct cl_ctx {
     uint32_t replicas;
     uint32_t ec_k, ec_m;
 
-    /* volume move / node hold / node drain / node replace */
+    /* volume move / volume redundancy / node hold / node drain / node replace */
     uint32_t mv_from, mv_to, mv_flags, mv_pos;
     int have_pos;
+    uint32_t red_flags;
     uint32_t hold_for_s, hold_flags, drain_flags, repl_flags;
     int have_hold_for;
 
@@ -2552,6 +2697,16 @@ static int parse_flag_volume_move(struct cl_ctx *ctx, int argc, char **argv, int
     return 0;
 }
 
+static int parse_flag_volume_redundancy(struct cl_ctx *ctx, int argc, char **argv, int *idx)
+{
+    (void)argc;
+    if (!strcmp(argv[*idx], "--cancel")) {
+        ctx->red_flags |= CLUSTER_REDUND_CANCEL;
+        return 1;
+    }
+    return 0;
+}
+
 static int parse_flag_status(struct cl_ctx *ctx, int argc, char **argv, int *idx)
 {
     (void)argc;
@@ -2731,8 +2886,9 @@ static int enc_volume_add(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *
     return 0;
 }
 
-/* `volume gc resume`'s VOLUME: exact name in PEER's status, else numeric volume number. */
-static int resolve_gc_volume(const char *s, const char *addr, const uint8_t *secret, size_t slen, uint32_t *out)
+/* Resolve VOLUME by exact name in PEER's status, else numeric volume number. */
+static int resolve_volume_arg(const char *cmd, const char *s, const char *addr, const uint8_t *secret, size_t slen,
+                              uint32_t *out)
 {
     char *end;
     unsigned long v = strtoul(s, &end, 10);
@@ -2765,7 +2921,7 @@ static int resolve_gc_volume(const char *s, const char *addr, const uint8_t *sec
         found = 1;
     }
     if (!found)
-        fprintf(stderr, "tsdb cluster volume gc resume: no volume named %s in the status of %s\n", s, addr);
+        fprintf(stderr, "tsdb cluster %s: no volume named %s in the status of %s\n", cmd, s, addr);
     return found ? 0 : -1;
 }
 
@@ -2774,11 +2930,67 @@ static int enc_volume_gc_resume(struct cl_ctx *ctx, uint8_t *req, size_t cap, si
     (void)cap;
     ctx->peer = ctx->pos[0];
     uint32_t gv = 0;
-    if (resolve_gc_volume(ctx->pos[1], ctx->peer, ctx->secret, ctx->slen, &gv) != 0)
+    if (resolve_volume_arg("volume gc resume", ctx->pos[1], ctx->peer, ctx->secret, ctx->slen, &gv) != 0)
         return 1;
     for (int j = 0; j < 4; j++)
         req[j] = (uint8_t)(gv >> (8 * j));
     *req_len = 4;
+    return 0;
+}
+
+static int enc_volume_redundancy(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
+{
+    if (cap < 16)
+        return 1;
+    ctx->peer = ctx->pos[0];
+    struct meta_redundancy_target tgt;
+    memset(&tgt, 0, sizeof tgt);
+    if (ctx->red_flags & CLUSTER_REDUND_CANCEL) {
+        if (ctx->npos != 2) {
+            fprintf(stderr, "tsdb cluster volume redundancy: --cancel takes no target geometry\n");
+            return 2;
+        }
+    } else {
+        if (ctx->npos != 3) {
+            fprintf(stderr, "tsdb cluster volume redundancy: expected target ec=K+M or replicas=N (or --cancel)\n");
+            return 2;
+        }
+        const char *rv = ctx->pos[2];
+        char *end = NULL;
+        if (!strncmp(rv, "replicas=", 9)) {
+            uint32_t nr = 0;
+            if (num("replicas=", rv + 9, &nr) != 0 || nr > META_REPLICAS_MAX) {
+                fprintf(stderr, "tsdb cluster volume redundancy: %s: expected replicas=1..%d\n", rv, META_REPLICAS_MAX);
+                return 2;
+            }
+            tgt.redundancy = META_RED_REPLICAS;
+            tgt.replicas = nr;
+        } else if (!strncmp(rv, "ec=", 3)) {
+            unsigned long k = strtoul(rv + 3, &end, 10), m = 0;
+            int ok = end != rv + 3 && *end == '+' && isdigit((unsigned char)rv[3]);
+            if (ok) {
+                const char *ms = end + 1;
+                m = strtoul(ms, &end, 10);
+                ok = end != ms && !*end && isdigit((unsigned char)ms[0]);
+            }
+            if (!ok || k < 1 || k > META_EC_K_MAX || m < 1 || m > META_EC_M_MAX) {
+                fprintf(stderr, "tsdb cluster volume redundancy: %s: expected ec=K+M with K 1 to %d and M 1 to %d\n",
+                        rv, META_EC_K_MAX, META_EC_M_MAX);
+                return 2;
+            }
+            tgt.redundancy = META_RED_EC;
+            tgt.ec_k = (uint8_t)k;
+            tgt.ec_m = (uint8_t)m;
+            tgt.replicas = (uint32_t)(m + 1);
+        } else {
+            fprintf(stderr, "tsdb cluster volume redundancy: %s: expected ec=K+M or replicas=N\n", rv);
+            return 2;
+        }
+    }
+    uint32_t vol = 0;
+    if (resolve_volume_arg("volume redundancy", ctx->pos[1], ctx->peer, ctx->secret, ctx->slen, &vol) != 0)
+        return 1;
+    *req_len = cluster_volume_redundancy_encode(vol, &tgt, ctx->red_flags, req);
     return 0;
 }
 
@@ -3306,6 +3518,9 @@ static const struct cl_verb cl_verbs[] = {
      prt_text_reply, help_volume_transfer},
     {{"volume", "move", NULL}, 2, 2, 2, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_VOLUME_MOVE, 30000, parse_flag_volume_move,
      enc_volume_move, prt_text_reply, help_volume_move},
+    {{"volume", "redundancy", NULL}, 2, 2, 3, CL_VF_PRINT_ERR_BODY | CL_VF_SECRET_IN_ENCODE,
+     CLUSTER_OP_VOLUME_REDUNDANCY, 30000, parse_flag_volume_redundancy, enc_volume_redundancy, prt_text_reply,
+     help_volume_redundancy},
     {{"replica", "reset", NULL}, 2, 3, 3, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_REPLICA_RESET, 30000, NULL, enc_vol_node,
      prt_text_reply, help_replica_reset},
     {{"status", "volumes", NULL}, 2, 1, 1, 0, CLUSTER_OP_STATUS, 30000, parse_flag_status, enc_status_volumes,

@@ -19,6 +19,87 @@ static int member_state(const struct cluster_copy *cp, uint32_t id)
     return -1;
 }
 
+static void eval_geom(const struct cluster_copy *cp, const struct cluster_copy_vol *v, const uint32_t *destroyed,
+                      size_t nd, bool corrupt, int mutant, uint32_t npos, uint8_t k, uint8_t m, int *settled_out,
+                      uint8_t *tier_out, uint8_t *present_out, uint8_t *away_out, uint8_t *destroyed_out)
+{
+    uint8_t pres = 0, away = 0, dest = 0;
+    for (uint32_t p = 0; p < npos && p < v->nstripe && p < META_STRIPE_MAX; p++) {
+        bool gone = false;
+        for (size_t i = 0; i < nd && !gone; i++)
+            gone = destroyed[i] == v->stripe[p];
+        int st = member_state(cp, v->stripe[p]);
+        if (st == META_DESTROYED)
+            gone = true;
+        if (gone && mutant != MARGIN_MUT_LOSTASDOWN)
+            dest++;
+        else if (!gone && (st == META_UP || st == META_DRAINING))
+            pres++;
+        else
+            away++;
+    }
+    int base = mutant == MARGIN_MUT_MARGINOFF ? (int)k + (int)m : (int)k;
+    int settled = (int)pres - base;
+    uint8_t tier;
+    if (dest > m)
+        tier = MARGIN_TIER_LOST;
+    else if (corrupt && mutant == MARGIN_MUT_CORRUPTFIRST)
+        tier = MARGIN_TIER_CORRUPT;
+    else if (pres < k)
+        tier = MARGIN_TIER_UNAVAILABLE;
+    else if (corrupt)
+        tier = MARGIN_TIER_CORRUPT;
+    else
+        tier = MARGIN_TIER_OK;
+    *settled_out = settled;
+    *tier_out = tier;
+    *present_out = pres;
+    *away_out = away;
+    *destroyed_out = dest;
+}
+
+static int tier_rank(uint8_t tier, int mutant)
+{
+    if (tier == MARGIN_TIER_LOST)
+        return 4;
+    if (mutant == MARGIN_MUT_CORRUPTFIRST) {
+        if (tier == MARGIN_TIER_CORRUPT)
+            return 3;
+        if (tier == MARGIN_TIER_UNAVAILABLE)
+            return 2;
+    } else {
+        if (tier == MARGIN_TIER_UNAVAILABLE)
+            return 3;
+        if (tier == MARGIN_TIER_CORRUPT)
+            return 2;
+    }
+    if (tier == MARGIN_TIER_OK)
+        return 1;
+    return 0;
+}
+
+static void merge_geom(struct margins *out, bool *have, int settled, uint8_t tier, uint8_t pres, uint8_t away,
+                       uint8_t dest, int mutant)
+{
+    if (!*have) {
+        out->settled = settled;
+        out->tier = tier;
+        out->present = pres;
+        out->away = away;
+        out->destroyed = dest;
+        *have = true;
+        return;
+    }
+    if (settled < out->settled) {
+        out->settled = settled;
+        out->present = pres;
+        out->away = away;
+        out->destroyed = dest;
+    }
+    if (tier_rank(tier, mutant) > tier_rank(out->tier, mutant))
+        out->tier = tier;
+}
+
 void margins_of(const struct cluster_copy *cp, const struct cluster_copy_vol *v, const uint32_t *destroyed, size_t nd,
                 bool corrupt, int mutant, struct margins *out)
 {
@@ -29,36 +110,38 @@ void margins_of(const struct cluster_copy *cp, const struct cluster_copy_vol *v,
         out->young = 0;
         out->young_na = true;
     }
-    if (v->redundancy != META_RED_EC || v->nstripe == 0) {
+    if (v->nstripe == 0) {
         out->tier = MARGIN_TIER_NONE;
         return;
     }
-    for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
-        bool gone = false;
-        for (size_t i = 0; i < nd && !gone; i++)
-            gone = destroyed[i] == v->stripe[p];
-        int st = member_state(cp, v->stripe[p]);
-        if (st == META_DESTROYED)
-            gone = true;
-        if (gone && mutant != MARGIN_MUT_LOSTASDOWN)
-            out->destroyed++;
-        else if (!gone && (st == META_UP || st == META_DRAINING))
-            out->present++;
-        else
-            out->away++;
+    bool have = false;
+    int s;
+    uint8_t t, pres, away, dest;
+    if (v->redundancy == META_RED_EC && v->ec_k > 0) {
+        uint32_t npos = (uint32_t)v->ec_k + (uint32_t)v->ec_m;
+        if (npos > v->nstripe)
+            npos = v->nstripe;
+        eval_geom(cp, v, destroyed, nd, corrupt, mutant, npos, v->ec_k, v->ec_m, &s, &t, &pres, &away, &dest);
+        merge_geom(out, &have, s, t, pres, away, dest, mutant);
     }
-    int base = mutant == MARGIN_MUT_MARGINOFF ? (int)v->ec_k + (int)v->ec_m : (int)v->ec_k;
-    out->settled = (int)out->present - base;
-    if (out->destroyed > v->ec_m)
-        out->tier = MARGIN_TIER_LOST;
-    else if (corrupt && mutant == MARGIN_MUT_CORRUPTFIRST)
-        out->tier = MARGIN_TIER_CORRUPT;
-    else if (out->present < v->ec_k)
-        out->tier = MARGIN_TIER_UNAVAILABLE;
-    else if (corrupt)
-        out->tier = MARGIN_TIER_CORRUPT;
-    else
-        out->tier = MARGIN_TIER_OK;
+    /* R10 (D29): during REENCODE/DROP, old EC objects still use orig_k+orig_m — take minimum margin across geometries. */
+    if ((v->conv.phase == META_CONV_REENCODE || v->conv.phase == META_CONV_DROP) &&
+        v->conv.orig_redundancy == META_RED_EC && v->conv.orig_k > 0 &&
+        v->nstripe >= (uint32_t)v->conv.orig_k + (uint32_t)v->conv.orig_m) {
+        uint32_t npos = (uint32_t)v->conv.orig_k + (uint32_t)v->conv.orig_m;
+        eval_geom(cp, v, destroyed, nd, corrupt, mutant, npos, v->conv.orig_k, v->conv.orig_m, &s, &t, &pres, &away,
+                  &dest);
+        merge_geom(out, &have, s, t, pres, away, dest, mutant);
+    }
+    /* R10 (D29): after a cancelled REENCODE, leftover EC objects keep capping settled margin until cleared. */
+    if (v->mixed_redundancy == META_RED_EC && v->mixed_k > 0 &&
+        v->nstripe >= (uint32_t)v->mixed_k + (uint32_t)v->mixed_m) {
+        uint32_t npos = (uint32_t)v->mixed_k + (uint32_t)v->mixed_m;
+        eval_geom(cp, v, destroyed, nd, corrupt, mutant, npos, v->mixed_k, v->mixed_m, &s, &t, &pres, &away, &dest);
+        merge_geom(out, &have, s, t, pres, away, dest, mutant);
+    }
+    if (!have)
+        out->tier = MARGIN_TIER_NONE;
 }
 
 const char *margin_tier_name(int tier)

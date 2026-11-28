@@ -1600,6 +1600,77 @@ static void test_filling_reads_and_release(void)
     chunksrv_set_rel_guard(F.cs[1], NULL, NULL);
     CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) == 0);
 
+    /* 5f. R10 retired-position release (pos >= active, retired_ver > 0) and post-STRIPE_DROP (nstripe == 0):
+     *     - candidate emitted with retired=1;
+     *     - release_verify refuses while any live object has sv < ver or pos < npos;
+     *     - once 0 old live objects remain, release_verify returns 1 and release_pos deletes orphan chunks;
+     *     - if node holds active pos again (e.g. --cancel), release_pos returns 0 without deleting;
+     *     - after STRIPE_DROP reduces nstripe to 0, a pending release still deletes remaining orphan chunks. */
+    atomic_store(&g_rel_guard_rc, 0);
+    chunksrv_set_rel_guard(F.cs[5], mock_rel_guard, NULL);
+    chunksrv_set_rel_guard(F.cs[4], mock_rel_guard, NULL);
+    pthread_mutex_lock(&F.mu);
+    F.view.stripe[0] = 6;
+    F.view.stripe[3] = 4;
+    F.view.stripe[4] = 5;
+    F.view.stripe_prev[0] = 0;
+    F.view.stripe_prev[3] = 0;
+    F.view.stripe_prev[4] = 0;
+    F.view.stripe_filling[0] = 0;
+    F.view.stripe_filling[3] = 0;
+    F.view.stripe_filling[4] = 0;
+    F.view.stripe_set_ver[0] = 3;
+    F.view.stripe_set_ver[3] = 3;
+    F.view.stripe_set_ver[4] = 3;
+    F.view.k = 2;
+    F.view.m = 2; /* active = 4, so pos 4 (on node 5) is retired */
+    F.view.nstripe = 5;
+    F.view.stripe_version = 4;
+    F.view.stripe_retired_ver[4] = 4;
+    pthread_mutex_unlock(&F.mu);
+
+    cold_release rcands[8];
+    unsigned rnc = coldops_peer.release_candidates(ctx, rcands, 8);
+    bool found_ret = false;
+    for (unsigned i = 0; i < rnc; i++)
+        if (rcands[i].pos == 4 && rcands[i].node == 5 && rcands[i].version == 4 && rcands[i].retired == 1)
+            found_ret = true;
+    CHECK(found_ret);
+    /* Still refused while live objects exist with sv < 4 or pos 4 < npos. */
+    CHECK(coldops_peer.release_verify(ctx, 4, 5, 4, live, 3) == -1);
+    /* With 0 live objects, node 5 holds old_o/old_o2/new_o at pos 4 -> verify returns 1, release_pos cleans it. */
+    CHECK(coldops_peer.release_verify(ctx, 4, 5, 4, NULL, 0) == 1);
+    CHECK(coldops_peer.release_pos(ctx, 4, 5, 4, 5, 43) == 0);
+    CHECK(coldops_peer.release_verify(ctx, 4, 5, 4, NULL, 0) == 0);
+
+    /* Post-STRIPE_DROP (nstripe == 0, k == 0, m == 0): pending release on pos 3 (node 4) still deletes its chunks! */
+    pthread_mutex_lock(&F.mu);
+    F.view.k = 0;
+    F.view.m = 0;
+    F.view.nstripe = 0;
+    F.view.stripe_version = 5;
+    F.view.stripe_retired_ver[4] = 0;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.release_pos(ctx, 3, 4, 5, 5, 44) == 0);
+    /* Restore active pos 3 on node 4: release_pos returns 0 as SUPERSEDED without error. */
+    pthread_mutex_lock(&F.mu);
+    F.view.k = 3;
+    F.view.m = 2;
+    F.view.nstripe = 5;
+    F.view.stripe[3] = 4;
+    F.view.stripe_retired_ver[3] = 5;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.release_pos(ctx, 3, 4, 5, 5, 44) == 0);
+    /* Confirm node 4 actually has 0 chunks left at pos 3 after the post-drop release above. */
+    pthread_mutex_lock(&F.mu);
+    F.view.k = 0;
+    F.view.m = 0;
+    F.view.stripe_retired_ver[3] = 5;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.release_verify(ctx, 3, 4, 5, NULL, 0) == 0);
+    chunksrv_set_rel_guard(F.cs[5], NULL, NULL);
+    chunksrv_set_rel_guard(F.cs[4], NULL, NULL);
+
     free(got);
     obj_free(&old_o);
     obj_free(&old_o2);

@@ -825,6 +825,12 @@ static void putdown_hook(eng *db, int step)
     if (step == ECCOLD_STEP_PUT)
         atomic_store(&DOWN, true);
 }
+static void svbump_hook(eng *db, int step)
+{
+    (void)db;
+    if (step == ECCOLD_STEP_PUT)
+        atomic_fetch_add(&SV, 1);
+}
 static void test_down(void)
 {
     lt L;
@@ -858,6 +864,14 @@ static void test_down(void)
     CHECK(c.rc == TSDB_ERR_UNAVAILABLE && !c.gated);
     atomic_store(&DOWN, false);
     CHECK(chunks_go(&L, 0)); /* nothing names the objects: r7-gc takes them */
+    /* stripe_version advances during put: stripe_wait aborts immediately (STOPPED, never waits wait_max_s for UNAVAILABLE) */
+    uint64_t saved_sv = atomic_load(&SV);
+    atomic_store(&CASE_HOOK, svbump_hook);
+    int sv_rc = settle_key(L.db, KEY);
+    atomic_store(&CASE_HOOK, NULL);
+    atomic_store(&SV, saved_sv);
+    CHECK(sv_rc == TSDB_ERR_STOPPED);
+    CHECK(chunks_go(&L, 0));
     /* DOWN at the re-check after the gate */
     atomic_store(&CASE_HOOK, down_hook);
     CHECK(settle_key(L.db, KEY) == TSDB_ERR_UNAVAILABLE);

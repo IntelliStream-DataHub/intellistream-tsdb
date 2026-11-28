@@ -245,8 +245,14 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
         return 0;
     /* R8: a cluster ec volume settles on its leader only (settle_engine asks), never on a diverged engine (item 9) */
     bool cluster = db->ec_cluster;
-    if (cluster && atomic_load(&db->diverged))
-        return 0;
+    if (cluster) {
+        if (atomic_load(&db->diverged))
+            return 0;
+        int ck = 0, cm = 0;
+        tier_settings_get_km(cfg, &ck, &cm);
+        if (ck <= 0 || cm <= 0)
+            return 0; /* R10: redundancy is replicas (e.g. converting ec -> replicas=3): do not settle new parts */
+    }
     /* R15 (D6, E55): a single-server tier opened from TIERS settles after tier_after_s (604,800 s by default, or
      * per-volume TIERS SETTINGS; TSDB_TEST_TIER grace_s= overrides tier_after_s in tier.c). */
     int64_t grace;
@@ -782,6 +788,12 @@ size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, si
     if (!ps || !cfg || !cap || (!cluster && (db->cluster_req || db->replica_req || eng_jr(db))) ||
         (cluster && !eccold_leader(db)) || atomic_load(&db->diverged))
         return 0;
+    if (cluster) {
+        int ck = 0, cm = 0;
+        tier_settings_get_km(cfg, &ck, &cm);
+        if (ck <= 0 || cm <= 0)
+            return 0; /* R10: redundancy is replicas (converting ec -> replicas=3): no automatic EC re-encodes */
+    }
     pthread_mutex_lock(&ps->pmu);
     ecpolicy_state snap = *ps;
     pthread_mutex_unlock(&ps->pmu);

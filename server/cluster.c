@@ -101,6 +101,7 @@
 #include "cluster_int.h"
 
 #include "crashpt.h"
+#include "credund.h"
 #include "creport.h"
 #include "disks.h"
 #include "meta.h"
@@ -1424,6 +1425,7 @@ static struct {
     int stripe_whole_file; /* TSDB_CLUSTER_TEST stripe_whole_file=1: leader proposes STRIPE_WHOLE lines in <state-dir>/stripewhole */
     char stripewholefile[1100];
     int live_objs_test; /* TSDB_CLUSTER_TEST live_objs_test=1: publish test HBS_LIVE_OBJS entries and self-check cl_heard_live_objs */
+    int versions_mixed_file; /* TSDB_CLUSTER_TEST versions_mixed_file=1: cluster_versions_mixed() returns 1 while <state-dir>/versionsmixed exists */
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1856,6 +1858,8 @@ static void test_knobs(void)
             C.nogasp = v != 0;
         else if (sscanf(p, "live_objs_test=%llu", &v) == 1)
             C.live_objs_test = v != 0;
+        else if (sscanf(p, "versions_mixed_file=%llu", &v) == 1)
+            C.versions_mixed_file = v != 0;
         p = strchr(p, ',');
         if (p)
             p++;
@@ -5659,6 +5663,60 @@ int cluster_disk_class_decode(const uint8_t *p, size_t n, uint32_t *node, uint8_
     return 0;
 }
 
+size_t cluster_volume_redundancy_encode(uint32_t volume, const struct meta_redundancy_target *target, uint32_t flags,
+                                        uint8_t *out)
+{
+    for (int j = 0; j < 4; j++)
+        out[j] = (uint8_t)(volume >> (8 * j));
+    out[4] = target ? target->redundancy : 0;
+    out[5] = target ? target->ec_k : 0;
+    out[6] = target ? target->ec_m : 0;
+    out[7] = 0;
+    uint32_t rep = target ? target->replicas : 0;
+    for (int j = 0; j < 4; j++)
+        out[8 + j] = (uint8_t)(rep >> (8 * j));
+    for (int j = 0; j < 4; j++)
+        out[12 + j] = (uint8_t)(flags >> (8 * j));
+    return 16;
+}
+
+int cluster_volume_redundancy_decode(const uint8_t *p, size_t n, uint32_t *volume,
+                                     struct meta_redundancy_target *target, uint32_t *flags)
+{
+    if (!p || n != 16 || p[7] != 0)
+        return -1;
+    *volume = le32(p);
+    memset(target, 0, sizeof *target);
+    target->redundancy = p[4];
+    target->ec_k = p[5];
+    target->ec_m = p[6];
+    target->replicas = le32(p + 8);
+    *flags = le32(p + 12);
+    return 0;
+}
+
+#ifdef TSDB_TEST_HOOKS
+static pthread_mutex_t g_vm_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_vm_on;
+static char g_vm_file[1100];
+#endif
+
+int cluster_versions_mixed(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    char path[1100];
+    int on = 0;
+    pthread_mutex_lock(&g_vm_mu);
+    on = g_vm_on;
+    if (on)
+        snprintf(path, sizeof path, "%s", g_vm_file);
+    pthread_mutex_unlock(&g_vm_mu);
+    if (on)
+        return access(path, F_OK) == 0 ? 1 : 0;
+#endif
+    return 0;
+}
+
 /* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
 static int text_ok_cl(const char *s)
 {
@@ -6950,6 +7008,7 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_DISK_OUT: r4_admin(c, reqid, r, cnode_disk_out_admin); break;
     case CLUSTER_OP_DISK_REPLACE: r4_admin(c, reqid, r, cnode_disk_replace_admin); break;
     case CLUSTER_OP_DISK_CLASS: r4_admin(c, reqid, r, cnode_disk_class_admin); break;
+    case CLUSTER_OP_VOLUME_REDUNDANCY: r4_admin(c, reqid, r, credund_admin); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -8184,6 +8243,11 @@ static void vol_watch_duty(void)
             r->young_move_pct = C.sm.set.young_move_pct;
             r->disk_stall_s = C.sm.set.disk_stall_s;
             r->log_on_hdd = C.sm.set.log_on_hdd;
+            r->redundancy = v->redundancy;
+            r->ec_k = v->ec_k;
+            r->ec_m = v->ec_m;
+            r->nstripe = v->nstripe;
+            r->stripe_version = v->stripe_version;
             for (uint32_t j = 0; hold && j < nprev; j++) /* drop_fence_file: a volume this server led stays so here */
                 if (prev[j].number == r->number && prev[j].leader == C.id && r->epoch > prev[j].epoch) {
                     *r = prev[j];
@@ -9920,7 +9984,7 @@ static void dev_fast_rebuild_duty(uint64_t now)
     uint32_t ncands = 0;
     for (uint32_t vi = 0; vi < C.sm.nvolumes && ncands < 64; vi++) {
         const struct meta_volume *v = &C.sm.volumes[vi];
-        if (v->kind != META_VOL_REPLICATED || v->nrep == 0)
+        if (v->kind != META_VOL_REPLICATED || v->nrep == 0 || v->conv.phase != META_CONV_NONE)
             continue;
         if (ctr_running(v->number) || cl_promo_running(v->number))
             continue;
@@ -10287,6 +10351,7 @@ static void leader_duties(uint64_t now)
     promote_duty(now);
     ctr_duty(now); /* R4: transfers, moves (cluster_int.h; each checks cl_leading itself) */
     cmove_duty(now);
+    credund_duty(now); /* R10 (r10-driver): redundancy conversion state machine */
     cheal_duty(now); /* R12 (D8): automatic transfer/reset for DAMAGED replicas */
     if (leader_settled(now))
         dev_fast_rebuild_duty(now);
@@ -10685,6 +10750,12 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     snprintf(C.fillpctfile, sizeof C.fillpctfile, "%s/fillpct", C.metadir);
     test_knobs();
+#ifdef TSDB_TEST_HOOKS
+    pthread_mutex_lock(&g_vm_mu);
+    g_vm_on = C.versions_mixed_file;
+    snprintf(g_vm_file, sizeof g_vm_file, "%s/versionsmixed", C.metadir);
+    pthread_mutex_unlock(&g_vm_mu);
+#endif
     atomic_store_explicit(&g_fill_override_active, (C.fill_pct_override >= 0 || C.fill_pct_file) ? 1 : 0,
                           memory_order_release);
     if (C.fill_pct_override >= 0)
@@ -10978,6 +11049,12 @@ void cluster_stop(void)
     close(C.stop_pipe[1]);
     cluster_set_fills(NULL, 0);
     ret_cands_clear();
+#ifdef TSDB_TEST_HOOKS
+    pthread_mutex_lock(&g_vm_mu);
+    g_vm_on = 0;
+    g_vm_file[0] = '\0';
+    pthread_mutex_unlock(&g_vm_mu);
+#endif
 }
 
 /* ------------------------------------------------------------------ cluster_int.h (R4's files) */

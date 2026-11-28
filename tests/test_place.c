@@ -1585,6 +1585,90 @@ static void test_balance(void)
     meta_free(&sm);
 }
 
+/* R10 (r10-driver): converting-volume handling in place_rack_survivable and place_plan. */
+static void test_r10_converting(void)
+{
+    struct meta_state sm;
+    struct place_member pm[8];
+    const char *racks[8] = {"r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"};
+    init_cluster_state(&sm, 8, racks, pm, 1);
+
+    /* EC 4+3 converting to 4+2 in REENCODE: nstripe=7, pos 6 is retired (retired_ver=2). */
+    uint32_t lrep[4] = {1, 2, 3, 4};
+    uint32_t stp[7] = {1, 2, 3, 4, 5, 6, 7};
+    add_vol(&sm, 1, "conv1", lrep, 4, 4, 3, stp);
+    struct meta_volume *v = &sm.volumes[0];
+    v->ec_k = 4;
+    v->ec_m = 2;
+    v->stripe_version = 2;
+    v->stripe_pos[6].retired_ver = 2;
+    v->conv.phase = META_CONV_REENCODE;
+    v->conv.orig_redundancy = META_RED_EC;
+    v->conv.orig_k = 4;
+    v->conv.orig_m = 3;
+    v->conv.orig_replicas = 4;
+    v->conv.target_replicas = 3;
+    v->conv.new_stripe_version = 2;
+
+    /* All 7 stripe positions on distinct racks: both 4+2 and 4+3 survive any single rack loss. */
+    CHECK(place_rack_survivable(&sm, v) == 1, "conv 4+3->4+2 on 7 racks should be rack survivable");
+
+    /* Mark node 7 DRAINING (retired pos 6) and node 1 OUT (log replica + active pos 0): place_plan must NOT move log
+     * replicas during active conversion and must NOT drain retired pos 6, while still healing active pos 0. */
+    set_member_state(&sm, 7, META_DRAINING);
+    set_member_state(&sm, 1, META_OUT);
+    struct place_in in = make_in(&sm, pm, 8);
+    struct place_out out;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    for (uint32_t i = 0; i < out.nprops; i++) {
+        CHECK(out.props[i].kind != PLACE_PROP_REPLICA_ADD,
+              "conv: place_plan must not emit REPLICA_ADD during active conversion");
+        CHECK(!(out.props[i].kind == PLACE_PROP_STRIPE_SET && out.props[i].pos == 6),
+              "conv: place_plan must not drain retired stripe pos 6");
+    }
+    /* Active pos 0 on node 1 (non-retired) SHOULD still be re-placed onto node 8 during REENCODE. */
+    if (g_mut == PLACE_MUT_NONE) {
+        int saw_pos0 = 0;
+        for (uint32_t i = 0; i < out.nprops; i++)
+            if (out.props[i].kind == PLACE_PROP_STRIPE_SET && out.props[i].pos == 0)
+                saw_pos0 = 1;
+        CHECK(saw_pos0, "conv REENCODE: expected active pos 0 on OUT node 1 to be re-placed");
+    }
+    place_out_free(&out);
+
+    /* During ec -> replicas REENCODE (redundancy == REPLICAS, nstripe > 0, all positions retired), an OUT stripe
+     * holder MUST still be rebuilt so old objects remain decodable for MK_UNSETTLE. */
+    set_member_state(&sm, 7, META_OUT);
+    set_member_state(&sm, 1, META_UP);
+    sm.volumes[0].redundancy = META_RED_REPLICAS;
+    sm.volumes[0].ec_k = 0;
+    sm.volumes[0].ec_m = 0;
+    for (uint32_t p = 0; p < 7; p++)
+        sm.volumes[0].stripe_pos[p].retired_ver = 2;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    if (g_mut == PLACE_MUT_NONE) {
+        int saw_pos6 = 0;
+        for (uint32_t i = 0; i < out.nprops; i++)
+            if (out.props[i].kind == PLACE_PROP_STRIPE_SET && out.props[i].pos == 6)
+                saw_pos6 = 1;
+        CHECK(saw_pos6, "conv ec->replicas REENCODE: expected OUT retired pos 6 to still be rebuilt");
+    }
+    place_out_free(&out);
+
+    /* During DROP phase, place_plan skips all stripe fills on the converting volume. */
+    sm.volumes[0].conv.phase = META_CONV_DROP;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    for (uint32_t i = 0; i < out.nprops; i++)
+        CHECK(out.props[i].kind != PLACE_PROP_STRIPE_SET,
+              "conv DROP: place_plan must not emit STRIPE_SET during DROP");
+    place_out_free(&out);
+
+    meta_free(&sm);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "--mutant") == 0) {
@@ -1614,6 +1698,7 @@ int main(int argc, char **argv)
     test_r13_capability_class_and_fill();
     test_r9_return();
     test_balance();
+    test_r10_converting();
 
     if (fails) {
         fprintf(stderr, "test_place: %d checks failed\n", fails);

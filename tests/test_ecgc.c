@@ -1646,6 +1646,74 @@ static void cluster_gc_case(void)
     printf("  cluster_gc: uncommitted gate, WAL log scan, gc_suspended, replica apply, FENCED + r8f F4, MK_GC_RELEASE OK\n");
 }
 
+static int live_sv_mid_hits, live_sv_mid_rc;
+static uint8_t live_sv_mid_ovf;
+static uint32_t live_sv_mid_nsv;
+
+static void live_sv_mid_hook(eng *db)
+{
+    ecgc_live_sv sv[8];
+    live_sv_mid_nsv = 0;
+    live_sv_mid_ovf = 0;
+    live_sv_mid_rc = ecgc_live_by_sv(db, sv, 8, &live_sv_mid_nsv, &live_sv_mid_ovf);
+    live_sv_mid_hits++;
+}
+
+static void live_by_sv_apply_gap_case(void)
+{
+    char dir[PATH_MAX], name[96];
+    uint8_t oid[16];
+    fresh("cg_live_gap", dir, sizeof dir);
+    make_cluster_dir(dir);
+    mock_jr mj = {0};
+    struct jr_ops jops = {0};
+    h x = {0};
+    atomic_store(&MC.suspended, false);
+    meta_cluster_open_allow(true);
+    CHECK(open_cluster_leader(&x, dir, 1, &mj, &jops) == 0);
+    if (x.db) {
+        CHECK(chunk_be_see_epoch(tier_backend(x.t), x.db->tier_vol, 1) == 0);
+        write_day(x.db, 0);
+        write_day(x.db, 1);
+        settle_day(&x, 0, oid, name);
+
+        /* 1. Listed .ec object is counted. */
+        ecgc_live_sv sv[8];
+        uint32_t nsv = 0;
+        uint8_t ovf = 0;
+        CHECK(ecgc_live_by_sv(x.db, sv, 8, &nsv, &ovf) == 0 && ovf == 0 && nsv == 1 && sv[0].count == 1);
+
+        /* 2. Retired object in ge->r (before MK_GC) stays counted even after digest/floor. */
+        CHECK(eng_drop_before(x.db, DAY) == 0);
+        CHECK(ecgc_live_by_sv(x.db, sv, 8, &nsv, &ovf) == 0 && ovf == 0 && nsv == 1 && sv[0].count == 1);
+
+        /* 3. Mid-ecgcmk_apply gap (after ge->r removal, before GCMK insert) must NEVER return 0 live objects. */
+        live_sv_mid_hits = 0;
+        live_sv_mid_rc = 0;
+        live_sv_mid_ovf = 0;
+        live_sv_mid_nsv = 99;
+        atomic_store_explicit(&ecgcmk_test_apply_mid_hook, live_sv_mid_hook, memory_order_release);
+        mk m = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_RETIRED, .noids = 1, .oids = oid}};
+        CHECK(ecgcmk_apply(x.db, 100, &m) == 0);
+        atomic_store_explicit(&ecgcmk_test_apply_mid_hook, NULL, memory_order_release);
+        CHECK(live_sv_mid_hits == 1);
+        CHECK(live_sv_mid_rc == TSDB_ERR_UNAVAILABLE && live_sv_mid_ovf == 1);
+
+        /* 4. Pending in GCMK (before MK_GC_DONE) stays counted. */
+        CHECK(ecgcmk_pending_count(x.db) == 1);
+        CHECK(ecgc_live_by_sv(x.db, sv, 8, &nsv, &ovf) == 0 && ovf == 0 && nsv == 1 && sv[0].count == 1);
+
+        /* 5. After CHUNK_DEL + MK_GC_DONE, live count drops to 0 and 0 chunks remain. */
+        ecgc_tier_work(x.t);
+        CHECK(chunks(dir, oid) == 0);
+        CHECK(ecgcmk_pending_count(x.db) == 0);
+        CHECK(ecgc_live_by_sv(x.db, sv, 8, &nsv, &ovf) == 0 && ovf == 0 && nsv == 0);
+        h_close(&x);
+    }
+    meta_cluster_open_allow(false);
+    printf("  live_by_sv_apply_gap: listed -> retired -> mid-apply(UNAVAILABLE) -> GCMK -> DONE(0) OK\n");
+}
+
 static void run(void)
 {
     hold_case(0);
@@ -1661,6 +1729,7 @@ static void run(void)
     power_case();
     gcmk_power_case();
     cluster_gc_case();
+    live_by_sv_apply_gap_case();
 }
 #endif
 
