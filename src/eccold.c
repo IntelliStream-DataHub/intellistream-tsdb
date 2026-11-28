@@ -501,23 +501,35 @@ static int take_y_locked(eng *db, int64_t key, part **pin, size_t np, part **y, 
     *nlate = 0;
     if (partition_dropping(db, key))
         return TSDB_ERR_STOPPED;
+    uint64_t lo_i = UINT64_MAX, hi_i = 0;
     for (size_t i = 0; i < np; i++) {
         bool listed = false;
         for (size_t j = 0; j < db->nparts && !listed; j++)
             listed = db->parts[j] == pin[i];
         if (!listed || pin[i]->dropped)
             return TSDB_ERR_STOPPED;
+        if (pin[i]->min_block < lo_i)
+            lo_i = pin[i]->min_block;
+        if (pin[i]->max_block > hi_i)
+            hi_i = pin[i]->max_block;
     }
     size_t n = 0;
     for (size_t i = 0; i < db->nparts; i++) {
         part *p = db->parts[i];
-        if (p->partition != key || part_is_ec(p) || p->dropped)
+        if (p->partition != key || p->dropped)
             continue;
+        if (part_is_ec(p)) {
+            if (p->max_block > lo_i)
+                return TSDB_ERR_STOPPED; /* an .ec part above I would reorder under replicas' fresh numbering */
+            continue;
+        }
         bool in_i = false;
         for (size_t j = 0; j < np && !in_i; j++)
             in_i = pin[j] == p;
         if (in_i)
             continue;
+        if (p->min_block < hi_i)
+            return TSDB_ERR_STOPPED; /* a non-.ec part below I cannot be placed in Y above I's .ec parts */
         if (p->merging || p->settling) /* a merge of late parts in flight: its output would be another Y */
             return TSDB_ERR_STOPPED;
         y[n++] = p;

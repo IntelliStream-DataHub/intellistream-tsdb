@@ -112,7 +112,19 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # during settles), `full` (`fill_pct_file=1` -> `TSDB_WHY_FULL` backpressure + resume); checker fails on
                           # any non-rot `DIVERGED` or `LOCAL_FAULT` and requires every stripe pos `WHOLE` or `FILLING` with progress;
                           # selftest plants `noguard` (`TSDB_PLACE_MUTANT`), `wholeearly` (`TSDB_SFILL_MUTANT`), `fillnocheck`
-                          # (`TSDB_SFILL_MUTANT`), and `partialdelnow` (`TSDB_PLACE_MUTANT`) (~45 runs across r3/4+2/8+2/8+4/16+4)
+                          # (`TSDB_SFILL_MUTANT`), and `partialdelnow` (`TSDB_PLACE_MUTANT`) (~45 runs across r3/4+2/8+2/8+4/16+4).
+                          # `jepsen-cluster-r13` (`tests/jepsen/cluster_r13.h`, §15.9, D21; run by `make jepsen-cluster`; `JEPSEN_R13=none`
+                          # skips; `JEPSEN_R13_DISKS`, default `nvme,nvme,hdd,hdd`; `JEPSEN_R13_NEMESES`): runs `--disks` (`tsdb disk init`,
+                          # `--allow-shared-device`, fast disks under the scratch root, `:hdd` disks under `--hdd-dir` wrapped by
+                          # `outagefs` `--hdd-slow-ms 4` + `--hdd-rate-mb 150`, `io_uring` on at most 2 nodes) with nemeses
+                          # `hddeio` (EIO on one HDD -> DOWN -> OUT -> sibling-HDD rebuild with 0 chunks on NVMe -> replace/adopt UP),
+                          # `nvmestuck` (NVMe hang -> leader failover within `disk_stall_s` + process stays alive -> heal/reopen),
+                          # `diskloss` (one HDD and one NVMe lost -> sibling/peer rebuild -> replace/adopt UP),
+                          # `diskback` (HDD and NVMe hung and healed within `--rebuild-after-s`, `--diskback-hold-s` -> clean attach, 0 rebuild;
+                          # `jepsen-cluster-r13-diskback-long` runs the 35-min run with `--rebuild-after-s 2400 --diskback-hold-s 1500`),
+                          # and `nvmefill` (one NVMe fills via `TSDB_DISK_USAGE_FILE` -> `kvr` refused with `TSDB_WHY_FULL` while sibling
+                          # volume on the other NVMe of the same node keeps accepting writes); `jepsen-cluster-selftest` plants
+                          # `TSDB_DISKS_MUTANT=stallexit` (under `nvmestuck`) and `TSDB_DISKS_MUTANT=fullall` (under `nvmefill`)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec

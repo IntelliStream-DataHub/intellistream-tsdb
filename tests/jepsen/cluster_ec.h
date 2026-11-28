@@ -137,6 +137,7 @@ static void ec_stores_init(int i)
 }
 
 /* after cluster_form: the cluster's uuid, every node's stores, every node restarted in parallel with them */
+static void r13_wait_all_disks_registered(int timeout_ms);
 static void ec_form_stores(void)
 {
     struct view v;
@@ -144,6 +145,12 @@ static void ec_form_stores(void)
         die(2, "ec: no STATUS of node 0 for the cluster's uuid");
     memcpy(ec_uuid, v.m.uuid, sizeof ec_uuid);
     view_free(&v);
+    if (r13_disks_on) {
+        /* R13 (--disks): HDD stores were already initialised and passed via --disk at first start. */
+        r13_wait_all_disks_registered(30000);
+        ec_poller_start();
+        return;
+    }
     if (stop_nodes_par() != 0)
         die(1, "ec: a node did not stop cleanly to get its chunk stores");
     for (int i = 0; i < nn; i++)

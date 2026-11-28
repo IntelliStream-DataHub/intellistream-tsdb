@@ -178,15 +178,20 @@ static void resolve(void)
 
 /* ------------------------------------------------------------- the fault */
 
-/* The prefix (index + 1) of an absolute path, 0 if none. A prefix matches whole path components. */
+/* The longest matching prefix (index + 1) of an absolute path, 0 if none. A prefix matches whole path components. */
 static int root_of_path(const char *p)
 {
     if (!p || p[0] != '/')
         return 0;
+    int best = 0;
+    size_t best_len = 0;
     for (int i = 0; i < nroots; i++)
-        if (!strncmp(p, roots[i].path, roots[i].len) && (p[roots[i].len] == '/' || p[roots[i].len] == 0))
-            return i + 1;
-    return 0;
+        if (!strncmp(p, roots[i].path, roots[i].len) && (p[roots[i].len] == '/' || p[roots[i].len] == 0) &&
+            roots[i].len >= best_len) {
+            best = i + 1;
+            best_len = roots[i].len;
+        }
+    return best;
 }
 
 static int root_of_fd(int fd)
@@ -280,6 +285,10 @@ static void rate_gate(int r, size_t nbytes)
         int64_t chunk = wait_ns > 50000000LL ? 50000000LL : wait_ns;
         struct timespec sl = {.tv_sec = chunk / 1000000000LL, .tv_nsec = chunk % 1000000000LL};
         nanosleep(&sl, NULL);
+        if (parent0 > 1 && getppid() != parent0) {
+            abandoned = true;
+            break;
+        }
         pthread_mutex_lock(&mu);
         bool off = roots[i].rate_bps <= 0.0;
         pthread_mutex_unlock(&mu);

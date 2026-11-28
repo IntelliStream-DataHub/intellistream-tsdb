@@ -170,6 +170,26 @@ static void run(void)
         t0 = now_ms();
         CHECK(pread(rfd, big, sz, 0) == (ssize_t)sz);
         CHECK(now_ms() - t0 < 400);
+
+        /* slow + rate combined on dir_a (HDD emulation: seek + throughput cap), while dir_b stays fast;
+         * eio on dir_a fails dir_a without affecting dir_b, then heal clears both slow and rate. */
+        CHECK(cmd("slow", dir_a, "150") == 0);
+        CHECK(cmd("rate", dir_a, "1.0") == 0); /* 0.25 MiB -> >= 150 ms slow + ~250 ms rate = >= 350 ms */
+        t0 = now_ms();
+        CHECK(pread(rfd, big, sz, 0) == (ssize_t)sz);
+        CHECK(now_ms() - t0 >= 340);
+        CHECK(cmd("eio", dir_a, NULL) == 0);
+        CHECK(pread(rfd, big, sz, 0) == -1 && errno == EIO);
+        int bf2 = open(rpb, O_RDWR);
+        CHECK(bf2 >= 0);
+        t0 = now_ms();
+        CHECK(pread(bf2, big, sz, 0) == (ssize_t)sz);
+        CHECK(now_ms() - t0 < 300);
+        close(bf2);
+        CHECK(cmd("heal", dir_a, NULL) == 0);
+        t0 = now_ms();
+        CHECK(pread(rfd, big, sz, 0) == (ssize_t)sz);
+        CHECK(now_ms() - t0 < 300);
         close(rfd);
         free(big);
     }

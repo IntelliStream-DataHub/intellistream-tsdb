@@ -26,6 +26,7 @@
  */
 #define _GNU_SOURCE
 #include "internal.h"
+#include "cvol.h"
 #include "chunk.h"
 #include "coldops.h"
 #include "tier.h"
@@ -1121,6 +1122,120 @@ static void test_policy(void)
     printf("  policy: whole keys past the grace, never level 0, never about to expire, never diverged\n");
 }
 
+/* Regression test (caught by r13-jc nvmefill): a non-settleable young part (e.g. a tombstone-only ng==0 part under
+ * disk_full/merges_held) below a newer settleable part must NEVER be placed in Y (which replicas renumber ABOVE I). */
+static void test_ybelow(void)
+{
+    lt L;
+    if (!start("ybelow", &L))
+        return;
+    int64_t end = DAY0 + DAY_MS, g = GRACE_S * 1000, force = 3600 * 1000LL, key = -1;
+    /* p1 (level 1, ng > 0) < p_tomb (level 0, ng == 0 tombstone-only) < p_newer (level 0, ng > 0). */
+    CHECK(rows(L.db, L.s[0], 0, 0, 100, 1.0f) == 0);
+    CHECK(eng_optimize(L.db) == 0);
+    CHECK(eng_delete_range(L.db, L.s[0], DAY0, DAY0 + 10000) == 0);
+    CHECK(rows(L.db, L.s[0], 0, 0, 100, 2.0f) == 0);
+    CHECK(eng_flush(L.db) == 0);
+
+    eng_set_disk_full(L.db, true);
+
+    /* Find p1 (below p_tomb), p_tomb (ng == 0), and p_newer (above p_tomb) under db->lock. */
+    part *p1 = NULL, *p_tomb = NULL, *p_newer = NULL;
+    pthread_mutex_lock(&L.db->lock);
+    for (size_t i = 0; i < L.db->nparts; i++) {
+        part *p = L.db->parts[i];
+        if (p->partition != KEY || part_is_ec(p) || p->dropped)
+            continue;
+        if (!p_tomb && p->ng > 0)
+            p1 = p;
+        else if (p->ng == 0 && p->nt > 0 && !p_tomb)
+            p_tomb = p;
+        else if (p_tomb && p->ng > 0 && p->min_block > p_tomb->max_block)
+            p_newer = p;
+    }
+    if (p1)
+        part_ref(p1);
+    if (p_newer)
+        part_ref(p_newer);
+    pthread_mutex_unlock(&L.db->lock);
+    CHECK(p1 != NULL && p_tomb != NULL && p_newer != NULL);
+
+    /* 1. ecpolicy_pick must stop at p_tomb and select only p1 (never skip p_tomb to take p_newer). */
+    CHECK(pick(L.db, end + g + force + 1000, &key) == 1 && key == KEY);
+
+    /* 2. Direct eng_settle of p_newer while p_tomb lies below it must be refused (never reorder p_tomb into Y). */
+    if (p_newer) {
+        size_t n = 0;
+        int rc = eng_settle(L.db, KEY, &p_newer, 1, &n);
+        size_t nec = 0;
+        pthread_mutex_lock(&L.db->lock);
+        for (size_t i = 0; i < L.db->nparts; i++)
+            if (L.db->parts[i]->partition == KEY && part_is_ec(L.db->parts[i]))
+                nec++;
+        pthread_mutex_unlock(&L.db->lock);
+        CHECK(rc == TSDB_ERR_STOPPED && n == 0 && nec == 0);
+        part_unref(p_newer);
+    }
+
+    /* 3. Settle p1 cleanly (strictly below p_tomb), then verify both policy and take_y_locked refuse settling
+     *    a young part below an .ec part. */
+    if (p1) {
+        size_t n1 = 0;
+        CHECK(eng_settle(L.db, KEY, &p1, 1, &n1) == 0 && n1 == 1);
+        part_unref(p1);
+    }
+    part *p_low = NULL;
+    uint64_t orig_min = 0, orig_max = 0;
+    pthread_mutex_lock(&L.db->lock);
+    for (size_t i = 0; i < L.db->nparts; i++) {
+        part *p = L.db->parts[i];
+        if (p->partition == KEY && !part_is_ec(p) && !p->dropped && p->ng > 0) {
+            p_low = p;
+            orig_min = p->min_block;
+            orig_max = p->max_block;
+            p->min_block = 0;
+            p->max_block = 0;
+            /* Re-sort db->parts to reflect [young p_low (block 0)][.ec p1 (block >= 1)]. */
+            for (size_t j = i; j > 0 && L.db->parts[j - 1]->partition == KEY; j--) {
+                part *tmp = L.db->parts[j];
+                L.db->parts[j] = L.db->parts[j - 1];
+                L.db->parts[j - 1] = tmp;
+            }
+            part_ref(p_low);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&L.db->lock);
+    CHECK(p_low != NULL);
+    if (p_low) {
+        CHECK(pick(L.db, end + g + force + 2000, &key) == 0);
+        size_t n = 0;
+        int rc = eng_settle(L.db, KEY, &p_low, 1, &n);
+        size_t nec = 0;
+        pthread_mutex_lock(&L.db->lock);
+        for (size_t i = 0; i < L.db->nparts; i++)
+            if (L.db->parts[i]->partition == KEY && part_is_ec(L.db->parts[i]))
+                nec++;
+        /* Restore p_low's original block range & position before close. */
+        p_low->min_block = orig_min;
+        p_low->max_block = orig_max;
+        for (size_t i = 0; i + 1 < L.db->nparts; i++) {
+            if (L.db->parts[i] == p_low && L.db->parts[i + 1]->partition == KEY &&
+                L.db->parts[i + 1]->min_block < p_low->min_block) {
+                L.db->parts[i] = L.db->parts[i + 1];
+                L.db->parts[i + 1] = p_low;
+            }
+        }
+        pthread_mutex_unlock(&L.db->lock);
+        CHECK(rc == TSDB_ERR_STOPPED && n == 0 && nec == 1);
+        part_unref(p_low);
+    }
+
+    eng_set_disk_full(L.db, false);
+    lclose(&L);
+    printf("  ybelow: policy and eccold_settle refuse settling past a lower young part or below an .ec part\n");
+}
+
 /* the swap refused after its COLD marker committed: the engine fails (the replicas carry the marker out), and once the
  * hook says a marker names the objects (r8h's ecapply_swap_pre; ecswap_test_logged until then) nothing goes to r7-gc */
 static lt *CUR_L;           /* the case's leader, for a hook that counts chunk files */
@@ -2035,7 +2150,8 @@ int main(int argc, char **argv)
                  {"swapfail", test_swapfail}, {"deposeappend", test_deposeappend}, {"crash", test_crash},
                  {"drop", test_drop},     {"indexfail", test_indexfail}, {"ymerging", test_ymerging},
                  {"swappower", test_swappower}, {"toomany", test_toomany}, {"turns", test_turns},
-                 {"ticket", test_ticket}, {"jrpair", test_jrpair}, {"degraded", test_degraded}};
+                 {"ticket", test_ticket}, {"jrpair", test_jrpair}, {"degraded", test_degraded},
+                 {"ybelow", test_ybelow}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();

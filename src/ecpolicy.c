@@ -374,13 +374,34 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
             if (now - phi < grace + force && mt_holds_locked(db, plo, phi - 1))
                 continue;
             /* the whole key or nothing: the parts it settles (I) and the rest of it (Y) must fit one marker; a key that
-             * does not is said once and tried an hour later (the merges may make it smaller), never settled in part */
+             * does not is said once and tried an hour later (the merges may make it smaller), never settled in part.
+             * Replicas renumber all new .ec parts (I) ABOVE existing .ec parts and all Y parts ABOVE I (src/ecapply.c),
+             * so:
+             *  - If any .ec part sits above a young part (legacy disordered layout), skip the key so settle does not
+             *    enter an encode/put/GC loop against take_y_locked().
+             *  - Stop taking into I at the first non-settleable young part (e.g. a tombstone-only ng==0 part under
+             *    merges_held, or a level-0 part with no merge selectable when merges are not held) so it and everything
+             *    above it stay in Y in the exact same order. */
             size_t ni = 0, nall = 0;
+            bool saw_young = false, y_started = false, ec_above_young = false;
             for (size_t i = lo_i; i < hi_i; i++) {
                 const part *p = db->parts[i];
-                nall += !part_is_ec(p);
-                ni += settleable(db->parts[i]) && (p->level > 0 || merges_held); /* D18: level-0 only when merges held */
+                if (part_is_ec(p)) {
+                    if (saw_young) {
+                        ec_above_young = true;
+                        break;
+                    }
+                    continue;
+                }
+                saw_young = true;
+                nall++;
+                if (!y_started && settleable(p) && (p->level > 0 || merges_held))
+                    ni++;
+                else
+                    y_started = true;
             }
+            if (ec_above_young)
+                continue;
             if (ni > cap || nall > MK_FILES_MAX || ecpolicy_test_cap_hit) {
                 if (ni) {
                     fprintf(stderr, "tsdb: %s: settle: key %lld has %zu parts to settle and %zu in all, more than one "
@@ -390,9 +411,14 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
                 }
                 continue;
             }
-            for (size_t i = lo_i; i < hi_i; i++)
-                if (settleable(db->parts[i]) && (db->parts[i]->level > 0 || merges_held))
-                    sel[n++] = db->parts[i];
+            for (size_t i = lo_i; i < hi_i; i++) {
+                part *p = db->parts[i];
+                if (part_is_ec(p))
+                    continue;
+                if (!settleable(p) || (p->level == 0 && !merges_held))
+                    break;
+                sel[n++] = p;
+            }
         } else if (cfg->eager) {
             for (size_t i = lo_i; i < hi_i && n < cap; i++) {
                 part *p = db->parts[i];

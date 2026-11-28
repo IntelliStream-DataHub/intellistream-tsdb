@@ -191,7 +191,7 @@ static int r9_count_degraded_ec_parts_on_leader(void)
     if (rep_rec_get(&r) != 0 || r.leader < 0)
         return 0;
     char vdir[PATH_MAX + 64];
-    snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, nodes[r.leader].dir, rep_number);
+    node_vol_dir(r.leader, rep_number, vdir, sizeof vdir);
     DIR *dp = opendir(vdir);
     if (!dp)
         return 0;
@@ -234,7 +234,7 @@ static int r9_count_ec_parts_on_leader(void)
     if (rep_rec_get(&r) != 0 || r.leader < 0)
         return 0;
     char vdir[PATH_MAX + 64];
-    snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, nodes[r.leader].dir, rep_number);
+    node_vol_dir(r.leader, rep_number, vdir, sizeof vdir);
     DIR *dp = opendir(vdir);
     if (!dp)
         return 0;

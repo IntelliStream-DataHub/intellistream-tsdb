@@ -130,6 +130,7 @@
 #include "cluster.h"
 #include "crashpt.h"
 #include "cvol_check.h"
+#include "disk.h"
 #include "harness.h"
 #include "meta.h"
 #include "tsdb.h"
@@ -211,14 +212,18 @@ enum {
     N_ROTPARITY = 1u << 15, N_ROTCOLD = 1u << 16, N_ROTYOUNG = 1u << 17, N_ROTTHENM = 1u << 18, /* R12 scrub/repair/heal */
     /* R9 failure handling, rebuild, return, backpressure and multi-fault nemeses (cluster_r9.h) */
     N_OUT = 1u << 19, N_BACK = 1u << 20, N_TWO = 1u << 21, N_MFAIL = 1u << 22, N_M1 = 1u << 23,
-    N_SLOWLOSS = 1u << 24, N_HOLD = 1u << 25, N_STRIPESET = 1u << 26, N_FULL = 1u << 27
+    N_SLOWLOSS = 1u << 24, N_HOLD = 1u << 25, N_STRIPESET = 1u << 26, N_FULL = 1u << 27,
+    /* R13 two-class disks and disk nemeses (cluster_r13.h, §15.9, D21) */
+    N_HDDEIO = 1u << 28, N_NVMESTUCK = 1u << 29, N_DISKBACK = 1u << 30
 };
-#define NNEM 28
+#define N_NVMEFILL (1u << 31) /* bit 31: defined outside enum so all enumerators fit in ISO C int */
+#define NNEM 32
 #define N_R12_EC (N_ROTPARITY | N_ROTCOLD | N_ROTTHENM)
 #define N_R12 (N_R12_EC | N_ROTYOUNG)
 #define N_EC_ROT (N_ROT | N_R12_EC)
 #define N_R9_EC (N_MFAIL | N_M1 | N_STRIPESET)
 #define N_R9 (N_OUT | N_BACK | N_TWO | N_MFAIL | N_M1 | N_SLOWLOSS | N_HOLD | N_STRIPESET | N_FULL)
+#define N_R13 (N_HDDEIO | N_NVMESTUCK | N_DISKBACK | N_NVMEFILL)
 #define N_EC (N_PARTIAL | N_DISKLOSS | N_EC_ROT | N_R9_EC)
 #define N_R4_KV (N_LONGDOWN | N_REBUILD | N_CHURN) /* these need kvr: workload kv, kv-via or classes */
 
@@ -290,6 +295,26 @@ static int rnd_range(int lo, int hi) { return lo + (int)(rnd() % (uint64_t)(hi -
 
 /* ------------------------------------------------------------------ the node table */
 
+#define R13_MAX_DISKS 8
+struct node_disk {
+    char path[PATH_MAX + 32];
+    char cls[8];            /* "nvme", "ssd", "hdd" */
+    uint8_t store_id[16];
+    char hex[33];
+    int is_fast;
+};
+
+static int r13_disks_on;                /* --disks nvme,hdd... */
+static char r13_disk_spec[128];         /* raw --disks spec */
+static char r13_disk_cls[R13_MAX_DISKS][8];
+static int r13_ndisks_cfg;
+static const char *opt_hdd_dir;         /* --hdd-dir DIR (optional second prefix for :hdd disks) */
+static char hdd_rundir[PATH_MAX - 48];  /* <opt_hdd_dir>/run.XXXXXX or <rundir>/hdd */
+static int opt_hdd_slow_ms = 4;         /* --hdd-slow-ms MS (outagefs seek latency on :hdd) */
+static double opt_hdd_rate_mb = 150.0;  /* --hdd-rate-mb MB (outagefs throughput cap on :hdd) */
+static int opt_diskback_hold_s;         /* --diskback-hold-s S (0: scaled 5-8 s) */
+static int opt_rebuild_after_s;         /* --rebuild-after-s S (0: default/scaled) */
+
 struct node {
     pid_t pid;      /* 0: not running */
     int cport;      /* the client port of the running server, from its port file */
@@ -302,6 +327,9 @@ struct node {
     _Atomic uint32_t id; /* member id, 0 until it joined */
     char dir[PATH_MAX + 16], log[PATH_MAX + 32];
     char chunk[2][PATH_MAX + 32]; /* --ec: the node's two chunk stores ("" until made after the cluster has member ids) */
+    struct node_disk disks[R13_MAX_DISKS]; /* --disks: configured multi-class disks */
+    int ndisks;
+    char usage_file[PATH_MAX + 32]; /* R13 nvmefill: TSDB_DISK_USAGE_FILE */
     int mport;                    /* its metrics port (--ec), from its port file */
     char octl[PATH_MAX + 32]; /* the outagefs shim's control socket of this node (--outagefs: the slow nemesis) */
     int dead_for_good;        /* R9: killed permanently by `out` or declared DESTROYED by `m1` */
@@ -310,6 +338,8 @@ struct node {
     _Atomic unsigned peak_fds;    /* highest open fd count seen for this node across the run */
 };
 static struct node nodes[MAXN];
+static void node_vol_dir(int node, uint32_t vol, char *out, size_t cap);
+static void r13_apply_hdd_profile(int i);
 static pthread_mutex_t tbl_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int stopping;
 
@@ -723,15 +753,23 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     snprintf(padv, sizeof padv, "127.0.0.1:%d", n->proxy_port);
     snprintf(state, sizeof state, "%s/state", n->dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
-    const char *argv[64];
-    char rpool[24], darg[2][PATH_MAX + 8];
+    const char *argv[96];
+    char rpool[24], darg[R13_MAX_DISKS][PATH_MAX + 48];
     int na = 0;
     argv[na++] = "tsdbd";
     if (!want_auth) /* --auth (and the users workload): every node requires a login, as production does */
         argv[na++] = "--no-auth";
     argv[na++] = flag;
-    argv[na++] = "--dir";
-    argv[na++] = n->dir;
+    if (!(r13_disks_on && n->ndisks > 0)) {
+        argv[na++] = "--dir";
+        argv[na++] = n->dir;
+    } else {
+        for (int k = 0; k < n->ndisks; k++) {
+            snprintf(darg[k], sizeof darg[k], "%s:%s", n->disks[k].path, n->disks[k].cls);
+            argv[na++] = "--disk";
+            argv[na++] = darg[k];
+        }
+    }
     argv[na++] = "--port";
     argv[na++] = "0";
     argv[na++] = "--port-file";
@@ -772,7 +810,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         argv[na++] = "--merge-idle-s";
         argv[na++] = "1";
     }
-    if (want_ec_k || rdma_metrics || (nemeses & (N_ROTYOUNG | N_R9)) || opt_geometry[0]) {
+    if (want_ec_k || rdma_metrics || (nemeses & (N_ROTYOUNG | N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on) {
         argv[na++] = "--metrics-port";
         argv[na++] = "auto";
     }
@@ -801,13 +839,15 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
             argv[na++] = "--merge-idle-s";
             argv[na++] = "1";
         }
-        for (int k = 0; k < 2 && n->chunk[k][0]; k++) {
-            snprintf(darg[k], sizeof darg[k], "%s:hdd", n->chunk[k]);
-            argv[na++] = "--disk";
-            argv[na++] = darg[k];
+        if (!r13_disks_on) {
+            for (int k = 0; k < 2 && n->chunk[k][0]; k++) {
+                snprintf(darg[k], sizeof darg[k], "%s:hdd", n->chunk[k]);
+                argv[na++] = "--disk";
+                argv[na++] = darg[k];
+            }
         }
     }
-    if ((want_ec_k || opt_geometry[0] || (nemeses & N_R9) || nn > 6) && i >= 2) { /* D15/D24: io_uring on at most two nodes (8 MB memlock per user), epoll on the rest */
+    if ((want_ec_k || opt_geometry[0] || (nemeses & (N_R9 | N_R13)) || r13_disks_on || nn > 6) && i >= 2) { /* D15/D24: io_uring on at most two nodes (8 MB memlock per user), epoll on the rest */
         argv[na++] = "--io";
         argv[na++] = "epoll";
     } else if (getenv("TSDBD_IO") && *getenv("TSDBD_IO")) {
@@ -820,14 +860,21 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     char *envp[512];
     int ne = 0;
     const char *orig_plrdma_test = getenv("TSDB_PLRDMA_TEST");
-    for (char **e = environ; *e && ne < 495; e++)
+    for (char **e = environ; *e && ne < 490; e++)
         if (strncmp(*e, "TSDB_CLUSTER_TEST=", 18) && strncmp(*e, "TSDB_CRASH_AT=", 14) && strncmp(*e, "LD_PRELOAD=", 11) &&
             strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "OUTAGEFS_", 9) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20) &&
             strncmp(*e, "TSDBD_TEST_FWD_STALL=", 21) &&
             (!(nemeses & N_RDMA_QPERR) || strncmp(*e, "TSDB_PLRDMA_TEST=", 17)))
             envp[ne++] = *e;
     char e1[256], e2[2 * PATH_MAX + 64], e3[PATH_MAX + 64], e4[64], e5[PATH_MAX + 64], e6[PATH_MAX + 64], e7[PATH_MAX + 64],
-         e8[PATH_MAX + 256], e9[PATH_MAX + 96], e10[256], e11[PATH_MAX + 128];
+         e8[PATH_MAX + 256], e9[PATH_MAX + 96], e10[256], e11[PATH_MAX + 128], e12[PATH_MAX + 64];
+    char *e6_dyn = NULL;
+    if ((r13_disks_on || (nemeses & N_R13)) && !getenv("TSDBD_TEST_HEALTH"))
+        envp[ne++] = "TSDBD_TEST_HEALTH=read=250,write=350,recover=800,fast=400";
+    if ((nemeses & N_NVMEFILL) && n->usage_file[0]) {
+        snprintf(e12, sizeof e12, "TSDB_DISK_USAGE_FILE=%s", n->usage_file);
+        envp[ne++] = e12;
+    }
     if (nemeses & N_RDMA_QPERR) {
         if (orig_plrdma_test && *orig_plrdma_test)
             snprintf(e8, sizeof e8, "TSDB_PLRDMA_TEST=%s,qperr_file=%s/rdma_qperr", orig_plrdma_test, n->dir);
@@ -875,10 +922,21 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         snprintf(e1, sizeof e1, "TSDB_CRASH_AT=%s", crash_at);
         envp[ne++] = e1;
     }
-    if (use_outagefs) { /* the slow nemesis: the node's whole directory is a domain of the shim (stacked before crashfs) */
-        snprintf(e6, sizeof e6, "OUTAGEFS_ROOTS=%s", n->dir);
+    if (use_outagefs) { /* the slow nemesis or R13 per-disk outagefs (stacked before crashfs) */
+        if (r13_disks_on && n->ndisks > 0) {
+            size_t cap = (size_t)n->ndisks * (PATH_MAX + 40) + 32;
+            e6_dyn = malloc(cap);
+            if (!e6_dyn)
+                die(2, "out of memory building OUTAGEFS_ROOTS");
+            size_t off = (size_t)snprintf(e6_dyn, cap, "OUTAGEFS_ROOTS=");
+            for (int k = 0; k < n->ndisks; k++)
+                off += (size_t)snprintf(e6_dyn + off, cap - off, "%s%s", k ? ":" : "", n->disks[k].path);
+            envp[ne++] = e6_dyn;
+        } else {
+            snprintf(e6, sizeof e6, "OUTAGEFS_ROOTS=%s", n->dir);
+            envp[ne++] = e6;
+        }
         snprintf(e7, sizeof e7, "OUTAGEFS_CTL=%s", n->octl);
-        envp[ne++] = e6;
         envp[ne++] = e7;
     }
     if (use_outagefs || use_crashfs) {
@@ -904,8 +962,10 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     envp[ne] = NULL;
     int64_t t_fork = now_ns();
     pid_t pid = fork();
-    if (pid < 0)
+    if (pid < 0) {
+        free(e6_dyn);
         die(2, "fork: %s", strerror(errno));
+    }
     if (pid == 0) {
         int fd = open(n->log, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0)
@@ -916,6 +976,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         execve(bin, (char *const *)argv, envp);
         _exit(127);
     }
+    free(e6_dyn);
     if (!strcmp(mutant, "foreign-pid") && i == 1 && n->starts == 0) {
         struct pfcopy *c = malloc(sizeof *c);
         snprintf(c->from, sizeof c->from, "%s", pf);
@@ -965,6 +1026,7 @@ static int start_node(int i, const char *crash_at, int *status)
         die(1, "node %d: %s", i, th_why);
     }
     record_node_up(i, pid, port, th_mport, th_pport, t_fork);
+    r13_apply_hdd_profile(i);
     return 0;
 }
 
@@ -1042,6 +1104,7 @@ static void start_nodes_par(const char *crash_at)
             }
             if (port > 0) {
                 record_node_up(i, pids[i], port, mp, pp, tfork[i]);
+                r13_apply_hdd_profile(i);
                 ready[i] = 1;
                 left--;
             }
@@ -2174,7 +2237,7 @@ static void rep_setup(void)
         view_free(&v);
     }
     for (int r = 0; r < rep_n; r++)
-        snprintf(rep_dir[r], sizeof rep_dir[r], "%s/v%" PRIu32, nodes[rep_nodes[r]].dir, rep_number);
+        node_vol_dir(rep_nodes[r], rep_number, rep_dir[r], sizeof rep_dir[r]);
     nhists = REP_HISTS;
     static const char *const names[REP_HISTS + 1] = {"kvr.a", "kvr.b", "kvr.fill"};
     for (int i = 0; i <= REP_HISTS; i++) {
@@ -2356,7 +2419,7 @@ static int rep_sync_members(void)
             return 0;
     for (int k = 0; k < rep_n; k++) {
         rep_nodes[k] = r.node[k];
-        snprintf(rep_dir[k], sizeof rep_dir[k], "%s/v%" PRIu32, nodes[r.node[k]].dir, rep_number);
+        node_vol_dir(r.node[k], rep_number, rep_dir[k], sizeof rep_dir[k]);
     }
     return 1;
 }
@@ -3397,7 +3460,7 @@ static unsigned long long vdir_ino(int i)
 {
     char vd[PATH_MAX + 64];
     struct stat sb;
-    snprintf(vd, sizeof vd, "%s/v%" PRIu32, nodes[i].dir, rep_number);
+    node_vol_dir(i, rep_number, vd, sizeof vd);
     return stat(vd, &sb) == 0 ? (unsigned long long)sb.st_ino : 0;
 }
 
@@ -4140,9 +4203,13 @@ static int r4_scan_dir(const char *where, int node, int say, int depth)
 static int r4_leftovers_once(int say)
 {
     int bad = 0;
-    for (int i = 0; i < nn; i++)
-        if (!nodes[i].dead_for_good)
-            bad += r4_scan_dir(nodes[i].dir, i, say, 0);
+    for (int i = 0; i < nn; i++) {
+        if (nodes[i].dead_for_good)
+            continue;
+        bad += r4_scan_dir(nodes[i].dir, i, say, 0);
+        for (int d = 0; d < nodes[i].ndisks; d++)
+            bad += r4_scan_dir(nodes[i].disks[d].path, i, say, 0);
+    }
     return bad;
 }
 
@@ -4345,6 +4412,7 @@ static int r4_leftovers_check(void)
 
 #include "cluster_ec.h"
 #include "cluster_r9.h"
+#include "cluster_r13.h"
 
 /* ---- RDMA metrics probe and rdma-qperr nemesis (design-rdma.md §8, rd-hw) */
 
@@ -4734,6 +4802,23 @@ static int cluster_form(void)
         S.scrub_mb_s = 20;
         S.scrub_out_count = 1000;
     }
+    if (r13_disks_on || (nemeses & N_R13)) { /* R13 (§15.9, D21): scaled disk stall & device OUT timers */
+        S.disk_stall_s = 2;
+        if (opt_rebuild_after_s > 0)
+            S.rebuild_after_s = (uint32_t)opt_rebuild_after_s;
+        else if (nemeses & N_DISKBACK)
+            S.rebuild_after_s = opt_diskback_hold_s > 0 ? (uint32_t)(opt_diskback_hold_s + 30) : 25u;
+        else if (nemeses & N_DISKLOSS)
+            S.rebuild_after_s = 10u;
+        else
+            S.rebuild_after_s = 20u;
+        /* Short failstop_out_s (3 s) for hddeio/diskloss, but >= rebuild_after_s for nvmestuck/diskback so a
+         * transient fast-disk stall (LOCAL_FAULT while hung) does not evict kvr before the disk heals. */
+        if ((nemeses & (N_HDDEIO | N_DISKLOSS)) && !(nemeses & (N_NVMESTUCK | N_DISKBACK)))
+            S.failstop_out_s = 3;
+        else
+            S.failstop_out_s = S.rebuild_after_s > 20u ? S.rebuild_after_s : 20u;
+    }
     /* Any S.* override added here must be mirrored in ju_init_cluster() (cluster_users.h), which runs
      * `tsdb cluster init --superuser` instead of CLUSTER_OP_INIT on odd-seed --auth runs. */
     uint8_t req[4 * (META_SETTINGS_WORDS + 1)]; /* 64 overflowed since the settings grew past 15 words (ASan) */
@@ -4946,7 +5031,10 @@ static void usage(void)
     fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--geometry 4+2|8+2|8+4|16+4|r3] [--seconds 30] [--seed N]\n"
                     "         [--nemesis kill,partition,pause,midcommit,power,fwdstall,kill2,slow,longdown,rebuild,churn,\n"
                     "                    partial,diskloss,rot,rotparity,rotcold,rotthenm,mfail,m1,stripeset (with --ec),\n"
-                    "                    rotyoung,rdma-qperr,out,back,two,slowloss,hold,full] [--ec K+M]\n"
+                    "                    rotyoung,rdma-qperr,out,back,two,slowloss,hold,full,\n"
+                    "                    hddeio,nvmestuck,diskback,nvmefill (with --disks)] [--ec K+M]\n"
+                    "         [--disks nvme,nvme,hdd,hdd] [--hdd-dir DIR] [--hdd-slow-ms 4] [--hdd-rate-mb 150]\n"
+                    "         [--diskback-hold-s S] [--rebuild-after-s S]\n"
                     "         [--workload meta,kv-local|kv|kv-via|classes|users] [--auth] [--retain-s S]\n"
                     "         [--peer-rdma auto|on|off] [--peer-rdma-pool-mb N] [--peer-rdma-device DEV[:PORT]]\n"
                     "         [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so] [--mutant NAME]\n"
@@ -5086,6 +5174,48 @@ int main(int argc, char **argv)
                 fprintf(stderr, "jepsen-cluster: --geometry %s: expected 4+2, 8+2, 8+4, 16+4 or r3\n", g);
                 return 2;
             }
+        } else if (!strcmp(k, "--disks")) { /* R13 (§15.9, D21): per-node disk classes (e.g. nvme,nvme,hdd,hdd) */
+            if (a + 1 >= argc || r13_parse_disks(argv[++a]) != 0) {
+                fprintf(stderr, "jepsen-cluster: --disks expects 1..%d comma-separated classes (nvme,ssd,hdd)\n",
+                        R13_MAX_DISKS);
+                return 2;
+            }
+        } else if (!strcmp(k, "--hdd-dir")) {
+            if (a + 1 >= argc)
+                usage();
+            opt_hdd_dir = argv[++a];
+        } else if (!strcmp(k, "--hdd-slow-ms")) {
+            if (a + 1 >= argc)
+                usage();
+            opt_hdd_slow_ms = atoi(argv[++a]);
+            if (opt_hdd_slow_ms < 0 || opt_hdd_slow_ms > 5000) {
+                fprintf(stderr, "jepsen-cluster: --hdd-slow-ms must be 0 to 5000\n");
+                return 2;
+            }
+        } else if (!strcmp(k, "--hdd-rate-mb")) {
+            if (a + 1 >= argc)
+                usage();
+            opt_hdd_rate_mb = strtod(argv[++a], NULL);
+            if (!(opt_hdd_rate_mb >= 0.0) || opt_hdd_rate_mb > 1e6) {
+                fprintf(stderr, "jepsen-cluster: --hdd-rate-mb must be >= 0\n");
+                return 2;
+            }
+        } else if (!strcmp(k, "--diskback-hold-s")) {
+            if (a + 1 >= argc)
+                usage();
+            opt_diskback_hold_s = atoi(argv[++a]);
+            if (opt_diskback_hold_s < 1 || opt_diskback_hold_s > 86400) {
+                fprintf(stderr, "jepsen-cluster: --diskback-hold-s must be 1 to 86400\n");
+                return 2;
+            }
+        } else if (!strcmp(k, "--rebuild-after-s")) {
+            if (a + 1 >= argc)
+                usage();
+            opt_rebuild_after_s = atoi(argv[++a]);
+            if (opt_rebuild_after_s < 5 || opt_rebuild_after_s > 86400) {
+                fprintf(stderr, "jepsen-cluster: --rebuild-after-s must be 5 to 86400\n");
+                return 2;
+            }
         } else if (!strcmp(k, "--ec")) { /* K+M: kvr is an erasure-coded volume (cluster_ec.h) */
             if (a + 1 >= argc || sscanf(argv[++a], "%d+%d", &want_ec_k, &want_ec_m) != 2 || want_ec_k < 1 ||
                 want_ec_k > META_EC_K_MAX || want_ec_m < 1 || want_ec_m > META_EC_M_MAX) {
@@ -5151,6 +5281,14 @@ int main(int argc, char **argv)
                     nemeses |= N_STRIPESET;
                 else if (nem && !strcmp(t, "full"))
                     nemeses |= N_FULL;
+                else if (nem && !strcmp(t, "hddeio"))
+                    nemeses |= N_HDDEIO;
+                else if (nem && !strcmp(t, "nvmestuck"))
+                    nemeses |= N_NVMESTUCK;
+                else if (nem && !strcmp(t, "diskback"))
+                    nemeses |= N_DISKBACK;
+                else if (nem && !strcmp(t, "nvmefill"))
+                    nemeses |= N_NVMEFILL;
                 else if (nem && !strcmp(t, "none"))
                     nemeses |= 0;
                 else if (!nem && !strcmp(t, "meta"))
@@ -5215,8 +5353,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "jepsen-cluster: --nemesis rot, rotparity, rotcold and rotthenm cannot be combined (each uses its own fault budget up to m positions)\n");
             return 2;
         }
-    } else if (nemeses & N_EC) {
-        fprintf(stderr, "jepsen-cluster: the partial, diskloss, rot, rotparity, rotcold, rotthenm, mfail, m1 and stripeset nemeses need --ec K+M (or --geometry 4+2|8+2|8+4|16+4)\n");
+    } else if ((nemeses & N_EC) && !(r13_disks_on && (nemeses & N_EC) == N_DISKLOSS)) {
+        fprintf(stderr, "jepsen-cluster: the partial, diskloss (without --disks), rot, rotparity, rotcold, rotthenm, mfail, m1 and stripeset nemeses need --ec K+M (or --geometry 4+2|8+2|8+4|16+4)\n");
+        return 2;
+    }
+    if ((nemeses & N_R13) && !r13_disks_on) {
+        fprintf(stderr, "jepsen-cluster: the R13 nemeses (hddeio, nvmestuck, diskback, nvmefill) need --disks nvme,nvme,hdd,hdd\n");
+        return 2;
+    }
+    if ((nemeses & N_R13) && !want_rep) {
+        fprintf(stderr, "jepsen-cluster: the R13 nemeses (hddeio, nvmestuck, diskback, nvmefill) work on kvr: they need the workload kv, kv-via or classes\n");
         return 2;
     }
     if ((nemeses & N_R9) && !want_rep) {
@@ -5257,8 +5403,8 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    if ((nemeses & (N_SLOW | N_SLOWLOSS)) && !outagefs_so) {
-        fprintf(stderr, "jepsen-cluster: the slow and slowloss nemeses need --outagefs build/liboutagefs.so\n");
+    if ((nemeses & (N_SLOW | N_SLOWLOSS | N_HDDEIO | N_NVMESTUCK | N_DISKBACK)) && !outagefs_so) {
+        fprintf(stderr, "jepsen-cluster: the slow, slowloss, hddeio, nvmestuck and diskback nemeses need --outagefs build/liboutagefs.so\n");
         return 2;
     }
     if (opt_retain_s == 0 || opt_retain_s > 100000) {
@@ -5266,8 +5412,9 @@ int main(int argc, char **argv)
         return 2;
     }
     use_crashfs = (nemeses & N_POWER) != 0;
-    use_outagefs = (nemeses & (N_SLOW | N_SLOWLOSS)) != 0;
-    r4_dynamic = (nemeses & (N_CHURN | N_OUT | N_BACK | N_TWO | N_SLOWLOSS | N_M1)) != 0;
+    use_outagefs = (nemeses & (N_SLOW | N_SLOWLOSS | N_HDDEIO | N_NVMESTUCK | N_DISKBACK)) != 0 ||
+                   (r13_disks_on && outagefs_so != NULL);
+    r4_dynamic = (nemeses & (N_CHURN | N_OUT | N_BACK | N_TWO | N_SLOWLOSS | N_M1 | N_R13)) != 0 || r13_disks_on;
     /* repl_retain_s: --retain-s; longdown 3 s (a replica down for longer needs a snapshot); a classes run until r4-replay
      * is on main the age that lets the class switches' deferral pass (CLASSES_RETAIN_S); else the cluster's default */
     retain_eff = opt_retain_s > 0 ? opt_retain_s : (nemeses & N_LONGDOWN) ? 3 : (want_classes && !R4_REPLAY_ON_MAIN) ? CLASSES_RETAIN_S : 0;
@@ -5313,6 +5460,20 @@ int main(int argc, char **argv)
         die(2, "the cluster secret: %s", err);
     obs = calloc(MAXOBS, sizeof *obs);
 
+    if (r13_disks_on) {
+        if (opt_hdd_dir && *opt_hdd_dir) {
+            mkdir(opt_hdd_dir, 0755);
+            snprintf(hdd_rundir, sizeof hdd_rundir, "%s/hdd.XXXXXX", opt_hdd_dir);
+            if (!mkdtemp(hdd_rundir)) {
+                fprintf(stderr, "jepsen-cluster: mkdtemp %s: %s\n", hdd_rundir, strerror(errno));
+                return 2;
+            }
+        } else {
+            snprintf(hdd_rundir, sizeof hdd_rundir, "%s/hdd", rundir);
+            if (mkdir(hdd_rundir, 0755) != 0 && errno != EEXIST)
+                die(2, "r13: mkdir %s: %s", hdd_rundir, strerror(errno));
+        }
+    }
     for (int i = 0; i < MAXN; i++)
         nodes[i].sfill_pause_override = -1;
     for (int i = 0; i < nn; i++) {
@@ -5323,8 +5484,10 @@ int main(int argc, char **argv)
             die(2, "the outagefs control socket path %s is too long for a unix socket (use a shorter --dir)", nodes[i].octl);
         char st[PATH_MAX + 16];
         snprintf(st, sizeof st, "%s/state", nodes[i].dir);
-        /* R13 (E58): initialise the node's --dir as an ssd disk before creating state/ inside it. */
-        {
+        if (r13_disks_on) {
+            r13_init_node_disks(i);
+        } else {
+            /* R13 (E58): initialise the node's --dir as an ssd disk before creating state/ inside it. */
             const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
             char spec[PATH_MAX + 8];
             snprintf(spec, sizeof spec, "%s:ssd", nodes[i].dir);
@@ -5365,12 +5528,18 @@ int main(int argc, char **argv)
     settle("the formation");
     if (want_ec_k)
         ec_form_stores();
-    else if ((nemeses & N_R9) || opt_geometry[0])
-        ec_poller_start();
+    else {
+        if (r13_disks_on)
+            r13_wait_all_disks_registered(30000);
+        if ((nemeses & (N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on)
+            ec_poller_start();
+    }
     if (want_kv)
         kv_setup();
-    if (want_rep)
+    if (want_rep) {
         rep_setup();
+        r13_nvmefill_setup();
+    }
     if (rdma_tracking()) {
         struct rdma_mstat rms;
         rdma_sample_all(&rms);
@@ -5433,7 +5602,7 @@ int main(int argc, char **argv)
         case N_REBUILD: faults[9]++; nem_rebuild(); break;
         case N_CHURN: faults[10]++; nem_churn(); break;
         case N_PARTIAL: faults[11]++; nem_partial(); break;
-        case N_DISKLOSS: faults[12]++; nem_diskloss(); break;
+        case N_DISKLOSS: faults[12]++; if (r13_disks_on) nem_r13_diskloss(); else nem_diskloss(); break;
         case N_ROT: faults[13]++; nem_rot(); break;
         case N_RDMA_QPERR: faults[14]++; nem_rdma_qperr(); break;
         case N_ROTPARITY: faults[15]++; nem_rotparity(); break;
@@ -5449,6 +5618,10 @@ int main(int argc, char **argv)
         case N_HOLD: faults[25]++; nem_hold(); break;
         case N_STRIPESET: faults[26]++; nem_stripeset(); break;
         case N_FULL: faults[27]++; nem_full(); break;
+        case N_HDDEIO: faults[28]++; nem_hddeio(); break;
+        case N_NVMESTUCK: faults[29]++; nem_nvmestuck(); break;
+        case N_DISKBACK: faults[30]++; nem_diskback(); break;
+        case N_NVMEFILL: faults[31]++; nem_nvmefill(); break;
         }
         if (rdma_tracking()) {
             struct rdma_mstat rms;
@@ -5465,7 +5638,8 @@ int main(int argc, char **argv)
                 kind == N_OUT ? "out" : kind == N_BACK ? "back" : kind == N_TWO ? "two" : kind == N_MFAIL ? "mfail" :
                 kind == N_M1 ? "m1" : kind == N_SLOWLOSS ? "slowloss" : kind == N_HOLD ? "hold" :
                 kind == N_STRIPESET ? "stripeset" : kind == N_FULL ? "full" :
-                "power", rounds);
+                kind == N_HDDEIO ? "hddeio" : kind == N_NVMESTUCK ? "nvmestuck" : kind == N_DISKBACK ? "diskback" :
+                kind == N_NVMEFILL ? "nvmefill" : "power", rounds);
         settle(kind == N_KILL ? "a kill" : kind == N_PARTITION ? "a partition" : kind == N_PAUSE ? "a pause" :
                kind == N_MIDCOMMIT ? "a crash point" : kind == N_FWDSTALL ? "a forward stall" : kind == N_KILL2 ? "two kills" :
                kind == N_SLOW ? "a slow disk" : kind == N_LONGDOWN ? "a long outage" : kind == N_REBUILD ? "a rebuild" :
@@ -5477,7 +5651,9 @@ int main(int argc, char **argv)
                kind == N_BACK ? "a return during rebuild" : kind == N_TWO ? "two kills (guard)" :
                kind == N_MFAIL ? "m stripe kills" : kind == N_M1 ? "m+1 stripe kills" :
                kind == N_SLOWLOSS ? "slow then leader loss" : kind == N_HOLD ? "a node hold" :
-               kind == N_STRIPESET ? "a stripe pos move" : kind == N_FULL ? "full backpressure" : "a power loss");
+               kind == N_STRIPESET ? "a stripe pos move" : kind == N_FULL ? "full backpressure" :
+               kind == N_HDDEIO ? "an HDD EIO" : kind == N_NVMESTUCK ? "a stuck NVMe" :
+               kind == N_DISKBACK ? "a returning disk" : kind == N_NVMEFILL ? "an NVMe fill" : "a power loss");
         hold_ms(rnd_range(300, 1200));
     }
     if (term_cp >= 0 && !term_done) {
@@ -5579,12 +5755,14 @@ int main(int argc, char **argv)
     const char *dirs[MAXN * 3];
     int nd = replica_dirs(dirs, MAXN * 3);
     int rdiff = isr_short, isr = rep_full_mask();
-    if (want_ec_k || (nemeses & N_R9) || opt_geometry[0])
+    if (want_ec_k || (nemeses & (N_R9 | N_R13)) || opt_geometry[0] || r13_disks_on)
         r4_end_bad += ec_div_check(); /* its own FAIL line: not one of "the replicas differ" */
     if (nemeses & N_R12)
         r4_end_bad += r12_end_check();
     if (want_ec_k || (nemeses & N_R9) || opt_geometry[0])
         r4_end_bad += r9_end_check();
+    if (r13_disks_on || (nemeses & N_R13))
+        r4_end_bad += r13_end_check();
     struct rdma_mstat rdma_end;
     memset(&rdma_end, 0, sizeof rdma_end);
     if (rdma_tracking())
@@ -5653,6 +5831,7 @@ int main(int argc, char **argv)
     ec_summary();
     r12_summary();
     r9_summary();
+    r13_summary();
     if (want_via)
         printf("kv-via: %" PRIu64 " writes and %" PRIu64 " reads answered through a member that did not lead kvr, %" PRIu64
                " read-your-writes reads, %d stall window(s) checked, %" PRIu64 " of %" PRIu64 " nemesis picks aimed at an entry "
@@ -5765,7 +5944,7 @@ int main(int argc, char **argv)
      * ones, and the floor, as everywhere, a third of the honest rate (never below one fault). A list without these two
      * keeps its 10 s. */
     int per_round = 10;
-    if (nemeses & (N_LONGDOWN | N_REBUILD | N_R12 | N_R9)) {
+    if (nemeses & (N_LONGDOWN | N_REBUILD | N_R12 | N_R9 | N_R13) || (r13_disks_on && (nemeses & N_DISKLOSS))) {
         int sum = 0, n = 0;
         for (int k = 0; k < nk; k++) {
             sum += kinds[k] == N_LONGDOWN ? (retain_eff > 0 ? retain_eff : 3) + 14
@@ -5778,6 +5957,9 @@ int main(int argc, char **argv)
                  : kinds[k] == N_HOLD                     ? (int)S.rebuild_after_s + 20
                  : kinds[k] == N_SLOWLOSS                 ? 25
                  : (kinds[k] & N_R9)                      ? 15
+                 : kinds[k] == N_DISKBACK                 ? (opt_diskback_hold_s > 0 ? opt_diskback_hold_s + 25 : 25)
+                 : (r13_disks_on && kinds[k] == N_DISKLOSS) ? (int)S.rebuild_after_s + 30
+                 : (kinds[k] & N_R13)                     ? 25
                                                           : 6;
             n++;
         }
@@ -5844,9 +6026,11 @@ int main(int argc, char **argv)
     if (!rc && r12_harness_err)
         rc = 2;
     printf("jepsen-cluster: %s (seed %" PRIu64 ")\n", rc == 2 ? "HARNESS ERROR" : rc ? "FAILED" : "ok", seed);
-    if (!rc && !getenv("JEPSEN_KEEP"))
+    if (!rc && !getenv("JEPSEN_KEEP")) {
         rmtree(rundir);
-    else if (rc)
+        if (opt_hdd_dir && hdd_rundir[0])
+            rmtree(hdd_rundir);
+    } else if (rc)
         fprintf(stderr, "  logs and state of the nodes kept in %s\n", rundir);
     (void)keep_run;
     return rc;
