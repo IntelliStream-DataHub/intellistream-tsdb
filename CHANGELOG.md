@@ -104,6 +104,47 @@ disk format and the wire protocol.
     re-encodes as merges for the latest table (`lt_merge_marks`) and insert backpressure (`db_wait_merges`), with intent
     v4/v5 crash recovery and Jepsen coverage (`jepsen --tier 6 --reencode`, `jepsen-cluster-r10 --convert`).
 
+- **Cluster scrub, two-class disks, operator CLI, and Prometheus metrics (R12–R14; `META_SNAP_VERSION` 10 -> 11 -> 12 /
+  `"TME7"` -> `"TME8"` -> `"TME9"`, `RW_VERSION` 3, `PL_CL_VERSION` 11, `MK_DROP_OBJ` = 15).** Completes background
+  data integrity verification, NVMe/SSD/HDD device classes in one server, live cluster settings, structured status
+  views, salvage, and 55 cluster metric families (pre-1.0 preview clusters are initialised again across snapshot bumps;
+  `--chunk-dir` / `cluster.chunk.dir` and `tsdb chunk-store init` are removed and replaced by `--disk` / `storage.disks`
+  and `tsdb disk init`):
+  - **Background scrub, chunk repair, and automatic damage healing (`R12`: `src/chunkscrub.c`, `server/chunkrepair.c`,
+    `src/scrub.c`, `server/scrubd.c`, `server/cheal.c`, `tests/jepsen/cluster_ec.h`).** Per-store chunk scrub paces at
+    `scrub_mb_s` (50 MB/s) within `scrub_days` (14), pauses locally during heals/fills/`CHUNKR`/`CHUNKB`, persists
+    advisory progress in `<store>/SCRUB`, reports damage once per pass via `CS_OP_DAMAGED`, and marks a store
+    `DOWN_DAMAGED` (triggering immediate device `OUT`) above `scrub_out_count` (8/UTC-day). Volume leaders repair
+    damaged chunks under `ecgc_oid_lock` (`ecgc_oid_is_live` before decode and put — never resurrecting retired or
+    GC-pending objects) by RS-decoding from `k` sum-verified survivors and issuing `CS_PUT_F_REPLACE` at `writer_epoch`
+    with read-back scrub. Log replicas scrub young parts and `.ec` files via `pread` (never mmap, avoiding `SIGBUS`),
+    mark damaged replicas `CL_HEALTH_DAMAGED`, leave ISR when keeping `min_isr`, and heal automatically on the Raft
+    leader (`cheal_duty`: planned transfer + `REPLICA_RESET`, preserving `v<N>.lost-<rid>`). Verified by Jepsen nemeses
+    `rotparity`, `rotcold` (with D9 GC-vs-repair check), `rotthenm`, and `rotyoung`.
+  - **Two-class disks (`nvme`/`ssd`/`hdd`), per-disk fault isolation, per-disk FULL, local moves, device `DOWN`/`OUT`,
+    and host adoption (`R13`: `src/disk.[ch]`, `src/chunkmove.[ch]`, `server/disks.[ch]`, `server/cvolfs.c`,
+    `server/chunksrv.c`, `server/place.c`, `server/balance.c`, `tests/sim_place.c --classes`,
+    `tests/jepsen/cluster_r13.h`).** Adds `tsdb disk init|show` (`/sys` NVMe/SSD/HDD detection and 100×4 KiB
+    `fdatasync` latency check, `<disk>/DISK` metadata), `--disk PATH[:CLASS]` (`storage.disks`), `--role`,
+    `--allow-shared-device`, and `--adopt OLD` (`cluster.adopt`). Places log replicas across UP fast disks (weighted by
+    ingest, `nvme` before `ssd`, `log_on_hdd` fallback), places chunks on capacity disks (shared fast disks only on
+    flash-only servers, draining locally via `src/chunkmove.c` at 0 peer bytes once HDDs are added), and prefers
+    single-class stripe groups. Isolates each disk as its own fault domain (`src/health.c` `O_DIRECT` probes at
+    `disk_stall_s`, per-store 2-worker pools, fast-disk `DOWN` deposing only its volumes without exiting `tsdbd`),
+    tracks per-disk bytes by use (75/80/90% marks, per-volume `TSDB_WHY_FULL`, early retired-part release, non-shrinking
+    merge hold, 95% chunk put cap), drives per-disk `DOWN`/`OUT` timers, sibling-HDD local rebuilds, fast-disk log
+    rebuilds, host `--adopt OLD` recovery, and `tsdb cluster disk out|replace|class`, gated by `sim-place-soak-classes`
+    and 5 R13 Jepsen disk nemeses (`hddeio`, `nvmestuck`, `diskloss`, `diskback`, `nvmefill`).
+  - **Operator CLI, `creport` metrics, live settings, and salvage (`R14`: `server/creport.[ch]`, `src/ecsalvage.[ch]`,
+    `tools/cluster-cli.c`, `docs/metrics.md`).** Adds heartbeat-section and metrics registries exporting 55 cluster
+    metric families for P4 alerts plus `HBS_PROGRESS` (rebuild bytes/stall, settle backlog, scrub age, drain bytes).
+    Restructures `tools/cluster-cli.c` into a declarative verb table with `help` and `status` views (`status`,
+    `status volumes`, `status volume V`, `status disks`, `--json`). Adds live cluster settings (`tsdb cluster settings
+    show|set`, `META_OP_SETTINGS` CAS on `settings_version`, D25 23-live/16-init-only whitelist, `CLUSTER_OP_SETTINGS`
+    = 21, live consumer watch hooks). Hardens `node destroyed` against still-heard members and adds `tsdb cluster volume
+    salvage` (`MK_DROP_OBJ` = 15, `CLUSTER_OP_VOLUME_SALVAGE` = 27, `TSDB_WHY_LOST` write refusal and post-salvage
+    resume, whole-log-group loss report).
+
 - **Cluster disk flags, start checks, binding, and `HBS_DISKS` (`r13-start`).** Replaces `--chunk-dir`
   (`cluster.chunk.dir`) and `tsdb chunk-store init` with `--disk PATH[:CLASS]` (`storage.disks`, initialised with
   `tsdb disk init`), `--role compute|storage|both` (`cluster.role`), and `--allow-shared-device`

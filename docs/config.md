@@ -105,10 +105,13 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
   granule cache budget (default: a tenth of the RAM); persistent tier settings (`--redundancy`, `--after`,
   `--high-pct`, `--young-high-pct`, `--rebuild-mb-s`, `--scrub-mb-s`, `--scrub-days`) live in `TIERS` via
   `tsdb DIR tier set`.
-- **Reserved keys:** `storage.disks` is named for the device classes
-  (`docs/design-cluster-data.md`) and not built. It is a row in the table with no option: a file that sets it is
-  refused (`reserved and not implemented yet`), so a file written for a later version is never read as if the key did
-  nothing. Nothing else in the `storage.` group may take that name.
+- **Cluster disk keys (`storage.disks`, `cluster.role`, `cluster.allow.shared.device`, `cluster.adopt`):** in cluster
+  mode, `storage.disks` (`--disk`) declares the node's initialised disks (`PATH[:CLASS]`, comma-separated; each
+  initialised with `tsdb disk init`; replaces the removed `--chunk-dir` / `cluster.chunk.dir`). `cluster.role` (`--role`)
+  narrows the capability derived from the disks (`both`, `compute`, or `storage`), `cluster.allow.shared.device`
+  (`--allow-shared-device`) lifts the `st_dev` isolation check for test harnesses and single-disk dev hosts (emitting a
+  health warning), and `cluster.adopt` (`--adopt OLD`) accepts a replaced member's disks as pending adoption until
+  `tsdb cluster node replace OLD NEW` commits.
 
 ## tsdbd keys
 

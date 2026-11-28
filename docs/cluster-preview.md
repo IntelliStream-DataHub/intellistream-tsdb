@@ -506,6 +506,172 @@ line until the group has confirmed it.
 How many voters? The group has one voter with one or two members, three with three or four, and five with five or
 more (at most `--voters`). A member that does not vote watches.
 
+## Disks, status views, live settings, and salvage
+
+In addition to `--dir`, a cluster node can declare typed disks with `tsdb disk init` and repeatable `--disk PATH[:CLASS]`
+(`nvme`, `ssd`, or `hdd`, replacing `--chunk-dir` and `tsdb chunk-store init`). Fast disks (`nvme`, `ssd`) hold log
+replicas (`v<N>/`, WAL, young parts, `.ec` index files); capacity disks (`hdd`) hold chunk stores (`<disk>/chunks/`).
+On a server without capacity disks, fast disks hold chunk stores too (up to the young-tier reserve). On a single host
+where scratch directories share one filesystem, pass `--allow-shared-device` (health warns while set).
+
+The outputs below are taken directly from a 3-node run against `build/tsdbd` and `build/tsdb` (each node given one
+`:nvme` disk and one `:hdd` disk under `--port 0 --peer-port 0 --port-file`, `--allow-shared-device`, and an `ec=2+1`
+volume named `metrics`):
+
+### Initialising and inspecting disks (`tsdb disk init`, `tsdb disk show`, `--disk`)
+
+```sh
+build/tsdb disk init /srv/n1/nvme0:nvme
+build/tsdb disk init /srv/n1/hdd0:hdd
+build/tsdb disk show /srv/n1/nvme0
+```
+
+Without `:CLASS`, `tsdb disk init` detects `nvme`, `ssd`, or `hdd` from `/sys/dev/block` (recursing through dm/md
+slaves) and measures 100×4 KiB `fdatasync` latency (warning above 2 ms on fast classes). Output from the 3-node run:
+
+```
+disk /srv/n1/nvme0: id 3fbc613d30052c2c25a9594911bee50c, class nvme, sync_p50 0 us
+disk /srv/n1/hdd0: id 5c11c052b969598bb07c4ddb5649c428, class hdd, sync_p50 0 us
+path: /srv/n1/nvme0
+version: 1
+store_id: 3fbc613d30052c2c25a9594911bee50c
+class: nvme
+sync_p50_us: 0
+cluster: (unbound)
+node: (unbound)
+```
+
+Start each `tsdbd` with `--disk PATH[:CLASS]` (repeatable) instead of `--dir`:
+
+```sh
+build/tsdbd --cluster --cluster-secret-file $D/secret --state-dir $D/n1/state \
+    --disk $D/n1/nvme0:nvme --disk $D/n1/hdd0:hdd --allow-shared-device \
+    --no-auth --listen 127.0.0.1 --port 0 --peer-port 0 --port-file $D/n1/port --rack rack1
+```
+
+On first start, `tsdbd` binds each unbound `DISK` to the node and cluster, reports it in heartbeats (`HBS_DISKS`), and
+the Raft leader registers it (`STORE_ADD`).
+
+### `status` views (`status`, `status volumes`, `status volume V`, `status disks`, `--json`)
+
+`tsdb cluster status` provides four views — every view also accepts `--json` (before or after the view/peer) with
+documented, stable JSON keys (`tsdb cluster help status`):
+
+- **`tsdb cluster status PEER`**: summary showing node state, cluster/replicated/failure/scrub settings, Raft quorum,
+  per-member disk and volume reports, unified `health summary`, transfer/move counters, and active peer links:
+
+```
+node 1 mode core role leader term 1 leader 1 commit 14 applied 14
+cluster 6060032a7184b1157773d9cc31c9992b replication 3 min_isr 1 node_timeout_ms 3000 heartbeat_ms 500 voter_replace_s 600 voters_max 5 mode replicated failover lease read_barrier on lease_s 10 restore_gen 0
+replicated lease_ms 2000 drift_ppm 500 unanswered_ms 1000 commit_interval_ms 5 repl_retain_mb 4096 repl_retain_s 1800 idle_seal_ms 1000 rebuild_mb_s 200 rebuild_max 2 transfer_wait_ms 2000 leader_balance_s 0
+failure rebuild_after_s 1800 opening_hold_s 3600 failstop_out_s 60 out_guard_pct 25 out_guard_hold_s 7200 repl_retain_down_gb 64 young_high_pct 90 balance_mb_s 0 rebuild_concurrency 4
+scrub scrub_days 14 scrub_mb_s 50 scrub_out_count 8 log_on_hdd off young_warn_pct 75 young_move_pct 80 disk_stall_s 10
+group voters 1,2,3 learners -
+quorum yes voters_up 3/3 needed 2
+member 1 up incarnation 1 addr 127.0.0.1:34473 peer 127.0.0.1:34239 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on role both cap both disks 2
+disk node 1 store 3fbc613d30052c2c25a9594911bee50c class nvme uses log size 33221013504 sync_us 0 state up
+disk node 1 store 5c11c052b969598bb07c4ddb5649c428 class hdd uses chunk size 33221013504 sync_us 0 state up
+volume-report node 1 volume 1 role owner health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+...
+volume 1 name metrics uuid b06641a7ff69b22006839b46c99b31e2 leader 1 epoch 1 min_isr 1 replicas 1,2 isr 1,2 isr_version 1 set_version 1 preferred 1 redundancy ec=2+1 stripe 1,2,3 stripe_version 1 gc_suspended 0 rack loss survivable: yes
+replica volume 1 node 1 rid a5e895fa53a3b273 open_gen 1
+replica volume 1 node 2 rid 6d5a8463270b44cd open_gen 1
+health summary warn volumes_ok 1/1 degraded 0 unavailable 0 lost 0 warnings 3
+volumes 1 users 0
+```
+
+- **`tsdb cluster status volumes PEER`**: one row per volume with redundancy, leader, epoch, ISR, both margins
+  (`young/settled`), health, active rebuild progress (`-` when idle), and settle backlog:
+
+```
+vol  name           red         leader epoch isr         margins  health      rebuild            settle
+1    metrics        ec=2+1      1      1     1,2         1/1      ok          -                  0
+```
+
+- **`tsdb cluster status volume V PEER`**: full detail for one volume (name or number), including young/settled
+  margins, `settled_state`, stripe list, per-replica report health, active rebuild progress, settle backlog, and
+  `young_scrub_age_s`:
+
+```
+volume 1 name metrics uuid b06641a7ff69b22006839b46c99b31e2 health ok redundancy ec=2+1
+leader 1 preferred 1 epoch 1 min_isr 1 isr 1,2 isr_version 1 set_version 1
+margins young 1 settled 1 settled_state ok rack_survivable yes
+stripe 1,2,3 stripe_version 1 gc_suspended 0 mixed_class 0
+replica node 1 rid a5e895fa53a3b273 open_gen 1 learner 0 role owner report_health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+replica node 2 rid 6d5a8463270b44cd open_gen 1 learner 0 role none report_health ok epoch 1 domain - local_fault_s 0 fenced_age_ms 0
+rebuild none
+settle keys_waiting 0 oldest_wait_s 0 young_scrub_age_s 0
+```
+
+- **`tsdb cluster status disks PEER`**: per-class capacity, usage by category, fill marks, and active disk warnings:
+
+```
+class  disks  size     young   retired  index   chunks   free     marks       days to mark
+nvme   3      99.7 GB  33.6 KB 0        0       0        99.7 GB  75/80/90%   -
+hdd    3      99.7 GB  -       -        -       16.6 KB  99.7 GB  63%         -
+warn node 1: allow_shared_device
+warn node 2: allow_shared_device
+warn node 3: allow_shared_device
+```
+
+### Live cluster settings (`tsdb cluster settings show|set`)
+
+`tsdb cluster settings show PEER [--json]` prints `settings_version` and every setting marked `init-only` (16 keys:
+replication, min_isr, voters, lease/fence/heartbeat/commit/idle_seal timings, failover, read_barrier) or `live` (23
+keys: rebuild/balance pacing, retention, failure timers, mass-OUT guard, scrub, disk thresholds, `log_on_hdd`,
+`balance`). `tsdb cluster settings set PEER [--version N] KEY=VALUE...` updates live settings atomically with CAS on
+`settings_version` and propagates them to every member without restart; init-only keys are refused:
+
+```sh
+build/tsdb cluster settings show $(peer 1) --secret-file $D/secret
+build/tsdb cluster settings set $(peer 1) scrub_mb_s=40 young_warn_pct=70 --secret-file $D/secret
+build/tsdb cluster settings set $(peer 1) lease_ms=1000 --secret-file $D/secret
+```
+
+Output from the 3-node run:
+
+```
+settings_version 1
+replication            3          init-only
+...
+scrub_days             14         live
+scrub_mb_s             50         live
+scrub_out_count        8          live
+log_on_hdd             off        live
+young_warn_pct         75         live
+young_move_pct         80         live
+young_high_pct         90         live
+disk_stall_s           10         live
+balance                on         live
+
+settings updated (version 2): scrub_mb_s 50->40, young_warn_pct 75->70
+
+tsdb cluster settings set: lease_ms is init-only (D25: lease and fence timing rests on it)
+tsdb cluster settings: not allowed
+```
+
+### Declaring lost nodes and salvaging EC volumes (`node destroyed`, `volume salvage`)
+
+When a dead member is gone for good, mark it `out` and then `destroyed` (irreversible; refused while the member is
+still heard). If more than `M` stripe holders of an EC volume are destroyed, settled objects past redundancy become
+`LOST` (`TSDB_WHY_LOST`) while statistics queries and young parts remain intact; `tsdb cluster volume salvage PEER
+VOLUME [--force]` drops only the unrecoverable settled objects via `MK_DROP_OBJ` so the volume resumes writes and
+serves its surviving data (refusing while an `out` holder may still return unless `--force` is given):
+
+```sh
+build/tsdb cluster node out $(peer 1) 3 --secret-file $D/secret
+build/tsdb cluster node destroyed $(peer 1) 3 --secret-file $D/secret
+build/tsdb cluster volume salvage $(peer 1) metrics --secret-file $D/secret
+```
+
+Output from the 3-node run (with 1 of 3 `ec=2+1` holders destroyed, within `m=1` redundancy):
+
+```
+node 3: marked out (reason: operator)
+node 3: declared destroyed (final)
+volume 1 (metrics): 0 lost objects dropped
+```
+
 ## If something goes wrong
 
 - **`cannot connect to ...: Connection refused`**: the server is not running (yet), or the address is wrong. Look at
@@ -554,6 +720,10 @@ Everything below is off without `--cluster`.
 | `--power-feed NAME` | The server's power feed, the same. Shown by `status`. |
 | `--bmc ADDR` | The address of the server's management controller, for the `bmc` failover. Stored; nothing uses it yet. |
 | `--read-barrier on\|off` | This server's own read barrier setting, for shared volumes. Default `on`. |
+| `--disk PATH[:CLASS]` | Repeatable: declare a disk initialised with `tsdb disk init` (`nvme`, `ssd`, or `hdd`; config key `storage.disks`). Replaces `--chunk-dir`. Fast disks hold log replicas (`v<N>/`); capacity disks hold chunk stores (`<disk>/chunks/`), or fast disks hold both when no capacity disk is present. |
+| `--role both\|compute\|storage` | Narrow this member's capability derived from its disks (`both` default, `compute` log replicas only, `storage` chunk stores only). |
+| `--allow-shared-device` | Lift the start-time `st_dev` isolation check against `/`, `--state-dir`, and sibling disks (for test harnesses and single-disk dev hosts; health warns while set). |
+| `--adopt OLD` | Accept disks bound to replaced member `OLD` as pending adoption (serving nothing until `tsdb cluster node replace OLD NEW` commits, then rebinding `DISK` metadata and reconciling chunks). |
 | `--wal-sync-ms` | Must stay 0 (sync every write before its answer, the default) with `--cluster`: the server refuses to start otherwise. |
 | `TSDB_CLUSTER_WRITES=1` | In the environment, not an option, for tests only: opens every cluster volume as a plain writer, with no replication, no failover and none of step 10. Do not set it. |
 | `--witness` | A member without data: needs `--cluster`, takes no `--dir` (and has no client port). Give it `--advertise`, the host the others reach it at. It votes and keeps the group's state. |
@@ -570,6 +740,8 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 
 | Command | What it does |
 |---|---|
+| `tsdb disk init PATH[:CLASS] [--chunks]` | Initialise a disk for cluster mode: detect or record its class (`nvme`, `ssd`, `hdd`), measure 100×4 KiB `fdatasync` latency, and write `<disk>/DISK` with a fresh 32-hex store id. `tsdb disk show PATH` prints the stored metadata. |
+| `tsdb cluster help [VERB]` | Print usage and stable `--json` key documentation for a verb or verb group (`help status`, `help settings`, `help disk`, `help node`, `help volume`). |
 | `tsdb cluster secret FILE` | Make a new secret: 32 random bytes as hex, mode 0600. Never overwrites a file. |
 | `tsdb cluster init PEER --secret-file F [options]` | Make the cluster on one server that is in no cluster yet. It becomes node 1 and the leader. The options fix the settings (below). |
 | `tsdb cluster node add PEER NEW_PEER --secret-file F` | Add the server at `NEW_PEER` (running with `--cluster`, in no cluster yet). `PEER` is any member; the command follows to the leader. A server that is already a member is added again without harm (the same number). |
@@ -578,11 +750,17 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster node drain PEER NODE [--cancel] --secret-file F` | Mark `NODE` `draining` so every log replica and EC stripe position moves off it before automatic `out`. `--cancel` returns a live draining node to `up`. |
 | `tsdb cluster node replace PEER OLD (NEW \| --cancel) --secret-file F` | Move every log replica and EC stripe position of `OLD` directly onto `NEW` (which must be `up`, accept volumes, have chunk stores if `OLD` holds stripe positions, and hold none of `OLD`'s volumes); `OLD` is held while the replace runs and marked `out` once empty. `--cancel` clears the replace and releases `OLD`'s hold. |
 | `tsdb cluster node destroyed PEER NODE --secret-file F` | Declare an `out` node permanently `destroyed` (final; refused while still heard; frees its peer address and identity; more than `M` destroyed stripe holders mark an EC volume `LOST`). |
+| `tsdb cluster disk out PEER NODE STORE --secret-file F` | Mark store `STORE` (32 hex chars) on `NODE` `out` immediately: readable chunk stores drain locally onto sibling capacity stores (0 peer decode bytes); failed/down stores rebuild onto sibling capacity stores or other nodes. |
+| `tsdb cluster disk replace PEER NODE STORE --secret-file F` | Mark an `out` or `down` store `STORE` on `NODE` `destroyed` so a newly initialised replacement disk at that path is adopted and takes its uses. |
+| `tsdb cluster disk class PEER NODE STORE (nvme \| ssd \| hdd) --secret-file F` | Change store `STORE`'s recorded class on `NODE` (`STORE_CLASS`) and drain or rebuild data that no longer belongs on that class. |
 | `tsdb cluster volume add PEER NAME [--replicas N] --secret-file F` | Add a cluster volume called `NAME` on `N` servers (default: the cluster's `--replication`), in different racks where it can. Answers with its number. Refused when fewer than `N` members are up and may hold volumes. A name is never used twice. |
 | `tsdb cluster volume add PEER NAME --redundancy ec=K+M --secret-file F` | An erasure-coded volume (K 1 to 16, M 1 to 4): its settled parts are coded K+M across a stripe group of K+M members, each with a chunk store up (`tsdbd --disk PATH[:CLASS]`), which the leader picks once; positions are never renumbered. Its log is kept on M+1 servers and `min_isr` is M. Refused, naming how many members qualify, when fewer than K+M do. `--redundancy replicas=N` is `--replicas N`. `tsdb cluster status` shows `redundancy ec=K+M stripe A,B,... stripe_version V gc_suspended 0\|1`. |
 | `tsdb cluster volume redundancy PEER VOLUME (ec=K+M \| replicas=N \| --cancel) --secret-file F` | Convert an existing replicated volume online between `replicas=N` and `ec=K+M` (K 1..16, M 1..4), or between EC geometries, in five committed phases (`grow -> record -> reencode -> drop -> shrink`). Returns once committed; track progress with `tsdb cluster status volume VOLUME [--json] PEER --secret-file F`. `--cancel` stops a conversion before the `drop` phase (see [Changing volume redundancy online](#changing-volume-redundancy-online)). |
 | `tsdb cluster volume gc resume PEER VOLUME --secret-file F` | Turn the orphan collection of an erasure-coded volume (a name, else a number) back on. A `force-leader` (and a restore, once built) stops it (`gc_suspended 1`), because a chunk that a lost log tail still needs would look like an orphan; resume it once the volume is checked. |
-| `tsdb cluster status PEER --secret-file F` | What that server knows (see above). Views: `status volumes`, `status volume V`, `status disks`; `--json` on each. |
+| `tsdb cluster volume salvage PEER VOLUME [--force] --secret-file F` | Drop permanently lost settled `.ec` objects (fewer than `K` positions not on destroyed members) on `VOLUME` (name or number) via committed `MK_DROP_OBJ`, keeping young parts and surviving settled objects intact and resuming writes. Refuses while an `out` holder may still return or a local `settled_` copy exists unless `--force` is given; reports unaccounted log positions if the whole log group is destroyed. |
+| `tsdb cluster status [volumes \| volume V \| disks] [--json] PEER --secret-file F` | Cluster views: summary (`status`), per-volume table (`status volumes`), single-volume detail (`status volume V`), and per-class disk table (`status disks`); `--json` prints stable JSON keys on every view. |
+| `tsdb cluster settings show [--json] PEER --secret-file F` | Print `settings_version` and every cluster setting marked `init-only` or `live`. |
+| `tsdb cluster settings set PEER [--version N] KEY=VALUE... --secret-file F` | Update one or more `live` cluster settings atomically with CAS on `settings_version` (refuses `init-only` keys and stale versions) and propagate them live to every member without restart. |
 | `tsdb cluster volume move PEER VOLUME --log --from A --to B --secret-file F` | Move volume `VOLUME`'s copy on node `A` to node `B` (up, allowed to hold volumes, no copy of it yet). It answers at once and runs in the background: `B` gets a new copy, fills it and joins the in-sync set; then, if `A` leads the volume, leadership moves first; then `A` leaves the in-sync set and its copy is removed, `B` taking its place in the list. The number of in-sync copies never goes below what it was before `B` joined, so a lagging copy makes the move wait. A new group leader carries a move on, but once `B` has joined it waits until every other copy is in sync (it no longer knows the smaller size from before the join), so with another copy down such a move waits for it to come back. One move per volume at a time. With `--cancel` instead, `B`'s copy is removed and the old set stays (a move already past its last step ends anyway). `status` shows it. |
 | `tsdb cluster volume move PEER VOLUME --pos P --to B --secret-file F` | Move EC stripe position `P` of volume `VOLUME` to storage-capable node `B`. `B` enters `filling` (taking new settles at once and copying 1x from the previous holder where readable, else decoding), commits `STRIPE_WHOLE` at the barrier version, and releases the old holder via committed `MK_GC_RELEASE`. |
 | `tsdb cluster balance PEER [--apply] --secret-file F` | Show the cluster balancer's planned moves across log replicas, EC stripe positions, and leaders (dry-run by default). With `--apply`, override the 25% automatic plan cap (or `balance=off`) and run the plan at 5% concurrent bounds. |
@@ -612,7 +790,14 @@ and `--read-barrier` are stored only, and `--mode shared` and `--failover` (the 
 | `--out-guard-pct N` | 25 | Mass-OUT guard threshold (% of non-OUT members down; also triggers if an entire multi-server rack is down). |
 | `--out-guard-hold-s S` | 7200 | Upper bound of the mass-OUT guard before automatic `out` proceeds with a log line and metric (1 to 86400). |
 | `--repl-retain-down-gb GB` | 64 | Per-server WAL retention budget for `down` or held members (ignores `repl_retain_s` until `out` or hold expiry). |
+| `--young-warn-pct N` | 75 | Fast-disk fill % warning threshold (`warn=filling`, `TsdbFastDiskFilling`). |
+| `--young-move-pct N` | 80 | Fast-disk fill % move threshold (`warn=move_needed`; excluded from new log placements). |
 | `--young-high-pct N` | 90 | Fill % at which a member/disk enters `FULL` backpressure (`UNAVAILABLE` `TSDB_WHY_FULL`; clears 2 points lower). |
+| `--disk-stall-s S` | 10 | `O_DIRECT` disk probe stall timeout before marking a `--disk` `DOWN` (E57). |
+| `--log-on-hdd on\|off` | off | Allow placing log replicas on `hdd`-only servers only when no fast-disk servers remain (health warns while any do). |
+| `--scrub-days D` | 14 | Target background scrub cycle length in days; health warns past `2 * scrub_days`. |
+| `--scrub-mb-s MB` | 50 | Per-disk background scrub read pace in MB/s (pauses locally during heals/fills/reads/puts). |
+| `--scrub-out-count N` | 8 | Damaged chunks per UTC day on one store above which the store is marked `DOWN_DAMAGED` and driven `OUT`. |
 | `--balance on\|off` | on | Automatic greedy balancer after `node add`, `node drain`, and rebuilds (5% concurrent, 25% plan cap). |
 | `--balance-mb-s MB` | 0 | Balancer move rate in MB/s (0: equals `--rebuild-mb-s`; yields to any active rebuild). |
 | `--rebuild-concurrency N` | 4 | EC objects filled in flight per server (1 to 64). |

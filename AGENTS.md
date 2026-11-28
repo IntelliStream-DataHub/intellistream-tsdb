@@ -694,6 +694,38 @@ cgroup, so `nice` does not keep your work out of its way.
   file name against every predicate, `make NO_EC=1`), `test_settle.c`, `test_settle_oracle.c`, `test_ecgc.c`, each with
   its planted bugs (`--mutant NAME`, a Makefile loop that requires each to fail). A test that cannot run without the codec
   prints that it is skipped.
+- `src/scrub.[ch]`, `server/scrubd.[ch]` (R12 `r12-young`; E25, §5.9, D4, D7, D27): cluster-only young-part and `.ec`
+  scrubber. `eng_scrub_step` (`src/scrub.c`) verifies every granule checksum, index hash, footer hash, and `.ec` object
+  record/trailer via `pread` (never touching `p->map`, so EIO never raises `SIGBUS`), holding a part reference and no
+  engine lock across reads, skipping merged-away parts. `server/scrubd.c` runs one background thread per server walking
+  held volumes paced to `scrub_mb_s` (live-updated via `cluster_add_settings_watch`), persisting advisory progress in
+  `v<N>/SCRUB` (tracks `(st_dev, st_ino)` so snapshot installs/resets clear stale damage; re-scrubs a previously damaged
+  part first on restart), calling `part_mark_payload` + setting `CL_HEALTH_DAMAGED` (lock-free `dmg_map` / `min_isr_held`
+  atomics), leaving the ISR in `server/repld.c` only when remaining ISR `>= min_isr`, and exporting
+  `tsdb_young_scrub_*` metrics via `creport`. `tests/test_scrub.c`, `test_cluster youngscrub`, `make scrub-mutants`
+  (`youngskipgranule`, `youngmmap`, `youngleavebelow`).
+- `src/disk.[ch]` (R13 `r13-disk`, `r13-adopt`; E47, E58, §15.1, D11): block-device class detection (`disk_detect` via
+  `/sys/dev/block`, recursing dm/md `slaves/`, PCIe `nvme*` -> `nvme`, `queue/rotational` 0 -> `ssd`, 1 -> `hdd`; refuses
+  anonymous/mixed/loop/btrfs/remote devices asking for explicit `:CLASS`), 100×4 KiB `fdatasync` latency probe (warns
+  above 2 ms on fast classes), `<disk>/DISK` metadata (encode/parse with checksum, atomic `disk_init2`, `disk_bind`,
+  `disk_rebind_locked` via `DISK.tmp -> fsync -> rename -> dir fsync` under exclusive `flock`), and `tsdb disk
+  init|show` in `tools/tsdb-cli.c`. `tests/test_disks.c` (against `tests/data/fake-sys/` + `crashfs` sweeps),
+  `tests/fuzz/fuzz_disk.c`, `make disk-mutants` (`rotationalflip`, `bindtwice`).
+- `src/ecsalvage.[ch]` (R14 `r14-salvage`; E15, §5.8, D26): cluster EC volume salvage. `ec_salvage_leader` inspects
+  listed `.ec` parts via `pos_fn`, refuses `OUT` holders or parts with a local `settled_*.part` copy unless `--force`,
+  serializes with `MK_UNSETTLE` via `jr_serial` and `unsettle_hold_pos`, commits `MK_DROP_OBJ = 15`, retires lost `.ec`
+  parts via `ec_swap_salvage_at` (`ecgc_retire_locked_at` gated on all replicas applying past `MK_DROP_OBJ`, logging a
+  warning when a dropped part shadowed lower blocks), and `ec_salvage_apply` applies committed `MK_DROP_OBJ` on
+  followers and replay. Crash point `CP_SALVAGE_AFTER_MARKER` (`salvage-after-marker`); `CLUSTER_OP_VOLUME_SALVAGE = 27`
+  (`tsdb cluster volume salvage`); `test_cluster salvage`, `make salvage-mutants` (`salvageheard`, `salvagenotlost`).
+- `server/creport.[ch]` (R14 `r14-report`, `r14-progress`; §14.4, D22, D23): cluster heartbeat-section registry
+  (`creport_section` / `creport_sec_encode_all` / `creport_sec_decode_into`) and cluster Prometheus metrics registry
+  (`creport_metric_collector`, rendering immutable snapshots off cluster locks in `server/metrics.c`, exporting 55
+  cluster families documented in `docs/metrics.md`), plus `HBS_PROGRESS` (per-volume snapshot/stripe-fill bytes done
+  and total, 15-minute stall detection, settle backlog count/oldest age, scrub age, and per-store drain bytes). Compiled
+  twice (`creport.o` pure registry; `creport_drv.o` with `-DCREPORT_DRV_ONLY` for `creport_repld_lag`). `test_cluster
+  metrics progress`, `make report-mutants` (`metricstale`, `sectionsdrop`), `make progress-mutants` (`progressfrozen`,
+  `progressnototal`).
 - `src/chunkscrub.[ch]` (per-store background chunk scrubber; R12, r12-chunk, E25, E26, §5.9): walks every volume's
   chunks per store verifying header/size/sums/footer and every cell's xxh64 (`chunk_rd_scrub_ex`), paced to `scrub_mb_s`
   (default 50 MiB/s) within `scrub_days` (default 14 d), paused during heals/fills (`sfill`), remote chunk reads
@@ -891,8 +923,9 @@ cgroup, so `nice` does not keep your work out of its way.
   file's settings are spliced into argv in front of the real command line, so the program's own option parser stays the
   only reader and the command line wins. The tables of `docs/config.md` between the `keys:` markers are what
   `tsdbd --config-keys` and `tsdb --config-keys` print (`tests/test_config.sh` compares them; paste the output after
-  a change). `tests/test_props.c` and `tests/fuzz/fuzz_props.c` test the parser. The keys of `storage.` for the
-  device classes are reserved, not built.
+  a change). `tests/test_props.c` and `tests/fuzz/fuzz_props.c` test the parser. `storage.disks` (`--disk`),
+  `cluster.role` (`--role`), `cluster.allow.shared.device`, and `cluster.adopt` are built in R13, and `storage.tiers`
+  (`--tier`) and `storage.tier.cache` in R15.
 - `tools/`: CLI and benchmarks. `tests/`: tests; `tests/jepsen/`: the
   fault-injection harness and the `crashfs` LD_PRELOAD power-loss simulator.
 
@@ -1125,6 +1158,35 @@ cgroup, so `nice` does not keep your work out of its way.
     and `MK_NOW` pass so young data drains; mutant `fullafteradmit`), and `server/tsdbd.c` refuses large writes before
     `lw_enter` with definite `TSDB_ERR_UNAVAILABLE` (`TSDB_WHY_FULL`, `retry_after` 1000 ms). Replica FULL travels in
     every ACK (`RW_ACK_FULL` bit 1, `RW_VERSION` 3).
+- **Scrub, disk fault domains, and cluster reporting (R12–R14)** (`src/scrub.c`, `src/chunkscrub.c`, `src/chunkmove.c`,
+  `src/disk.c`, `src/ecsalvage.c`, `server/scrubd.c`, `server/chunkrepair.c`, `server/cheal.c`, `server/disks.c`,
+  `server/creport.c`):
+  - **Scrub never deletes or resurrects** (D9): `src/chunkscrub.c` and `src/scrub.c` are strictly read-only verifiers
+    (`pread`, never `mmap`, so EIO never raises `SIGBUS`); `server/chunkrepair.c` verifies `ecgc_oid_is_live` before
+    decoding and again under `ecgc_oid_lock` before putting, and `server/chunksrv.c` `CS_PUT_F_REPLACE` refuses when
+    the target chunk file no longer exists under `st->mu`, so a late repair never resurrects a `MK_GC`-deleted object
+    (mutant `repairnolive`).
+  - **Repair at the object's epoch** (D5): `server/chunkrepair.c` reconstructs damaged chunks from `k` sum-verified
+    survivors, checks every rebuilt cell against the `.ec` record's sums (mutant `repairnosums`), and sends
+    `CS_PUT_MAGIC_V2` with `CS_PUT_F_REPLACE` writing `hdr_epoch = writer_epoch` under the leader's pinned
+    `fence_epoch` (never writing the leader's own epoch into the chunk header; mutant `repairownepoch`), verified on
+    disk by `chunk_rd_scrub` before `PUT_OK`.
+  - **A disk is a fault domain** (E57, §15.6): every present `--disk` runs its own `src/health.c` `O_DIRECT` probe at
+    `disk_stall_s` and every chunk store runs its own bounded 2-worker pool (`CS_STORE_WORKERS = 2` in
+    `server/chunksrv.c`). A `DOWN` fast disk deposes and quiesces only the volumes on that disk (`repld_disk_down`)
+    without exiting `tsdbd`, reopening on recovery (`cvol_disk_reopen`); a chunk-store EIO/ENOSPC marks only that store
+    `DOWN_IOERR` and falls back puts to surviving UP stores; only `--state-dir` or `USERS` fail-stop exits the process
+    (mutants `stallexit`, `stallnoresign`, `storeeioexit`).
+  - **FULL per disk** (E53, §15.4): per-disk detachable 256 KiB workers (`server/disks.c` `disk_usage_*`) sample bytes
+    by use (`young`, `retained`, `retired`, `local`, `index`, `chunks`) and enforce 75/80/90% marks per fast disk;
+    `disks_vol_full` / `RW_ACK_FULL` refuse inserts with `TSDB_WHY_FULL` only for volumes with a replica on the full
+    disk while volumes on sibling disks keep writing, while `eng_set_disk_full` releases matched retired settle copies
+    immediately and holds non-shrinking merges (mutants `fullall`, `fullmergeon`, `fullnorelease`).
+  - **R12–R14 mutant targets** (all run through `tools/mutants.sh`): `scrub-mutants`, `chunkscrub-mutants`,
+    `repair-mutants`, `heal-mutants`, `disk-mutants`, `disks-mutants`, `cvolfs-mutants`, `placeclass-mutants`,
+    `diskfault-mutants`, `diskfill-mutants`, `lmove-mutants`, `diskout-mutants`, `adopt-mutants`,
+    `sim-place-class-mutants` (plus `make sim-place-soak-classes`), `report-mutants`, `progress-mutants`,
+    `settings-mutants`, and `salvage-mutants`.
 - **Settled parts** (R7 single-server, R8-1 cluster EC, R10 single-server re-encode; `src/ecpart.c`, `src/ecswap.c`,
   `src/settle.c`, `src/eccold.c`, `src/ecapply.c`, `src/ppos.c`, `src/ecdigest.c`, `src/ecdiverge.c`, `src/eckeep.c`,
   `src/ecgc.c`, `src/ecgcmk.c`; `docs/design-cluster-data.md` §2.3). On one server (R7, D2) a settle turns
@@ -1586,6 +1648,20 @@ cgroup, so `nice` does not keep your work out of its way.
   A leader's snapshot (`src/snapshot.c`) adds no edge: its cut takes `flush_lock` > `publish_lock` (and inside them
   `db->lock`, `buf_lock`, `lead_mu` briefly), and after releasing them its barrier takes each dictionary's `append_lock`,
   `ret_lock` and `class_lock` one at a time, alone, under no other engine lock.
+  `creport` / R12–R14 lock rules: `src/scrub.c` (`eng_scrub_step`) holds a part reference and takes no engine lock
+  across `pread`; `server/scrubd.c` `S.mu` is a leaf (hot cross-lock callers read lock-free `dmg_map`/`min_isr_held`
+  atomics, and `tsdb_cvol_ref` is held only per bounded slice); `src/chunkscrub.c` `sc->mu` and `server/chunkrepair.c`
+  `cr->mu` are leaves never held across disk or network I/O (repair releases `ecgc_oid_lock` and its engine ref before
+  `net_put`); `src/chunkmove.c` writes and fsyncs `tmp_*` outside `oid_mu[64]` (outermost per-`(volume, oid)` stripe
+  lock in `src/chunkstore.c` serializing `chunk_move`, `chunk_be_del`, and `replace_only`), then takes `oid_mu` only
+  across source-inode verification, rename + dir fsync, read-back verify, `loc_tab` update, and source unlink;
+  `server/disks.c` uses `g_probe_mu` + `probe_users` refcount (never recursive locks) so `disk_probe_stop` drains active
+  callers before closing `probe_h`, and `disk_usage_*` detachable workers hold no engine lock or `G.mu` across `statvfs`
+  or directory walks (using `flush_cv` on the engine flush thread for FULL-entry `graveyard_purge`); `server/creport.c`
+  takes its section/metrics registry locks only to copy descriptors or snapshots, never across scrapes or under cluster
+  locks (`cheal.c` uses a private leaf lock for its blocked-volume snapshot); and `src/ecsalvage.c` (`ec_salvage_leader`)
+  takes `jr_serial` > `db->lock` > `buf_lock` briefly to arm `unsettle_hold_pos`, then `ec_swap_salvage_at` matches
+  drop lock order (`publish_lock` > `latest_rw` > `db->lock`).
   The latest table (design-latest.md section 10): `publish_lock` > `latest_rw` > `manifest_lock` > `db->lock` >
   `buf_lock` (a publisher's write section); `ret_lock` > `latest_rw` > `db->lock` (a limit change); `tsdb_drop_before` and a merge
   that lists across a limit change take `latest_rw` (write) > `db->lock` (a merge lets go of `db->lock` to take it); lookups and
