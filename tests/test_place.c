@@ -1512,6 +1512,76 @@ static void test_balance(void)
     CHECK(out.nprops == 1, "bal(e): must emit 0 new props when place_plan emitted proposals this tick");
     place_out_free(&out);
 
+    /* (f) Regression test (r13-sim seed 550): concurrent balance emission must check chunk fill mark against REAL
+     *     (non-virtual) bytes so an incoming move onto dst does not ride a concurrent outgoing move off dst before
+     *     STRIPE_WHOLE + MK_GC actually frees space on dst. */
+    {
+        struct meta_state sm2;
+        struct place_member pm2[9];
+        init_cluster_state(&sm2, 9, NULL, pm2, 1);
+        struct meta_disk dks2[9];
+        struct place_disk_usage du2[9];
+        for (uint32_t i = 0; i < 9; i++) {
+            dks2[i] = mk_disk((uint8_t)(100 + i), META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+            add_disk(&sm2, i + 1, &dks2[i]);
+            struct meta_disk nv = mk_disk((uint8_t)(120 + i), META_DISK_NVME, META_DISK_USE_LOG, sz);
+            add_disk(&sm2, i + 1, &nv);
+            du2[i] = (struct place_disk_usage){.disk_class = META_DISK_HDD,
+                                               .uses = META_DISK_USE_CHUNK,
+                                               .state = META_STORE_UP,
+                                               .have_usage = 1,
+                                               .size_bytes = sz,
+                                               .chunk_bytes = sz * 41 / 100};
+            memcpy(du2[i].store_id, dks2[i].store_id, 16);
+            pm2[i].disks = &du2[i];
+            pm2[i].ndisks = 1;
+            set_role(&sm2, i + 1, (i < 6) ? META_ROLE_BOTH : META_ROLE_STORAGE);
+        }
+        /* 6 EC 4+2 volumes -> total_pos = 54, max_conc = 2. Balanced logs on nodes 1..6 (3 each).
+         * Vols 1-2 stripe = {1,2,3,4,5,9} (node 9 already holds vols 1-2, so 1 cannot move to 9);
+         * Vols 3-6 stripe = {2,3,4,5,6,8} (node 8 holds 4 pos at 44%, est_b = 11%).
+         * Node 1 holds 2 pos at 94% (est_b = 47%); node 9 is at 10%; mark_ppm = 95% * 8/9 = 84.4%.
+         * Move 1 (8->9) virtually drops node 8 from 44% to 33%, making virtual 1->8 look 33% + 47% = 80% < 84.4%,
+         * while REAL concurrent 44% + 47% = 91% >= 84.4%. Step 10 MUST NOT emit 1->8 concurrently with 8->9! */
+        for (uint32_t v = 1; v <= 6; v++) {
+            uint32_t lrep[3] = {(v % 2) ? 1u : 4u, (v % 2) ? 2u : 5u, (v % 2) ? 3u : 6u};
+            uint32_t stp[6];
+            if (v <= 2) {
+                uint32_t s1[6] = {1, 2, 3, 4, 5, 9};
+                memcpy(stp, s1, sizeof stp);
+            } else {
+                uint32_t s2[6] = {2, 3, 4, 5, 6, 8};
+                memcpy(stp, s2, sizeof stp);
+            }
+            char vname[32];
+            snprintf(vname, sizeof vname, "reg%u", v);
+            add_vol(&sm2, v, vname, lrep, 3, 4, 2, stp);
+        }
+        du2[0].chunk_bytes = sz * 94 / 100; /* node 1: 94% across 2 pos -> est_b = 47% */
+        du2[6].chunk_bytes = sz * 80 / 100; /* node 7: 80% (80+47=127 >= 84.4) */
+        du2[7].chunk_bytes = sz * 44 / 100; /* node 8: 44% across 4 pos -> est_b = 11% */
+        du2[8].chunk_bytes = sz * 10 / 100; /* node 9: 10% across 2 pos */
+        struct place_in in2 = make_in(&sm2, pm2, 9);
+        in2.balance_apply = 1;
+        place_out_init(&out);
+        balance_plan(&in2, &out);
+        if (g_mut != PLACE_MUT_PLACE_FULL && g_mut != PLACE_MUT_MIX_STRIPE) {
+            int saw_8_to_9 = 0;
+            for (uint32_t i = 0; i < out.nprops; i++) {
+                if (out.props[i].kind == PLACE_PROP_STRIPE_SET && out.props[i].other_node == 8 &&
+                    out.props[i].node == 9)
+                    saw_8_to_9 = 1;
+                CHECK(!(out.props[i].kind == PLACE_PROP_STRIPE_SET && out.props[i].other_node == 1 &&
+                        out.props[i].node == 8),
+                      "bal(f): emitted concurrent 1->8 move projecting node 8 to 91%% >= 84.4%% fill mark before "
+                      "outgoing 8->9 freed space");
+            }
+            CHECK(saw_8_to_9, "bal(f): expected 8->9 move to be emitted so concurrent fill-mark path is exercised");
+        }
+        place_out_free(&out);
+        meta_free(&sm2);
+    }
+
     meta_free(&sm);
 }
 

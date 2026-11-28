@@ -146,6 +146,8 @@ int place_mutant_parse(const char *name)
         return PLACE_MUT_TAKEBACK_WHOLE;
     if (!strcmp(name, "partialdelnow"))
         return PLACE_MUT_PARTIAL_DEL_NOW;
+    if (!strcmp(name, "usechange"))
+        return PLACE_MUT_USE_CHANGE;
     return -1;
 }
 
@@ -497,20 +499,23 @@ static int member_stripe_eval(const struct place_in *in, const struct meta_membe
             *why_out = "unknown member";
         return 0;
     }
-    if (mb->role == META_ROLE_COMPUTE) {
-        if (why_out)
-            *why_out = "the node's role is compute-only";
-        return 0;
-    }
-    if (mb->ndisks > 0 && !(meta_member_effective_cap(mb) & META_CAP_STORAGE)) {
-        if (why_out)
-            *why_out = "the node is not storage-capable";
-        return 0;
-    }
-    if (member_chunk_stores(in, mb->id) == 0) {
-        if (why_out)
-            *why_out = "the node has no chunk stores up";
-        return 0;
+    int allow_use_change = (in->mutant == PLACE_MUT_USE_CHANGE && is_rebuild);
+    if (!allow_use_change) {
+        if (mb->role == META_ROLE_COMPUTE) {
+            if (why_out)
+                *why_out = "the node's role is compute-only";
+            return 0;
+        }
+        if (mb->ndisks > 0 && !(meta_member_effective_cap(mb) & META_CAP_STORAGE)) {
+            if (why_out)
+                *why_out = "the node is not storage-capable";
+            return 0;
+        }
+        if (member_chunk_stores(in, mb->id) == 0) {
+            if (why_out)
+                *why_out = "the node has no chunk stores up";
+            return 0;
+        }
     }
     if (mb->ndisks == 0)
         return 1;
@@ -1433,7 +1438,7 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
     int32_t best_mi = -1;
     uint32_t best_rack = UINT32_MAX, best_holds = UINT32_MAX, best_pairs = UINT32_MAX;
     uint64_t best_cppm = UINT64_MAX;
-    int best_dup = 0, best_cls_match = 0;
+    int best_dup = 0, best_cls_match = 0, best_bad_use = 0;
     for (uint32_t i = 0; i < nm; i++) {
         uint32_t used_recv = urgent ? stripe_recv_urgent[i] : stripe_recv[i];
         if (used_recv >= stripe_cap || pend_gone[i])
@@ -1447,6 +1452,12 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
         int dup = vol_has_stripe(v, mb->id);
         if (dup && in->mutant != PLACE_MUT_TWO_PER_SERVER)
             continue;
+        int bad_use = (in->mutant == PLACE_MUT_USE_CHANGE && is_rebuild &&
+                       (mb->role == META_ROLE_COMPUTE ||
+                        (mb->ndisks > 0 && !(meta_member_effective_cap(mb) & META_CAP_STORAGE)) ||
+                        member_chunk_stores(in, mb->id) == 0))
+                          ? 1
+                          : 0;
         uint32_t rack_cnt = 0;
         if (racks) {
             for (uint32_t j = 0; j < nrem; j++)
@@ -1460,6 +1471,8 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
         int better = 0;
         if (best_mi < 0) {
             better = 1;
+        } else if (in->mutant == PLACE_MUT_USE_CHANGE && is_rebuild && bad_use != best_bad_use) {
+            better = bad_use > best_bad_use; /* planted mutant: actively rebuild chunk onto non-storage node */
         } else if (in->mutant == PLACE_MUT_TWO_PER_SERVER && dup != best_dup) {
             better = dup > best_dup;
         } else if (rack_cnt != best_rack) {
@@ -1483,6 +1496,7 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
             best_cppm = cppm;
             best_pairs = pairs;
             best_dup = dup;
+            best_bad_use = bad_use;
         }
     }
     return best_mi >= 0 ? sm->members[best_mi].id : 0;

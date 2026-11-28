@@ -1,27 +1,33 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * Placement, failure-handling, and MTTDL simulator (docs/design-cluster-data.md §5.3, §10.2; R9 plan D7;
- * track r9-simplace).
+ * Placement, failure-handling, disk/class, and MTTDL simulator (docs/design-cluster-data.md §5.3, §10.2, §15.9;
+ * R9 plan D7, track r9-simplace; R13 track r13-sim).
  *
  * Drives the real pure planners (`pout_plan`, `place_plan`, `balance_plan`, `place_volume`, `place_stripe`,
  * `place_rack_survivable`) and applies their proposals through the real metadata state machine (`meta_apply`,
  * checked by `meta_check_step`) over seeded discrete-event clusters with:
- *   - N servers across racks, 1-4 chunk disks per server (one storage class), mixed geometries:
- *     `replicas=3` and EC `4+2`, `8+2`, `8+4`, `16+4`;
+ *   - N servers across racks, 1-4 chunk disks per server (default mode) or realistic R13 multi-disk/multi-class
+ *     topologies (`--classes`: NVMe+HDD mixed, HDD-only storage/both, NVMe-only compute, SSD/NVMe all-flash shared
+ *     disks with per-disk `class`, `uses`, `size_bytes`, `state`, and live `young_bytes`/`chunk_bytes` usage),
+ *     mixed geometries: `replicas=3` and EC `4+2`, `8+2`, `8+4`, `16+4`;
  *   - Settled objects over time (`MK_COLD` pending -> committed, carrying `stripe_version`, including E10 degraded
  *     settles with k+m-1 positions) and `MK_GC` releases;
- *   - Faults: server down/back, slow opening past `opening_hold_s`, single-disk and full-store loss, fail-stop
- *     last-gasp beats, per-replica `LOCAL_FAULT`, rack-down and >25% mass outages, `m` and `m+1` simultaneous losses;
+ *   - Faults & R13 disk/class events: server down/back, slow opening past `opening_hold_s`, single-disk and
+ *     full-store loss, fail-stop last-gasp beats, per-replica `LOCAL_FAULT`, rack-down and >25% mass outages, `m` and
+ *     `m+1` simultaneous losses; in `--classes`: `STORE_STATE` disk DOWN/OUT/recovery, `STORE_ADD`, `STORE_CLASS`,
+ *     fast-disk fill past `young_move_pct` and chunk-store fill past §5.6 mark (then drain), HDD-only storage joins,
+ *     and live `log_on_hdd` toggling via `META_OP_SETTINGS`;
  *   - Operator operations: `node hold` (including refusal of >24 h holds), `node replace`, `node drain`,
  *     `node destroyed`, `volume move --pos`, and `node add`;
  *   - Modelled proposal delay and loss, and margin-paced log catch-up and EC stripe fills;
- *   - Checker after every step verifying all placement, barrier, durability, GC, hold, and guard invariants;
+ *   - Checker after every step verifying all placement, barrier, durability, GC, hold, guard, and R13 disk/class/fill
+ *     invariants;
  *   - Planted mutants (`--mutant NAME` / `TSDB_PLACE_MUTANT`) verifying the checker catches every bug;
  *   - `--mttdl` Monte Carlo MTTDL over topologies built by real `place_volume`/`place_stripe` with E13 margin-first
  *     ordering and pacing beside §5.3's closed form k*D / ((N-1)*r).
  *
  * Usage:
- *   sim_place [--seeds N] [--first S] [--seed S] [--ticks T] [--mutant NAME] [--trace]
+ *   sim_place [--classes] [--seeds N] [--first S] [--seed S] [--ticks T] [--mutant NAME] [--trace]
  *   sim_place --mttdl GEOM|all [--mttdl-table] [--disks-afr P] [--servers-afr P] [--disks-per-node D]
  *             [--tb-per-node T] [--rate MB/s] [--nodes N] [--trials N] [--seed S]
  */
@@ -40,7 +46,8 @@
 /* ------------------------------------------------------------------ constants */
 
 #define SIM_MAX_NODES 32
-#define SIM_MAX_DISKS 4
+#define SIM_MAX_DISKS 8
+#define SIM_STD_DISKS 4
 #define SIM_MAX_VOLS 8
 #define SIM_MAX_OBJS 36
 #define SIM_MAX_RELEASES 48
@@ -133,13 +140,30 @@ struct sim_release {
     uint8_t done;
 };
 
+struct sim_disk {
+    uint8_t store_uuid[16]; /* registered meta_disk.store_id */
+    uint8_t disk_class;     /* enum meta_disk_class */
+    uint8_t uses;           /* enum meta_disk_uses bitmask */
+    uint8_t state;          /* enum meta_store_state */
+    uint64_t size_bytes;
+    uint64_t young_bytes;
+    uint64_t chunk_bytes;
+    uint64_t young_peak_7d;
+    uint32_t out_tick;        /* tick when DOWN disk escalates to OUT (0: none) */
+    uint32_t recover_tick;    /* tick when DOWN/OUT disk recovers to UP (0: none) */
+    uint32_t fill_until_tick; /* tick when a simulated fill spike drains back (0: none) */
+};
+
 struct sim_node {
     uint32_t id;
     char rack[META_RACK_MAX];
+    uint8_t class_mode;
+    uint8_t role; /* enum meta_role (used in --classes mode) */
     int ndisks;
     uint8_t disk_ok[SIM_MAX_DISKS];
     uint64_t disk_store_id[SIM_MAX_DISKS];
     uint64_t expected_store_id[SIM_MAX_DISKS];
+    struct sim_disk disks[SIM_MAX_DISKS];
     int alive;
     int destroyed;
     uint64_t incarnation;
@@ -203,6 +227,19 @@ struct sim_cov {
     uint64_t repl_faults;
     uint64_t disk_losses;
     uint64_t slow_opens;
+    /* R13 (--classes) coverage counters */
+    uint64_t cls_disk_down;
+    uint64_t cls_disk_out;
+    uint64_t cls_disk_recover;
+    uint64_t cls_disk_add;
+    uint64_t cls_disk_class;
+    uint64_t cls_fast_fill;
+    uint64_t cls_chunk_fill;
+    uint64_t cls_hdd_join;
+    uint64_t cls_log_on_hdd_on;
+    uint64_t cls_log_on_hdd_off;
+    uint64_t cls_single_stripes;
+    uint64_t cls_mixed_stripes;
 };
 
 struct sim {
@@ -221,6 +258,7 @@ struct sim {
     struct sim_vol vols[SIM_MAX_VOLS];
     uint32_t nracks;
     int use_racks;
+    int use_classes;
     uint32_t ninflight;
     struct sim_inflight inflight[SIM_MAX_INFLIGHT];
     uint32_t nret_cands;
@@ -295,17 +333,26 @@ static uint32_t node_healthy_disks(const struct sim_node *n)
     if (!n || !n->alive || n->destroyed)
         return 0;
     uint32_t c = 0;
-    for (int d = 0; d < n->ndisks; d++)
-        c += n->disk_ok[d] != 0;
+    for (int d = 0; d < n->ndisks; d++) {
+        if (!n->disk_ok[d])
+            continue;
+        if (n->class_mode && (!(n->disks[d].uses & META_DISK_USE_CHUNK) || n->disks[d].state != META_STORE_UP))
+            continue;
+        c++;
+    }
     return c;
 }
 
 static int node_pick_disk(struct sim *s, const struct sim_node *n)
 {
     int ok[SIM_MAX_DISKS], cnt = 0;
-    for (int d = 0; d < n->ndisks; d++)
-        if (n->disk_ok[d])
-            ok[cnt++] = d;
+    for (int d = 0; d < n->ndisks; d++) {
+        if (!n->disk_ok[d])
+            continue;
+        if (n->class_mode && (!(n->disks[d].uses & META_DISK_USE_CHUNK) || n->disks[d].state != META_STORE_UP))
+            continue;
+        ok[cnt++] = d;
+    }
     if (!cnt)
         return -1;
     return ok[rng_u32(&s->r, (uint32_t)cnt)];
@@ -437,6 +484,7 @@ static int sim_apply_entry(struct sim *s, struct meta_entry *e, int *res, uint32
 struct plan_snap {
     struct place_member pm[SIM_MAX_NODES];
     uint32_t npm;
+    struct place_disk_usage disk_usages[SIM_MAX_NODES][SIM_MAX_DISKS];
     struct place_fill fills[SIM_MAX_VOLS * META_STRIPE_MAX];
     uint32_t nfills;
     struct place_replace replaces[SIM_MAX_NODES];
@@ -464,13 +512,36 @@ static void build_place_in(const struct sim *s, struct plan_snap *snap, struct p
         pm->failstop = (uint8_t)(n->failstop_beat != 0);
         pm->fill_pct = 25;
         uint32_t stores = 0;
-        for (int d = 0; d < n->ndisks; d++) {
-            if (n->expected_store_id[d] && pm->expected_nstore_ids < PLACE_STORES_MAX)
-                pm->expected_store_ids[pm->expected_nstore_ids++] = n->expected_store_id[d];
-            if (n->disk_ok[d] && !n->destroyed) {
-                if (pm->nstore_ids < PLACE_STORES_MAX)
-                    pm->store_ids[pm->nstore_ids++] = n->disk_store_id[d];
-                stores++;
+        if (s->use_classes) {
+            pm->disks = snap->disk_usages[i];
+            pm->ndisks = (uint32_t)n->ndisks;
+            for (int d = 0; d < n->ndisks; d++) {
+                struct place_disk_usage *du = &snap->disk_usages[i][d];
+                memcpy(du->store_id, n->disks[d].store_uuid, 16);
+                du->disk_class = n->disks[d].disk_class;
+                du->uses = n->disks[d].uses;
+                du->state = n->disks[d].state;
+                du->have_usage = 1;
+                du->size_bytes = n->disks[d].size_bytes;
+                du->young_bytes = n->disks[d].young_bytes;
+                du->chunk_bytes = n->disks[d].chunk_bytes;
+                du->young_peak_7d = n->disks[d].young_peak_7d;
+                if ((n->disks[d].uses & META_DISK_USE_CHUNK) && n->disks[d].state == META_STORE_UP && n->disk_ok[d] &&
+                    !n->destroyed) {
+                    if (pm->nstore_ids < PLACE_STORES_MAX)
+                        pm->store_ids[pm->nstore_ids++] = n->disk_store_id[d];
+                    stores++;
+                }
+            }
+        } else {
+            for (int d = 0; d < n->ndisks; d++) {
+                if (n->expected_store_id[d] && pm->expected_nstore_ids < PLACE_STORES_MAX)
+                    pm->expected_store_ids[pm->expected_nstore_ids++] = n->expected_store_id[d];
+                if (n->disk_ok[d] && !n->destroyed) {
+                    if (pm->nstore_ids < PLACE_STORES_MAX)
+                        pm->store_ids[pm->nstore_ids++] = n->disk_store_id[d];
+                    stores++;
+                }
             }
         }
         pm->chunk_stores = n->alive ? stores : 0;
@@ -769,6 +840,301 @@ static uint32_t actual_max_per_rack(const struct meta_state *sm, const uint32_t 
     return mx;
 }
 
+/* ------------------------------------------------------------------ independent R13 class & fill oracles */
+
+enum chk_elig_err {
+    CHK_ELIG_OK = 0,
+    CHK_ELIG_ROLE = 1,
+    CHK_ELIG_CAP = 2,
+    CHK_ELIG_FULL = 3,
+    CHK_ELIG_NO_STORE = 4,
+};
+
+static const struct place_member *chk_find_pm(const struct place_in *in, uint32_t id)
+{
+    if (!in || !in->members)
+        return NULL;
+    for (uint32_t i = 0; i < in->nmembers; i++)
+        if (in->members[i].id == id)
+            return &in->members[i];
+    return NULL;
+}
+
+static const struct place_disk_usage *chk_find_du(const struct place_member *pm, const uint8_t store_id[16])
+{
+    if (!pm || !pm->disks || pm->ndisks == 0)
+        return NULL;
+    for (uint32_t i = 0; i < pm->ndisks; i++)
+        if (memcmp(pm->disks[i].store_id, store_id, 16) == 0)
+            return &pm->disks[i];
+    return NULL;
+}
+
+/* Independent effective chunk disk class oracle (HDD > SSD > NVME across UP chunk disks, else non-DESTROYED). */
+static uint8_t chk_chunk_class(const struct meta_member *mb)
+{
+    if (!mb || mb->ndisks == 0)
+        return META_DISK_NONE;
+    uint8_t cls = META_DISK_NONE;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if (d->state != META_STORE_UP || !(d->uses & META_DISK_USE_CHUNK))
+            continue;
+        if (d->disk_class > cls)
+            cls = d->disk_class;
+    }
+    if (cls != META_DISK_NONE)
+        return cls;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if (d->state == META_STORE_DESTROYED || !(d->uses & META_DISK_USE_CHUNK))
+            continue;
+        if (d->disk_class > cls)
+            cls = d->disk_class;
+    }
+    return cls;
+}
+
+static uint64_t chk_vol_bytes(const struct place_in *in, uint32_t volume)
+{
+    if (!in || !in->vol_sizes)
+        return 0;
+    for (uint32_t i = 0; i < in->nvol_sizes; i++)
+        if (in->vol_sizes[i].volume == volume)
+            return in->vol_sizes[i].bytes;
+    return 0;
+}
+
+static void chk_node_chunk_stats(const struct place_in *in, const struct meta_member *mb, uint64_t *cap_out,
+                                 uint64_t *used_out, int *have_usage_out)
+{
+    uint64_t cap = 0, used = 0;
+    uint32_t nup = 0, nusage = 0;
+    const struct place_member *pm = chk_find_pm(in, mb->id);
+    for (uint32_t d = 0; d < mb->ndisks && d < META_DISKS_MAX; d++) {
+        const struct meta_disk *dk = &mb->disks[d];
+        if (dk->state != META_STORE_UP || !(dk->uses & META_DISK_USE_CHUNK))
+            continue;
+        nup++;
+        const struct place_disk_usage *du = chk_find_du(pm, dk->store_id);
+        uint64_t sz = (du && du->size_bytes > 0) ? du->size_bytes : dk->size_bytes;
+        cap = add_sat_u64(cap, sz);
+        if (du && du->have_usage && sz > 0) {
+            used = add_sat_u64(used, du->chunk_bytes);
+            nusage++;
+        }
+    }
+    *cap_out = cap;
+    *used_out = used;
+    *have_usage_out = (nup > 0 && nusage == nup && cap > 0) ? 1 : 0;
+}
+
+/* Independent §5.6 / E53 chunk store fill mark oracle: 95% * (1 - largest_domain_share), fallback 90%. */
+static uint64_t chk_chunk_fill_mark_ppm(const struct place_in *in)
+{
+    const struct meta_state *sm = in->sm;
+    uint32_t nm = sm->nmembers;
+    int all_racked = 1;
+    uint64_t total_cap = 0;
+    uint32_t nstorage = 0;
+    for (uint32_t i = 0; i < nm; i++) {
+        const struct meta_member *mb = &sm->members[i];
+        if (mb->state >= META_OUT || mb->role == META_ROLE_COMPUTE || mb->ndisks == 0)
+            continue;
+        uint64_t cap = 0, used = 0;
+        int hu = 0;
+        chk_node_chunk_stats(in, mb, &cap, &used, &hu);
+        if (cap == 0)
+            continue;
+        nstorage++;
+        total_cap = add_sat_u64(total_cap, cap);
+        if (!mb->rack[0])
+            all_racked = 0;
+    }
+    if (total_cap == 0 || nstorage <= 1)
+        return 900000ull;
+    uint64_t max_dom = 0;
+    for (uint32_t i = 0; i < nm; i++) {
+        const struct meta_member *mb = &sm->members[i];
+        if (mb->state >= META_OUT || mb->role == META_ROLE_COMPUTE || mb->ndisks == 0)
+            continue;
+        uint64_t dcap = 0;
+        if (all_racked) {
+            int seen = 0;
+            for (uint32_t j = 0; j < i; j++) {
+                if (sm->members[j].state < META_OUT && sm->members[j].role != META_ROLE_COMPUTE &&
+                    sm->members[j].ndisks > 0 && !strcmp(sm->members[j].rack, mb->rack)) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (seen)
+                continue;
+            for (uint32_t j = i; j < nm; j++) {
+                const struct meta_member *mj = &sm->members[j];
+                if (mj->state >= META_OUT || mj->role == META_ROLE_COMPUTE || mj->ndisks == 0 ||
+                    strcmp(mj->rack, mb->rack) != 0)
+                    continue;
+                uint64_t cap = 0, used = 0;
+                int hu = 0;
+                chk_node_chunk_stats(in, mj, &cap, &used, &hu);
+                dcap = add_sat_u64(dcap, cap);
+            }
+        } else {
+            uint64_t used = 0;
+            int hu = 0;
+            chk_node_chunk_stats(in, mb, &dcap, &used, &hu);
+        }
+        if (dcap > max_dom)
+            max_dom = dcap;
+    }
+    if (max_dom >= total_cap)
+        return 900000ull;
+    return (uint64_t)(((__uint128_t)950000ull * (total_cap - max_dom)) / total_cap);
+}
+
+/* Independent R13 log placement eligibility oracle (never consults in->mutant). */
+static int chk_member_log_elig(const struct place_in *in, const struct meta_member *mb, uint64_t add_bytes,
+                               int *fast_out, enum chk_elig_err *err_out)
+{
+    if (fast_out)
+        *fast_out = 1;
+    if (err_out)
+        *err_out = CHK_ELIG_OK;
+    if (!mb) {
+        if (err_out)
+            *err_out = CHK_ELIG_CAP;
+        return 0;
+    }
+    int has_fast = (mb->ndisks == 0) || meta_member_has_fast_disk(mb);
+    if (fast_out)
+        *fast_out = has_fast;
+    if (mb->role == META_ROLE_STORAGE) {
+        if (err_out)
+            *err_out = CHK_ELIG_ROLE;
+        return 0;
+    }
+    if (mb->ndisks == 0)
+        return 1;
+    if (!(meta_member_effective_cap(mb) & META_CAP_COMPUTE)) {
+        if (err_out)
+            *err_out = CHK_ELIG_CAP;
+        return 0;
+    }
+    uint32_t mark = in->set.young_move_pct ? in->set.young_move_pct
+                                           : (in->sm->set.young_move_pct ? in->sm->set.young_move_pct : 80u);
+    const struct place_member *pm = chk_find_pm(in, mb->id);
+    uint32_t n_elig = 0, n_avail = 0;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if (d->state != META_STORE_UP)
+            continue;
+        if (has_fast) {
+            if (!meta_disk_class_fast(d->disk_class))
+                continue;
+        } else if (in->sm->set.log_on_hdd) {
+            if (d->disk_class != META_DISK_HDD)
+                continue;
+        } else {
+            continue;
+        }
+        n_elig++;
+        const struct place_disk_usage *du = chk_find_du(pm, d->store_id);
+        if (!du || !du->have_usage || du->size_bytes == 0) {
+            n_avail++;
+            continue;
+        }
+        uint64_t denom = du->size_bytes;
+        if ((d->uses & META_DISK_USE_CHUNK) && du->chunk_bytes > 0)
+            denom = du->size_bytes > du->chunk_bytes ? du->size_bytes - du->chunk_bytes : 0;
+        uint64_t proj = add_sat_u64(du->young_bytes, add_bytes);
+        int full = (denom == 0) || ((__uint128_t)proj * 100u >= (__uint128_t)mark * denom);
+        if (!full)
+            n_avail++;
+    }
+    if (n_elig == 0) {
+        if (err_out)
+            *err_out = CHK_ELIG_CAP;
+        return 0;
+    }
+    if (n_avail == 0) {
+        if (err_out)
+            *err_out = CHK_ELIG_FULL;
+        return 0;
+    }
+    return 1;
+}
+
+/* Independent R13 EC stripe placement eligibility oracle (never consults in->mutant). */
+static int chk_member_stripe_elig(const struct place_in *in, const struct meta_member *mb, int is_rebuild,
+                                  uint64_t mark_ppm, enum chk_elig_err *err_out)
+{
+    if (err_out)
+        *err_out = CHK_ELIG_OK;
+    if (!mb) {
+        if (err_out)
+            *err_out = CHK_ELIG_CAP;
+        return 0;
+    }
+    if (mb->role == META_ROLE_COMPUTE) {
+        if (err_out)
+            *err_out = CHK_ELIG_ROLE;
+        return 0;
+    }
+    if (mb->ndisks > 0 && !(meta_member_effective_cap(mb) & META_CAP_STORAGE)) {
+        if (err_out)
+            *err_out = CHK_ELIG_CAP;
+        return 0;
+    }
+    const struct place_member *pm = chk_find_pm(in, mb->id);
+    if (!pm || pm->chunk_stores == 0) {
+        if (err_out)
+            *err_out = CHK_ELIG_NO_STORE;
+        return 0;
+    }
+    if (mb->ndisks == 0)
+        return 1;
+    uint64_t eff_mark = is_rebuild ? 950000ull : mark_ppm;
+    uint32_t n_elig = 0, n_avail = 0;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if (d->state != META_STORE_UP || !(d->uses & META_DISK_USE_CHUNK))
+            continue;
+        n_elig++;
+        const struct place_disk_usage *du = chk_find_du(pm, d->store_id);
+        if (!du || !du->have_usage || du->size_bytes == 0) {
+            n_avail++;
+            continue;
+        }
+        uint64_t cppm = (uint64_t)(((__uint128_t)du->chunk_bytes * 1000000ull) / du->size_bytes);
+        if (cppm > 1000000ull)
+            cppm = 1000000ull;
+        int full = (cppm >= eff_mark);
+        if (!full && !is_rebuild && (d->uses & META_DISK_USE_LOG)) {
+            uint64_t reserve = du->size_bytes / 10u;
+            uint64_t peak = du->young_peak_7d > du->young_bytes ? du->young_peak_7d : du->young_bytes;
+            uint64_t y2 = peak > (UINT64_MAX / 2u) ? UINT64_MAX : peak * 2u;
+            if (y2 > reserve)
+                reserve = y2;
+            if (du->size_bytes <= du->chunk_bytes || (du->size_bytes - du->chunk_bytes) < reserve)
+                full = 1;
+        }
+        if (!full)
+            n_avail++;
+    }
+    if (n_elig == 0) {
+        if (err_out)
+            *err_out = CHK_ELIG_NO_STORE;
+        return 0;
+    }
+    if (n_avail == 0) {
+        if (err_out)
+            *err_out = CHK_ELIG_FULL;
+        return 0;
+    }
+    return 1;
+}
+
 /* ------------------------------------------------------------------ Checker: initial placement */
 
 static void check_initial_placement(struct sim *s, const struct place_in *in, const uint32_t *nodes, uint32_t n,
@@ -779,7 +1145,64 @@ static void check_initial_placement(struct sim *s, const struct place_in *in, co
         sim_fail(s, "initial %s placement has duplicate server (E9 violated)", is_stripe ? "stripe" : "log");
         return;
     }
+    uint64_t mark_ppm = s->use_classes ? chk_chunk_fill_mark_ppm(in) : 900000ull;
+
+    /* R13 per-member capability, class and fill-mark checks on every chosen node. */
+    if (s->use_classes) {
+        uint32_t nfast_elig = 0;
+        for (uint32_t i = 0; i < sm->nmembers; i++) {
+            const struct meta_member *mb = &sm->members[i];
+            if (mb->state != META_UP || !(mb->flags & META_MF_VOLUMES_OK))
+                continue;
+            const struct sim_node *sn = sim_node_by_id_c(s, mb->id);
+            if (!sn || !node_is_heard_fresh(s, sn))
+                continue;
+            int is_fast = 0;
+            if (!is_stripe && chk_member_log_elig(in, mb, 0, &is_fast, NULL) && is_fast)
+                nfast_elig++;
+        }
+        for (uint32_t k = 0; k < n; k++) {
+            const struct meta_member *mb = meta_member(sm, nodes[k]);
+            enum chk_elig_err err = CHK_ELIG_OK;
+            if (!is_stripe) {
+                int is_fast = 0;
+                if (!chk_member_log_elig(in, mb, 0, &is_fast, &err)) {
+                    if (err == CHK_ELIG_FULL)
+                        sim_fail(s, "initial log placement violated R13 young_move_pct fill mark on node %" PRIu32,
+                                 nodes[k]);
+                    else
+                        sim_fail(s,
+                                 "initial log placement violated R13 log capability/class on node %" PRIu32
+                                 " (role=%s cap=%s log_on_hdd=%u)",
+                                 nodes[k], mb ? meta_role_name(mb->role) : "?",
+                                 mb ? meta_cap_name(mb->capability) : "?", sm->set.log_on_hdd);
+                    return;
+                }
+                if (nfast_elig >= n && !is_fast) {
+                    sim_fail(s,
+                             "initial log placement picked HDD-only node %" PRIu32
+                             " while %" PRIu32 " fast compute nodes qualified (E50 violated)",
+                             nodes[k], nfast_elig);
+                    return;
+                }
+            } else {
+                if (!chk_member_stripe_elig(in, mb, 0, mark_ppm, &err)) {
+                    if (err == CHK_ELIG_FULL)
+                        sim_fail(s, "initial stripe placement violated R13 chunk fill mark on node %" PRIu32, nodes[k]);
+                    else
+                        sim_fail(s,
+                                 "initial stripe placement violated disk use/capability on node %" PRIu32
+                                 " (role=%s cap=%s)",
+                                 nodes[k], mb ? meta_role_name(mb->role) : "?",
+                                 mb ? meta_cap_name(mb->capability) : "?");
+                    return;
+                }
+            }
+        }
+    }
+
     uint32_t cands[SIM_MAX_NODES], nc = 0;
+    uint32_t fast_cands[SIM_MAX_NODES], nfc = 0;
     int all_racks = 1;
     for (uint32_t i = 0; i < sm->nmembers; i++) {
         const struct meta_member *mb = &sm->members[i];
@@ -788,18 +1211,79 @@ static void check_initial_placement(struct sim *s, const struct place_in *in, co
         const struct sim_node *sn = sim_node_by_id_c(s, mb->id);
         if (!sn || !node_is_heard_fresh(s, sn))
             continue;
-        if (is_stripe && node_healthy_disks(sn) == 0)
-            continue;
+        if (s->use_classes) {
+            if (!is_stripe) {
+                int is_fast = 0;
+                if (!chk_member_log_elig(in, mb, 0, &is_fast, NULL))
+                    continue;
+                if (is_fast)
+                    fast_cands[nfc++] = i;
+            } else {
+                if (!chk_member_stripe_elig(in, mb, 0, mark_ppm, NULL))
+                    continue;
+            }
+        } else {
+            if (is_stripe && node_healthy_disks(sn) == 0)
+                continue;
+        }
         cands[nc++] = i;
         if (!mb->rack[0])
             all_racks = 0;
     }
-    if (all_racks && nc >= n) {
-        uint32_t opt = optimal_max_per_rack(sm, cands, nc, n);
+    const uint32_t *rcands = cands;
+    uint32_t nrc = nc;
+    if (s->use_classes && !is_stripe && nfc >= n) {
+        rcands = fast_cands;
+        nrc = nfc;
+        all_racks = 1;
+        for (uint32_t i = 0; i < nrc; i++)
+            if (!sm->members[rcands[i]].rack[0])
+                all_racks = 0;
+    }
+    uint32_t opt = 0;
+    if (all_racks && nrc >= n) {
+        opt = optimal_max_per_rack(sm, rcands, nrc, n);
         uint32_t act = actual_max_per_rack(sm, nodes, n);
         if (act > opt) {
             sim_fail(s, "initial %s placement violated E9 rack cap: max_per_rack=%" PRIu32 " > optimal %" PRIu32,
                      is_stripe ? "stripe" : "log", act, opt);
+            return;
+        }
+    }
+
+    /* R13 E51 / §15.3: single disk class per stripe group whenever k + m eligible same-class members satisfy E9. */
+    if (s->use_classes && is_stripe) {
+        uint8_t first_cls = META_DISK_NONE;
+        int mixed = 0;
+        for (uint32_t k = 0; k < n; k++) {
+            uint8_t cls = chk_chunk_class(meta_member(sm, nodes[k]));
+            if (cls == META_DISK_NONE)
+                continue;
+            if (first_cls == META_DISK_NONE)
+                first_cls = cls;
+            else if (cls != first_cls)
+                mixed = 1;
+        }
+        if (mixed) {
+            s->cov.cls_mixed_stripes++;
+            static const uint8_t cls_list[3] = {META_DISK_HDD, META_DISK_SSD, META_DISK_NVME};
+            for (size_t ci = 0; ci < 3; ci++) {
+                uint32_t cc[SIM_MAX_NODES], ncc = 0;
+                for (uint32_t i = 0; i < nc; i++)
+                    if (chk_chunk_class(&sm->members[cands[i]]) == cls_list[ci])
+                        cc[ncc++] = cands[i];
+                if (ncc < n)
+                    continue;
+                if (!all_racks || optimal_max_per_rack(sm, cc, ncc, n) <= opt) {
+                    sim_fail(s,
+                             "initial stripe placement mixed disk classes when single class %s (%" PRIu32
+                             " eligible) satisfied E9 rack spread",
+                             meta_disk_class_name(cls_list[ci]), ncc);
+                    return;
+                }
+            }
+        } else {
+            s->cov.cls_single_stripes++;
         }
     }
 }
@@ -1298,7 +1782,7 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
             }
         }
 
-        /* Rule 4: valid list, one position per server, and E9 rack optimality for REPLICA_ADD. */
+        /* Rule 4 & R13: valid list, one position per server, capability/fill/class, and E9 rack optimality for REPLICA_ADD. */
         if (p->kind == PLACE_PROP_REPLICA_ADD) {
             if (meta_replica(v, p->node) != NULL) {
                 sim_fail(s, "REPLICA_ADD duplicate server: vol %" PRIu32 " already has node %" PRIu32, p->volume,
@@ -1312,6 +1796,45 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
             }
             int urgent = p->margin <= 0;
             uint32_t forced = p->other_node ? chk_forced_target(in, p->other_node) : 0;
+            uint64_t vbytes = chk_vol_bytes(in, p->volume);
+            int target_fast = 1;
+            if (s->use_classes) {
+                enum chk_elig_err err = CHK_ELIG_OK;
+                if (!chk_member_log_elig(in, tmb, vbytes, &target_fast, &err)) {
+                    if (err == CHK_ELIG_FULL)
+                        sim_fail(s,
+                                 "REPLICA_ADD violated R13 young_move_pct fill mark on vol %" PRIu32
+                                 ": target node %" PRIu32,
+                                 p->volume, p->node);
+                    else
+                        sim_fail(s,
+                                 "REPLICA_ADD violated R13 log capability/class on vol %" PRIu32
+                                 ": target node %" PRIu32 " (role=%s cap=%s log_on_hdd=%u)",
+                                 p->volume, p->node, meta_role_name(tmb->role), meta_cap_name(tmb->capability),
+                                 sm->set.log_on_hdd);
+                    return;
+                }
+                if (!forced && !target_fast) {
+                    /* E50: HDD-only member may receive a log replica only when no fast compute node qualifies. */
+                    for (uint32_t mi = 0; mi < nm; mi++) {
+                        uint32_t used = urgent ? log_recv_urg[mi] : log_recv[mi];
+                        if (used >= rebuild_max)
+                            continue;
+                        const struct meta_member *mb = &sm->members[mi];
+                        if (!chk_member_placeable(s, in, mb, pend_gone, mi) || mb->id == p->other_node ||
+                            meta_replica(v, mb->id))
+                            continue;
+                        int cf = 0;
+                        if (chk_member_log_elig(in, mb, vbytes, &cf, NULL) && cf) {
+                            sim_fail(s,
+                                     "REPLICA_ADD placed log on HDD-only node %" PRIu32 " on vol %" PRIu32
+                                     " while fast compute node %" PRIu32 " was available (E50 violated)",
+                                     p->node, p->volume, mb->id);
+                            return;
+                        }
+                    }
+                }
+            }
             if (!forced) {
                 /* Verify rack-spreading optimality (catches rackignored). */
                 int racks_ok = 1;
@@ -1331,6 +1854,8 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
                     const struct meta_member *mb = &sm->members[mi];
                     if (!chk_member_placeable(s, in, mb, pend_gone, mi))
                         continue;
+                    if (s->use_classes && !chk_member_log_elig(in, mb, vbytes, NULL, NULL))
+                        continue;
                     if (!meta_replica(v, mb->id) && !mb->rack[0])
                         racks_ok = 0;
                 }
@@ -1349,6 +1874,13 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
                             continue;
                         if (meta_replica(v, mb->id))
                             continue;
+                        if (s->use_classes) {
+                            int cf = 0;
+                            if (!chk_member_log_elig(in, mb, vbytes, &cf, NULL))
+                                continue;
+                            if (target_fast && !cf)
+                                continue; /* fast nodes always beat HDD-only regardless of rack (E50) */
+                        }
                         uint32_t rc = 0;
                         for (uint32_t j = 0; j < nrem; j++)
                             if (!strcmp(mb->rack, rem_racks[j]))
@@ -1373,7 +1905,7 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
             }
         }
 
-        /* Rule 4: valid list, one position per server, and E9 rack optimality for STRIPE_SET. */
+        /* Rule 4 & R13: valid list, one position per server, capability/fill/class, and E9 rack optimality for STRIPE_SET. */
         if (p->kind == PLACE_PROP_STRIPE_SET) {
             if (v->redundancy != META_RED_EC || p->pos >= v->nstripe) {
                 sim_fail(s, "STRIPE_SET invalid vol %" PRIu32 " pos %" PRIu32, p->volume, p->pos);
@@ -1406,24 +1938,65 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
             int urgent = p->margin <= 0;
             uint32_t old_holder = v->stripe[p->pos];
             uint32_t forced = chk_forced_target(in, old_holder);
+            const struct meta_member *omb = meta_member(sm, old_holder);
+            int is_drain = (!forced && !p->is_return && omb && omb->state == META_DRAINING);
+            int is_rebuild = !is_drain;
+            uint64_t mark_ppm = s->use_classes ? chk_chunk_fill_mark_ppm(in) : 900000ull;
+
+            if (s->use_classes) {
+                enum chk_elig_err err = CHK_ELIG_OK;
+                int elig = chk_member_stripe_elig(in, tmb, is_rebuild, mark_ppm, &err);
+                if (!elig) {
+                    if (err == CHK_ELIG_FULL && !p->is_return) {
+                        sim_fail(s,
+                                 "STRIPE_SET violated R13 chunk fill mark on vol %" PRIu32 " pos %" PRIu32
+                                 ": target node %" PRIu32 " (is_rebuild=%d)",
+                                 p->volume, p->pos, p->node, is_rebuild);
+                        return;
+                    } else if (err != CHK_ELIG_FULL) {
+                        sim_fail(s,
+                                 "STRIPE_SET violated disk use/capability on vol %" PRIu32 " pos %" PRIu32
+                                 ": target node %" PRIu32 " is not storage-capable (role=%s cap=%s)",
+                                 p->volume, p->pos, p->node, meta_role_name(tmb->role),
+                                 meta_cap_name(tmb->capability));
+                        return;
+                    }
+                }
+            }
+
             if (!forced && !p->is_return) {
                 int racks_ok = 1;
                 const char *rem_racks[META_STRIPE_MAX];
                 uint32_t nrem = 0;
+                uint8_t want_cls = META_DISK_NONE;
+                int cls_mixed = 0;
                 for (uint32_t k = 0; k < v->nstripe && k < META_STRIPE_MAX; k++) {
                     if (k == p->pos)
                         continue;
                     const struct meta_member *rm = meta_member(sm, v->stripe[k]);
                     if (!rm || !rm->rack[0]) {
                         racks_ok = 0;
-                        break;
+                    } else {
+                        rem_racks[nrem++] = rm->rack;
                     }
-                    rem_racks[nrem++] = rm->rack;
+                    if (s->use_classes && rm) {
+                        uint8_t rc = chk_chunk_class(rm);
+                        if (rc != META_DISK_NONE) {
+                            if (want_cls == META_DISK_NONE)
+                                want_cls = rc;
+                            else if (want_cls != rc)
+                                cls_mixed = 1;
+                        }
+                    }
                 }
+                if (cls_mixed)
+                    want_cls = META_DISK_NONE;
                 for (uint32_t mi = 0; mi < nm && racks_ok; mi++) {
                     const struct meta_member *mb = &sm->members[mi];
                     const struct sim_node *sn = sim_node_by_id_c(s, mb->id);
                     if (!chk_member_placeable(s, in, mb, pend_gone, mi) || !sn || node_healthy_disks(sn) == 0)
+                        continue;
+                    if (s->use_classes && !chk_member_stripe_elig(in, mb, is_rebuild, mark_ppm, NULL))
                         continue;
                     int has_sp = 0;
                     for (uint32_t k = 0; k < v->nstripe; k++)
@@ -1432,41 +2005,61 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
                     if (!has_sp && !mb->rack[0])
                         racks_ok = 0;
                 }
+                uint32_t chosen_rc = 0;
                 if (racks_ok) {
-                    uint32_t chosen_rc = 0;
                     for (uint32_t j = 0; j < nrem; j++)
                         if (!strcmp(tmb->rack, rem_racks[j]))
                             chosen_rc++;
-                    uint32_t min_rc = UINT32_MAX;
-                    for (uint32_t mi = 0; mi < nm; mi++) {
-                        uint32_t used = urgent ? stripe_recv_urg[mi] : stripe_recv[mi];
-                        if (used >= stripe_cap)
-                            continue;
-                        const struct meta_member *mb = &sm->members[mi];
-                        const struct sim_node *sn = sim_node_by_id_c(s, mb->id);
-                        if (!chk_member_placeable(s, in, mb, pend_gone, mi) || mb->id == old_holder || !sn ||
-                            node_healthy_disks(sn) == 0)
-                            continue;
-                        int has_sp = 0;
-                        for (uint32_t k = 0; k < v->nstripe; k++)
-                            if (v->stripe[k] == mb->id)
-                                has_sp = 1;
-                        if (has_sp)
-                            continue;
-                        uint32_t rc = 0;
+                }
+                uint32_t min_rc = UINT32_MAX;
+                int same_cls_avail = 0;
+                uint32_t same_cls_node = 0;
+                for (uint32_t mi = 0; mi < nm; mi++) {
+                    uint32_t used = urgent ? stripe_recv_urg[mi] : stripe_recv[mi];
+                    if (used >= stripe_cap)
+                        continue;
+                    const struct meta_member *mb = &sm->members[mi];
+                    const struct sim_node *sn = sim_node_by_id_c(s, mb->id);
+                    if (!chk_member_placeable(s, in, mb, pend_gone, mi) || mb->id == old_holder || !sn ||
+                        node_healthy_disks(sn) == 0)
+                        continue;
+                    if (s->use_classes && !chk_member_stripe_elig(in, mb, is_rebuild, mark_ppm, NULL))
+                        continue;
+                    int has_sp = 0;
+                    for (uint32_t k = 0; k < v->nstripe; k++)
+                        if (v->stripe[k] == mb->id)
+                            has_sp = 1;
+                    if (has_sp)
+                        continue;
+                    uint32_t rc = 0;
+                    if (racks_ok) {
                         for (uint32_t j = 0; j < nrem; j++)
                             if (!strcmp(mb->rack, rem_racks[j]))
                                 rc++;
                         if (rc < min_rc)
                             min_rc = rc;
                     }
-                    if (min_rc < chosen_rc) {
-                        sim_fail(s, "STRIPE_SET violated E9 rack rule on vol %" PRIu32 " pos %" PRIu32
-                                    ": picked node %" PRIu32 " (rack %s, count %" PRIu32 ") while count %" PRIu32
-                                    " was available",
-                                 p->volume, p->pos, p->node, tmb->rack, chosen_rc, min_rc);
-                        return;
+                    if (s->use_classes && want_cls != META_DISK_NONE && chk_chunk_class(mb) == want_cls &&
+                        (!racks_ok || rc <= chosen_rc)) {
+                        same_cls_avail = 1;
+                        same_cls_node = mb->id;
                     }
+                }
+                if (racks_ok && min_rc < chosen_rc) {
+                    sim_fail(s, "STRIPE_SET violated E9 rack rule on vol %" PRIu32 " pos %" PRIu32
+                                ": picked node %" PRIu32 " (rack %s, count %" PRIu32 ") while count %" PRIu32
+                                " was available",
+                             p->volume, p->pos, p->node, tmb->rack, chosen_rc, min_rc);
+                    return;
+                }
+                if (s->use_classes && want_cls != META_DISK_NONE && chk_chunk_class(tmb) != want_cls &&
+                    same_cls_avail) {
+                    sim_fail(s,
+                             "STRIPE_SET mixed disk classes on vol %" PRIu32 " pos %" PRIu32 ": picked node %" PRIu32
+                             " (%s) while same-class node %" PRIu32 " (%s) was available",
+                             p->volume, p->pos, p->node, meta_disk_class_name(chk_chunk_class(tmb)), same_cls_node,
+                             meta_disk_class_name(want_cls));
+                    return;
                 }
             }
             for (uint32_t mi = 0; mi < nm; mi++) {
@@ -1538,6 +2131,7 @@ static void check_balance_output(struct sim *s, const struct place_in *in, const
         max_conc = 1;
 
     uint32_t bal_moves = 0;
+    uint64_t bal_dst_added[SIM_MAX_NODES] = {0};
     for (uint32_t i = place_end_idx; i < out->nprops; i++) {
         const struct place_prop *p = &out->props[i];
         if (p->kind == PLACE_PROP_REPLICA_REMOVE) {
@@ -1571,6 +2165,93 @@ static void check_balance_output(struct sim *s, const struct place_in *in, const
                         sim_fail(s, "balance_plan duplicate stripe server %" PRIu32 " on vol %" PRIu32, p->node,
                                  p->volume);
                         return;
+                    }
+                }
+            }
+            if (s->use_classes) {
+                const struct meta_member *smb = p->other_node ? meta_member(sm, p->other_node) : NULL;
+                if (p->kind == PLACE_PROP_REPLICA_ADD) {
+                    uint64_t vbytes = chk_vol_bytes(in, p->volume);
+                    int dst_fast = 1;
+                    enum chk_elig_err err = CHK_ELIG_OK;
+                    if (!chk_member_log_elig(in, tmb, vbytes, &dst_fast, &err)) {
+                        if (err == CHK_ELIG_FULL)
+                            sim_fail(s,
+                                     "balance_plan violated R13 young_move_pct fill mark on vol %" PRIu32
+                                     " target %" PRIu32,
+                                     p->volume, p->node);
+                        else
+                            sim_fail(s,
+                                     "balance_plan violated R13 log capability/class on vol %" PRIu32
+                                     " target %" PRIu32 " (role=%s cap=%s)",
+                                     p->volume, p->node, meta_role_name(tmb->role), meta_cap_name(tmb->capability));
+                        return;
+                    }
+                    if (smb && meta_member_has_fast_disk(smb) && !dst_fast) {
+                        sim_fail(s,
+                                 "balance_plan moved log replica from fast node %" PRIu32 " to HDD-only node %" PRIu32
+                                 " on vol %" PRIu32 " (E50 violated)",
+                                 smb->id, tmb->id, p->volume);
+                        return;
+                    }
+                } else {
+                    uint64_t mark_ppm = chk_chunk_fill_mark_ppm(in);
+                    enum chk_elig_err err = CHK_ELIG_OK;
+                    if (!chk_member_stripe_elig(in, tmb, 0, mark_ppm, &err)) {
+                        if (err == CHK_ELIG_FULL)
+                            sim_fail(s,
+                                     "balance_plan violated R13 chunk fill mark on vol %" PRIu32 " pos %" PRIu32
+                                     " target %" PRIu32,
+                                     p->volume, p->pos, p->node);
+                        else
+                            sim_fail(s,
+                                     "balance_plan violated disk use/capability on vol %" PRIu32 " pos %" PRIu32
+                                     " target %" PRIu32 " (role=%s cap=%s)",
+                                     p->volume, p->pos, p->node, meta_role_name(tmb->role),
+                                     meta_cap_name(tmb->capability));
+                        return;
+                    }
+                    if (smb) {
+                        uint8_t scls = chk_chunk_class(smb);
+                        uint8_t dcls = chk_chunk_class(tmb);
+                        if (scls != META_DISK_NONE && dcls != META_DISK_NONE && scls != dcls) {
+                            sim_fail(s,
+                                     "balance_plan moved stripe position across disk classes on vol %" PRIu32
+                                     " pos %" PRIu32 " (%s -> %s)",
+                                     p->volume, p->pos, meta_disk_class_name(scls), meta_disk_class_name(dcls));
+                            return;
+                        }
+                        uint64_t scap = 0, sused = 0, dcap = 0, dused = 0;
+                        int shu = 0, dhu = 0;
+                        chk_node_chunk_stats(in, smb, &scap, &sused, &shu);
+                        chk_node_chunk_stats(in, tmb, &dcap, &dused, &dhu);
+                        uint32_t sholds = 0;
+                        for (uint32_t vj = 0; vj < sm->nvolumes; vj++) {
+                            const struct meta_volume *mv = &sm->volumes[vj];
+                            if (mv->redundancy != META_RED_EC)
+                                continue;
+                            for (uint32_t k = 0; k < mv->nstripe && k < META_STRIPE_MAX; k++)
+                                if (mv->stripe[k] == smb->id)
+                                    sholds++;
+                        }
+                        if (shu && dhu && dcap > 0 && sholds > 0) {
+                            uint64_t est_b = sused / sholds;
+                            if (est_b > 0) {
+                                uint64_t dst_prev =
+                                    (tmb->id >= 1 && tmb->id <= SIM_MAX_NODES) ? bal_dst_added[tmb->id - 1] : 0;
+                                uint64_t proj_d = add_sat_u64(add_sat_u64(dused, dst_prev), est_b);
+                                uint64_t nu_d = (uint64_t)(((__uint128_t)proj_d * 1000000ull) / dcap);
+                                if (nu_d >= mark_ppm) {
+                                    sim_fail(s,
+                                             "balance_plan violated R13 chunk fill mark: projected target %" PRIu32
+                                             " to %" PRIu64 " ppm >= %" PRIu64 " ppm on vol %" PRIu32,
+                                             tmb->id, nu_d, mark_ppm, p->volume);
+                                    return;
+                                }
+                                if (tmb->id >= 1 && tmb->id <= SIM_MAX_NODES)
+                                    bal_dst_added[tmb->id - 1] = add_sat_u64(dst_prev, est_b);
+                            }
+                        }
                     }
                 }
             }
@@ -1647,6 +2328,22 @@ static void check_global_state(struct sim *s)
                 sim_fail(s, "member %" PRIu32 " hold exceeds 24h bound (until=%" PRIu64 " clock=%" PRIu64 ")", m->id,
                          m->hold_until_ms, m->hold_clock_ms);
                 return;
+            }
+        }
+        if (s->use_classes) {
+            const struct sim_node *sn = sim_node_by_id_c(s, m->id);
+            if (!sn || m->ndisks != (uint32_t)sn->ndisks) {
+                sim_fail(s, "member %" PRIu32 " disk count drifted from metadata (meta=%" PRIu32 " sim=%d)", m->id,
+                         m->ndisks, sn ? sn->ndisks : -1);
+                return;
+            }
+            for (uint32_t d = 0; d < m->ndisks; d++) {
+                if (memcmp(m->disks[d].store_id, sn->disks[d].store_uuid, 16) != 0 ||
+                    m->disks[d].disk_class != sn->disks[d].disk_class || m->disks[d].state != sn->disks[d].state ||
+                    m->disks[d].uses != sn->disks[d].uses) {
+                    sim_fail(s, "member %" PRIu32 " disk %" PRIu32 " state drifted from metadata", m->id, d);
+                    return;
+                }
             }
         }
     }
@@ -1782,18 +2479,90 @@ static const struct geom_spec k_geoms[] = {
     {META_RED_EC, 16, 4, 5, 21},
 };
 
-static void sim_add_member_meta(struct sim *s, uint32_t id, const char *rack)
+static void make_store_uuid(uint64_t sid, uint8_t out[16])
+{
+    memset(out, 0, 16);
+    out[0] = 0xd1;
+    for (int i = 0; i < 8; i++)
+        out[1 + i] = (uint8_t)((sid >> (i * 8)) & 0xffu);
+    out[15] = (uint8_t)((sid ^ 0x5au) & 0xffu);
+}
+
+enum sim_node_layout {
+    NL_MIXED_NVME_HDD = 0, /* 1-2 NVMe(LOG) + 2-3 HDD(CHUNK), role=BOTH */
+    NL_HDD_STORAGE = 1,    /* 2-3 HDD(CHUNK), role=STORAGE */
+    NL_HDD_BOTH = 2,       /* 2-3 HDD(CHUNK), role=BOTH (compute only if log_on_hdd=1) */
+    NL_NVME_COMPUTE = 3,   /* 1-2 NVMe(LOG), role=COMPUTE */
+    NL_ALL_FLASH_NVME = 4, /* 2 NVMe(ALL), role=BOTH */
+    NL_ALL_FLASH_SSD = 5,  /* 2 SSD(ALL), role=BOTH */
+    NL_MIXED_NVME_SSD = 6, /* 1 NVMe(LOG) + 2 SSD(CHUNK), role=BOTH */
+};
+
+static int sim_register_disk(struct sim *s, struct sim_node *n, uint8_t disk_class, uint8_t uses, uint64_t size_gib)
+{
+    if (!n || n->ndisks >= SIM_MAX_DISKS)
+        return -1;
+    uint64_t sid = ++s->next_store_id;
+    struct meta_disk md;
+    memset(&md, 0, sizeof md);
+    make_store_uuid(sid, md.store_id);
+    md.disk_class = disk_class;
+    md.uses = uses;
+    md.state = META_STORE_UP;
+    md.size_bytes = size_gib << 30;
+    md.sync_us = (disk_class == META_DISK_NVME) ? 80 : (disk_class == META_DISK_SSD ? 400 : 4000);
+
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_store_add(&e, n->id, &md);
+    int res[4] = {0};
+    sim_apply_entry(s, &e, res, 4);
+    if (res[0] != META_OK)
+        return -1;
+
+    int d = n->ndisks++;
+    n->disk_ok[d] = 1;
+    n->disk_store_id[d] = sid;
+    n->expected_store_id[d] = sid;
+    struct sim_disk *sd = &n->disks[d];
+    memset(sd, 0, sizeof *sd);
+    memcpy(sd->store_uuid, md.store_id, 16);
+    sd->disk_class = md.disk_class;
+    sd->uses = md.uses;
+    sd->state = META_STORE_UP;
+    sd->size_bytes = md.size_bytes;
+    /* Moderate baseline usage (15..45%) so fill spikes and volume sizes interact cleanly with marks. */
+    if (uses & META_DISK_USE_CHUNK) {
+        uint64_t pct = 15 + rng_u32(&s->r, 31);
+        sd->chunk_bytes = (sd->size_bytes / 100u) * pct;
+    }
+    if (uses & META_DISK_USE_LOG) {
+        uint64_t room = (uses & META_DISK_USE_CHUNK) && sd->size_bytes > sd->chunk_bytes
+                            ? (sd->size_bytes - sd->chunk_bytes)
+                            : sd->size_bytes;
+        uint64_t pct = 10 + rng_u32(&s->r, 30);
+        sd->young_bytes = (room / 100u) * pct;
+        sd->young_peak_7d = sd->young_bytes;
+    }
+    return d;
+}
+
+static void sim_add_member_meta_ex(struct sim *s, uint32_t id, const char *rack, uint8_t init_log_on_hdd,
+                                   enum sim_node_layout layout)
 {
     struct sim_node *n = &s->nodes[id - 1];
     memset(n, 0, sizeof *n);
     n->id = id;
+    n->class_mode = (uint8_t)(s->use_classes != 0);
     if (rack && rack[0])
         snprintf(n->rack, sizeof n->rack, "%s", rack);
-    n->ndisks = 1 + (int)rng_u32(&s->r, SIM_MAX_DISKS);
-    for (int d = 0; d < n->ndisks; d++) {
-        n->disk_ok[d] = 1;
-        n->disk_store_id[d] = ++s->next_store_id;
-        n->expected_store_id[d] = n->disk_store_id[d];
+    if (!s->use_classes) {
+        n->ndisks = 1 + (int)rng_u32(&s->r, SIM_STD_DISKS);
+        for (int d = 0; d < n->ndisks; d++) {
+            n->disk_ok[d] = 1;
+            n->disk_store_id[d] = ++s->next_store_id;
+            n->expected_store_id[d] = n->disk_store_id[d];
+        }
     }
     n->alive = 1;
     n->incarnation = 1;
@@ -1828,23 +2597,103 @@ static void sim_add_member_meta(struct sim *s, uint32_t id, const char *rack)
         ms.rebuild_concurrency = s->pset.rebuild_concurrency;
         ms.rebuild_max = 1 + rng_u32(&s->r, 2); /* 1..2 to exercise E13 queueing contention */
         ms.rebuild_mb_s = 200;
+        ms.log_on_hdd = init_log_on_hdd;
+        ms.young_move_pct = s->pset.young_move_pct;
+        ms.young_high_pct = s->pset.young_high_pct;
         meta_op_init(&e, uuid, &ms, &mb, META_MODE_REPLICATED, META_LEVEL);
     } else {
         meta_op_member_add(&e, &mb);
     }
     int res[4] = {0};
     sim_apply_entry(s, &e, res, 4);
-    if (res[0] != META_OK)
+    if (res[0] != META_OK) {
         sim_fail(s, "init/add member %" PRIu32 " failed: %s", id, meta_strerror(res[0]));
+        return;
+    }
+
+    if (!s->use_classes)
+        return;
+
+    /* Register R13 disks via real META_OP_STORE_ADD and declared role via real META_OP_MEMBER_ROLE. */
+    uint8_t role = META_ROLE_BOTH;
+    switch (layout) {
+    case NL_MIXED_NVME_HDD: {
+        int nnvme = 1 + (int)rng_u32(&s->r, 2);
+        int nhdd = 2 + (int)rng_u32(&s->r, 2);
+        for (int i = 0; i < nnvme; i++)
+            sim_register_disk(s, n, META_DISK_NVME, META_DISK_USE_LOG, 120 + rng_u32(&s->r, 120));
+        for (int i = 0; i < nhdd; i++)
+            sim_register_disk(s, n, META_DISK_HDD, META_DISK_USE_CHUNK, 400 + rng_u32(&s->r, 600));
+        role = META_ROLE_BOTH;
+        break;
+    }
+    case NL_HDD_STORAGE: {
+        int nhdd = 2 + (int)rng_u32(&s->r, 2);
+        for (int i = 0; i < nhdd; i++)
+            sim_register_disk(s, n, META_DISK_HDD, META_DISK_USE_CHUNK, 400 + rng_u32(&s->r, 600));
+        role = META_ROLE_STORAGE;
+        break;
+    }
+    case NL_HDD_BOTH: {
+        int nhdd = 2 + (int)rng_u32(&s->r, 2);
+        for (int i = 0; i < nhdd; i++)
+            sim_register_disk(s, n, META_DISK_HDD, META_DISK_USE_CHUNK, 400 + rng_u32(&s->r, 600));
+        role = META_ROLE_BOTH;
+        break;
+    }
+    case NL_NVME_COMPUTE: {
+        int nnvme = 1 + (int)rng_u32(&s->r, 2);
+        for (int i = 0; i < nnvme; i++)
+            sim_register_disk(s, n, META_DISK_NVME, META_DISK_USE_LOG, 120 + rng_u32(&s->r, 120));
+        role = META_ROLE_COMPUTE;
+        break;
+    }
+    case NL_ALL_FLASH_NVME: {
+        for (int i = 0; i < 2; i++)
+            sim_register_disk(s, n, META_DISK_NVME, META_DISK_USE_ALL, 200 + rng_u32(&s->r, 200));
+        role = META_ROLE_BOTH;
+        break;
+    }
+    case NL_ALL_FLASH_SSD: {
+        for (int i = 0; i < 2; i++)
+            sim_register_disk(s, n, META_DISK_SSD, META_DISK_USE_ALL, 240 + rng_u32(&s->r, 240));
+        role = META_ROLE_BOTH;
+        break;
+    }
+    case NL_MIXED_NVME_SSD: {
+        sim_register_disk(s, n, META_DISK_NVME, META_DISK_USE_LOG, 120 + rng_u32(&s->r, 120));
+        for (int i = 0; i < 2; i++)
+            sim_register_disk(s, n, META_DISK_SSD, META_DISK_USE_CHUNK, 300 + rng_u32(&s->r, 300));
+        role = META_ROLE_BOTH;
+        break;
+    }
+    }
+    n->role = role;
+    if (role != META_ROLE_BOTH) {
+        struct meta_entry er;
+        meta_entry_init(&er);
+        meta_op_member_role(&er, id, role);
+        int r2[4] = {0};
+        sim_apply_entry(s, &er, r2, 4);
+        if (r2[0] != META_OK)
+            sim_fail(s, "member_role node %" PRIu32 " -> %u failed: %s", id, role, meta_strerror(r2[0]));
+    }
 }
 
-static void sim_init_cluster(struct sim *s, uint64_t seed, int mutant, const char *mutant_name, int trace)
+static void sim_add_member_meta(struct sim *s, uint32_t id, const char *rack)
+{
+    sim_add_member_meta_ex(s, id, rack, 0, NL_MIXED_NVME_HDD);
+}
+
+static void sim_init_cluster(struct sim *s, uint64_t seed, int mutant, const char *mutant_name, int trace,
+                             int use_classes)
 {
     memset(s, 0, sizeof *s);
     s->seed = seed;
     s->mutant = mutant;
     s->mutant_name = mutant_name;
     s->trace = trace;
+    s->use_classes = use_classes;
     rng_init(&s->r, seed);
     meta_init(&s->sm);
     s->now_ms = 10000000ull;
@@ -1867,32 +2716,142 @@ static void sim_init_cluster(struct sim *s, uint64_t seed, int mutant, const cha
     uint32_t gidx = prof < 5 ? prof : (1 + rng_u32(&s->r, 2)); /* prof 5 = mixed replicas=3 + EC */
     const struct geom_spec *gs = &k_geoms[gidx];
 
-    uint32_t extra = 1 + rng_u32(&s->r, 3); /* 1..3 extra spare servers for rebuild/replace */
-    s->nnodes = gs->min_nodes + extra;
-    if (s->nnodes > SIM_MAX_NODES - 4)
-        s->nnodes = SIM_MAX_NODES - 4; /* leave room for node add ops */
+    enum sim_node_layout layouts[SIM_MAX_NODES];
+    uint8_t init_log_on_hdd = 0;
 
-    /* Racks: 90% multi-rack (3..6 racks, >=2 servers per rack so rack guard can trigger!), 10% unracked. */
-    s->use_racks = (seed % 10 != 0);
-    if (s->use_racks) {
-        uint32_t max_racks = s->nnodes / 2;
-        if (max_racks > 6)
-            max_racks = 6;
-        if (max_racks < 2)
-            max_racks = 2;
-        uint32_t min_racks = gs->m >= 4 ? 4 : 3;
-        if (min_racks > max_racks)
-            min_racks = max_racks;
-        s->nracks = min_racks + rng_u32(&s->r, max_racks - min_racks + 1);
+    if (!s->use_classes) {
+        uint32_t extra = 1 + rng_u32(&s->r, 3); /* 1..3 extra spare servers for rebuild/replace */
+        s->nnodes = gs->min_nodes + extra;
+        if (s->nnodes > SIM_MAX_NODES - 4)
+            s->nnodes = SIM_MAX_NODES - 4; /* leave room for node add ops */
+
+        /* Racks: 90% multi-rack (3..6 racks, >=2 servers per rack so rack guard can trigger!), 10% unracked. */
+        s->use_racks = (seed % 10 != 0);
+        if (s->use_racks) {
+            uint32_t max_racks = s->nnodes / 2;
+            if (max_racks > 6)
+                max_racks = 6;
+            if (max_racks < 2)
+                max_racks = 2;
+            uint32_t min_racks = gs->m >= 4 ? 4 : 3;
+            if (min_racks > max_racks)
+                min_racks = max_racks;
+            s->nracks = min_racks + rng_u32(&s->r, max_racks - min_racks + 1);
+        } else {
+            s->nracks = 0;
+        }
+
+        for (uint32_t id = 1; id <= s->nnodes; id++) {
+            char rbuf[16] = "";
+            if (s->use_racks)
+                snprintf(rbuf, sizeof rbuf, "r%" PRIu32, (id - 1) % s->nracks);
+            sim_add_member_meta(s, id, rbuf);
+        }
     } else {
-        s->nracks = 0;
-    }
-
-    for (uint32_t id = 1; id <= s->nnodes; id++) {
-        char rbuf[16] = "";
-        if (s->use_racks)
-            snprintf(rbuf, sizeof rbuf, "r%" PRIu32, (id - 1) % s->nracks);
-        sim_add_member_meta(s, id, rbuf);
+        /* R13 (--classes): build 6 diverse multi-disk / multi-class / role topologies across seeds. */
+        uint32_t cprof = (uint32_t)((seed - 1) % 6);
+        uint32_t nn = 0;
+        if (cprof == 0) {
+            /* Mixed NVMe+HDD cluster + HDD-only storage + NVMe-only compute (4+2 or 8+2). */
+            gidx = (seed & 1) ? 1 : 2;
+            gs = &k_geoms[gidx];
+            uint32_t nmix = (uint32_t)gs->k + gs->m + 2;
+            for (uint32_t i = 0; i < nmix; i++)
+                layouts[nn++] = NL_MIXED_NVME_HDD;
+            layouts[nn++] = NL_HDD_STORAGE;
+            layouts[nn++] = NL_HDD_BOTH;
+            layouts[nn++] = NL_NVME_COMPUTE;
+            layouts[nn++] = NL_NVME_COMPUTE;
+        } else if (cprof == 1) {
+            /* Multi-class storage: >= k+m HDD nodes PLUS SSD and NVMe all-flash nodes (catches mixstripe). */
+            gidx = 1; /* 4+2 -> k+m = 6 */
+            gs = &k_geoms[gidx];
+            for (uint32_t i = 0; i < 6; i++)
+                layouts[nn++] = NL_MIXED_NVME_HDD;
+            for (uint32_t i = 0; i < 3; i++)
+                layouts[nn++] = NL_ALL_FLASH_SSD;
+            for (uint32_t i = 0; i < 3; i++)
+                layouts[nn++] = NL_ALL_FLASH_NVME;
+            layouts[nn++] = NL_HDD_STORAGE;
+            layouts[nn++] = NL_HDD_STORAGE;
+            layouts[nn++] = NL_NVME_COMPUTE;
+            layouts[nn++] = NL_NVME_COMPUTE;
+        } else if (cprof == 2) {
+            /* All-flash shared disks (NVMe + SSD with USE_ALL) + mixed NVMe+SSD + HDD storage. */
+            gidx = (seed & 2) ? 1 : 0; /* 4+2 or replicas=3 */
+            gs = &k_geoms[gidx];
+            for (uint32_t i = 0; i < 6; i++)
+                layouts[nn++] = NL_ALL_FLASH_SSD;
+            for (uint32_t i = 0; i < 4; i++)
+                layouts[nn++] = NL_ALL_FLASH_NVME;
+            for (uint32_t i = 0; i < 2; i++)
+                layouts[nn++] = NL_MIXED_NVME_SSD;
+            layouts[nn++] = NL_HDD_STORAGE;
+            layouts[nn++] = NL_HDD_BOTH;
+            layouts[nn++] = NL_NVME_COMPUTE;
+        } else if (cprof == 3) {
+            /* Separated compute + storage (§9 / E20 / E49): NVMe-only compute + HDD-only storage. */
+            gidx = 1; /* 4+2 */
+            gs = &k_geoms[gidx];
+            for (uint32_t i = 0; i < 6; i++)
+                layouts[nn++] = NL_NVME_COMPUTE;
+            for (uint32_t i = 0; i < 6; i++)
+                layouts[nn++] = NL_HDD_STORAGE;
+            for (uint32_t i = 0; i < 3; i++)
+                layouts[nn++] = NL_HDD_BOTH;
+        } else if (cprof == 4) {
+            /* log_on_hdd enabled cluster: few fast nodes + many HDD-only nodes (BOTH & STORAGE). */
+            gidx = 1; /* 4+2 */
+            gs = &k_geoms[gidx];
+            init_log_on_hdd = 1;
+            for (uint32_t i = 0; i < 5; i++)
+                layouts[nn++] = NL_MIXED_NVME_HDD;
+            for (uint32_t i = 0; i < 4; i++)
+                layouts[nn++] = NL_HDD_BOTH;
+            for (uint32_t i = 0; i < 3; i++)
+                layouts[nn++] = NL_HDD_STORAGE;
+            layouts[nn++] = NL_NVME_COMPUTE;
+            layouts[nn++] = NL_ALL_FLASH_SSD;
+            layouts[nn++] = NL_ALL_FLASH_SSD;
+        } else {
+            /* Large EC (8+4 or 16+4) with mixed NVMe+HDD, SSD, compute-only, and storage-only nodes. */
+            gidx = (seed & 1) ? 3 : 4; /* 8+4 or 16+4 */
+            gs = &k_geoms[gidx];
+            uint32_t nmix = (uint32_t)gs->k + gs->m;
+            for (uint32_t i = 0; i < nmix; i++)
+                layouts[nn++] = NL_MIXED_NVME_HDD;
+            layouts[nn++] = NL_HDD_STORAGE;
+            layouts[nn++] = NL_HDD_BOTH;
+            layouts[nn++] = NL_NVME_COMPUTE;
+            layouts[nn++] = NL_NVME_COMPUTE;
+            layouts[nn++] = NL_ALL_FLASH_SSD;
+            layouts[nn++] = NL_ALL_FLASH_SSD;
+            if (nn > SIM_MAX_NODES - 4)
+                nn = SIM_MAX_NODES - 4;
+        }
+        s->nnodes = nn;
+        s->use_racks = (seed % 10 != 0);
+        if (s->use_racks) {
+            uint32_t max_racks = s->nnodes / 3;
+            if (max_racks > 6)
+                max_racks = 6;
+            if (max_racks < 3)
+                max_racks = 3;
+            uint32_t min_racks = gs->m >= 4 ? 4 : 3;
+            if (min_racks > max_racks)
+                min_racks = max_racks;
+            s->nracks = min_racks + rng_u32(&s->r, max_racks - min_racks + 1);
+        } else {
+            s->nracks = 0;
+        }
+        for (uint32_t id = 1; id <= s->nnodes; id++) {
+            char rbuf[16] = "";
+            if (s->use_racks)
+                snprintf(rbuf, sizeof rbuf, "r%" PRIu32, (id - 1) % s->nracks);
+            sim_add_member_meta_ex(s, id, rbuf, init_log_on_hdd, layouts[id - 1]);
+            if (s->failed)
+                return;
+        }
     }
 
     /* Create 4..7 volumes using the real place_volume / place_stripe! */
@@ -1901,13 +2860,66 @@ static void sim_init_cluster(struct sim *s, uint64_t seed, int mutant, const cha
         nv = SIM_MAX_VOLS;
 
     for (uint32_t vi = 1; vi <= nv && !s->failed; vi++) {
+        /* In --classes mode, pre-fill 1 compute node's fast disks above young_move_pct and 1 storage node's chunk
+         * stores past fill mark before the last volume so initial placement also exercises fill avoidance! */
+        if (s->use_classes && vi == nv && (seed % 2 == 0)) {
+            uint32_t fast_cnt = 0, stor_cnt = 0;
+            for (uint32_t i = 0; i < s->sm.nmembers; i++) {
+                const struct meta_member *mb = &s->sm.members[i];
+                if (mb->role != META_ROLE_STORAGE && meta_member_has_fast_disk(mb))
+                    fast_cnt++;
+                if (mb->role != META_ROLE_COMPUTE && (meta_member_effective_cap(mb) & META_CAP_STORAGE))
+                    stor_cnt++;
+            }
+            if (fast_cnt > gs->nrep + 1) {
+                uint32_t pick = rng_u32(&s->r, s->nnodes);
+                for (uint32_t off = 0; off < s->nnodes; off++) {
+                    struct sim_node *fn = &s->nodes[(pick + off) % s->nnodes];
+                    const struct meta_member *fmb = meta_member(&s->sm, fn->id);
+                    if (fmb && fmb->role != META_ROLE_STORAGE && meta_member_has_fast_disk(fmb)) {
+                        for (int d = 0; d < fn->ndisks; d++) {
+                            if (meta_disk_class_fast(fn->disks[d].disk_class)) {
+                                uint64_t room = (fn->disks[d].uses & META_DISK_USE_CHUNK) &&
+                                                        fn->disks[d].size_bytes > fn->disks[d].chunk_bytes
+                                                    ? (fn->disks[d].size_bytes - fn->disks[d].chunk_bytes)
+                                                    : fn->disks[d].size_bytes;
+                                fn->disks[d].young_bytes = (room / 100u) * 86u;
+                                if (fn->disks[d].young_bytes > fn->disks[d].young_peak_7d)
+                                    fn->disks[d].young_peak_7d = fn->disks[d].young_bytes;
+                                fn->disks[d].fill_until_tick = 25 + rng_u32(&s->r, 30);
+                            }
+                        }
+                        s->cov.cls_fast_fill++;
+                        break;
+                    }
+                }
+            }
+            if (gs->redundancy == META_RED_EC && stor_cnt > (uint32_t)gs->k + gs->m + 1) {
+                uint32_t pick = rng_u32(&s->r, s->nnodes);
+                for (uint32_t off = 0; off < s->nnodes; off++) {
+                    struct sim_node *sn = &s->nodes[(pick + off) % s->nnodes];
+                    const struct meta_member *smb = meta_member(&s->sm, sn->id);
+                    if (smb && smb->role != META_ROLE_COMPUTE && (meta_member_effective_cap(smb) & META_CAP_STORAGE)) {
+                        for (int d = 0; d < sn->ndisks; d++) {
+                            if (sn->disks[d].uses & META_DISK_USE_CHUNK) {
+                                sn->disks[d].chunk_bytes = (sn->disks[d].size_bytes / 100u) * 96u;
+                                sn->disks[d].fill_until_tick = 25 + rng_u32(&s->r, 30);
+                            }
+                        }
+                        s->cov.cls_chunk_fill++;
+                        break;
+                    }
+                }
+            }
+        }
+
         struct plan_snap snap;
         struct place_in in;
         build_place_in(s, &snap, &in);
 
         const struct geom_spec *vg = gs;
-        if (prof == 5) {
-            /* Mixed cluster: alternate replicas=3 and EC (4+2 or 8+2). */
+        if (prof == 5 || (s->use_classes && vi == 1 && gs->redundancy == META_RED_EC)) {
+            /* Mixed cluster: include both replicas=3 and EC volumes. */
             vg = (vi % 2 == 1) ? &k_geoms[0] : gs;
         }
 
@@ -1977,7 +2989,7 @@ static void sim_init_cluster(struct sim *s, uint64_t seed, int mutant, const cha
                 sv->rep_log_end[va.nodes[k] - 1] = sv->log_end;
 
         /* Verify place_rack_survivable matches rack configuration when racks are configured and nracks >= m+1. */
-        if (s->use_racks && s->mutant == PLACE_MUT_NONE) {
+        if (s->use_racks && !s->use_classes && s->mutant == PLACE_MUT_NONE) {
             const struct meta_volume *mv = meta_volume(&s->sm, vi);
             uint32_t eff_m = va.redundancy == META_RED_EC ? va.ec_m : (va.n - va.min_isr);
             if (s->nracks >= va.n && (va.redundancy != META_RED_EC || (va.nstripe + s->nracks - 1) / s->nracks <= eff_m)) {
@@ -2964,7 +3976,8 @@ static void wipe_node_disk(struct sim *s, struct sim_node *n, int d)
     if (!n || d < 0 || d >= n->ndisks)
         return;
     n->disk_ok[d] = 0;
-    n->disk_store_id[d] = ++s->next_store_id;
+    if (!n->class_mode)
+        n->disk_store_id[d] = ++s->next_store_id;
     uint32_t bit = 1u << (n->id - 1);
     for (uint32_t vi = 0; vi < s->nvols; vi++) {
         struct sim_vol *sv = &s->vols[vi];
@@ -2996,8 +4009,279 @@ static void snapshot_node_stores(struct sim_node *n)
         n->expected_store_id[d] = n->disk_store_id[d];
 }
 
+static void sim_step_class_timers(struct sim *s)
+{
+    if (!s->use_classes)
+        return;
+    for (uint32_t i = 0; i < s->nnodes && !s->failed; i++) {
+        struct sim_node *n = &s->nodes[i];
+        const struct meta_member *mb = meta_member(&s->sm, n->id);
+        if (!mb || mb->state == META_DESTROYED)
+            continue;
+        for (int d = 0; d < n->ndisks && !s->failed; d++) {
+            struct sim_disk *sd = &n->disks[d];
+            /* Drain temporary fill spikes back below mark. */
+            if (sd->fill_until_tick > 0 && s->tick >= sd->fill_until_tick) {
+                sd->fill_until_tick = 0;
+                if (sd->uses & META_DISK_USE_CHUNK) {
+                    uint64_t pct = 20 + rng_u32(&s->r, 30);
+                    sd->chunk_bytes = (sd->size_bytes / 100u) * pct;
+                }
+                if (sd->uses & META_DISK_USE_LOG) {
+                    uint64_t room = (sd->uses & META_DISK_USE_CHUNK) && sd->size_bytes > sd->chunk_bytes
+                                        ? (sd->size_bytes - sd->chunk_bytes)
+                                        : sd->size_bytes;
+                    uint64_t pct = 15 + rng_u32(&s->r, 25);
+                    sd->young_bytes = (room / 100u) * pct;
+                }
+            }
+            /* Escalate DOWN disk -> OUT when its timer expires (if safe for live EC objects). */
+            if (sd->state == META_STORE_DOWN && sd->out_tick > 0 && s->tick >= sd->out_tick) {
+                sd->out_tick = 0;
+                int safe = !(sd->uses & META_DISK_USE_CHUNK) || !taking_down_exceeds(s, n->id, 0);
+                if (safe) {
+                    struct meta_entry e;
+                    meta_entry_init(&e);
+                    meta_op_store_state(&e, n->id, sd->store_uuid, META_STORE_OUT);
+                    int res[4] = {0};
+                    sim_apply_entry(s, &e, res, 4);
+                    if (res[0] == META_OK) {
+                        sd->state = META_STORE_OUT;
+                        if (sd->uses & META_DISK_USE_CHUNK)
+                            wipe_node_disk(s, n, d);
+                        else
+                            n->disk_ok[d] = 0;
+                        sd->recover_tick = s->tick + 25 + rng_u32(&s->r, 40);
+                        s->cov.cls_disk_out++;
+                        sim_trace(s, "R13 disk OUT node=%" PRIu32 " disk=%d class=%s", n->id, d,
+                                  meta_disk_class_name(sd->disk_class));
+                    }
+                } else {
+                    sd->recover_tick = s->tick + 10;
+                }
+            }
+            /* Recover DOWN or OUT disk back to UP. */
+            if ((sd->state == META_STORE_DOWN || sd->state == META_STORE_OUT) && sd->recover_tick > 0 &&
+                s->tick >= sd->recover_tick) {
+                sd->recover_tick = 0;
+                int was_out = (sd->state == META_STORE_OUT);
+                struct meta_entry e;
+                meta_entry_init(&e);
+                meta_op_store_state(&e, n->id, sd->store_uuid, META_STORE_UP);
+                int res[4] = {0};
+                sim_apply_entry(s, &e, res, 4);
+                if (res[0] == META_OK) {
+                    sd->state = META_STORE_UP;
+                    n->disk_ok[d] = 1;
+                    if (was_out) {
+                        sd->chunk_bytes = (sd->uses & META_DISK_USE_CHUNK) ? (sd->size_bytes / 100u) * 15u : 0;
+                        sd->young_bytes = (sd->uses & META_DISK_USE_LOG) ? (sd->size_bytes / 100u) * 10u : 0;
+                    }
+                    s->cov.cls_disk_recover++;
+                    sim_trace(s, "R13 disk RECOVER node=%" PRIu32 " disk=%d", n->id, d);
+                }
+            }
+        }
+    }
+}
+
+static void sim_inject_class_event(struct sim *s)
+{
+    uint32_t cev = rng_u32(&s->r, 100);
+    if (cev < 24) {
+        /* Disk DOWN via META_OP_STORE_STATE (fast or capacity disk). */
+        uint32_t id = 1 + rng_u32(&s->r, s->nnodes);
+        struct sim_node *n = sim_node_by_id(s, id);
+        const struct meta_member *mb = meta_member(&s->sm, id);
+        if (!n || !mb || !n->alive || n->destroyed || mb->state != META_UP || n->ndisks == 0)
+            return;
+        int cands[SIM_MAX_DISKS], nc = 0;
+        for (int d = 0; d < n->ndisks; d++)
+            if (n->disks[d].state == META_STORE_UP && n->disk_ok[d])
+                cands[nc++] = d;
+        if (!nc)
+            return;
+        int d = cands[rng_u32(&s->r, (uint32_t)nc)];
+        struct sim_disk *sd = &n->disks[d];
+        if ((sd->uses & META_DISK_USE_CHUNK) && taking_down_exceeds(s, id, 0))
+            return;
+        struct meta_entry e;
+        meta_entry_init(&e);
+        meta_op_store_state(&e, id, sd->store_uuid, META_STORE_DOWN);
+        int res[4] = {0};
+        sim_apply_entry(s, &e, res, 4);
+        if (res[0] == META_OK) {
+            sd->state = META_STORE_DOWN;
+            n->disk_ok[d] = 0;
+            if (rng_pct(&s->r, 55)) {
+                sd->out_tick = s->tick + s->pset.failstop_out_s + 2 + rng_u32(&s->r, 10);
+                sd->recover_tick = 0;
+            } else {
+                sd->out_tick = 0;
+                sd->recover_tick = s->tick + 8 + rng_u32(&s->r, 25);
+            }
+            /* E57: a DOWN fast disk fail-stops a log replica on that node so it rebuilds elsewhere. */
+            if (meta_disk_class_fast(sd->disk_class) && n->fault_vol == 0) {
+                for (uint32_t vi = 0; vi < s->sm.nvolumes; vi++) {
+                    const struct meta_volume *v = &s->sm.volumes[vi];
+                    if (meta_replica(v, id) && !chk_vol_has_move(v) && v->nisr > v->min_isr) {
+                        n->fault_vol = v->number;
+                        n->fault_ticks = 1;
+                        s->cov.repl_faults++;
+                        break;
+                    }
+                }
+            }
+            s->cov.cls_disk_down++;
+            sim_trace(s, "R13 disk DOWN node=%" PRIu32 " disk=%d class=%s", id, d,
+                      meta_disk_class_name(sd->disk_class));
+        }
+    } else if (cev < 38) {
+        /* Disk added via META_OP_STORE_ADD. */
+        uint32_t id = 1 + rng_u32(&s->r, s->nnodes);
+        struct sim_node *n = sim_node_by_id(s, id);
+        const struct meta_member *mb = meta_member(&s->sm, id);
+        if (!n || !mb || !n->alive || n->destroyed || mb->state != META_UP || n->ndisks >= SIM_MAX_DISKS)
+            return;
+        uint8_t cls, uses;
+        uint64_t gib;
+        if (n->role == META_ROLE_COMPUTE) {
+            cls = rng_pct(&s->r, 70) ? META_DISK_NVME : META_DISK_SSD;
+            uses = META_DISK_USE_LOG;
+            gib = 150 + rng_u32(&s->r, 150);
+        } else if (n->role == META_ROLE_STORAGE) {
+            cls = rng_pct(&s->r, 80) ? META_DISK_HDD : META_DISK_SSD;
+            uses = META_DISK_USE_CHUNK;
+            gib = 400 + rng_u32(&s->r, 600);
+        } else {
+            uint32_t pick = rng_u32(&s->r, 3);
+            cls = pick == 0 ? META_DISK_HDD : (pick == 1 ? META_DISK_SSD : META_DISK_NVME);
+            uses = (cls == META_DISK_HDD) ? META_DISK_USE_CHUNK
+                                          : (rng_pct(&s->r, 50) ? META_DISK_USE_LOG : META_DISK_USE_ALL);
+            gib = (cls == META_DISK_HDD) ? (400 + rng_u32(&s->r, 600)) : (180 + rng_u32(&s->r, 200));
+        }
+        if (sim_register_disk(s, n, cls, uses, gib) >= 0) {
+            s->cov.cls_disk_add++;
+            sim_trace(s, "R13 disk ADD node=%" PRIu32 " class=%s uses=%u", id, meta_disk_class_name(cls), uses);
+        }
+    } else if (cev < 50) {
+        /* Disk class changed via META_OP_STORE_CLASS. */
+        uint32_t id = 1 + rng_u32(&s->r, s->nnodes);
+        struct sim_node *n = sim_node_by_id(s, id);
+        const struct meta_member *mb = meta_member(&s->sm, id);
+        if (!n || !mb || !n->alive || n->destroyed || mb->state == META_DESTROYED || n->ndisks == 0)
+            return;
+        int d = (int)rng_u32(&s->r, (uint32_t)n->ndisks);
+        struct sim_disk *sd = &n->disks[d];
+        if (sd->state == META_STORE_DESTROYED)
+            return;
+        uint8_t new_cls;
+        if (sd->disk_class == META_DISK_NVME)
+            new_cls = META_DISK_SSD;
+        else if (sd->disk_class == META_DISK_SSD)
+            new_cls = (sd->uses & META_DISK_USE_CHUNK) && n->role != META_ROLE_COMPUTE ? META_DISK_HDD : META_DISK_NVME;
+        else
+            new_cls = META_DISK_SSD;
+        struct meta_entry e;
+        meta_entry_init(&e);
+        meta_op_store_class(&e, id, sd->store_uuid, new_cls);
+        int res[4] = {0};
+        sim_apply_entry(s, &e, res, 4);
+        if (res[0] == META_OK) {
+            sd->disk_class = new_cls;
+            s->cov.cls_disk_class++;
+            sim_trace(s, "R13 disk CLASS node=%" PRIu32 " disk=%d -> %s", id, d, meta_disk_class_name(new_cls));
+        }
+    } else if (cev < 66) {
+        /* Fast disk filling above young_move_pct (80%), then draining back after 25..65 ticks. */
+        uint32_t id = 1 + rng_u32(&s->r, s->nnodes);
+        struct sim_node *n = sim_node_by_id(s, id);
+        const struct meta_member *mb = meta_member(&s->sm, id);
+        if (!n || !mb || !n->alive || n->destroyed || mb->state != META_UP)
+            return;
+        int spiked = 0;
+        for (int d = 0; d < n->ndisks; d++) {
+            struct sim_disk *sd = &n->disks[d];
+            if (sd->state != META_STORE_UP || !meta_disk_class_fast(sd->disk_class))
+                continue;
+            uint64_t room = (sd->uses & META_DISK_USE_CHUNK) && sd->size_bytes > sd->chunk_bytes
+                                ? (sd->size_bytes - sd->chunk_bytes)
+                                : sd->size_bytes;
+            uint64_t pct = s->pset.young_move_pct + 2 + rng_u32(&s->r, 12); /* 82..93% */
+            if (pct > 95)
+                pct = 95;
+            sd->young_bytes = (room / 100u) * pct;
+            if (sd->young_bytes > sd->young_peak_7d)
+                sd->young_peak_7d = sd->young_bytes;
+            sd->fill_until_tick = s->tick + 25 + rng_u32(&s->r, 40);
+            spiked = 1;
+        }
+        if (spiked) {
+            s->cov.cls_fast_fill++;
+            sim_trace(s, "R13 fast disk FILL spike node=%" PRIu32, id);
+        }
+    } else if (cev < 80) {
+        /* Chunk store filling past §5.6 fill mark (and sometimes past 95% rebuild full), then draining back. */
+        uint32_t id = 1 + rng_u32(&s->r, s->nnodes);
+        struct sim_node *n = sim_node_by_id(s, id);
+        const struct meta_member *mb = meta_member(&s->sm, id);
+        if (!n || !mb || !n->alive || n->destroyed || mb->state != META_UP)
+            return;
+        int spiked = 0;
+        uint64_t pct = rng_pct(&s->r, 60) ? (96 + rng_u32(&s->r, 3)) : (88 + rng_u32(&s->r, 6));
+        for (int d = 0; d < n->ndisks; d++) {
+            struct sim_disk *sd = &n->disks[d];
+            if (sd->state != META_STORE_UP || !(sd->uses & META_DISK_USE_CHUNK))
+                continue;
+            sd->chunk_bytes = (sd->size_bytes / 100u) * pct;
+            sd->fill_until_tick = s->tick + 25 + rng_u32(&s->r, 40);
+            spiked = 1;
+        }
+        if (spiked) {
+            s->cov.cls_chunk_fill++;
+            sim_trace(s, "R13 chunk store FILL spike node=%" PRIu32 " (%" PRIu64 "%%)", id, pct);
+        }
+    } else if (cev < 90) {
+        /* HDD-only storage-role (or HDD-only BOTH) server joining. */
+        if (s->nnodes < SIM_MAX_NODES) {
+            uint32_t nid = s->nnodes + 1;
+            s->nnodes = nid;
+            char rbuf[16] = "";
+            if (s->use_racks && s->nracks > 0)
+                snprintf(rbuf, sizeof rbuf, "r%" PRIu32, (nid - 1) % s->nracks);
+            enum sim_node_layout lay = rng_pct(&s->r, 60) ? NL_HDD_STORAGE : NL_HDD_BOTH;
+            sim_add_member_meta_ex(s, nid, rbuf, s->sm.set.log_on_hdd, lay);
+            s->cov.cls_hdd_join++;
+            s->cov.op_node_add++;
+            sim_trace(s, "R13 HDD-only node JOIN id=%" PRIu32 " role=%s rack=%s", nid,
+                      lay == NL_HDD_STORAGE ? "storage" : "both", rbuf);
+        }
+    } else {
+        /* Toggle log_on_hdd on/off via real META_OP_SETTINGS (CAS on settings_version). */
+        struct meta_settings ns = s->sm.set;
+        ns.log_on_hdd = ns.log_on_hdd ? 0 : 1;
+        struct meta_entry e;
+        meta_entry_init(&e);
+        meta_op_settings(&e, &ns, s->sm.settings_version);
+        int res[4] = {0};
+        sim_apply_entry(s, &e, res, 4);
+        if (res[0] == META_OK) {
+            if (ns.log_on_hdd)
+                s->cov.cls_log_on_hdd_on++;
+            else
+                s->cov.cls_log_on_hdd_off++;
+            sim_trace(s, "R13 log_on_hdd -> %u", ns.log_on_hdd);
+        }
+    }
+}
+
 static void sim_step_events(struct sim *s, uint32_t total_ticks)
 {
+    /* 0. R13 disk fill drains, DOWN->OUT escalations, and disk recoveries. */
+    sim_step_class_timers(s);
+    if (s->failed)
+        return;
+
     /* 1. Scheduled auto-recoveries of transient faults. */
     for (uint32_t i = 0; i < s->nnodes; i++) {
         struct sim_node *n = &s->nodes[i];
@@ -3006,10 +4290,16 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
             n->incarnation++;
             n->recover_tick = 0;
             n->failstop_beat = 0;
-            /* Repair any failed disks on restart (fresh empty store if lost). */
-            for (int d = 0; d < n->ndisks; d++)
-                if (!n->disk_ok[d])
+            /* Repair any failed disks on restart (fresh empty store if lost; in --classes mode keep META_STORE_UP
+             * disks healthy and leave DOWN/OUT/DESTROYED disks to STORE_STATE recovery). */
+            for (int d = 0; d < n->ndisks; d++) {
+                if (n->class_mode) {
+                    if (n->disks[d].state == META_STORE_UP)
+                        n->disk_ok[d] = 1;
+                } else if (!n->disk_ok[d]) {
                     n->disk_ok[d] = 1;
+                }
+            }
             /* 35% of recoveries enter `opening` state (sometimes past opening_hold_s to exercise openingunbounded). */
             if (rng_pct(&s->r, 35)) {
                 n->opening = 1;
@@ -3072,7 +4362,12 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
     if (s->tick < 8 || s->tick + 60 >= total_ticks)
         return;
 
-    /* Inject faults & operator ops probabilistically (~12% chance per tick). */
+    /* Inject faults & operator ops probabilistically (~12% chance per tick, plus R13 disk/class events in --classes). */
+    if (s->use_classes && rng_pct(&s->r, 12)) {
+        sim_inject_class_event(s);
+        if (s->failed)
+            return;
+    }
     if (!rng_pct(&s->r, 12))
         return;
 
@@ -3131,14 +4426,45 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
         if (n && n->alive && !n->destroyed && node_healthy_disks(n) > 0 && !taking_down_exceeds(s, id, 0)) {
             int d = node_pick_disk(s, n);
             if (d >= 0) {
-                wipe_node_disk(s, n, d);
-                s->cov.disk_losses++;
-                /* Replace/remount empty disk after 10 ticks if all disks failed. */
-                if (node_healthy_disks(n) == 0) {
-                    n->alive = 0;
-                    n->recover_tick = s->tick + s->pset.rebuild_after_s + 25;
+                int do_wipe = 1;
+                if (s->use_classes) {
+                    do_wipe = 0;
+                    struct sim_disk *sd = &n->disks[d];
+                    if (sd->state == META_STORE_UP) {
+                        struct meta_entry e1, e2;
+                        int r1[4] = {0}, r2[4] = {0};
+                        meta_entry_init(&e1);
+                        meta_op_store_state(&e1, id, sd->store_uuid, META_STORE_DOWN);
+                        sim_apply_entry(s, &e1, r1, 4);
+                        if (r1[0] == META_OK) {
+                            sd->state = META_STORE_DOWN;
+                            n->disk_ok[d] = 0;
+                            meta_entry_init(&e2);
+                            meta_op_store_state(&e2, id, sd->store_uuid, META_STORE_OUT);
+                            sim_apply_entry(s, &e2, r2, 4);
+                            if (r2[0] == META_OK) {
+                                sd->state = META_STORE_OUT;
+                                sd->out_tick = 0;
+                                sd->recover_tick = s->tick + 25 + rng_u32(&s->r, 40);
+                                s->cov.cls_disk_out++;
+                                do_wipe = 1;
+                            } else {
+                                sd->out_tick = 0;
+                                sd->recover_tick = s->tick + 15;
+                            }
+                        }
+                    }
                 }
-                sim_trace(s, "FAULT lost disk node=%" PRIu32 " disk=%d", id, d);
+                if (do_wipe) {
+                    wipe_node_disk(s, n, d);
+                    s->cov.disk_losses++;
+                    /* Replace/remount empty disk after 10 ticks if all disks failed. */
+                    if (!s->use_classes && node_healthy_disks(n) == 0) {
+                        n->alive = 0;
+                        n->recover_tick = s->tick + s->pset.rebuild_after_s + 25;
+                    }
+                    sim_trace(s, "FAULT lost disk node=%" PRIu32 " disk=%d", id, d);
+                }
             }
         }
     } else if (ev < 62) {
@@ -3305,7 +4631,14 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
             char rbuf[16] = "";
             if (s->use_racks && s->nracks > 0)
                 snprintf(rbuf, sizeof rbuf, "r%" PRIu32, (nid - 1) % s->nracks);
-            sim_add_member_meta(s, nid, rbuf);
+            if (s->use_classes) {
+                enum sim_node_layout lay = (enum sim_node_layout)rng_u32(&s->r, 7);
+                sim_add_member_meta_ex(s, nid, rbuf, s->sm.set.log_on_hdd, lay);
+                if (lay == NL_HDD_STORAGE || lay == NL_HDD_BOTH)
+                    s->cov.cls_hdd_join++;
+            } else {
+                sim_add_member_meta(s, nid, rbuf);
+            }
             s->cov.op_node_add++;
             sim_trace(s, "OP node add id=%" PRIu32 " rack=%s", nid, rbuf);
         }
@@ -3319,17 +4652,23 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
                     continue;
                 const struct meta_member *nmb = meta_member(&s->sm, nid);
                 const struct sim_node *nn = sim_node_by_id_c(s, nid);
-                if (!nmb || nmb->state != META_UP || !nn || !nn->alive || node_healthy_disks(nn) == 0)
+                if (!nmb || nmb->state != META_UP || !nn || !nn->alive)
                     continue;
-                int overlap = 0, old_holds = 0;
+                if (!s->use_classes && node_healthy_disks(nn) == 0)
+                    continue;
+                int overlap = 0, old_holds = 0, old_log = 0, old_stripe = 0;
                 for (uint32_t vi = 0; vi < s->sm.nvolumes; vi++) {
                     const struct meta_volume *v = &s->sm.volumes[vi];
                     int oh = meta_replica(v, old_id) != NULL;
                     int nh = meta_replica(v, nid) != NULL;
+                    if (oh)
+                        old_log = 1;
                     if (v->redundancy == META_RED_EC) {
                         for (uint32_t p = 0; p < v->nstripe; p++) {
-                            if (v->stripe[p] == old_id)
+                            if (v->stripe[p] == old_id) {
                                 oh = 1;
+                                old_stripe = 1;
+                            }
                             if (v->stripe[p] == nid)
                                 nh = 1;
                         }
@@ -3340,6 +4679,13 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
                         overlap = 1;
                         break;
                     }
+                }
+                if (s->use_classes) {
+                    if (old_log && (nmb->role == META_ROLE_STORAGE || !(meta_member_effective_cap(nmb) & META_CAP_COMPUTE)))
+                        continue;
+                    if (old_stripe && (nmb->role == META_ROLE_COMPUTE ||
+                                       !(meta_member_effective_cap(nmb) & META_CAP_STORAGE) || node_healthy_disks(nn) == 0))
+                        continue;
                 }
                 if (old_holds && !overlap) {
                     if (omb->state < META_OUT) {
@@ -3376,6 +4722,9 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
                 const struct meta_member *mb = meta_member(&s->sm, nid);
                 const struct sim_node *nn = sim_node_by_id_c(s, nid);
                 if (!mb || mb->state != META_UP || !nn || !nn->alive || node_healthy_disks(nn) == 0)
+                    continue;
+                if (s->use_classes &&
+                    (mb->role == META_ROLE_COMPUTE || !(meta_member_effective_cap(mb) & META_CAP_STORAGE)))
                     continue;
                 int in_sp = 0;
                 for (uint32_t k = 0; k < v->nstripe; k++)
@@ -3465,7 +4814,7 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
 
 /* ------------------------------------------------------------------ single seed driver */
 
-static int run_seed(uint64_t seed, uint32_t ticks, int mutant, const char *mutant_name, int trace,
+static int run_seed(uint64_t seed, uint32_t ticks, int mutant, const char *mutant_name, int trace, int use_classes,
                     struct sim_cov *total_cov)
 {
     struct sim *s = calloc(1, sizeof *s);
@@ -3473,7 +4822,7 @@ static int run_seed(uint64_t seed, uint32_t ticks, int mutant, const char *mutan
         fprintf(stderr, "sim_place: out of memory\n");
         return 2;
     }
-    sim_init_cluster(s, seed, mutant, mutant_name, trace);
+    sim_init_cluster(s, seed, mutant, mutant_name, trace, use_classes);
 
     for (uint32_t t = 1; t <= ticks && !s->failed; t++) {
         s->tick = t;
@@ -3572,6 +4921,18 @@ static int run_seed(uint64_t seed, uint32_t ticks, int mutant, const char *mutan
         total_cov->repl_faults += s->cov.repl_faults;
         total_cov->disk_losses += s->cov.disk_losses;
         total_cov->slow_opens += s->cov.slow_opens;
+        total_cov->cls_disk_down += s->cov.cls_disk_down;
+        total_cov->cls_disk_out += s->cov.cls_disk_out;
+        total_cov->cls_disk_recover += s->cov.cls_disk_recover;
+        total_cov->cls_disk_add += s->cov.cls_disk_add;
+        total_cov->cls_disk_class += s->cov.cls_disk_class;
+        total_cov->cls_fast_fill += s->cov.cls_fast_fill;
+        total_cov->cls_chunk_fill += s->cov.cls_chunk_fill;
+        total_cov->cls_hdd_join += s->cov.cls_hdd_join;
+        total_cov->cls_log_on_hdd_on += s->cov.cls_log_on_hdd_on;
+        total_cov->cls_log_on_hdd_off += s->cov.cls_log_on_hdd_off;
+        total_cov->cls_single_stripes += s->cov.cls_single_stripes;
+        total_cov->cls_mixed_stripes += s->cov.cls_mixed_stripes;
     }
 
     meta_free(&s->sm);
@@ -4190,7 +5551,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage:\n"
-            "  sim_place [--seeds N] [--first S] [--seed S] [--ticks T] [--mutant NAME] [--trace]\n"
+            "  sim_place [--classes] [--seeds N] [--first S] [--seed S] [--ticks T] [--mutant NAME] [--trace]\n"
             "  sim_place --mttdl GEOM|all [--mttdl-table] [--disks-afr P] [--servers-afr P] [--disks-per-node D]\n"
             "            [--tb-per-node T] [--rate MB/s] [--nodes N] [--trials N] [--seed S]\n");
 }
@@ -4201,6 +5562,7 @@ int main(int argc, char **argv)
     uint32_t ticks = 600;
     const char *mutant_name = NULL;
     int trace = 0;
+    int use_classes = 0;
 
     const char *mttdl_geom = NULL;
     double disks_afr = 0.02;
@@ -4226,6 +5588,8 @@ int main(int argc, char **argv)
             mutant_name = argv[++i];
         } else if (!strcmp(argv[i], "--trace")) {
             trace = 1;
+        } else if (!strcmp(argv[i], "--classes")) {
+            use_classes = 1;
         } else if (!strcmp(argv[i], "--mttdl") && i + 1 < argc) {
             mttdl_geom = argv[++i];
         } else if (!strcmp(argv[i], "--mttdl-table")) {
@@ -4286,7 +5650,7 @@ int main(int argc, char **argv)
     memset(&cov, 0, sizeof cov);
     for (uint64_t k = 0; k < seeds; k++) {
         uint64_t seed = first + k;
-        int rc = run_seed(seed, ticks, mutant, mutant_name, trace, &cov);
+        int rc = run_seed(seed, ticks, mutant, mutant_name, trace, use_classes, &cov);
         if (rc != 0)
             return rc;
     }
@@ -4311,17 +5675,38 @@ int main(int argc, char **argv)
                     cov.log_cancels, cov.m_faults, cov.op_destroyed, cov.props_lost, cov.props_delayed);
             return 1;
         }
+        if (use_classes && (!cov.cls_disk_down || !cov.cls_disk_out || !cov.cls_disk_recover || !cov.cls_disk_add ||
+                            !cov.cls_disk_class || !cov.cls_fast_fill || !cov.cls_chunk_fill || !cov.cls_hdd_join ||
+                            !cov.cls_log_on_hdd_on || !cov.cls_log_on_hdd_off || !cov.cls_single_stripes)) {
+            fprintf(stderr,
+                    "sim_place --classes: R13 coverage floor failed over %" PRIu64 " seeds (down=%" PRIu64
+                    " out=%" PRIu64 " rec=%" PRIu64 " add=%" PRIu64 " cls=%" PRIu64 " ffill=%" PRIu64
+                    " cfill=%" PRIu64 " hddjoin=%" PRIu64 " lhdd=%" PRIu64 "/%" PRIu64 " single=%" PRIu64 ")\n",
+                    seeds, cov.cls_disk_down, cov.cls_disk_out, cov.cls_disk_recover, cov.cls_disk_add,
+                    cov.cls_disk_class, cov.cls_fast_fill, cov.cls_chunk_fill, cov.cls_hdd_join,
+                    cov.cls_log_on_hdd_on, cov.cls_log_on_hdd_off, cov.cls_single_stripes);
+            return 1;
+        }
     }
-    printf("sim_place: %" PRIu64 " seeds ok (first=%" PRIu64 " ticks=%" PRIu32
+    printf("sim_place%s: %" PRIu64 " seeds ok (first=%" PRIu64 " ticks=%" PRIu32
            " settled=%" PRIu64 " deg=%" PRIu64 " fills=%" PRIu64 " gc=%" PRIu64 " logmoves=%" PRIu64
            " guards=%" PRIu64 "/%" PRIu64 " holds=%" PRIu64 " returns=%" PRIu64 " sret=%" PRIu64 " lcan=%" PRIu64
            " ops[rep=%" PRIu64 " drn=%" PRIu64 " dst=%" PRIu64 " mov=%" PRIu64 " add=%" PRIu64 "]"
            " faults[m=%" PRIu64 " m1=%" PRIu64 " fs=%" PRIu64 " rf=%" PRIu64 " dk=%" PRIu64 " op=%" PRIu64 "]"
-           " net[lost=%" PRIu64 " dly=%" PRIu64 "])\n",
-           seeds, first, ticks, cov.objs_settled, cov.deg_settled, cov.fills_done, cov.gc_releases, cov.log_moves,
-           cov.guards_active, cov.guards_passed, cov.holds_applied, cov.returns_after_out, cov.stripe_returns,
-           cov.log_cancels, cov.op_replace, cov.op_drain, cov.op_destroyed, cov.op_move_pos, cov.op_node_add,
-           cov.m_faults, cov.mplus1_faults, cov.failstops, cov.repl_faults, cov.disk_losses, cov.slow_opens,
-           cov.props_lost, cov.props_delayed);
+           " net[lost=%" PRIu64 " dly=%" PRIu64 "]",
+           use_classes ? " --classes" : "", seeds, first, ticks, cov.objs_settled, cov.deg_settled, cov.fills_done,
+           cov.gc_releases, cov.log_moves, cov.guards_active, cov.guards_passed, cov.holds_applied,
+           cov.returns_after_out, cov.stripe_returns, cov.log_cancels, cov.op_replace, cov.op_drain, cov.op_destroyed,
+           cov.op_move_pos, cov.op_node_add, cov.m_faults, cov.mplus1_faults, cov.failstops, cov.repl_faults,
+           cov.disk_losses, cov.slow_opens, cov.props_lost, cov.props_delayed);
+    if (use_classes) {
+        printf(" r13[down=%" PRIu64 " out=%" PRIu64 " rec=%" PRIu64 " add=%" PRIu64 " cls=%" PRIu64
+               " ffill=%" PRIu64 " cfill=%" PRIu64 " hddjoin=%" PRIu64 " lhdd=%" PRIu64 "/%" PRIu64
+               " stripes=%" PRIu64 "/%" PRIu64 "]",
+               cov.cls_disk_down, cov.cls_disk_out, cov.cls_disk_recover, cov.cls_disk_add, cov.cls_disk_class,
+               cov.cls_fast_fill, cov.cls_chunk_fill, cov.cls_hdd_join, cov.cls_log_on_hdd_on, cov.cls_log_on_hdd_off,
+               cov.cls_single_stripes, cov.cls_mixed_stripes);
+    }
+    printf(")\n");
     return 0;
 }

@@ -1087,7 +1087,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants tierscrub-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants balance-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants tierscrub-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants balance-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak sim-place-soak-classes sim-place-class-mutants place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1207,10 +1207,16 @@ $(B)/test_pout: tests/test_pout.c $(R9_PLACE_HDR) $(B)/pout.o $(B)/place.o $(B)/
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/test_pout.c $(B)/pout.o $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
 pout-mutants: $(B)/test_pout
 	$(MUT) --name test_pout --list "noguard guardunbounded holdignored openingunbounded failstopslow" -- ./$(B)/test_pout --mutant @M@
-PLACE_SEEDS ?= 10000
-PLACE_JOBS  ?= $(shell nproc 2>/dev/null || echo 4)
+PLACE_SEEDS       ?= 10000
+PLACE_CLASS_SEEDS ?= 0
+PLACE_SOAK_HOURS  ?= 4
+PLACE_JOBS        ?= $(shell nproc 2>/dev/null || echo 4)
 place-soak: $(B)/sim_place
 	B=$(B) tests/sim_place.sh soak $(PLACE_SEEDS) $(PLACE_JOBS)
+sim-place-soak-classes: $(B)/sim_place
+	B=$(B) PLACE_CLASS_SEEDS=$(PLACE_CLASS_SEEDS) PLACE_SOAK_HOURS=$(PLACE_SOAK_HOURS) tests/sim_place.sh soak-classes $(PLACE_JOBS)
+sim-place-class-mutants: $(B)/sim_place
+	B=$(B) tests/sim_place.sh class-mutants
 place-mutants: $(B)/sim_place
 	B=$(B) tests/sim_place.sh mutants
 # R9 checked stripe fill worker unit tests and planted mutants (server/sfill.c, tests/test_sfill.c; track r9-fill)

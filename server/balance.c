@@ -424,11 +424,14 @@ static void balance_run(const struct place_in *in, struct place_out *out, struct
     uint8_t *chunk_cls = calloc(nm, sizeof *chunk_cls);
     uint64_t *chunk_cap = calloc(nm, sizeof *chunk_cap);
     uint64_t *chunk_used = calloc(nm, sizeof *chunk_used);
+    uint64_t *real_used_init = calloc(nm, sizeof *real_used_init);
+    uint64_t *real_used = calloc(nm, sizeof *real_used);
     uint8_t *have_usage = calloc(nm, sizeof *have_usage);
     uint32_t *log_holds = calloc(nm, sizeof *log_holds);
     uint32_t *rep0_holds = calloc(nm, sizeof *rep0_holds);
     uint32_t *leads = calloc(nm, sizeof *leads);
     uint32_t *stripe_holds = calloc(nm, sizeof *stripe_holds);
+    uint32_t *real_stripe_holds = calloc(nm, sizeof *real_stripe_holds);
     uint32_t *log_recv = calloc(nm, sizeof *log_recv);
     uint32_t *log_send = calloc(nm, sizeof *log_send);
     uint32_t *stripe_recv = calloc(nm, sizeof *stripe_recv);
@@ -447,10 +450,10 @@ static void balance_run(const struct place_in *in, struct place_out *out, struct
     struct bal_xfer *xfers = NULL;
     uint32_t nxfers = 0, cap_xfers = 0;
 
-    if (!elig_log || !fast_log || !elig_stripe || !chunk_cls || !chunk_cap || !chunk_used || !have_usage ||
-        !log_holds || !rep0_holds || !leads || !stripe_holds || !log_recv || !log_send || !stripe_recv ||
-        !log_pairs || !stripe_pairs || !vol_ym || !vol_sm || !vol_inflight || !vol_busy_log || !vol_busy_stripe ||
-        !sim_nrep || !sim_rep || !sim_stripe)
+    if (!elig_log || !fast_log || !elig_stripe || !chunk_cls || !chunk_cap || !chunk_used || !real_used_init ||
+        !real_used || !have_usage || !log_holds || !rep0_holds || !leads || !stripe_holds || !real_stripe_holds ||
+        !log_recv || !log_send || !stripe_recv || !log_pairs || !stripe_pairs || !vol_ym || !vol_sm || !vol_inflight ||
+        !vol_busy_log || !vol_busy_stripe || !sim_nrep || !sim_rep || !sim_stripe)
         goto cleanup;
 
     /* 4. Inspect every replicated volume: detect any queued/active rebuild, compute margins and total positions. */
@@ -619,6 +622,9 @@ static void balance_run(const struct place_in *in, struct place_out *out, struct
         const struct meta_member *mb = &sm->members[i];
         chunk_cls[i] = place_member_chunk_class(mb);
         member_chunk_stats(in, mb, &chunk_cap[i], &chunk_used[i], &have_usage[i]);
+        real_used_init[i] = chunk_used[i];
+        real_used[i] = chunk_used[i];
+        real_stripe_holds[i] = stripe_holds[i];
         fast_log[i] = (uint8_t)((mb->ndisks == 0) || meta_member_has_fast_disk(mb));
         if (!member_placeable(in, mb))
             continue;
@@ -1218,6 +1224,20 @@ static void balance_run(const struct place_in *in, struct place_out *out, struct
                 if (!place_rack_survivable(sm, &va))
                     continue;
             }
+            /* Re-check chunk fill mark against REAL (non-virtual) current bytes plus same-tick emitted incoming
+             * moves: a concurrent outgoing move off dst_mi has not freed its chunks until STRIPE_WHOLE + MK_GC
+             * completes (E53 / §5.6). Earlier-tick FILLING positions are bounded by max_conc/stripe_cap and
+             * progressively reflected in reported chunk_bytes without double-counting already-copied bytes. */
+            uint64_t real_est_b = (have_usage[m->src_mi] && real_stripe_holds[m->src_mi] > 0)
+                                      ? (real_used_init[m->src_mi] / real_stripe_holds[m->src_mi])
+                                      : 0;
+            if (in->mutant != PLACE_MUT_PLACE_FULL && have_usage[m->dst_mi] && chunk_cap[m->dst_mi] > 0 &&
+                real_est_b > 0) {
+                uint64_t nu_d = (uint64_t)(((__uint128_t)sat_add_u64(real_used[m->dst_mi], real_est_b) * 1000000ull) /
+                                           chunk_cap[m->dst_mi]);
+                if (nu_d >= mark_ppm)
+                    continue;
+            }
             struct place_prop prop = {
                 .kind = PLACE_PROP_STRIPE_SET,
                 .volume = m->volume,
@@ -1234,6 +1254,8 @@ static void balance_run(const struct place_in *in, struct place_out *out, struct
             vol_emitted_stripe[m->vol_idx] = 1;
             vol_inflight[m->vol_idx]++;
             stripe_recv[m->dst_mi]++;
+            if (real_est_b > 0)
+                real_used[m->dst_mi] = sat_add_u64(real_used[m->dst_mi], real_est_b);
             emitted_data++;
         }
     }
@@ -1273,11 +1295,14 @@ cleanup:
     free(stripe_recv);
     free(log_send);
     free(log_recv);
+    free(real_stripe_holds);
     free(stripe_holds);
     free(leads);
     free(rep0_holds);
     free(log_holds);
     free(have_usage);
+    free(real_used);
+    free(real_used_init);
     free(chunk_used);
     free(chunk_cap);
     free(chunk_cls);

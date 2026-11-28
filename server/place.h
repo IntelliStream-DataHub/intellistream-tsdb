@@ -120,6 +120,7 @@ enum place_mutant {
     PLACE_MUT_PLACE_FULL = 15,     /* R13 r13-place: ignore young_move_pct (80%) and chunk fill mark */
     PLACE_MUT_TAKEBACK_WHOLE = 16, /* R9 r9-return: take a stripe position back from a WHOLE holder */
     PLACE_MUT_PARTIAL_DEL_NOW = 17,/* R9 r9-return: delete B's partial chunks at STRIPE_SET, not by MK_GC release */
+    PLACE_MUT_USE_CHANGE = 18,     /* R13 r13-sim: rebuild EC stripe position onto a non-storage / compute-only node */
 };
 
 /* Active `node replace OLD NEW` intent (r9-ops records; place_plan sends each of OLD's positions to NEW). */
