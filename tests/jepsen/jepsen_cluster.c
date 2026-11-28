@@ -162,7 +162,7 @@
 #include <sys/wait.h>
 #include <time.h>
 
-#define MAXN 22
+#define MAXN 48
 #define KEYS 40
 #define KV_BASE_TS 1700000000000LL
 #define RAFT_LEADER_ROLE 3
@@ -185,6 +185,11 @@ static int want_meta = 1, want_kv = 1;
 static int want_rep, want_classes; /* workloads kv and classes: one volume of 3 replicas, written through its leader */
 static int want_via;               /* workload kv-via: kv, with the clients on entry nodes (forwarding), RYW, fwdstall */
 static int want_ec_k, want_ec_m; /* --ec K+M: kvr is an erasure-coded volume (cluster_ec.h) */
+static char opt_geometry[16];    /* --geometry 4+2|8+2|8+4|16+4|r3 (D24) */
+static _Atomic uint64_t kv_why_full;
+static _Atomic unsigned r9_local_faults;
+static char r9_local_fault_msg[256];
+static int r9_loss_expected;
 static int want_auth, want_users; /* --auth: every tsdbd requires a login (a superuser from the init); workload users */
 static const char *opt_peer_rdma; /* --peer-rdma auto|on|off (NULL: tsdbd default) */
 static int opt_peer_rdma_pool_mb; /* --peer-rdma-pool-mb N (0: tsdbd default) */
@@ -199,17 +204,22 @@ static void ec_add_kvr(void);
 static void rmtree(const char *path);
 
 enum {
-    N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16, N_FWDSTALL = 32,
-    N_KILL2 = 64, N_SLOW = 128, N_LONGDOWN = 256, N_REBUILD = 512, N_CHURN = 1024,
-    N_PARTIAL = 2048, N_DISKLOSS = 4096, N_ROT = 8192, /* --ec runs (cluster_ec.h) */
-    N_RDMA_QPERR = 16384, /* mid-stream RDMA QP error via TSDB_PLRDMA_TEST=qperr_file=... */
-    N_ROTPARITY = 32768, N_ROTCOLD = 65536, N_ROTYOUNG = 131072, N_ROTTHENM = 262144 /* R12 scrub/repair/heal */
+    N_KILL = 1u << 0, N_PARTITION = 1u << 1, N_PAUSE = 1u << 2, N_MIDCOMMIT = 1u << 3, N_POWER = 1u << 4,
+    N_FWDSTALL = 1u << 5, N_KILL2 = 1u << 6, N_SLOW = 1u << 7, N_LONGDOWN = 1u << 8, N_REBUILD = 1u << 9,
+    N_CHURN = 1u << 10, N_PARTIAL = 1u << 11, N_DISKLOSS = 1u << 12, N_ROT = 1u << 13, /* --ec runs (cluster_ec.h) */
+    N_RDMA_QPERR = 1u << 14, /* mid-stream RDMA QP error via TSDB_PLRDMA_TEST=qperr_file=... */
+    N_ROTPARITY = 1u << 15, N_ROTCOLD = 1u << 16, N_ROTYOUNG = 1u << 17, N_ROTTHENM = 1u << 18, /* R12 scrub/repair/heal */
+    /* R9 failure handling, rebuild, return, backpressure and multi-fault nemeses (cluster_r9.h) */
+    N_OUT = 1u << 19, N_BACK = 1u << 20, N_TWO = 1u << 21, N_MFAIL = 1u << 22, N_M1 = 1u << 23,
+    N_SLOWLOSS = 1u << 24, N_HOLD = 1u << 25, N_STRIPESET = 1u << 26, N_FULL = 1u << 27
 };
-#define NNEM 19
+#define NNEM 28
 #define N_R12_EC (N_ROTPARITY | N_ROTCOLD | N_ROTTHENM)
 #define N_R12 (N_R12_EC | N_ROTYOUNG)
 #define N_EC_ROT (N_ROT | N_R12_EC)
-#define N_EC (N_PARTIAL | N_DISKLOSS | N_EC_ROT)
+#define N_R9_EC (N_MFAIL | N_M1 | N_STRIPESET)
+#define N_R9 (N_OUT | N_BACK | N_TWO | N_MFAIL | N_M1 | N_SLOWLOSS | N_HOLD | N_STRIPESET | N_FULL)
+#define N_EC (N_PARTIAL | N_DISKLOSS | N_EC_ROT | N_R9_EC)
 #define N_R4_KV (N_LONGDOWN | N_REBUILD | N_CHURN) /* these need kvr: workload kv, kv-via or classes */
 
 /* R4's nemeses and the tracks they need. `built`: that track is on main (flip it when it merges; the run is refused
@@ -241,7 +251,7 @@ static int retain_eff;            /* the repl_retain_s the cluster is made with 
 static int cls_defer_s;           /* how long a promoted writer's class switches wait for the members' log start */
 static const char *outagefs_so;   /* --outagefs: the shim under every server (the slow nemesis) */
 static int use_outagefs;
-static int nemeses = N_KILL | N_PARTITION | N_PAUSE | N_MIDCOMMIT;
+static unsigned nemeses = N_KILL | N_PARTITION | N_PAUSE | N_MIDCOMMIT;
 
 static int64_t now_ns(void)
 {
@@ -294,6 +304,8 @@ struct node {
     char chunk[2][PATH_MAX + 32]; /* --ec: the node's two chunk stores ("" until made after the cluster has member ids) */
     int mport;                    /* its metrics port (--ec), from its port file */
     char octl[PATH_MAX + 32]; /* the outagefs shim's control socket of this node (--outagefs: the slow nemesis) */
+    int dead_for_good;        /* R9: killed permanently by `out` or declared DESTROYED by `m1` */
+    int sfill_pause_override; /* R9: >= 0 overrides default pause_after for TSDB_SFILL_TEST (-1: default) */
     _Atomic uint64_t peak_rss_kb; /* highest VmHWM/VmRSS seen for this node across the run */
     _Atomic unsigned peak_fds;    /* highest open fd count seen for this node across the run */
 };
@@ -360,7 +372,7 @@ static void die(int code, const char *fmt, ...)
     va_start(ap, fmt);
     fprintf(stderr, "jepsen-cluster: FAIL: ");
     vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n  (seed %" PRIu64 ", nemeses %d, logs of the nodes in %s)\n", seed, nemeses, rundir);
+    fprintf(stderr, "\n  (seed %" PRIu64 ", nemeses %u, logs of the nodes in %s)\n", seed, nemeses, rundir);
     va_end(ap);
     atomic_store(&stopping, 1);
     kill_everything();
@@ -760,7 +772,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         argv[na++] = "--merge-idle-s";
         argv[na++] = "1";
     }
-    if (want_ec_k || rdma_metrics || (nemeses & N_ROTYOUNG)) {
+    if (want_ec_k || rdma_metrics || (nemeses & (N_ROTYOUNG | N_R9)) || opt_geometry[0]) {
         argv[na++] = "--metrics-port";
         argv[na++] = "auto";
     }
@@ -777,6 +789,10 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         argv[na++] = "5";
         argv[na++] = "--ec-settle-keep-s";
         argv[na++] = "30";
+        if (nemeses & N_HOLD) {
+            argv[na++] = "--ec-settle-wait-max-s";
+            argv[na++] = "5";
+        }
         argv[na++] = "--ec-cache-mb";
         argv[na++] = "16";
         if (!want_classes) {
@@ -791,7 +807,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
             argv[na++] = darg[k];
         }
     }
-    if ((want_ec_k || nn > 6) && i >= 2) { /* D15: io_uring on at most two nodes (8 MB memlock per user), epoll on the rest */
+    if ((want_ec_k || opt_geometry[0] || (nemeses & N_R9) || nn > 6) && i >= 2) { /* D15/D24: io_uring on at most two nodes (8 MB memlock per user), epoll on the rest */
         argv[na++] = "--io";
         argv[na++] = "epoll";
     } else if (getenv("TSDBD_IO") && *getenv("TSDBD_IO")) {
@@ -811,7 +827,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
             (!(nemeses & N_RDMA_QPERR) || strncmp(*e, "TSDB_PLRDMA_TEST=", 17)))
             envp[ne++] = *e;
     char e1[256], e2[2 * PATH_MAX + 64], e3[PATH_MAX + 64], e4[64], e5[PATH_MAX + 64], e6[PATH_MAX + 64], e7[PATH_MAX + 64],
-         e8[PATH_MAX + 256], e9[PATH_MAX + 96];
+         e8[PATH_MAX + 256], e9[PATH_MAX + 96], e10[256], e11[PATH_MAX + 128];
     if (nemeses & N_RDMA_QPERR) {
         if (orig_plrdma_test && *orig_plrdma_test)
             snprintf(e8, sizeof e8, "TSDB_PLRDMA_TEST=%s,qperr_file=%s/rdma_qperr", orig_plrdma_test, n->dir);
@@ -825,12 +841,24 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     }
     if (!want_rep) /* the leader of a 1-replica cluster volume takes writes without the driver (kv-local) */
         envp[ne++] = "TSDB_CLUSTER_WRITES=1";
-    if ((nemeses & N_CHURN) && (nemeses & N_ROTYOUNG))
-        envp[ne++] = "TSDB_CLUSTER_TEST=vol_trace=1,heal_cooldown_ms=2000";
-    else if (nemeses & N_CHURN) /* every applied record of kvr's set and ISR in <state>/voltrace (r4_move_trace_check) */
-        envp[ne++] = "TSDB_CLUSTER_TEST=vol_trace=1";
-    else if (nemeses & N_ROTYOUNG) /* R12 D8: short auto-reset cooldown so multiple rounds can rebuild */
-        envp[ne++] = "TSDB_CLUSTER_TEST=heal_cooldown_ms=2000";
+    {
+        char ct[192] = "";
+        if (nemeses & N_CHURN)
+            snprintf(ct + strlen(ct), sizeof ct - strlen(ct), "%svol_trace=1", ct[0] ? "," : "");
+        if (nemeses & N_ROTYOUNG)
+            snprintf(ct + strlen(ct), sizeof ct - strlen(ct), "%sheal_cooldown_ms=2000", ct[0] ? "," : "");
+        if (nemeses & N_FULL)
+            snprintf(ct + strlen(ct), sizeof ct - strlen(ct), "%sfill_pct_file=1", ct[0] ? "," : "");
+        if (ct[0]) {
+            snprintf(e10, sizeof e10, "TSDB_CLUSTER_TEST=%s", ct);
+            envp[ne++] = e10;
+        }
+    }
+    if (want_ec_k && (nemeses & (N_OUT | N_BACK)) && !getenv("TSDB_SFILL_TEST")) {
+        int pa = n->sfill_pause_override >= 0 ? n->sfill_pause_override : ((nemeses & N_BACK) ? 1 : 0);
+        snprintf(e11, sizeof e11, "TSDB_SFILL_TEST=obj_delay_ms=25,pause_after=%d:%s/n%d.sfill.pause", pa, rundir, i);
+        envp[ne++] = e11;
+    }
     if ((nemeses & N_R12_EC) && !getenv("TSDB_CHUNKSCRUB_TEST"))
         envp[ne++] = "TSDB_CHUNKSCRUB_TEST=interval_ms=400";
     if ((nemeses & N_ROTYOUNG) && !getenv("TSDB_SCRUB_TEST"))
@@ -1354,6 +1382,8 @@ static int settled_once(char *why, size_t wn)
     struct view v[MAXN];
     int have[MAXN] = {0}, leaders = 0, leader_i = -1, rc = 0;
     for (int i = 0; i < nn && !rc; i++) {
+        if (nodes[i].dead_for_good)
+            continue;
         pid_t pid;
         node_snap(i, &pid, NULL, NULL);
         if (pid <= 0 || nodes[i].paused) {
@@ -1385,13 +1415,24 @@ static int settled_once(char *why, size_t wn)
             snprintf(why, wn, "the leader's metadata has %u members, not %d", (unsigned)l->m.nmembers, nn);
             rc = -1;
         }
-        for (uint32_t k = 0; !rc && k < l->m.nmembers; k++)
-            if (l->m.members[k].state != META_UP) {
-                snprintf(why, wn, "member %u is %s", (unsigned)l->m.members[k].id,
-                         meta_member_state_name(l->m.members[k].state));
+        for (uint32_t k = 0; !rc && k < l->m.nmembers; k++) {
+            int ni = idx_of_id(l->m.members[k].id);
+            int expect_dead = ni >= 0 && nodes[ni].dead_for_good;
+            uint8_t st = l->m.members[k].state;
+            if (expect_dead) {
+                if (st != META_OUT && st != META_DESTROYED) {
+                    snprintf(why, wn, "permanently dead member %u is %s (expected OUT/DESTROYED)",
+                             (unsigned)l->m.members[k].id, meta_member_state_name(st));
+                    rc = -1;
+                }
+            } else if (st != META_UP) {
+                snprintf(why, wn, "member %u is %s", (unsigned)l->m.members[k].id, meta_member_state_name(st));
                 rc = -1;
             }
+        }
         for (int i = 0; !rc && i < nn; i++) {
+            if (nodes[i].dead_for_good)
+                continue;
             if (v[i].st.mode == CLUSTER_MODE_CORE && v[i].st.leader != l->st.self) {
                 snprintf(why, wn, "node %d names leader %u, not %u", i, (unsigned)v[i].st.leader, (unsigned)l->st.self);
                 rc = -1;
@@ -1544,6 +1585,8 @@ static void *sampler(void *arg)
             last_res = now_ms();
         }
         for (int i = 0; i < nn && atomic_load(&sampler_run); i++) {
+            if (nodes[i].dead_for_good)
+                continue;
             pid_t pid;
             node_snap(i, &pid, NULL, NULL);
             if (pid <= 0 || node_paused(i))
@@ -1556,6 +1599,17 @@ static void *sampler(void *arg)
             samples_ok++;
             kv_leader_see(&v);
             if (v.st.role == RAFT_LEADER_ROLE && v.st.mode == CLUSTER_MODE_CORE) {
+                for (uint32_t hi = 0; hi < v.st.nheard; hi++) {
+                    const struct cluster_heard *h = &v.st.heard[hi];
+                    for (uint32_t vi = 0; vi < h->nvols; vi++)
+                        if (h->vols[vi].v.health == CL_HEALTH_LOCAL_FAULT) {
+                            if (atomic_fetch_add(&r9_local_faults, 1) == 0)
+                                snprintf(r9_local_fault_msg, sizeof r9_local_fault_msg,
+                                         "member %u volume %u reported LOCAL_FAULT (%s)", (unsigned)h->id,
+                                         (unsigned)h->vols[vi].v.volume,
+                                         cluster_fault_reason_name(h->vols[vi].v.fault_reason));
+                        }
+                }
                 atomic_store(&last_leader, i);
                 uint32_t k = atomic_load(&nobs);
                 if (k < MAXOBS) {
@@ -1897,6 +1951,16 @@ static void *kv_writer(void *arg)
             }
         } else if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED || rc == TSDB_ERR_INVALID ||
                    rc == TSDB_ERR_DROPPED || rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_DENIED) {
+            if (rc == TSDB_ERR_UNAVAILABLE) {
+                tsdb_unavail u[4];
+                unsigned nu = 0;
+                if (tsdbc_unavailable(c, u, 4, &nu) == 0)
+                    for (unsigned ui = 0; ui < nu; ui++)
+                        if (u[ui].reason == TSDB_WHY_FULL) {
+                            atomic_fetch_add(&kv_why_full, 1);
+                            break;
+                        }
+            }
             hist_end(h, id, WS_FAIL); /* refused: definitely not applied */
             atomic_fetch_add(&kv_fail, 1);
             if (kv_follow(c, hi, node, &next, &logged, "the writer") || rc == TSDB_ERR_MOVED ||
@@ -3113,16 +3177,20 @@ static int pick_node(int bias_leader)
         atomic_fetch_add(&via_picks, 1);
     if (want_via && rnd() % 3 == 0) { /* kv-via: a third of the picks go to a node a client is connected to (an entry node) */
         int x = via_pick(0);
-        if (x >= 0) {
+        if (x >= 0 && !nodes[x].dead_for_good) {
             atomic_fetch_add(&via_aimed, 1);
             return x;
         }
     }
-    if (want_rep && k >= 0 && k < nn && rnd() % 2)
+    if (want_rep && k >= 0 && k < nn && !nodes[k].dead_for_good && rnd() % 2)
         return k;
-    if (bias_leader && l >= 0 && l < nn && rnd() % 2)
+    if (bias_leader && l >= 0 && l < nn && !nodes[l].dead_for_good && rnd() % 2)
         return l;
-    return rnd_range(0, nn - 1);
+    int live[MAXN], nl = 0;
+    for (int i = 0; i < nn; i++)
+        if (!nodes[i].dead_for_good)
+            live[nl++] = i;
+    return nl > 0 ? live[rnd_range(0, nl - 1)] : rnd_range(0, nn - 1);
 }
 
 static int term_cp = -1, term_fired, term_done, isr_short;
@@ -3312,7 +3380,7 @@ static int admin_any(int op, const void *req, size_t rl, int timeout_ms)
         int i = (start + k) % nn;
         pid_t pid;
         node_snap(i, &pid, NULL, NULL);
-        if (pid > 0 && !node_paused(i))
+        if (pid > 0 && !node_paused(i) && !nodes[i].dead_for_good && atomic_load(&nodes[i].id) != 0)
             return admin_real(i, op, req, rl, 1, timeout_ms);
     }
     die(2, "no node is running for an admin op");
@@ -4073,7 +4141,8 @@ static int r4_leftovers_once(int say)
 {
     int bad = 0;
     for (int i = 0; i < nn; i++)
-        bad += r4_scan_dir(nodes[i].dir, i, say, 0);
+        if (!nodes[i].dead_for_good)
+            bad += r4_scan_dir(nodes[i].dir, i, say, 0);
     return bad;
 }
 
@@ -4275,6 +4344,7 @@ static int r4_leftovers_check(void)
 }
 
 #include "cluster_ec.h"
+#include "cluster_r9.h"
 
 /* ---- RDMA metrics probe and rdma-qperr nemesis (design-rdma.md §8, rd-hw) */
 
@@ -4649,6 +4719,16 @@ static int cluster_form(void)
         S.repl_retain_s = (uint32_t)retain_eff;
         S.repl_retain_down_gb = 0; /* longdown / --retain-s tests snapshot catch-up past repl_retain_s (E29 off) */
     }
+    if (opt_geometry[0] || (nemeses & N_R9)) { /* R9 D24: scaled failure-handling timers */
+        S.rebuild_after_s = 15;
+        S.failstop_out_s = 3;
+        S.opening_hold_s = 20;
+        S.out_guard_hold_s = 30;
+        S.voter_replace_s = 10; /* replace permanently killed voters in multi-round `out` runs so Raft keeps quorum */
+    }
+    if ((nemeses & N_HOLD) && retain_eff == 0) {
+        S.repl_retain_s = 3; /* short normal cap while keeping E29 repl_retain_down_gb=64 -> 0 snapshots on hold */
+    }
     if (nemeses & N_R12) { /* R12 test pace via cluster init settings (D2, E25): pass finishes well within 60 s */
         S.scrub_days = 1;
         S.scrub_mb_s = 20;
@@ -4863,9 +4943,10 @@ static int selftest_checker(void)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--seed N]\n"
+    fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--geometry 4+2|8+2|8+4|16+4|r3] [--seconds 30] [--seed N]\n"
                     "         [--nemesis kill,partition,pause,midcommit,power,fwdstall,kill2,slow,longdown,rebuild,churn,\n"
-                    "                    partial,diskloss,rot,rotparity,rotcold,rotthenm (with --ec),rotyoung,rdma-qperr] [--ec K+M]\n"
+                    "                    partial,diskloss,rot,rotparity,rotcold,rotthenm,mfail,m1,stripeset (with --ec),\n"
+                    "                    rotyoung,rdma-qperr,out,back,two,slowloss,hold,full] [--ec K+M]\n"
                     "         [--workload meta,kv-local|kv|kv-via|classes|users] [--auth] [--retain-s S]\n"
                     "         [--peer-rdma auto|on|off] [--peer-rdma-pool-mb N] [--peer-rdma-device DEV[:PORT]]\n"
                     "         [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so] [--mutant NAME]\n"
@@ -4988,6 +5069,23 @@ int main(int argc, char **argv)
             }
         } else if (!strcmp(k, "--peer-rdma-device")) {
             opt_peer_rdma_dev = argv[++a];
+        } else if (!strcmp(k, "--geometry")) { /* R9 D24 convenience flag: sets nodes and --ec + scaled init timers */
+            const char *g = argv[++a];
+            snprintf(opt_geometry, sizeof opt_geometry, "%s", g);
+            if (!strcmp(g, "4+2")) {
+                want_ec_k = 4; want_ec_m = 2; nn = 7;
+            } else if (!strcmp(g, "8+2")) {
+                want_ec_k = 8; want_ec_m = 2; nn = 11;
+            } else if (!strcmp(g, "8+4")) {
+                want_ec_k = 8; want_ec_m = 4; nn = 13;
+            } else if (!strcmp(g, "16+4")) {
+                want_ec_k = 16; want_ec_m = 4; nn = 21;
+            } else if (!strcmp(g, "r3")) {
+                want_ec_k = 0; want_ec_m = 0; nn = 5;
+            } else {
+                fprintf(stderr, "jepsen-cluster: --geometry %s: expected 4+2, 8+2, 8+4, 16+4 or r3\n", g);
+                return 2;
+            }
         } else if (!strcmp(k, "--ec")) { /* K+M: kvr is an erasure-coded volume (cluster_ec.h) */
             if (a + 1 >= argc || sscanf(argv[++a], "%d+%d", &want_ec_k, &want_ec_m) != 2 || want_ec_k < 1 ||
                 want_ec_k > META_EC_K_MAX || want_ec_m < 1 || want_ec_m > META_EC_M_MAX) {
@@ -4998,7 +5096,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(k, "--nemesis") || !strcmp(k, "--workload")) {
             int nem = !strcmp(k, "--nemesis");
-            char list[128];
+            char list[256];
             snprintf(list, sizeof list, "%s", argv[++a]);
             if (nem)
                 nemeses = 0;
@@ -5018,7 +5116,7 @@ int main(int argc, char **argv)
                 else if (nem && !strcmp(t, "fwdstall"))
                     nemeses |= N_FWDSTALL;
                 else if (nem && r4_bit(t))
-                    nemeses |= r4_bit(t);
+                    nemeses |= (unsigned)r4_bit(t);
                 else if (nem && !strcmp(t, "partial"))
                     nemeses |= N_PARTIAL;
                 else if (nem && !strcmp(t, "diskloss"))
@@ -5035,6 +5133,24 @@ int main(int argc, char **argv)
                     nemeses |= N_ROTTHENM;
                 else if (nem && !strcmp(t, "rdma-qperr"))
                     nemeses |= N_RDMA_QPERR;
+                else if (nem && !strcmp(t, "out"))
+                    nemeses |= N_OUT;
+                else if (nem && !strcmp(t, "back"))
+                    nemeses |= N_BACK;
+                else if (nem && !strcmp(t, "two"))
+                    nemeses |= N_TWO;
+                else if (nem && !strcmp(t, "mfail"))
+                    nemeses |= N_MFAIL;
+                else if (nem && !strcmp(t, "m1"))
+                    nemeses |= N_M1;
+                else if (nem && !strcmp(t, "slowloss"))
+                    nemeses |= N_SLOWLOSS;
+                else if (nem && !strcmp(t, "hold"))
+                    nemeses |= N_HOLD;
+                else if (nem && !strcmp(t, "stripeset"))
+                    nemeses |= N_STRIPESET;
+                else if (nem && !strcmp(t, "full"))
+                    nemeses |= N_FULL;
                 else if (nem && !strcmp(t, "none"))
                     nemeses |= 0;
                 else if (!nem && !strcmp(t, "meta"))
@@ -5100,7 +5216,11 @@ int main(int argc, char **argv)
             return 2;
         }
     } else if (nemeses & N_EC) {
-        fprintf(stderr, "jepsen-cluster: the partial, diskloss, rot, rotparity, rotcold and rotthenm nemeses need --ec K+M\n");
+        fprintf(stderr, "jepsen-cluster: the partial, diskloss, rot, rotparity, rotcold, rotthenm, mfail, m1 and stripeset nemeses need --ec K+M (or --geometry 4+2|8+2|8+4|16+4)\n");
+        return 2;
+    }
+    if ((nemeses & N_R9) && !want_rep) {
+        fprintf(stderr, "jepsen-cluster: the R9 nemeses (out, back, two, mfail, m1, slowloss, hold, stripeset, full) work on kvr: they need the workload kv, kv-via or classes\n");
         return 2;
     }
     if ((nemeses & N_ROTYOUNG) && !want_rep) {
@@ -5137,8 +5257,8 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    if ((nemeses & N_SLOW) && !outagefs_so) {
-        fprintf(stderr, "jepsen-cluster: the slow nemesis needs --outagefs build/liboutagefs.so\n");
+    if ((nemeses & (N_SLOW | N_SLOWLOSS)) && !outagefs_so) {
+        fprintf(stderr, "jepsen-cluster: the slow and slowloss nemeses need --outagefs build/liboutagefs.so\n");
         return 2;
     }
     if (opt_retain_s == 0 || opt_retain_s > 100000) {
@@ -5146,8 +5266,8 @@ int main(int argc, char **argv)
         return 2;
     }
     use_crashfs = (nemeses & N_POWER) != 0;
-    use_outagefs = (nemeses & N_SLOW) != 0;
-    r4_dynamic = (nemeses & N_CHURN) != 0;
+    use_outagefs = (nemeses & (N_SLOW | N_SLOWLOSS)) != 0;
+    r4_dynamic = (nemeses & (N_CHURN | N_OUT | N_BACK | N_TWO | N_SLOWLOSS | N_M1)) != 0;
     /* repl_retain_s: --retain-s; longdown 3 s (a replica down for longer needs a snapshot); a classes run until r4-replay
      * is on main the age that lets the class switches' deferral pass (CLASSES_RETAIN_S); else the cluster's default */
     retain_eff = opt_retain_s > 0 ? opt_retain_s : (nemeses & N_LONGDOWN) ? 3 : (want_classes && !R4_REPLAY_ON_MAIN) ? CLASSES_RETAIN_S : 0;
@@ -5193,6 +5313,8 @@ int main(int argc, char **argv)
         die(2, "the cluster secret: %s", err);
     obs = calloc(MAXOBS, sizeof *obs);
 
+    for (int i = 0; i < MAXN; i++)
+        nodes[i].sfill_pause_override = -1;
     for (int i = 0; i < nn; i++) {
         snprintf(nodes[i].dir, sizeof nodes[i].dir, "%s/n%d", rundir, i);
         snprintf(nodes[i].log, sizeof nodes[i].log, "%s/n%d.log", rundir, i);
@@ -5220,6 +5342,8 @@ int main(int argc, char **argv)
         }
         if (mkdir(st, 0755) != 0)
             die(2, "mkdir %s: %s", st, strerror(errno));
+        if (nemeses & N_FULL)
+            r9_fillpct_set(i, 50);
         proxy_start(i);
     }
     trace_on = getenv("JEPSEN_TRACE") && atoi(getenv("JEPSEN_TRACE")) > 0;
@@ -5241,6 +5365,8 @@ int main(int argc, char **argv)
     settle("the formation");
     if (want_ec_k)
         ec_form_stores();
+    else if ((nemeses & N_R9) || opt_geometry[0])
+        ec_poller_start();
     if (want_kv)
         kv_setup();
     if (want_rep)
@@ -5255,16 +5381,17 @@ int main(int argc, char **argv)
         kv_start();
     if (want_users)
         ju_start();
-    printf("jepsen-cluster: %d nodes, seed %" PRIu64 ", %d s, nemeses %d, workloads%s%s%s%s, run in %s%s%s\n", nn, seed,
+    printf("jepsen-cluster: %d nodes, seed %" PRIu64 ", %d s, nemeses %u, workloads%s%s%s%s, run in %s%s%s\n", nn, seed,
            seconds, nemeses, want_meta ? " meta" : "", want_kv ? " kv-local" : "",
            want_classes ? " classes" : want_via ? " kv-via" : want_rep ? " kv" : "", want_users ? " users" : "", rundir, term_cp >= 0 ? "; terminal crash point " : "",
            term_cp >= 0 ? cps[term_cp].name : "");
     fflush(stdout);
 
-    int kinds[NNEM], nk = 0;
+    unsigned kinds[NNEM];
+    int nk = 0;
     for (int b = 0; b < NNEM; b++)
-        if (nemeses & (1 << b))
-            kinds[nk++] = 1 << b;
+        if (nemeses & (1u << b))
+            kinds[nk++] = 1u << b;
     int64_t t_start = now_ms(), t_end = t_start + (int64_t)seconds * 1000;
     int takeover = !strncmp(mutant, "takeover", 8);
     unsigned rounds = 0, applied = 0;
@@ -5278,7 +5405,7 @@ int main(int argc, char **argv)
             hold_ms(500);
             continue;
         }
-        int kind = kinds[rnd() % (uint64_t)nk];
+        unsigned kind = kinds[rnd() % (uint64_t)nk];
         rounds++;
         if (!strcmp(mutant, "idle")) { /* the planted nemesis that sleeps through its naps */
             hold_ms(rnd_range(2000, 4000));
@@ -5313,6 +5440,15 @@ int main(int argc, char **argv)
         case N_ROTCOLD: faults[16]++; nem_rotcold(); break;
         case N_ROTYOUNG: faults[17]++; nem_rotyoung(); break;
         case N_ROTTHENM: faults[18]++; nem_rotthenm(); break;
+        case N_OUT: faults[19]++; nem_out(); break;
+        case N_BACK: faults[20]++; nem_back(); break;
+        case N_TWO: faults[21]++; nem_two(); break;
+        case N_MFAIL: faults[22]++; nem_mfail(); break;
+        case N_M1: faults[23]++; nem_m1(); break;
+        case N_SLOWLOSS: faults[24]++; nem_slowloss(); break;
+        case N_HOLD: faults[25]++; nem_hold(); break;
+        case N_STRIPESET: faults[26]++; nem_stripeset(); break;
+        case N_FULL: faults[27]++; nem_full(); break;
         }
         if (rdma_tracking()) {
             struct rdma_mstat rms;
@@ -5326,6 +5462,9 @@ int main(int argc, char **argv)
                 kind == N_CHURN ? "churn" : kind == N_PARTIAL ? "partial" : kind == N_DISKLOSS ? "diskloss" :
                 kind == N_ROT ? "rot" : kind == N_RDMA_QPERR ? "rdma-qperr" : kind == N_ROTPARITY ? "rotparity" :
                 kind == N_ROTCOLD ? "rotcold" : kind == N_ROTYOUNG ? "rotyoung" : kind == N_ROTTHENM ? "rotthenm" :
+                kind == N_OUT ? "out" : kind == N_BACK ? "back" : kind == N_TWO ? "two" : kind == N_MFAIL ? "mfail" :
+                kind == N_M1 ? "m1" : kind == N_SLOWLOSS ? "slowloss" : kind == N_HOLD ? "hold" :
+                kind == N_STRIPESET ? "stripeset" : kind == N_FULL ? "full" :
                 "power", rounds);
         settle(kind == N_KILL ? "a kill" : kind == N_PARTITION ? "a partition" : kind == N_PAUSE ? "a pause" :
                kind == N_MIDCOMMIT ? "a crash point" : kind == N_FWDSTALL ? "a forward stall" : kind == N_KILL2 ? "two kills" :
@@ -5334,7 +5473,11 @@ int main(int argc, char **argv)
                kind == N_DISKLOSS ? "a disk loss" : kind == N_ROT ? "a rotted chunk" :
                kind == N_RDMA_QPERR ? "an RDMA QP error" : kind == N_ROTPARITY ? "a rotted parity chunk" :
                kind == N_ROTCOLD ? "a rotted cold chunk" : kind == N_ROTYOUNG ? "a rotted young part" :
-               kind == N_ROTTHENM ? "rot then m kills" : "a power loss");
+               kind == N_ROTTHENM ? "rot then m kills" : kind == N_OUT ? "an out and rebuild" :
+               kind == N_BACK ? "a return during rebuild" : kind == N_TWO ? "two kills (guard)" :
+               kind == N_MFAIL ? "m stripe kills" : kind == N_M1 ? "m+1 stripe kills" :
+               kind == N_SLOWLOSS ? "slow then leader loss" : kind == N_HOLD ? "a node hold" :
+               kind == N_STRIPESET ? "a stripe pos move" : kind == N_FULL ? "full backpressure" : "a power loss");
         hold_ms(rnd_range(300, 1200));
     }
     if (term_cp >= 0 && !term_done) {
@@ -5342,9 +5485,12 @@ int main(int argc, char **argv)
         snprintf(unfired_msg, sizeof unfired_msg, "the terminal crash point %s was never triggered (the run was too short)",
                  cps[term_cp].name);
     }
-    /* the end: everything healed, resumed and running */
+    /* the end: everything healed, resumed and running (skipping nodes killed permanently by out/m1) */
+    r9_sfill_pause_clear_all();
     net_heal();
     for (int i = 0; i < nn; i++) {
+        if (nodes[i].dead_for_good)
+            continue;
         pid_t pid;
         node_snap(i, &pid, NULL, NULL);
         if (pid > 0 && nodes[i].paused)
@@ -5433,10 +5579,12 @@ int main(int argc, char **argv)
     const char *dirs[MAXN * 3];
     int nd = replica_dirs(dirs, MAXN * 3);
     int rdiff = isr_short, isr = rep_full_mask();
-    if (want_ec_k)
+    if (want_ec_k || (nemeses & N_R9) || opt_geometry[0])
         r4_end_bad += ec_div_check(); /* its own FAIL line: not one of "the replicas differ" */
     if (nemeses & N_R12)
         r4_end_bad += r12_end_check();
+    if (want_ec_k || (nemeses & N_R9) || opt_geometry[0])
+        r4_end_bad += r9_end_check();
     struct rdma_mstat rdma_end;
     memset(&rdma_end, 0, sizeof rdma_end);
     if (rdma_tracking())
@@ -5504,6 +5652,7 @@ int main(int argc, char **argv)
     (void)nwrites;
     ec_summary();
     r12_summary();
+    r9_summary();
     if (want_via)
         printf("kv-via: %" PRIu64 " writes and %" PRIu64 " reads answered through a member that did not lead kvr, %" PRIu64
                " read-your-writes reads, %d stall window(s) checked, %" PRIu64 " of %" PRIu64 " nemesis picks aimed at an entry "
@@ -5616,7 +5765,7 @@ int main(int argc, char **argv)
      * ones, and the floor, as everywhere, a third of the honest rate (never below one fault). A list without these two
      * keeps its 10 s. */
     int per_round = 10;
-    if (nemeses & (N_LONGDOWN | N_REBUILD | N_R12)) {
+    if (nemeses & (N_LONGDOWN | N_REBUILD | N_R12 | N_R9)) {
         int sum = 0, n = 0;
         for (int k = 0; k < nk; k++) {
             sum += kinds[k] == N_LONGDOWN ? (retain_eff > 0 ? retain_eff : 3) + 14
@@ -5624,6 +5773,11 @@ int main(int argc, char **argv)
                  : kinds[k] == N_ROTTHENM ? 15
                  : kinds[k] == N_ROTYOUNG ? 12
                  : (kinds[k] & (N_ROTPARITY | N_ROTCOLD)) ? 8
+                 : (kinds[k] & (N_OUT | N_BACK))          ? (int)S.rebuild_after_s + 25
+                 : kinds[k] == N_TWO                      ? (int)S.rebuild_after_s + 15
+                 : kinds[k] == N_HOLD                     ? (int)S.rebuild_after_s + 20
+                 : kinds[k] == N_SLOWLOSS                 ? 25
+                 : (kinds[k] & N_R9)                      ? 15
                                                           : 6;
             n++;
         }

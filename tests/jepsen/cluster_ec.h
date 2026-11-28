@@ -363,12 +363,15 @@ static int r12_metrics_sample_node(int i)
 static void r12_metrics_sample_all(void)
 {
     for (int i = 0; i < nn; i++)
-        (void)r12_metrics_sample_node(i);
+        if (!nodes[i].dead_for_good)
+            (void)r12_metrics_sample_node(i);
 }
 
 static void ec_poll(void)
 {
     for (int i = 0; i < nn; i++) {
+        if (nodes[i].dead_for_good)
+            continue;
         pid_t pid;
         int port, paused;
         pthread_mutex_lock(&tbl_mu);
@@ -465,14 +468,22 @@ static int ec_div_check(void)
     ec_poller_stop();
     ec_poll();
     ec_stopped_lines = ec_log_stops();
+    unsigned lf = atomic_load(&r9_local_faults);
+    int fault_excused = ec_damaged || r9_loss_expected;
     int bad = 0;
-    if (ec_div_polls || ec_stopped_lines)
-        printf("jepsen-cluster: ec: %u of %u polls found a volume DIVERGED (%s), %u \"volume stopped\" line(s) in the node logs%s\n",
-               ec_div_polls, ec_polls, ec_div_polls ? ec_div_msg : "none", ec_stopped_lines,
-               ec_damaged ? " (rot or disk loss ran: allowed)" : "");
-    if (!ec_damaged && (ec_div_polls || ec_stopped_lines)) {
+    if (ec_div_polls || ec_stopped_lines || lf)
+        printf("jepsen-cluster: ec: %u of %u polls found a volume DIVERGED (%s), %u \"volume stopped\" line(s), "
+               "%u LOCAL_FAULT sample(s) (%s)%s\n",
+               ec_div_polls, ec_polls, ec_div_polls ? ec_div_msg : "none", ec_stopped_lines, lf,
+               lf ? r9_local_fault_msg : "none",
+               ec_damaged ? " (rot or disk loss ran: allowed)" : fault_excused ? " (expected loss)" : "");
+    if (!ec_damaged && ec_div_polls) {
         fprintf(stderr, "jepsen-cluster: FAIL: a volume was DIVERGED or stopped in a run without rot or disk loss: %s, %u "
-                "stop line(s)\n", ec_div_polls ? ec_div_msg : "no DIVERGED poll", ec_stopped_lines);
+                "stop line(s)\n", ec_div_msg, ec_stopped_lines);
+        bad++;
+    } else if (!fault_excused && (ec_stopped_lines || lf)) {
+        fprintf(stderr, "jepsen-cluster: FAIL: a volume was DIVERGED or stopped (LOCAL_FAULT) in a run without rot or disk loss: "
+                "%u stop line(s), %u LOCAL_FAULT (%s)\n", ec_stopped_lines, lf, lf ? r9_local_fault_msg : "none");
         bad++;
     }
     return bad;

@@ -2228,7 +2228,7 @@ jepsen-selftest-5:
 # front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
 # (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
 # each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
-$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/jepsen/cluster_ec.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
+$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/jepsen/cluster_ec.h tests/jepsen/cluster_r9.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
     server/crashpt.h server/users.h src/chunk.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
@@ -2284,6 +2284,39 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)
 	        || exit 1; \
 	    done; done; done
 	$(MAKE) --no-print-directory jepsen-cluster-ec
+	$(MAKE) --no-print-directory jepsen-cluster-r9
+
+# R9 failure handling, rebuild, return, hold, backpressure and multi-fault nemeses (tests/jepsen/cluster_r9.h, D24):
+# JEPSEN_R9_R3_NEMESES on --geometry r3 (5 nodes, both backends) and JEPSEN_R9_EC_NEMESES on --geometry 4+2 (7 nodes,
+# both backends; io_uring on at most 2 nodes). JEPSEN_R9_GEOMS (default "8+2 8+4 16+4") runs JEPSEN_R9_LARGE_NEMESES
+# on epoll. Set JEPSEN_R9=none to skip in `make jepsen-cluster`.
+JEPSEN_R9 ?=
+JEPSEN_R9_R3_NEMESES ?= out back two slowloss hold full
+JEPSEN_R9_EC_NEMESES ?= out back two mfail m1 slowloss hold stripeset full
+JEPSEN_R9_GEOMS ?= 8+2 8+4 16+4
+JEPSEN_R9_LARGE_NEMESES ?= out back mfail m1 stripeset
+jepsen-cluster-r9: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so
+	@if [ "$(JEPSEN_R9)" = none ]; then echo "jepsen-cluster-r9: off (JEPSEN_R9=none)"; exit 0; fi; \
+	for io in $(IO); do for nem in $(JEPSEN_R9_R3_NEMESES); do \
+	    echo "== tsdbd --io $$io, --geometry r3, nemesis $$nem (R9)"; \
+	    TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) \
+	        --geometry r3 --nemesis $$nem --workload meta,kv --seconds $(call jsec,30) --seed $(JEPSEN_SEED) \
+	        --crashfs $(B)/libcrashfs.so --outagefs $(B)/liboutagefs.so || exit 1; \
+	    done; done; \
+	if [ -n "$(EC_OBJ)" ]; then \
+	    for io in $(IO); do for nem in $(JEPSEN_R9_EC_NEMESES); do \
+	        echo "== tsdbd --io $$io, --geometry 4+2, nemesis $$nem (R9)"; \
+	        TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) \
+	            --geometry 4+2 --nemesis $$nem --workload meta,kv --seconds $(call jsec,30) --seed $(JEPSEN_SEED) \
+	            --crashfs $(B)/libcrashfs.so --outagefs $(B)/liboutagefs.so || exit 1; \
+	        done; done; \
+	    for g in $(JEPSEN_R9_GEOMS); do for nem in $(JEPSEN_R9_LARGE_NEMESES); do \
+	        echo "== tsdbd --io epoll, --geometry $$g, nemesis $$nem (R9)"; \
+	        TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=epoll ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) \
+	            --geometry $$g --nemesis $$nem --workload meta,kv --seconds $(call jsec,30) --seed $(JEPSEN_SEED) \
+	            --crashfs $(B)/libcrashfs.so --outagefs $(B)/liboutagefs.so || exit 1; \
+	        done; done; \
+	fi
 
 # --ec (tests/jepsen/cluster_ec.h, row r8l-jc, r12-jc): kvr as an erasure-coded volume on JEPSEN_EC_NODES nodes with two chunk stores each.
 # The nemeses default to kill partial diskloss, and, when this tsdbd settles ec volumes (built with TSDB_EC: only then
@@ -2449,7 +2482,19 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	    out=$$(TSDB_REPAIR_MUTANT=repairnolive $$j --nodes 7 --ec 4+2 --workload meta,kv --nemesis rotcold --seconds 40 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r12: .*chunk replace refused\|FAIL: r12: chunk repair resurrected'; then \
 	        echo "jepsen-cluster-selftest: chunk repair mutant repairnolive went unnoticed under rotcold (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate, scrubskipcell, repairnolive skipped (NO_EC=1)"; fi; \
+	    out=$$(TSDB_SFILL_MUTANT=wholeearly $$j --geometry 4+2 --workload meta,kv --nemesis out --seconds 35 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r9: wholeearly:'; then \
+	        echo "jepsen-cluster-selftest: R9 mutant wholeearly went unnoticed under out (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    out=$$(TSDB_SFILL_MUTANT=fillnocheck $$j --geometry 4+2 --workload meta,kv --nemesis out --seconds 30 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r9: fillnocheck:'; then \
+	        echo "jepsen-cluster-selftest: R9 mutant fillnocheck went unnoticed under out (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    out=$$(TSDB_PLACE_MUTANT=partialdelnow $$j --geometry 4+2 --workload meta,kv --nemesis back --seconds 40 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r9: partialdelnow:'; then \
+	        echo "jepsen-cluster-selftest: R9 mutant partialdelnow went unnoticed under back (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate, scrubskipcell, repairnolive, wholeearly, fillnocheck, partialdelnow skipped (NO_EC=1)"; fi; \
+	out=$$(TSDB_PLACE_MUTANT=noguard $$j --geometry r3 --workload meta,kv --nemesis two --seconds 35 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r9: noguard:'; then \
+	        echo "jepsen-cluster-selftest: R9 mutant noguard went unnoticed under two (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$(TSDB_SCRUB_MUTANT=youngskipgranule $$j --nodes 5 --workload meta,kv --nemesis rotyoung --seconds 40 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: r12: rotyoung planted [1-9][0-9]* rot(s), rebuilt 0, /metrics reports young_damaged=0'; then \
 	        echo "jepsen-cluster-selftest: young scrub mutant youngskipgranule went unnoticed under rotyoung (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
@@ -2593,4 +2638,4 @@ test: check-ci-groups
 check-ci-groups:
 	tests/check_ci_groups.sh
 
-.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper test-release-hooks tsan-par test-cluster-cli settings-mutants
+.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper test-release-hooks tsan-par test-cluster-cli settings-mutants jepsen-cluster-r9

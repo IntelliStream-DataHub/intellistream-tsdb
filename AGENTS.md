@@ -99,7 +99,20 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # `ec-notransfer`, `ec-nosettle`, and server mutants `ycold`, `ecabovey`, `cutnogate`,
                           # `scrubskipcell` (`TSDB_CHUNKSCRUB_MUTANT`), `repairnolive` (`TSDB_REPAIR_MUTANT`), and
                           # `youngskipgranule` (`TSDB_SCRUB_MUTANT`);
-                          # `jepsen_cluster --ec 16+4 --nodes 22` tests 22-node geometry (2 io_uring + 20 epoll)
+                          # `jepsen_cluster --ec 16+4 --nodes 22` tests 22-node geometry (2 io_uring + 20 epoll).
+                          # `jepsen-cluster-r9` (`tests/jepsen/cluster_r9.h`, run by `make jepsen-cluster`; `JEPSEN_R9=none` skips;
+                          # `JEPSEN_R9_R3_NEMESES`, `JEPSEN_R9_EC_NEMESES`, `JEPSEN_R9_GEOMS`, `JEPSEN_R9_LARGE_NEMESES`):
+                          # `--geometry 4+2|8+2|8+4|16+4|r3` sets nodes 7/11/13/21/5, scaled D24 init timers (`rebuild_after_s=15`,
+                          # `failstop_out_s=3`, `opening_hold_s=20`, `out_guard_hold_s=30`, `voter_replace_s=10`), and at most 2
+                          # `io_uring` nodes; nemeses `out` (kill for good + `node add` + fill to WHOLE + `fillnocheck` probe),
+                          # `back` (kill past `rebuild_after` + return mid-fill), `two` (mass-OUT guard), `mfail` (`m` stripe holders
+                          # down, full-width `kvr.ecwide` reads whole), `m1` (`m+1` down -> `UNAVAILABLE` only + end-of-run `node destroyed`
+                          # `tier=lost` check), `slowloss` (`outagefs` slow follower + leader dir removal), `hold` (`node hold` under
+                          # ingest: degraded EC settles verified via `.ec` `positions` bitmask, 0 snapshots), `stripeset` (`volume move --pos`
+                          # during settles), `full` (`fill_pct_file=1` -> `TSDB_WHY_FULL` backpressure + resume); checker fails on
+                          # any non-rot `DIVERGED` or `LOCAL_FAULT` and requires every stripe pos `WHOLE` or `FILLING` with progress;
+                          # selftest plants `noguard` (`TSDB_PLACE_MUTANT`), `wholeearly` (`TSDB_SFILL_MUTANT`), `fillnocheck`
+                          # (`TSDB_SFILL_MUTANT`), and `partialdelnow` (`TSDB_PLACE_MUTANT`) (~45 runs across r3/4+2/8+2/8+4/16+4)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
